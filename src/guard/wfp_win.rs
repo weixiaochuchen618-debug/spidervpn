@@ -604,7 +604,10 @@ mod imp {
             || f.flags & !(FILTER_FLAG_PERSISTENT | W::FWPM_FILTER_FLAG_DISABLED
                            | W::FWPM_FILTER_FLAG_INDEXED) != 0
             || read_blob(&f.providerData) != OWNER_MARKER
-            || from_win(f.Anonymous.providerContextKey) != Guid::nil()
+            // 当 HAS_PROVIDER_CONTEXT 未置位时，这个 union 的有效字段是
+            // rawContext (u64)，不能把它按 16 字节的 providerContextKey 读取。
+            || f.flags & W::FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT != 0
+            || f.Anonymous.rawContext != 0
             || f.weight.r#type != FWP_TYPE_UINT64
             || f.weight.Anonymous.uint64.is_null()
             || *f.weight.Anonymous.uint64 != FILTER_WEIGHT_BLOCK
@@ -716,7 +719,9 @@ mod imp {
                 let rules = compile_scoped_blocks(EgressPolicy::local_proxy(endpoint).unwrap(), &app).unwrap();
                 for candidate in rules {
                     let mut raw = RawFilter::scoped_v2_proxy("Trader", &app, &candidate).unwrap();
-                    assert!(unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    assert!(unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) },
+                        "v2 预期规则未被严格识别 endpoint={endpoint}, candidate={candidate:?}, actual={:?}",
+                        unsafe { filter_raw_from(raw.as_ptr()) });
                     // Wrong app identity and stale endpoint can never be certified.
                     let another_app = "other.exe".encode_utf16().chain(Some(0))
                         .flat_map(u16::to_le_bytes).collect::<Vec<_>>();
