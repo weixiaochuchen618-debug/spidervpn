@@ -336,7 +336,11 @@ pub fn maintenance_status_from(
             } else {
                 let plan = plan_restore(&j, current, &j.endpoint);
                 if plan.changes.is_empty() {
-                    Some("当前代理已与接管前一致；可清理残留凭据。".to_string())
+                    if plan.warnings.is_empty() {
+                        Some("当前代理已与接管前一致；可清理残留凭据。".to_string())
+                    } else {
+                        Some("检测到第三方对代理字段的修改，已保留当前设置；可清理残留凭据。".to_string())
+                    }
                 } else {
                     None
                 }
