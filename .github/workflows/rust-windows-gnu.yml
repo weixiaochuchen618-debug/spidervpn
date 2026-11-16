@@ -55,7 +55,7 @@ jobs:
         run: |
           $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
           $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
-          foreach ($filter in @('guard::wfp::tests::', 'guard::egress_policy::tests::', 'guard::tun_identity::tests::')) {
+          foreach ($filter in @('guard::wfp::tests::', 'guard::wfp_win::imp::scoped_v2_tests::', 'guard::egress_policy::tests::', 'guard::tun_identity::tests::')) {
             Write-Host "Running GNU Rust tests: $filter"
             & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn $filter -- --test-threads=1
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
