@@ -164,13 +164,17 @@ mod imp {
 
         /// 显式关闭：失败要返回给调用方（close 失败时策略状态不可确认）。
         pub fn close_checked(mut self) -> Result<(), WfpError> {
-            let Some(h) = self.handle.take() else {
+            let Some(h) = self.handle else {
                 return Ok(());
             };
             let rc = unsafe { W::FwpmEngineClose0(h) };
             if rc != 0 {
+                // FwpmEngineClose0 返回失败时不能先遗失 handle。
+                // 让接下来 self 的 Drop 再尝试一次关闭；临时许可持有进程
+                // 结束后的 RPC rundown 仍是最后一道 fail-closed 兜底。
                 return Err(classify(rc));
             }
+            self.handle = None;
             Ok(())
         }
     }
