@@ -658,6 +658,62 @@ mod imp {
             Ok(permit)
         }
 
+        /// TUN 正向临时许可的**内部候选构造器**：
+        ///    APP_ID == 交易软件 && NEXTHOP_INTERFACE == 经验证的 TUN LUID。
+        ///
+        /// 持久的 v1 APP_ID BLOCK 永不移除：字段为 FWP_EMPTY、接口改变、
+        /// 非 TUN 流量时，上述正向许可不匹配，继续由 v1 BLOCK 阻断。
+        /// 因此无需依赖 NOT_EQUAL 在缺失字段上的语义来实现 fail-closed。
+        ///
+        /// 这里只生成原生结构，不安装、不同步、不向 UI 暴露。真实 Wintun 和
+        /// ALE 重新授权尚未通过验证时，不得将它用于生产连接。
+        fn candidate_ephemeral_tun_permit(
+            name: &str,
+            app_id: &[u8],
+            layer: Layer,
+            expected_luid: u64,
+            lease_nonce: &[u8],
+        ) -> Result<Box<RawFilter>, String> {
+            use sha2::{Digest, Sha256};
+            if expected_luid == 0 || app_id.is_empty() || app_id.len() % 2 != 0
+                || lease_nonce.len() < 16
+            {
+                return Err("TUN 临时许可的 LUID、APP_ID 或 nonce 不合法".into());
+            }
+            let mut hash = Sha256::new();
+            hash.update(b"SpiderVPN/WFP-v2/dynamic-tun-permit/");
+            hash.update(match layer { Layer::V4 => b"ipv4", Layer::V6 => b"ipv6" });
+            hash.update((app_id.len() as u64).to_le_bytes());
+            hash.update(app_id);
+            hash.update(expected_luid.to_le_bytes());
+            hash.update(lease_nonce);
+            let digest = hash.finalize();
+            let mut key_bytes = [0u8; 16];
+            key_bytes.copy_from_slice(&digest[..16]);
+
+            let mut permit = RawFilter::block(name, app_id, layer);
+            permit.raw.filterKey = to_win(Guid::from_bytes_le(key_bytes));
+            permit.raw.flags = 0;
+            permit.raw.action.r#type = W::FWP_ACTION_PERMIT;
+            *permit._weight = super::super::wfp::FILTER_WEIGHT_PERMIT;
+            permit._scoped_luid = Some(Box::new(expected_luid));
+            let luid_ptr: *mut u64 = &mut **permit._scoped_luid.as_mut().unwrap();
+            permit._conditions = vec![
+                unsafe { std::ptr::read(&permit._conditions[0]) },
+                W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE,
+                    matchType: W::FWP_MATCH_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT64,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint64: luid_ptr },
+                    },
+                },
+            ].into_boxed_slice();
+            permit.raw.numFilterConditions = permit._conditions.len() as u32;
+            permit.raw.filterCondition = permit._conditions.as_mut_ptr();
+            Ok(permit)
+        }
+
         /// 在调用端遗漏进程归属检查的情况下也不可能从公共入口生成许可。
         /// 验证当前 TCP LISTEN 所属 PID 和 EXE，出错即拒绝构造。
         ///
@@ -840,6 +896,35 @@ mod imp {
                 assert_ne!(p.raw.filterKey,
                     RawFilter::block("Trader", &app, if endpoint.is_ipv4() { Layer::V4 } else { Layer::V6 }).raw.filterKey,
                     "动态许可不能覆盖 v1 持久 BLOCK filterKey");
+            }
+        }
+
+        #[test]
+        fn candidate_tun_permit_is_exact_nonpersistent_and_rejects_missing_luid() {
+            let app = app();
+            let nonce = [0x6Au8; 16];
+            for layer in [Layer::V4, Layer::V6] {
+                let permit = RawFilter::candidate_ephemeral_tun_permit(
+                    "Trader", &app, layer, 424242, &nonce).unwrap();
+                assert_eq!(permit.raw.flags, 0);
+                assert_eq!(permit.raw.action.r#type, W::FWP_ACTION_PERMIT);
+                assert_eq!(*permit._weight, super::super::super::wfp::FILTER_WEIGHT_PERMIT);
+                assert_eq!(permit._conditions.len(), 2);
+                assert_eq!(permit._conditions[0].fieldKey, W::FWPM_CONDITION_ALE_APP_ID);
+                assert_eq!(permit._conditions[1].fieldKey, W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE);
+                assert_eq!(permit._conditions[1].matchType, W::FWP_MATCH_EQUAL);
+                assert_eq!(permit._conditions[1].conditionValue.r#type, W::FWP_UINT64);
+                assert_eq!(unsafe { *permit._conditions[1].conditionValue.Anonymous.uint64 }, 424242);
+                assert_ne!(permit.raw.filterKey, RawFilter::block("Trader", &app, layer).raw.filterKey);
+                let mut other = nonce;
+                other[15] ^= 1;
+                let rotated = RawFilter::candidate_ephemeral_tun_permit(
+                    "Trader", &app, layer, 424242, &other).unwrap();
+                assert_ne!(permit.raw.filterKey, rotated.raw.filterKey);
+                assert!(RawFilter::candidate_ephemeral_tun_permit(
+                    "Trader", &app, layer, 0, &nonce).is_err());
+                assert!(RawFilter::candidate_ephemeral_tun_permit(
+                    "Trader", &app, layer, 424242, &[]).is_err());
             }
         }
 
