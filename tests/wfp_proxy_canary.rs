@@ -288,6 +288,71 @@ mod windows_canary {
         id
     }
 
+    /// WFP 备选的 fail-closed 架构验证：长期 BLOCK 在同一个 sublayer 中保持，
+    /// 仅引擎健康期间开启权重更高的“精确代理端点”动态 PERMIT。
+    ///
+    /// 动态 PERMIT 不带 CLEAR_ACTION_RIGHT，仍允许其它安全产品阻断连接；
+    /// 它只应在同一 sublayer 中提前命中、绕过我们的宽泛 BLOCK。
+    fn install_ephemeral_proxy_permit(engine: &DynamicEngine, app: &AppId, port: u16) {
+        let mut conditions = [
+            W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
+                matchType: W::FWP_MATCH_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_BYTE_BLOB_TYPE,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { byteBlob: app.0 },
+                },
+            },
+            W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType: W::FWP_MATCH_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT32,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 {
+                        uint32: u32::from_be_bytes([127, 0, 0, 1]),
+                    },
+                },
+            },
+            W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType: W::FWP_MATCH_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT16,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { uint16: port },
+                },
+            },
+            W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_PROTOCOL,
+                matchType: W::FWP_MATCH_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT8,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { uint8: 6 },
+                },
+            },
+        ];
+        let mut name: Vec<u16> = "SpiderVPN soft permit lifecycle canary"
+            .encode_utf16().chain(Some(0)).collect();
+        let mut raw = W::FWPM_FILTER0::default();
+        raw.displayData.name = name.as_mut_ptr();
+        raw.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+        raw.weight = W::FWP_VALUE0 {
+            r#type: W::FWP_UINT8,
+            Anonymous: W::FWP_VALUE0_0 { uint8: 14 }, // higher priority than broad BLOCK (13)
+        };
+        raw.numFilterConditions = conditions.len() as u32;
+        raw.filterCondition = conditions.as_mut_ptr();
+        raw.action = W::FWPM_ACTION0 {
+            r#type: W::FWP_ACTION_PERMIT,
+            Anonymous: W::FWPM_ACTION0_0 { filterType: windows_sys::core::GUID::default() },
+        };
+        raw.flags = 0; // nonpersistent, soft PERMIT
+        let mut id = 0u64;
+        let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null_mut(), &mut id) };
+        assert_eq!(rc, 0, "安装非持久精确代理 PERMIT 失败：0x{rc:08X}");
+        assert_ne!(id, 0);
+    }
+
     fn begin_txn(engine: &DynamicEngine) {
         let rc = unsafe { W::FwpmTransactionBegin0(engine.0, 0) };
         assert_eq!(rc, 0, "开始 WFP 原子迁移事务失败：0x{rc:08X}");
@@ -323,6 +388,39 @@ mod windows_canary {
         }
         let mut buffer = [0u8; 128];
         matches!(server.recv_from(&mut buffer), Ok((n, _)) if &buffer[..n] == b"vpn-wfp-test")
+    }
+
+    #[test]
+    #[ignore = "CI 仅针对测试 exe 的 WFP 动态双会话；验证常驻 BLOCK + 临时精确 PERMIT 的仲裁和撤销"]
+    fn persistent_style_block_plus_ephemeral_permit_fails_closed_on_session_exit() {
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+        let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let allowed_addr = allowed.local_addr().unwrap();
+        let other_addr = other.local_addr().unwrap();
+        assert!(connect(allowed_addr).is_ok() && connect(other_addr).is_ok());
+
+        // A 会话模拟“始终在位的 BLOCK”（CI 中保持动态以保证绝不残留）；
+        // B 会话只临时放行特定代理端点，退出自动失效。
+        let permanent_simulation = DynamicEngine::open();
+        let app = AppId::this_test_exe();
+        install_legacy_block(&permanent_simulation, &app);
+        assert!(connect(allowed_addr).is_err() && connect(other_addr).is_err(),
+            "基础规则没有做到无例外默认 BLOCK");
+
+        let permit_session = DynamicEngine::open();
+        install_ephemeral_proxy_permit(&permit_session, &app, allowed_addr.port());
+        assert!(connect(allowed_addr).is_ok(),
+            "较高权重的同子层精确 PERMIT 未能放行可信端点，架构不能发布");
+        assert!(connect(other_addr).is_err(), "更高权重 PERMIT 意外放行了非信任端口");
+
+        drop(permit_session);
+        assert!(connect(allowed_addr).is_err() && connect(other_addr).is_err(),
+            "临时 PERMIT 会话消失后没有恢复全阻断，断线防泄漏失败");
+
+        drop(permanent_simulation);
+        assert!(connect(allowed_addr).is_ok() && connect(other_addr).is_ok(),
+            "模拟基础 BLOCK 关闭后残留过滤器，可能污染 CI 或用户系统");
     }
 
     #[test]
