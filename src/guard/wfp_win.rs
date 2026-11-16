@@ -135,6 +135,29 @@ mod imp {
             Ok(WfpEngine { handle: Some(handle) })
         }
 
+        /// 打开**动态** WFP 会话：本会话内的非持久过滤器在进程崩溃/
+        /// 句柄被 BFE 回收后自动消失。与原有的持久安装 open() 严格分开。
+        /// 这只是构造能力；未来必须由受监督的单独进程持有至引擎退出。
+        pub fn open_dynamic() -> Result<WfpEngine, WfpError> {
+            let mut session: W::FWPM_SESSION0 = unsafe { std::mem::zeroed() };
+            session.flags = W::FWPM_SESSION_FLAG_DYNAMIC;
+            let mut handle: HANDLE = std::ptr::null_mut();
+            let rc = unsafe {
+                W::FwpmEngineOpen0(
+                    std::ptr::null(),
+                    RPC_C_AUTHN_WINNT,
+                    std::ptr::null(),
+                    &session,
+                    &mut handle,
+                )
+            };
+            if rc != 0 { return Err(classify(rc)); }
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return Err(WfpError::InvalidState);
+            }
+            Ok(WfpEngine { handle: Some(handle) })
+        }
+
         pub fn raw(&self) -> HANDLE {
             self.handle.unwrap_or(std::ptr::null_mut())
         }
@@ -1057,6 +1080,125 @@ mod imp {
             assert!(RawFilter::scoped_v2_proxy("Trader", &app, &bad).is_err());
             let altered = ScopedBlock { filter_key: Guid::nil(), ..bad };
             assert!(RawFilter::scoped_v2_proxy("Trader", &app, &altered).is_err());
+        }
+    }
+
+    /// 临时代理许可的 RAII 句柄。**不写持久规则**，Drop 必然关闭动态会话。
+    /// 未来的独立监督进程必须持有它，并在引擎退出或监听身份变化时丢弃。
+    /// 目前不接入任何正式连接入口，不能把它解释为已上线的 Kill Switch。
+    pub struct DynamicProxyLease {
+        engine: WfpEngine,
+        endpoint: std::net::SocketAddr,
+        owner_pid: u32,
+        permitted_filters: Vec<u64>,
+    }
+
+    impl DynamicProxyLease {
+        /// 唯一允许构造临时代理许可的内部入口，拒绝在持久阻断缺失时开放通道。
+        pub fn acquire(
+            ids: &[super::super::identity::ProgramIdentity],
+            endpoint: std::net::SocketAddr,
+            owner_pid: u32,
+            executable: &Path,
+            lease_nonce: &[u8],
+        ) -> Result<Self, String> {
+            if ids.is_empty() || lease_nonce.len() < 16 {
+                return Err("保护名单为空或许可会话 nonce 不足，拒绝临时放行".into());
+            }
+            super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
+            let engine = WfpEngine::open_dynamic().map_err(|e| e.to_string())?;
+            let provider = provider_get(&engine, PROVIDER_GUID).map_err(|e| e.to_string())?;
+            let sublayer = sublayer_get(&engine, SUBLAYER_GUID).map_err(|e| e.to_string())?;
+            if !provider.as_ref().is_some_and(ProviderDefinition::is_ours)
+                || !sublayer.as_ref().is_some_and(SubLayerDefinition::is_ours)
+            {
+                return Err("持久 WFP 保护基础设施缺失或身份不可信，不创建任何动态许可".into());
+            }
+            // snapshot 使用相同的 provider 枚举及 recognize 逻辑。额外规则、
+            // 重复条目、禁用的 BLOCK 都必须拒绝，不能“有一个就算安全”。
+            let existing = WindowsWfp::enumerate_ours(&engine).map_err(|e| e.to_string())?;
+            let mut wanted = std::collections::HashSet::new();
+            for id in ids {
+                if id.app_id.is_empty() { return Err("保护名单 APP_ID 为空".into()); }
+                for layer in Layer::ALL {
+                    let key = super::super::wfp::filter_key(&id.app_id, layer, false);
+                    if !wanted.insert(key) {
+                        return Err("交易保护名单含重复 APP_ID，拒绝不确定的持久规则集".into());
+                    }
+                    let matching: Vec<_> = existing.iter().filter(|f| f.filter_key == key).collect();
+                    if matching.len() != 1
+                        || !super::super::wfp::recognize(matching[0], &id.app_id, layer).ok()
+                    {
+                        return Err(format!("{} 的 {:?} 持久 BLOCK 不完整，拒绝动态许可", id.name, layer));
+                    }
+                }
+            }
+            if existing.len() != wanted.len() {
+                return Err("WFP provider 存在未预期或重复过滤器，拒绝临时放行".into());
+            }
+            // owner 检查可能与 BFE 枚举并发；真正写入之前再次核验。
+            super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
+            let mut permits = Vec::with_capacity(ids.len());
+            for id in ids {
+                let raw = RawFilter::trusted_ephemeral_proxy_permit(
+                    &id.name, &id.app_id, endpoint, owner_pid, executable, lease_nonce,
+                )?;
+                // 这里仍然只能写临时许可；RawFilter 内部使用 NULL providerKey，
+                // 不会在后续持久 Guard snapshot/sync 中被当作多余规则。
+                let installed = filter_add(&engine, &raw).map_err(|e| e.to_string())?;
+                if installed == 0 {
+                    return Err("动态 WFP 许可未返回有效 filterId".into());
+                }
+                permits.push(installed);
+            }
+            // 安装过程也可能跨越代理退出或端口重新绑定；失败直接 Drop
+            // 动态 engine，BFE 会移除已经装上的所有 permits。
+            super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
+            Ok(Self { engine, endpoint, owner_pid, permitted_filters: permits })
+        }
+
+        /// 每次接到存活检查都必须**消耗**旧 lease。失败时旧会话立即 Drop，
+        /// 防止监控调用方忘记主动撤销。不能代替实时进程退出通知机制。
+        pub fn revalidate(self, executable: &Path) -> Result<Self, String> {
+            super::super::proxy_identity::verify_proxy_owner(
+                self.endpoint, self.owner_pid, executable,
+            )?;
+            Ok(self)
+        }
+
+        /// 显式关闭，便于未来 helper 在退出前把关闭错误反馈给控制进程。
+        pub fn close(self) -> Result<(), WfpError> {
+            let Self { engine, .. } = self;
+            engine.close_checked()
+        }
+
+        pub fn count(&self) -> usize { self.permitted_filters.len() }
+    }
+
+    #[cfg(test)]
+    mod dynamic_proxy_lease_tests {
+        use super::*;
+
+        #[test]
+        fn lease_rejects_missing_ids_without_modifying_bfe() {
+            let exe = std::env::current_exe().unwrap();
+            assert!(DynamicProxyLease::acquire(
+                &[], "127.0.0.1:17890".parse().unwrap(),
+                std::process::id(), &exe, &[1u8; 16],
+            ).is_err());
+        }
+
+        #[test]
+        fn lease_rejects_short_nonce_before_touching_bfe() {
+            let exe = std::env::current_exe().unwrap();
+            let one = super::super::super::identity::ProgramIdentity {
+                name: "Trader".into(), path: exe.clone(),
+                app_id: vec![1u8, 0], device_path: String::new(),
+            };
+            assert!(DynamicProxyLease::acquire(
+                &[one], "127.0.0.1:17890".parse().unwrap(),
+                std::process::id(), &exe, &[2u8; 8],
+            ).is_err());
         }
     }
 
