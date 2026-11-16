@@ -1105,6 +1105,15 @@ mod imp {
             if ids.is_empty() || lease_nonce.len() < 16 {
                 return Err("保护名单为空或许可会话 nonce 不足，拒绝临时放行".into());
             }
+            // 与现有 install/sync/remove 使用完全相同的跨进程互斥，
+            // 保证检查持久 BLOCK → 安装许可之间不会被另一笔 Guard 变更打断。
+            // 仅保护创建时的原子前置检查；lease 运行期间不能长期占有互斥。
+            let lock_name = format!(
+                "{}{}",
+                super::super::GUARD_MUTEX_PREFIX,
+                super::super::wfp::PROVIDER_KEY.replace('-', "").to_uppercase(),
+            );
+            let _guard_lock = NamedMutex::acquire(&lock_name)?;
             super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
             let engine = WfpEngine::open_dynamic().map_err(|e| e.to_string())?;
             let provider = provider_get(&engine, PROVIDER_GUID).map_err(|e| e.to_string())?;
