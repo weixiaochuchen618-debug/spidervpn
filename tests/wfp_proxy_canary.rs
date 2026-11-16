@@ -1,0 +1,170 @@
+//! P0 的 Windows 原生 WFP 代理出口探针（**不安装持久规则**）。
+//!
+//! 只对本测试 exe 的 WFP AppId 安装动态会话过滤器，测试结束/进程退出由 BFE
+//! 自动移除；不修改 SpiderVPN 的正式 provider、subLayer、交易名单或用户防火墙。
+//!
+//! 显式运行：
+//!   $env:SPIDERVPN_WFP_CANARY='1'
+//!   cargo test --locked --test wfp_proxy_canary -- --ignored --test-threads=1 --nocapture
+//!
+//! 这只验证 IPv4 环回出口的 WFP 匹配与 BLOCK 仲裁，不能替代 TUN + IPv6 实机验证。
+
+#[cfg(not(windows))]
+#[test]
+fn canary_only_runs_on_windows() {}
+
+#[cfg(windows)]
+mod windows_canary {
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as W;
+
+    /// 不返回持久句柄：本探针的所有 WFP 对象都归动态会话。
+    struct DynamicEngine(HANDLE);
+
+    impl DynamicEngine {
+        fn open() -> Self {
+            let mut session = W::FWPM_SESSION0::default();
+            session.flags = W::FWPM_SESSION_FLAG_DYNAMIC;
+            let mut handle: HANDLE = null_mut();
+            let rc = unsafe { W::FwpmEngineOpen0(null(), 10, null(), &session, &mut handle) };
+            assert_eq!(rc, 0, "WFP 动态会话无法打开：0x{rc:08X}（CI 必须能提权）");
+            assert!(!handle.is_null());
+            DynamicEngine(handle)
+        }
+    }
+
+    impl Drop for DynamicEngine {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { W::FwpmEngineClose0(self.0); }
+                self.0 = null_mut();
+            }
+        }
+    }
+
+    struct AppId(*mut W::FWP_BYTE_BLOB);
+
+    impl AppId {
+        fn this_test_exe() -> Self {
+            let path = std::env::current_exe().expect("当前测试程序路径");
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut blob: *mut W::FWP_BYTE_BLOB = null_mut();
+            let rc = unsafe { W::FwpmGetAppIdFromFileName0(wide.as_ptr(), &mut blob) };
+            assert_eq!(rc, 0, "获取测试程序 WFP AppId 失败：0x{rc:08X}");
+            assert!(!blob.is_null());
+            AppId(blob)
+        }
+    }
+
+    impl Drop for AppId {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                let mut ptr = self.0.cast::<core::ffi::c_void>();
+                unsafe { W::FwpmFreeMemory0(&mut ptr); }
+                self.0 = null_mut();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum DenyKind { WrongIp, WrongPort, NotTcp }
+
+    fn install_filter(engine: &DynamicEngine, app: &AppId, port: u16, kind: DenyKind) {
+        let app_condition = W::FWPM_FILTER_CONDITION0 {
+            fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
+            matchType: W::FWP_MATCH_EQUAL,
+            conditionValue: W::FWP_CONDITION_VALUE0 {
+                r#type: W::FWP_BYTE_BLOB_TYPE,
+                Anonymous: W::FWP_CONDITION_VALUE0_0 { byteBlob: app.0 },
+            },
+        };
+        // 这里必须是三条独立过滤器，每条 APP_ID + 一个 NOT_EQUAL：
+        // 地址不同 OR 端口不同 OR 非 TCP 都阻断。
+        let destination_condition = match kind {
+            DenyKind::WrongIp => W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType: W::FWP_MATCH_NOT_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT32,
+                    // WFP IPv4 地址必须按 host-order 数值存储。
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 {
+                        uint32: u32::from_be_bytes([127, 0, 0, 1]),
+                    },
+                },
+            },
+            DenyKind::WrongPort => W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType: W::FWP_MATCH_NOT_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT16,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { uint16: port },
+                },
+            },
+            DenyKind::NotTcp => W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_PROTOCOL,
+                matchType: W::FWP_MATCH_NOT_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT8,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { uint8: 6 },
+                },
+            },
+        };
+        let mut conditions = [app_condition, destination_condition];
+        let mut name: Vec<u16> = "SpiderVPN temporary WFP canary".encode_utf16().chain(Some(0)).collect();
+        // 不复用正式 provider GUID、不使用 PERSISTENT flag、不引用正式 sublayer。
+        let mut raw = W::FWPM_FILTER0::default();
+        raw.displayData.name = name.as_mut_ptr();
+        raw.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+        raw.weight = W::FWP_VALUE0 {
+            r#type: W::FWP_UINT8,
+            Anonymous: W::FWP_VALUE0_0 { uint8: 13 },
+        };
+        raw.numFilterConditions = conditions.len() as u32;
+        raw.filterCondition = conditions.as_mut_ptr();
+        raw.action = W::FWPM_ACTION0 {
+            r#type: W::FWP_ACTION_BLOCK,
+            Anonymous: W::FWPM_ACTION0_0 { filterType: windows_sys::core::GUID::default() },
+        };
+        let mut id = 0u64;
+        let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null(), &mut id) };
+        assert_eq!(rc, 0, "安装动态代理过滤器失败：0x{rc:08X}");
+        assert_ne!(id, 0);
+    }
+
+    fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
+        TcpStream::connect_timeout(&addr, Duration::from_millis(700))
+    }
+
+    #[test]
+    #[ignore = "仅在隔离的 Windows CI 或临时测试机上显式启用，不影响日常 cargo test"]
+    fn proxy_exact_loopback_ip_and_port_are_the_only_allowed_tcp_destination() {
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"),
+            "需显式设置 SPIDERVPN_WFP_CANARY=1；不在真实交易机器自动运行");
+        let trusted = TcpListener::bind("127.0.0.1:0").expect("允许端点");
+        let other = TcpListener::bind("127.0.0.1:0").expect("另一代理端口");
+        let trusted_addr = trusted.local_addr().unwrap();
+        let other_addr = other.local_addr().unwrap();
+        assert!(connect(trusted_addr).is_ok(), "安装 WFP 前，可信端点本来应可用");
+        assert!(connect(other_addr).is_ok(), "安装 WFP 前，另一端点本来应可用");
+
+        let engine = DynamicEngine::open();
+        let app = AppId::this_test_exe();
+        for kind in [DenyKind::WrongIp, DenyKind::WrongPort, DenyKind::NotTcp] {
+            install_filter(&engine, &app, trusted_addr.port(), kind);
+        }
+
+        assert!(connect(trusted_addr).is_ok(),
+            "正确本地代理 IP+port+TCP 被误阻断，WFP v2 不能发布");
+        assert!(connect(other_addr).is_err(),
+            "其他 localhost 端口被放行，WFP v2 会留下绕行通道");
+
+        // BFE 动态会话关闭后，过滤器必须自动全部移除。
+        drop(engine);
+        assert!(connect(other_addr).is_ok(), "动态规则退出后没有清理");
+    }
+}
