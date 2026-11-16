@@ -605,6 +605,13 @@ mod imp {
             // 不得修改已有持久 v1 BLOCK；必须高于旧 BLOCK 0x1000 的权重。
             permit.raw.filterKey = to_win(permit_key);
             permit.raw.flags = 0; // 不持久、不禁用、不清空其它安全产品的 action right
+            // v1 guard 的 snapshot/sync 仅枚举 PROVIDER_GUID 下的持久 BLOCK。
+            // 动态许可不能使用这个 provider，否则会被误判为“多余过滤器”，
+            // 甚至在交易名单同步时遭到删除。许可由动态 WFP 会话拥有，
+            // 必须始终使用 NULL provider + 空 providerData；但继续引用
+            // 相同 sublayer，以保证与 v1 BLOCK 在同一子层内进行权重仲裁。
+            permit.raw.providerKey = std::ptr::null_mut();
+            permit.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
             permit.raw.action.r#type = W::FWP_ACTION_PERMIT;
             *permit._weight = super::super::wfp::FILTER_WEIGHT_PERMIT;
 
@@ -694,6 +701,9 @@ mod imp {
             let mut permit = RawFilter::block(name, app_id, layer);
             permit.raw.filterKey = to_win(Guid::from_bytes_le(key_bytes));
             permit.raw.flags = 0;
+            // 与代理动态许可一致：不归入 v1 持久 BLOCK 的 provider 枚举。
+            permit.raw.providerKey = std::ptr::null_mut();
+            permit.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
             permit.raw.action.r#type = W::FWP_ACTION_PERMIT;
             *permit._weight = super::super::wfp::FILTER_WEIGHT_PERMIT;
             permit._scoped_luid = Some(Box::new(expected_luid));
@@ -863,6 +873,9 @@ mod imp {
                 let endpoint: std::net::SocketAddr = endpoint.parse().unwrap();
                 let p = RawFilter::ephemeral_proxy_permit("Trader", &app, endpoint, &nonce).unwrap();
                 assert_eq!(p.raw.flags, 0);
+                assert!(p.raw.providerKey.is_null(), "动态许可不能进入 v1 持久规则 provider 枚举");
+                assert_eq!(p.raw.providerData.size, 0);
+                assert!(p.raw.providerData.data.is_null());
                 assert_eq!(p.raw.action.r#type, W::FWP_ACTION_PERMIT);
                 assert_eq!(p.raw.numFilterConditions, 4);
                 assert_eq!(*p._weight, super::super::super::wfp::FILTER_WEIGHT_PERMIT);
@@ -907,6 +920,9 @@ mod imp {
                 let permit = RawFilter::candidate_ephemeral_tun_permit(
                     "Trader", &app, layer, 424242, &nonce).unwrap();
                 assert_eq!(permit.raw.flags, 0);
+                assert!(permit.raw.providerKey.is_null(), "TUN 候选许可不得污染 v1 BLOCK provider");
+                assert_eq!(permit.raw.providerData.size, 0);
+                assert!(permit.raw.providerData.data.is_null());
                 assert_eq!(permit.raw.action.r#type, W::FWP_ACTION_PERMIT);
                 assert_eq!(*permit._weight, super::super::super::wfp::FILTER_WEIGHT_PERMIT);
                 assert_eq!(permit._conditions.len(), 2);
