@@ -1515,15 +1515,19 @@ pub fn prepare_engine_config(
     probe_creds: Option<(&str, &str)>,
     probe_port: Option<u16>,
 ) -> Result<std::path::PathBuf, String> {
-    let Ok(text) = std::fs::read_to_string(line_config) else {
-        // 读不到就照旧交给引擎去报错，别在这里编一个"更友好"的错盖住真因。
-        return Ok(line_config.to_path_buf());
-    };
+    let text = std::fs::read_to_string(line_config)
+        .map_err(|e| format!("无法读取线路引擎配置（{}）：{e}", line_config.display()))?;
     let mut root: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text))
         .map_err(|e| format!("线路引擎配置不是合法 JSON：{e}"))?;
-    let Some(obj) = root.as_object_mut() else {
-        return Ok(line_config.to_path_buf());
-    };
+    let obj = root.as_object_mut()
+        .ok_or_else(|| "线路引擎配置的根节点必须是 JSON 对象".to_string())?;
+    // DNS 重建并不属于 split/transport 变更，必须单独跟踪，否则仅 DNS
+    // 发生变化时会错误复用原配置，漏掉新解析规则。
+    let dns_before = obj.get("dns").cloned();
+    let resolver_before = obj.get("route")
+        .and_then(Value::as_object)
+        .and_then(|route| route.get("default_domain_resolver"))
+        .cloned();
     // 接管方式先落地：proxy 要去掉 TUN 入站、tun 要确认线路里真有 TUN 参数。
     // 出错原样上报——调用方必须拒绝连接，不许回退成另一种方式连。
     let mode_changed = apply_mode(obj, mode)?;
@@ -1549,7 +1553,13 @@ pub fn prepare_engine_config(
     let exit_changed = normalize_default_exit(obj);
     // 绑网卡放最后：前面几步可能增删出站（兼容连接会多插一条），绑完才不会漏。
     let bind_changed = apply_bind_interface(obj, bind_interface);
-    if !split_changed
+    let dns_changed = obj.get("dns") != dns_before.as_ref()
+        || obj.get("route")
+            .and_then(Value::as_object)
+            .and_then(|route| route.get("default_domain_resolver"))
+            != resolver_before.as_ref();
+    if !dns_changed
+        && !split_changed
         && !probe_changed
         && !exit_changed
         && !transport_changed
