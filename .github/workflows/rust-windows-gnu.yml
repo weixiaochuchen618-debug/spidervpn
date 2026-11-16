@@ -50,10 +50,13 @@ jobs:
           .\build.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Validate WFP Rust tests on GNU target
+      - name: Validate WFP, scoped egress and TUN identity Rust tests on GNU target
         shell: pwsh
         run: |
           $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
           $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
-          & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn 'guard::wfp::tests::' -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($filter in @('guard::wfp::tests::', 'guard::egress_policy::tests::', 'guard::tun_identity::tests::')) {
+            Write-Host "Running GNU Rust tests: $filter"
+            & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn $filter -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
