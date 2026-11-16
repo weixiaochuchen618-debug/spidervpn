@@ -1296,6 +1296,30 @@ mod tests {
     }
 
     #[test]
+    fn preflight_recognizes_running_connection_without_derived_config() {
+        let f = fixture("preflight-old-line");
+        let cfg = cfg();
+        let root = f.runtime.parent().unwrap();
+        let line_file = cfg.current_engine_path(root).unwrap();
+        std::fs::create_dir_all(line_file.parent().unwrap()).unwrap();
+        std::fs::write(&line_file, r#"{"inbounds":[{"type":"mixed","tag":"tc-mixed"}]}"#).unwrap();
+        assert!(!root.join("runtime-engine.json").exists());
+        write_runtime(&f.runtime, 4242, 1_700_000_000.0, "Running", false).unwrap();
+        f.store.apply(&[
+            proxy::Change { key: "ProxyEnable", from: "0".into(), to: "1".into() },
+            proxy::Change {
+                key: "ProxyServer", from: "127.0.0.1:7897".into(),
+                to: cfg.current_line().unwrap().proxy_endpoint.clone(),
+            },
+        ]).unwrap();
+        assert_eq!(
+            preflight_before_prepare(&cfg, root, &f.store, &always_alive, false),
+            Ok(true),
+            "老线路无 runtime-engine.json 也应识别正在运行的连接",
+        );
+    }
+
+    #[test]
     fn preflight_does_not_regenerate_live_engine_configuration() {
         let f = fixture("preflight-existing");
         let cfg = cfg();
