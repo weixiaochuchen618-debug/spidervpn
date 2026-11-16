@@ -34,6 +34,7 @@
 #![allow(dead_code)]
 
 pub mod elevate;
+pub mod egress_policy;
 pub mod evidence;
 pub mod identity;
 pub mod state;
