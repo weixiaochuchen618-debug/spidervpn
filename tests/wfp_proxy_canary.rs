@@ -411,6 +411,40 @@ mod windows_canary {
         loop { std::thread::sleep(Duration::from_millis(100)); }
     }
 
+    /// 保证崩溃测试中的拒绝不是由没有 accept 的 TCP backlog 填满造成的。
+    /// 后台持续取出所有已允许连接，失败判据才能归因于 WFP 策略而不是监听队列。
+    struct ListenerDrain {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl ListenerDrain {
+        fn start(listener: &TcpListener) -> Self {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let listener = listener.try_clone().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let thread = std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((connection, _)) => drop(connection),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock =>
+                            std::thread::sleep(Duration::from_millis(10)),
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self { stop, thread: Some(thread) }
+        }
+    }
+    impl Drop for ListenerDrain {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        }
+    }
+
     struct KillChild(std::process::Child);
     impl Drop for KillChild {
         fn drop(&mut self) {
@@ -430,6 +464,8 @@ mod windows_canary {
         let other = TcpListener::bind("127.0.0.1:0").unwrap();
         let trusted_addr = trusted.local_addr().unwrap();
         let other_addr = other.local_addr().unwrap();
+        let _trusted_drain = ListenerDrain::start(&trusted);
+        let _other_drain = ListenerDrain::start(&other);
         assert!(connect(trusted_addr).is_ok() && connect(other_addr).is_ok());
 
         let baseline = DynamicEngine::open();
