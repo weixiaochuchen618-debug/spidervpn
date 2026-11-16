@@ -14,5 +14,7 @@
 # 语言统计口径：产品本体是 src/ 下的 Rust。
 # tests/ 是验收脚本（Python / PowerShell），tools/ 是开发工具，两者都不参与构建、
 # 不进安装包，因此不计入 GitHub 的语言条——文件照常可浏览、可克隆、可运行。
-tests/** linguist-documentation
-tools/** linguist-documentation
+# 同时写两个属性：detectable=false 是精确开关，documentation 让 GitHub 在
+# 仓库语言摘要里按「文档」归类（两个都写不冲突）。
+tests/** linguist-detectable=false linguist-documentation
+tools/** linguist-detectable=false linguist-documentation
