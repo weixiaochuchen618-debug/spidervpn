@@ -5594,6 +5594,19 @@ fn connect_json(ctx: &Ctx) -> String {
         Some(c) => c,
         None => return refuse_now("找不到配置文件（config.json），请先导入线路"),
     };
+    // 已连接时不能先重写 runtime-engine.json：sing-box 仍在用旧探测凭据，
+    // 若磁盘被新凭据覆盖，就会变成「运行配置与记录不一致」。
+    let preflight_store = crate::proxy::ProxyStore::system();
+    match crate::connect::preflight_before_prepare(
+        cfg, &ctx.root, &preflight_store, &crate::probe::pid_alive, ctx.legacy_running,
+    ) {
+        Ok(true) => {
+            let outcome = crate::connect::record_already_connected(cfg, &ctx.root, &ctx.origin(None));
+            return outcome_json(Ok(outcome));
+        }
+        Ok(false) => {}
+        Err(e) => return refuse_now(&e),
+    }
     // 探测计划：探测端口（线路端口 +3）被占 → 摘掉探测入站再起引擎（引擎对绑不上的
     // 入站是整体 FATAL），自检届时报「自检跳过」。凭据在这里生成一次，两处共用。
     let endpoint = endpoint_of(&live);
