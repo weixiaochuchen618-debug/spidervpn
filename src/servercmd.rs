@@ -941,7 +941,9 @@ pub fn register_lines(
 /// 任何一步不成立（读不到参数、名字对不上）就跳过那一条，绝不猜参数。
 pub fn merge_compatible_lines(root: &Path) -> Result<usize, String> {
     let cfg_path = root.join(config::DEFAULT_PATH);
-    let Some(mut cfg) = config::load(&cfg_path).map_err(|e| e.to_string())? else {
+    // 这里只检查是否需要合并：不能因为检查本身就把 schema 1 配置写成 schema 2。
+    // 真正的迁移提示与落盘由 main 的首次写命令统一负责。
+    let Some(mut cfg) = config::load_readonly(&cfg_path).map_err(|e| e.to_string())? else {
         return Ok(0);
     };
     let suffix = "（兼容连接）";
