@@ -914,15 +914,21 @@ fn main() -> ExitCode {
         }
     };
 
+    // 只读命令不得在启动预处理阶段触发 schema 迁移或兼容线路合并。
+    // 此判断必须早于 merge_compatible_lines（它内部通过 config::load 会执行落盘迁移）。
+    let readonly_cmd = READONLY_COMMANDS.iter().any(|flag| std::env::args().any(|a| a == *flag));
+
     // 2.5 老数据结构收口：把「同一台服务器的两条线路」并成一条（幂等，失败不拦启动）。
     //
     // 上一版给每台服务器登记两条线路（`自建 · host` + `自建 · host（兼容连接）`），
     // 而线路卡片上的「标准/兼容」开关对前者是按不动的。现在改成一条线路两套方式，
     // 这里把已经产生的成对线路并掉；并之前先把参数落成附属文件，任何一步失败就停在那里。
-    match servercmd::merge_compatible_lines(&layout.root) {
-        Ok(0) => {}
-        Ok(count) => println!("  已合并 {count} 条重复的兼容连接线路"),
-        Err(error) => eprintln!("  合并重复线路失败（不影响启动）：{error}"),
+    if !readonly_cmd {
+        match servercmd::merge_compatible_lines(&layout.root) {
+            Ok(0) => {}
+            Ok(count) => println!("  已合并 {count} 条重复的兼容连接线路"),
+            Err(error) => eprintln!("  合并重复线路失败（不影响启动）：{error}"),
+        }
     }
 
     // 3. 单实例：名字必须带本程序前缀，不能和旧版共用。
@@ -1066,7 +1072,6 @@ fn main() -> ExitCode {
     let disconnect_only = std::env::args().any(|a| a == "--disconnect");
     // 只读命令绝不写盘：老配置在内存里迁成多线路格式照常展示，落盘留给第一个写命令。
     // （`--status` 跑一趟就把用户配置改了，既违反「默认根只读」，也让验收的「跑前跑后一致」失效。）
-    let readonly_cmd = READONLY_COMMANDS.iter().any(|flag| std::env::args().any(|a| a == *flag));
     // 读配置时顺带完成 schema 1 → 2 的迁移（只做一次，且只在写命令上）。提示也只在真落盘时打。
     let cfg_path = layout.root.join(config::DEFAULT_PATH);
     let loaded = if readonly_cmd {
