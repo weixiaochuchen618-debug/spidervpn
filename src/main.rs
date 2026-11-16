@@ -2543,13 +2543,27 @@ fn main() -> ExitCode {
     let tray_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tray_ok_ui = tray_ok.clone();
     let ui_handler = move |raw: &str| -> String {
+        let is_long = ipc::is_long_command(raw);
+        let is_short_write = ipc::is_short_write_command(raw);
         let transaction_gate = {
             let ctx = ui_ctx.lock().unwrap_or_else(|e| e.into_inner());
-            ipc::is_long_command(raw).then(|| std::sync::Arc::clone(&ctx.transaction_gate))
+            (is_long || is_short_write).then(|| std::sync::Arc::clone(&ctx.transaction_gate))
         };
-        let _transaction_guard = transaction_gate
-            .as_ref()
-            .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()));
+        let _transaction_guard = match transaction_gate.as_ref() {
+            Some(gate) if is_long => Some(gate.lock().unwrap_or_else(|e| e.into_inner())),
+            Some(gate) => match gate.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return serde_json::json!({
+                        "ok": false,
+                        "errorCode": "busy",
+                        "error": "当前有其他操作正在进行，配置修改未执行，请稍后重试"
+                    }).to_string();
+                }
+            },
+            None => None,
+        };
         let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
         let cmd = parsed.as_ref().and_then(|v| v.get("cmd")).and_then(|c| c.as_str());
         if cmd == Some("pick-file") {
