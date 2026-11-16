@@ -1,6 +1,82 @@
-# tests/ — 验收脚本的写法约定
+# tests/ — 测试与验收脚本
 
-四条硬规则，每条都是踩过的坑。写新脚本前先读一遍。
+这里是**验收脚本的集合**，不是构建产物的一部分：不参与编译、不进安装包、不随发布分发。
+
+产品本体是 `src/` 下的 Rust。测试分四层，从「克隆下来就能跑」到「需要一台真服务器」：
+
+| 层 | 需要什么 | 跑什么 | 规模 |
+|---|---|---|---|
+| **L1 单元测试** | 只要 Rust 工具链 | `cargo test --bin spidervpn` | 1390 项 |
+| **L2 集成测试** | 只要 Rust 工具链 | `cargo test --tests` | 10 套（`tests/*.rs`） |
+| **L3 界面/流程验收** | 编好的 exe + Python 3.10+ | `tests/*.py --exe <路径>` | 80 余个脚本 |
+| **L4 真机验收** | 一台可重置的 Linux VPS | `tests/t11_real_deploy_ui.py --host <地址>` 等 | 4 个脚本 |
+
+**第一次接触这个仓库，只需要跑 L1 + L2。** 两层的失败都指向产品缺陷，不需要任何外部环境。
+
+---
+
+## L1 / L2：单元与集成测试
+
+```powershell
+# 单元测试（含 UI 快照、IPC 协议、部署状态机、WFP 规则布局、邀请协议验签）
+cargo test --bin spidervpn -- --test-threads=1
+
+# 集成测试：argv / import / lines / mode / split / transport / settings /
+#             status-check / single-instance / runtime-engine
+cargo test --tests
+```
+
+`--test-threads=1` 不是性能选择：多条用例会抢同一个单实例锁和临时注册表键，并行跑会互相干扰。
+
+另有隔离门（确认与旧版客户端不共享任何运行时资源）：
+
+```powershell
+powershell -NoProfile -File ..\Test-Isolation.ps1
+```
+
+## L3：界面与流程验收（`tests/*.py`）
+
+这些脚本驱动**真实的 exe**：启动进程、通过命名管道发命令、用无头浏览器读页面 DOM，断言「界面上看到的东西」与「宿主真实状态」一致。统一入口是 `--exe`：
+
+```powershell
+python tests\r42_revoke_ui.py --exe C:\SpiderVPN\bin\spidervpn.exe
+python tests\m1_page_behaviors.py --exe C:\tc-rs-build\release\spidervpn.exe
+```
+
+按覆盖范围分组（每组举几个代表，`--help` 可看每个脚本自己的参数）：
+
+| 范围 | 脚本 |
+|---|---|
+| 页面渲染与行为 | `m1_form_render.py`、`m1_page_behaviors.py`、`m1_render_smoke.py`、`m1_webview_*.py`、`s0_page_fixtures.py`、`audit_ui.py` |
+| 首页与状态栏 | `t20_statusbar_matrix.py`、`t20_capture_compare.py`、`t20_probe_external_resize.py` |
+| 线路 / 分流 / 连接方式 | `r107_daily_ui.py`、`r108_compat_ui.py`、`r109_tradelist_ui.py`、`r93_transport_ui.py`、`r97_trade_domains_ui.py`、`r89_network_ui.py`、`r61_line_actions_ui.py` |
+| 部署中心 | `m5_deploy_ui.py`、`r46_tasks_ui.py`、`r69_draft_ui.py`、`r79_prune_startup.py`、`r98_deploy_steps_ui.py`、`r105_deploy_copy.py` |
+| 设备与邀请 | `m5_devices_ui.py`、`r35_invite_ui.py`、`r38_join_ui.py`、`r38_consume.py`、`r42_revoke_ui.py` |
+| 记录 / 历史 / 恢复 | `r57_history_detail_ui.py`、`r62_operation_review_ui.py`、`r70_attempt_history_ui.py`、`r73_archive_ui.py`、`r87_history_ui.py`、`r94_recovery_ui.py` |
+| 交易保护 | `r50_exit_guard_ui.py`、`r54_p013_guard_ui.py`、`r83_autotrust_ui.py` |
+| 设置 / 自启 / 拖放 | `r91_cloud_ui.py`、`r92_key_ui.py`、`r101_qa_drag.py`、`r102_agents_density.py` |
+| 性能基线 | `perf_startup.py`、`s0_startup_baseline.py`、`s0_fixtures.py` |
+
+## L4：真机验收（需要 Linux VPS）
+
+这几个脚本会真的 SSH 到一台服务器上部署、签发邀请、撤销设备。**不要指向生产服务器**，用一次性机器：
+
+| 脚本 | 作用 |
+|---|---|
+| `t11_real_deploy_ui.py --host <地址>` | 完整部署向导 + 接入本机 |
+| `r63_deploy_pause_ui.py --host <地址>` | 部署中断与续跑 |
+| `r66_device_actions_ui.py --host <地址>` | 设备改名 / 撤销 |
+| `..\tools\vps_reset.py` | 把测试机重置回干净状态（**会删服务器上的部署资料**） |
+
+## legacy/：历史轮次脚本
+
+`tests/legacy/` 下是早期迭代轮的对比脚本（`round2-*` / `round3-*`），依赖当时的固定环境和旧版引擎路径，公众环境跑不起来。保留它们是为了留下当时的对照方法，**不保证可运行**。
+
+---
+
+# 写新脚本前先读：四条硬规则
+
+每条都是踩过的坑。
 
 ## 1. 调用被测 exe：只认这一种写法
 
@@ -92,7 +168,7 @@ if (-not $env:SPIDERVPN_ROOT) { throw '没有设置 SPIDERVPN_ROOT：拒绝在�
 
 ## 7. 贴着地雷的一个能力：`process_name` 在**系统代理模式**下也生效
 
-**实测 2026-10-27，产物 SHA256 `7DBFDF39…B3B9F7`（sing-box 1.14.2，Windows）：**
+**实测 sing-box 1.14.2（Windows）：**
 
 ```
 proxy 模式（不带 TUN），经本程序代理取出口：

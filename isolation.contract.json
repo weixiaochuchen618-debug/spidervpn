@@ -56,8 +56,8 @@
       "reason": "隔离检查本身必须知道旧版资源名才能比较；它只声明常量，不构造可用路径。"
     },
     {
-      "file": "tests/round2-exclusive-a.ps1",
-      "reason": "验收脚本：A–E 对比段需要真引擎，故指向 旧版的 sing-box；只用于测试对照，不进产物、产品运行时不引用它。"
+      "file": "tests/legacy/round2-exclusive-a.ps1",
+      "reason": "验收脚本：A–E 对比段需要真引擎，故指向旧版客户端的 sing-box；只用于测试对照，不进产物、产品运行时不引用它。"
     }
   ]
 }

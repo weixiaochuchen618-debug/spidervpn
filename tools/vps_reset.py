@@ -8,8 +8,8 @@
 
 用法：
   set TC_SSH_PASSWORD=...
-  python tests/vps_reset.py --host 203.0.113.25 --check
-  python tests/vps_reset.py --host 203.0.113.25 --reset
+  python tools/vps_reset.py --host 203.0.113.25 --check
+  python tools/vps_reset.py --host 203.0.113.25 --reset
 """
 from __future__ import annotations
 
