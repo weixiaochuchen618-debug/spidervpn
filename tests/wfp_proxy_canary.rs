@@ -73,7 +73,7 @@ mod windows_canary {
     #[derive(Clone, Copy)]
     enum DenyKind { WrongIp, WrongPort, NotTcp }
 
-    fn install_filter(engine: &DynamicEngine, app: &AppId, port: u16, kind: DenyKind) {
+    fn install_filter(engine: &DynamicEngine, app: &AppId, port: u16, kind: DenyKind) -> u64 {
         let app_condition = W::FWPM_FILTER_CONDITION0 {
             fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
             matchType: W::FWP_MATCH_EQUAL,
@@ -134,6 +134,7 @@ mod windows_canary {
         let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null_mut(), &mut id) };
         assert_eq!(rc, 0, "安装动态代理过滤器失败：0x{rc:08X}");
         assert_ne!(id, 0);
+        id
     }
 
     /// 与 IPv4 对称的 IPv6 探针：FWP_BYTE_ARRAY16_TYPE 必须指向整个 16 字节。
@@ -241,6 +242,59 @@ mod windows_canary {
         assert_ne!(id, 0);
     }
 
+    /// 模拟正式旧版本：只有 ALE_APP_ID 条件的宽泛 BLOCK。
+    /// 测试 exe 自己作为名单程序，动态会话退出后无需卸载。
+    fn install_legacy_block(engine: &DynamicEngine, app: &AppId) -> u64 {
+        let mut cond = [W::FWPM_FILTER_CONDITION0 {
+            fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
+            matchType: W::FWP_MATCH_EQUAL,
+            conditionValue: W::FWP_CONDITION_VALUE0 {
+                r#type: W::FWP_BYTE_BLOB_TYPE,
+                Anonymous: W::FWP_CONDITION_VALUE0_0 { byteBlob: app.0 },
+            },
+        }];
+        let mut name: Vec<u16> = "SpiderVPN legacy migration canary".encode_utf16().chain(Some(0)).collect();
+        let mut raw = W::FWPM_FILTER0::default();
+        raw.displayData.name = name.as_mut_ptr();
+        raw.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+        raw.weight = W::FWP_VALUE0 {
+            r#type: W::FWP_UINT8,
+            Anonymous: W::FWP_VALUE0_0 { uint8: 13 },
+        };
+        raw.numFilterConditions = 1;
+        raw.filterCondition = cond.as_mut_ptr();
+        raw.action = W::FWPM_ACTION0 {
+            r#type: W::FWP_ACTION_BLOCK,
+            Anonymous: W::FWPM_ACTION0_0 { filterType: windows_sys::core::GUID::default() },
+        };
+        let mut id = 0u64;
+        let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null_mut(), &mut id) };
+        assert_eq!(rc, 0, "无法安装只供测试的旧宽泛规则：0x{rc:08X}");
+        assert_ne!(id, 0);
+        id
+    }
+
+    fn begin_txn(engine: &DynamicEngine) {
+        let rc = unsafe { W::FwpmTransactionBegin0(engine.0, 0) };
+        assert_eq!(rc, 0, "开始 WFP 原子迁移事务失败：0x{rc:08X}");
+    }
+
+    fn delete_filter(engine: &DynamicEngine, filter_id: u64) {
+        let rc = unsafe { W::FwpmFilterDeleteById0(engine.0, filter_id) };
+        assert_eq!(rc, 0, "在事务内删除测试规则失败：0x{rc:08X}");
+    }
+
+    fn commit_txn(engine: &DynamicEngine) {
+        let rc = unsafe { W::FwpmTransactionCommit0(engine.0) };
+        assert_eq!(rc, 0, "WFP 原子迁移提交失败：0x{rc:08X}");
+    }
+
+    fn abort_txn(engine: &DynamicEngine) {
+        let rc = unsafe { W::FwpmTransactionAbort0(engine.0) };
+        assert_eq!(rc, 0, "WFP 原子迁移回滚失败：0x{rc:08X}");
+    }
+
     fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
         TcpStream::connect_timeout(&addr, Duration::from_millis(700))
     }
@@ -256,6 +310,57 @@ mod windows_canary {
         }
         let mut buffer = [0u8; 128];
         matches!(server.recv_from(&mut buffer), Ok((n, _)) if &buffer[..n] == b"vpn-wfp-test")
+    }
+
+    #[test]
+    #[ignore = "真实 WFP 原子迁移及回滚，仅隔离 Windows runner 显式执行"]
+    fn atomic_migration_and_abort_preserve_exact_proxy_policy() {
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+        let a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr_a = a.local_addr().unwrap();
+        let addr_b = b.local_addr().unwrap();
+        assert!(connect(addr_a).is_ok() && connect(addr_b).is_ok(),
+            "过滤前两种 TCP 连接都要真正可用");
+
+        let engine = DynamicEngine::open();
+        let app = AppId::this_test_exe();
+        let old = install_legacy_block(&engine, &app);
+        assert!(connect(addr_a).is_err() && connect(addr_b).is_err(),
+            "旧 v1 APP_ID 宽泛 BLOCK 应阻断所有新 TCP 连接");
+
+        begin_txn(&engine);
+        delete_filter(&engine, old);
+        let mut scoped = Vec::new();
+        for kind in [DenyKind::WrongIp, DenyKind::WrongPort, DenyKind::NotTcp] {
+            scoped.push(install_filter(&engine, &app, addr_a.port(), kind));
+        }
+        commit_txn(&engine);
+        assert!(connect(addr_a).is_ok(), "原子迁移后可信代理应可用");
+        assert!(connect(addr_b).is_err(), "原子迁移后不应放行其他代理端口");
+
+        // 模拟端口变更事务中途失败：直接 abort，旧的可用策略必须完整留下。
+        begin_txn(&engine);
+        for id in &scoped { delete_filter(&engine, *id); }
+        for kind in [DenyKind::WrongIp, DenyKind::WrongPort, DenyKind::NotTcp] {
+            install_filter(&engine, &app, addr_b.port(), kind);
+        }
+        abort_txn(&engine);
+        assert!(connect(addr_a).is_ok(), "事务 abort 后先前的合法代理端口必须保留");
+        assert!(connect(addr_b).is_err(), "事务 abort 不得产生新的绕过端口");
+
+        // 成功的端口切换也要求同一事务中撤旧建新。
+        begin_txn(&engine);
+        for id in &scoped { delete_filter(&engine, *id); }
+        for kind in [DenyKind::WrongIp, DenyKind::WrongPort, DenyKind::NotTcp] {
+            install_filter(&engine, &app, addr_b.port(), kind);
+        }
+        commit_txn(&engine);
+        assert!(connect(addr_a).is_err(), "成功变更后旧端口必须失效");
+        assert!(connect(addr_b).is_ok(), "新端口必须接替旧端口");
+        drop(engine);
+        assert!(connect(addr_a).is_ok() && connect(addr_b).is_ok(),
+            "动态会话结束后所有旧/新测试规则都必须消失");
     }
 
     #[test]
