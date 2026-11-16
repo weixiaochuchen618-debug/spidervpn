@@ -17,6 +17,18 @@ jobs:
       - name: Build with Rust
         run: cargo build --locked
 
+      - name: Rust integration tests (each integration target, no duplicate binary unit tests)
+        shell: pwsh
+        run: |
+          $testTargets = Get-ChildItem tests -Filter '*.rs' -File | Sort-Object Name
+          if (-not $testTargets) { throw '没有找到 Rust 集成测试目标' }
+          foreach ($target in $testTargets) {
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($target.Name)
+            Write-Host "Running Rust integration target: $name"
+            & cargo test --locked --test $name -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
       - name: Regression tests for changed Rust modules
         shell: pwsh
         run: |
@@ -41,14 +53,3 @@ jobs:
           --skip tightening_closes_a_file_that_inherited_the_loose_acl
           --skip a_shortcut_is_replaced_by_the_program_it_points_at
 
-      - name: Rust integration tests (each integration target, no duplicate binary unit tests)
-        shell: pwsh
-        run: |
-          $testTargets = Get-ChildItem tests -Filter '*.rs' -File | Sort-Object Name
-          if (-not $testTargets) { throw '没有找到 Rust 集成测试目标' }
-          foreach ($target in $testTargets) {
-            $name = [System.IO.Path]::GetFileNameWithoutExtension($target.Name)
-            Write-Host "Running Rust integration target: $name"
-            & cargo test --locked --test $name -- --test-threads=1
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
