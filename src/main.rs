@@ -2031,6 +2031,28 @@ fn main() -> ExitCode {
             }
         }
         let cfg_ref = cfg.as_ref();
+        if wants_connect {
+            // 和 WebView 共用 Rust 预检：引擎已在运行时禁止重新生成
+            // runtime-engine.json / 探测凭据，避免磁盘与实际 sing-box 状态分叉。
+            let preflight_store = proxy::ProxyStore::system();
+            if let Some(c) = cfg_ref {
+                match connect::preflight_before_prepare(
+                    c, &layout.root, &preflight_store, &probe::pid_alive, legacy_running,
+                ) {
+                    Ok(true) => {
+                        let _ = connect::record_already_connected(c, &layout.root, &cli_origin);
+                        println!("  已处于目标状态，未做改动。");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(false) => {}
+                    Err(msg) => {
+                        println!("  {msg}");
+                        events::record(&layout.root, events::CONNECT, false, &msg, &cli_origin);
+                        return ExitCode::from(exit::CONFIG);
+                    }
+                }
+            }
+        }
         // 探测计划：探测端口（线路端口 +3）被占 → 摘掉探测入站再起引擎
         // （引擎对绑不上的入站是整体 FATAL，不摘掉连"日常能通"都保不住），自检届时报「跳过」。
         // 凭据在这里生成一次，配置注入与自检共用同一份事实。
