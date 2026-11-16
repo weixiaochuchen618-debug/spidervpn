@@ -1083,6 +1083,52 @@ mod imp {
         }
     }
 
+    /// 持有 Windows 内核进程对象 HANDLE，避免仅靠 PID 轮询造成 PID 复用误判。
+    /// 它只负责监听引擎存活，并不赋予任何 WFP 放行权限。
+    struct WatchedEngineProcess(HANDLE);
+
+    impl WatchedEngineProcess {
+        fn open(pid: u32) -> Result<Self, String> {
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            };
+            if pid == 0 { return Err("不能监控 PID=0 的引擎进程".into()); }
+            // SYNCHRONIZE 标准权限位（winnt.h），用于 WaitForSingleObject。
+            const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+            let handle = unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS, 0, pid)
+            };
+            if handle.is_null() {
+                return Err("无法打开受监督引擎进程句柄，拒绝临时放行".into());
+            }
+            let watched = Self(handle);
+            watched.require_alive()?;
+            Ok(watched)
+        }
+
+        fn wait(&self, millis: u32) -> u32 {
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            unsafe { WaitForSingleObject(self.0, millis) }
+        }
+
+        fn require_alive(&self) -> Result<(), String> {
+            use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+            if self.wait(0) != WAIT_TIMEOUT {
+                return Err("可信引擎已经退出或存活状态不可读，拒绝 WFP 临时放行".into());
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for WatchedEngineProcess {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0); }
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
+
     /// 临时代理许可的 RAII 句柄。**不写持久规则**，Drop 必然关闭动态会话。
     /// 未来的独立监督进程必须持有它，并在引擎退出或监听身份变化时丢弃。
     /// 目前不接入任何正式连接入口，不能把它解释为已上线的 Kill Switch。
@@ -1090,6 +1136,7 @@ mod imp {
         engine: WfpEngine,
         endpoint: std::net::SocketAddr,
         owner_pid: u32,
+        watched_process: WatchedEngineProcess,
         permitted_filters: Vec<u64>,
     }
 
@@ -1114,7 +1161,9 @@ mod imp {
                 super::super::wfp::PROVIDER_KEY.replace('-', "").to_uppercase(),
             );
             let _guard_lock = NamedMutex::acquire(&lock_name)?;
+            let watched_process = WatchedEngineProcess::open(owner_pid)?;
             super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
+            watched_process.require_alive()?;
             let engine = WfpEngine::open_dynamic().map_err(|e| e.to_string())?;
             let provider = provider_get(&engine, PROVIDER_GUID).map_err(|e| e.to_string())?;
             let sublayer = sublayer_get(&engine, SUBLAYER_GUID).map_err(|e| e.to_string())?;
@@ -1163,16 +1212,41 @@ mod imp {
             // 安装过程也可能跨越代理退出或端口重新绑定；失败直接 Drop
             // 动态 engine，BFE 会移除已经装上的所有 permits。
             super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
-            Ok(Self { engine, endpoint, owner_pid, permitted_filters: permits })
+            watched_process.require_alive()?;
+            Ok(Self {
+                engine, endpoint, owner_pid, watched_process, permitted_filters: permits,
+            })
         }
 
         /// 每次接到存活检查都必须**消耗**旧 lease。失败时旧会话立即 Drop，
         /// 防止监控调用方忘记主动撤销。不能代替实时进程退出通知机制。
         pub fn revalidate(self, executable: &Path) -> Result<Self, String> {
+            self.watched_process.require_alive()?;
             super::super::proxy_identity::verify_proxy_owner(
                 self.endpoint, self.owner_pid, executable,
             )?;
+            self.watched_process.require_alive()?;
             Ok(self)
+        }
+
+        /// 只供未来独立的提升权限 helper 线程调用，不能在 UI/IPC 主线程运行。
+        /// 引擎退出立即关闭动态许可；每 200ms 复查一次代理监听进程身份。
+        /// 临时许可进程本身崩溃时，由 WFP 动态会话的 RPC rundown 兜底。
+        pub fn supervise_until_exit(mut self, executable: &Path) -> Result<(), String> {
+            use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+            loop {
+                match self.watched_process.wait(200) {
+                    WAIT_OBJECT_0 => {
+                        // 引擎已经退出：先撤销许可，再返回。
+                        return self.close().map_err(|e| e.to_string());
+                    }
+                    WAIT_TIMEOUT => {
+                        // 任一核验失败都使 self 被消费并 Drop，绝不保留许可。
+                        self = self.revalidate(executable)?;
+                    }
+                    _ => return Err("引擎进程等待状态异常，动态许可已经撤销".into()),
+                }
+            }
         }
 
         /// 显式关闭，便于未来 helper 在退出前把关闭错误反馈给控制进程。
@@ -1187,6 +1261,13 @@ mod imp {
     #[cfg(test)]
     mod dynamic_proxy_lease_tests {
         use super::*;
+
+        #[test]
+        fn supervised_process_handle_rejects_invalid_pid_and_accepts_current() {
+            assert!(WatchedEngineProcess::open(0).is_err());
+            let process = WatchedEngineProcess::open(std::process::id()).unwrap();
+            assert!(process.require_alive().is_ok());
+        }
 
         #[test]
         fn lease_rejects_missing_ids_without_modifying_bfe() {
