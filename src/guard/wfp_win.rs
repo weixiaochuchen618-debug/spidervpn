@@ -867,14 +867,14 @@ mod imp {
                 assert_eq!(p.raw.numFilterConditions, 4);
                 assert_eq!(*p._weight, super::super::super::wfp::FILTER_WEIGHT_PERMIT);
                 assert_eq!(p.raw.weight.r#type, FWP_TYPE_UINT64);
-                assert_eq!(p.raw.subLayerKey, to_win(SUBLAYER_GUID));
+                assert_eq!(from_win(p.raw.subLayerKey), SUBLAYER_GUID);
                 for c in p._conditions.iter() {
                     assert_eq!(c.matchType, W::FWP_MATCH_EQUAL);
                 }
-                assert_eq!(p._conditions[0].fieldKey, W::FWPM_CONDITION_ALE_APP_ID);
-                assert_eq!(p._conditions[1].fieldKey, W::FWPM_CONDITION_IP_REMOTE_ADDRESS);
-                assert_eq!(p._conditions[2].fieldKey, W::FWPM_CONDITION_IP_REMOTE_PORT);
-                assert_eq!(p._conditions[3].fieldKey, W::FWPM_CONDITION_IP_PROTOCOL);
+                assert_eq!(from_win(p._conditions[0].fieldKey), from_win(W::FWPM_CONDITION_ALE_APP_ID));
+                assert_eq!(from_win(p._conditions[1].fieldKey), from_win(W::FWPM_CONDITION_IP_REMOTE_ADDRESS));
+                assert_eq!(from_win(p._conditions[2].fieldKey), from_win(W::FWPM_CONDITION_IP_REMOTE_PORT));
+                assert_eq!(from_win(p._conditions[3].fieldKey), from_win(W::FWPM_CONDITION_IP_PROTOCOL));
                 assert_eq!(unsafe { p._conditions[2].conditionValue.Anonymous.uint16 }, endpoint.port());
                 assert_eq!(unsafe { p._conditions[3].conditionValue.Anonymous.uint8 }, 6);
                 match endpoint.ip() {
@@ -892,9 +892,9 @@ mod imp {
                 let mut alternate = nonce;
                 alternate[0] ^= 1;
                 let other = RawFilter::ephemeral_proxy_permit("Trader", &app, endpoint, &alternate).unwrap();
-                assert_ne!(p.raw.filterKey, other.raw.filterKey, "旧会话不能共享新许可 key");
-                assert_ne!(p.raw.filterKey,
-                    RawFilter::block("Trader", &app, if endpoint.is_ipv4() { Layer::V4 } else { Layer::V6 }).raw.filterKey,
+                assert_ne!(from_win(p.raw.filterKey), from_win(other.raw.filterKey), "旧会话不能共享新许可 key");
+                assert_ne!(from_win(p.raw.filterKey),
+                    from_win(RawFilter::block("Trader", &app, if endpoint.is_ipv4() { Layer::V4 } else { Layer::V6 }).raw.filterKey),
                     "动态许可不能覆盖 v1 持久 BLOCK filterKey");
             }
         }
@@ -910,17 +910,17 @@ mod imp {
                 assert_eq!(permit.raw.action.r#type, W::FWP_ACTION_PERMIT);
                 assert_eq!(*permit._weight, super::super::super::wfp::FILTER_WEIGHT_PERMIT);
                 assert_eq!(permit._conditions.len(), 2);
-                assert_eq!(permit._conditions[0].fieldKey, W::FWPM_CONDITION_ALE_APP_ID);
-                assert_eq!(permit._conditions[1].fieldKey, W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE);
+                assert_eq!(from_win(permit._conditions[0].fieldKey), from_win(W::FWPM_CONDITION_ALE_APP_ID));
+                assert_eq!(from_win(permit._conditions[1].fieldKey), from_win(W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE));
                 assert_eq!(permit._conditions[1].matchType, W::FWP_MATCH_EQUAL);
                 assert_eq!(permit._conditions[1].conditionValue.r#type, W::FWP_UINT64);
                 assert_eq!(unsafe { *permit._conditions[1].conditionValue.Anonymous.uint64 }, 424242);
-                assert_ne!(permit.raw.filterKey, RawFilter::block("Trader", &app, layer).raw.filterKey);
+                assert_ne!(from_win(permit.raw.filterKey), from_win(RawFilter::block("Trader", &app, layer).raw.filterKey));
                 let mut other = nonce;
                 other[15] ^= 1;
                 let rotated = RawFilter::candidate_ephemeral_tun_permit(
                     "Trader", &app, layer, 424242, &other).unwrap();
-                assert_ne!(permit.raw.filterKey, rotated.raw.filterKey);
+                assert_ne!(from_win(permit.raw.filterKey), from_win(rotated.raw.filterKey));
                 assert!(RawFilter::candidate_ephemeral_tun_permit(
                     "Trader", &app, layer, 0, &nonce).is_err());
                 assert!(RawFilter::candidate_ephemeral_tun_permit(
