@@ -574,6 +574,109 @@ mod imp {
         }
     }
 
+    /// 严格核验一条 WFP v2 scoped 规则：必须核对条件真实值，而不能仅凭
+    /// filterKey / provider / “有 2 条条件”就宣称保护已生效。
+    ///
+    /// # Safety
+    /// raw 必须是当前调用期间有效的 FWPM_FILTER0（内存来自 WFP 读回或
+    /// RawFilter::scoped_v2_proxy 拥有的缓冲），且其中引用的指针有效。
+    /// TUN 条件在真正的断线/重授权测试完成前一律不接受。
+    unsafe fn scoped_native_matches(
+        raw: *const W::FWPM_FILTER0,
+        app_id: &[u8],
+        spec: &super::super::egress_policy::ScopedBlock,
+    ) -> bool {
+        use super::super::egress_policy::{scoped_key, DenyTerm, IpFamily};
+        if raw.is_null() || app_id.is_empty()
+            || spec.filter_key != scoped_key(app_id, spec.family, spec.predicate)
+        { return false; }
+        let f = &*raw;
+        let layer = match spec.family { IpFamily::V4 => Layer::V4, IpFamily::V6 => Layer::V6 };
+        if from_win(f.filterKey) != spec.filter_key
+            || f.providerKey.is_null()
+            || from_win(*f.providerKey) != PROVIDER_GUID
+            || from_win(f.subLayerKey) != SUBLAYER_GUID
+            || from_win(f.layerKey) != layer.guid()
+            || f.action.r#type != ACTION_BLOCK
+            || from_win(f.action.Anonymous.filterType) != Guid::nil()
+            || f.flags & FILTER_FLAG_PERSISTENT == 0
+            || f.flags & W::FWPM_FILTER_FLAG_DISABLED != 0
+            || f.flags & !(FILTER_FLAG_PERSISTENT | W::FWPM_FILTER_FLAG_DISABLED
+                           | W::FWPM_FILTER_FLAG_INDEXED) != 0
+            || read_blob(&f.providerData) != OWNER_MARKER
+            || from_win(f.Anonymous.providerContextKey) != Guid::nil()
+            || f.weight.r#type != FWP_TYPE_UINT64
+            || f.weight.Anonymous.uint64.is_null()
+            || *f.weight.Anonymous.uint64 != FILTER_WEIGHT_BLOCK
+        { return false; }
+
+        let expected_count = if spec.predicate == DenyTerm::Any { 1 } else { 2 };
+        if f.numFilterConditions != expected_count || f.filterCondition.is_null() { return false; }
+        let conditions = std::slice::from_raw_parts(f.filterCondition, expected_count as usize);
+        let app = &conditions[0];
+        if from_win(app.fieldKey) != CONDITION_ALE_APP_ID
+            || app.matchType != MATCH_EQUAL
+            || app.conditionValue.r#type != FWP_TYPE_BYTE_BLOB
+            || app.conditionValue.Anonymous.byteBlob.is_null()
+            || read_blob(&*app.conditionValue.Anonymous.byteBlob) != app_id
+        { return false; }
+
+        let Some(extra) = conditions.get(1) else {
+            return spec.predicate == DenyTerm::Any;
+        };
+        if extra.matchType != W::FWP_MATCH_NOT_EQUAL { return false; }
+        match spec.predicate {
+            DenyTerm::Any => false,
+            DenyTerm::RemoteAddressNot(ip) => {
+                if from_win(extra.fieldKey) != from_win(W::FWPM_CONDITION_IP_REMOTE_ADDRESS) {
+                    return false;
+                }
+                match (spec.family, ip) {
+                    (IpFamily::V4, std::net::IpAddr::V4(ip)) =>
+                        extra.conditionValue.r#type == W::FWP_UINT32
+                            && extra.conditionValue.Anonymous.uint32 == u32::from_be_bytes(ip.octets()),
+                    (IpFamily::V6, std::net::IpAddr::V6(ip)) =>
+                        extra.conditionValue.r#type == W::FWP_BYTE_ARRAY16_TYPE
+                            && !extra.conditionValue.Anonymous.byteArray16.is_null()
+                            && (*extra.conditionValue.Anonymous.byteArray16).byteArray16 == ip.octets(),
+                    _ => false,
+                }
+            }
+            DenyTerm::RemotePortNot(port) =>
+                from_win(extra.fieldKey) == from_win(W::FWPM_CONDITION_IP_REMOTE_PORT)
+                    && extra.conditionValue.r#type == W::FWP_UINT16
+                    && extra.conditionValue.Anonymous.uint16 == port,
+            DenyTerm::ProtocolNotTcp =>
+                from_win(extra.fieldKey) == from_win(W::FWPM_CONDITION_IP_PROTOCOL)
+                    && extra.conditionValue.r#type == W::FWP_UINT8
+                    && extra.conditionValue.Anonymous.uint8 == 6,
+            DenyTerm::NextHopNot(_) | DenyTerm::MissingNextHop => false,
+        }
+    }
+
+    /// 仅用于未来显式 v2 迁移的严格读回原语；不修改现有 v1 快照或状态。
+    /// 返回的 id 是 BFE 实际分配的 id，字段不合格则整笔拒绝。
+    pub fn scoped_v2_get_validated(
+        engine: &WfpEngine,
+        app_id: &[u8],
+        spec: &super::super::egress_policy::ScopedBlock,
+    ) -> Result<Option<u64>, WfpError> {
+        let key = to_win(spec.filter_key);
+        let mut raw: *mut W::FWPM_FILTER0 = std::ptr::null_mut();
+        let rc = unsafe { W::FwpmFilterGetByKey0(engine.raw(), &key, &mut raw) };
+        if rc != 0 {
+            let err = classify(rc);
+            return if err.is_absent() { Ok(None) } else { Err(err) };
+        }
+        let owned = unsafe { WfpBuf::from_raw(raw) };
+        let Some(native) = owned.as_ref() else { return Err(WfpError::InvalidState); };
+        let valid = unsafe { scoped_native_matches(native, app_id, spec) };
+        if !valid || native.filterId == 0 {
+            return Err(WfpError::InvalidState);
+        }
+        Ok(Some(native.filterId))
+    }
+
     #[cfg(test)]
     mod scoped_v2_tests {
         use super::*;
@@ -602,6 +705,39 @@ mod imp {
                 assert_eq!(projection.conditions[0].field_key, CONDITION_ALE_APP_ID);
                 if num == 2 {
                     assert_eq!(projection.conditions[1].match_type, W::FWP_MATCH_NOT_EQUAL);
+                }
+            }
+        }
+
+        #[test]
+        fn strict_native_readback_rejects_tampered_conditions_or_flags() {
+            let app = app();
+            for endpoint in ["127.0.0.1:17890", "[::1]:17890"] {
+                let rules = compile_scoped_blocks(EgressPolicy::local_proxy(endpoint).unwrap(), &app).unwrap();
+                for candidate in rules {
+                    let mut raw = RawFilter::scoped_v2_proxy("Trader", &app, &candidate).unwrap();
+                    assert!(unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    // Wrong app identity and stale endpoint can never be certified.
+                    let another_app = "other.exe".encode_utf16().chain(Some(0))
+                        .flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+                    assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &another_app, &candidate) });
+
+                    raw.raw.flags |= W::FWPM_FILTER_FLAG_DISABLED;
+                    assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    raw.raw.flags &= !W::FWPM_FILTER_FLAG_DISABLED;
+                    raw.raw.action.r#type = W::FWP_ACTION_PERMIT;
+                    assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    raw.raw.action.r#type = ACTION_BLOCK;
+                    if candidate.predicate == DenyTerm::Any { continue; }
+                    raw._conditions[1].matchType = W::FWP_MATCH_EQUAL;
+                    assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    raw._conditions[1].matchType = W::FWP_MATCH_NOT_EQUAL;
+                    assert!(unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+
+                    if candidate.predicate == DenyTerm::RemotePortNot(17890) {
+                        raw._conditions[1].conditionValue.Anonymous.uint16 = 17891;
+                        assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    }
                 }
             }
         }
