@@ -2096,19 +2096,12 @@ fn main() -> ExitCode {
                 probe_port,
             ) {
                 Ok(effective) => Some(settings.to_engine(&effective)),
-                // 连接方式派生失败也必须拒绝：选兼容连接却回落到标准连接是静默降级。
-                Err(err)
-                    if engine_config::is_transport_refusal(&err)
-                        || engine_config::is_mode_refusal(&err)
-                        || engine_config::has_probe_inbound_file(&p) =>
-                {
+                // 即使是老线路，配置准备失败也不再静默使用原文件。
+                // 否则可能缺少最新分流、DNS 或接口绑定约束。
+                Err(err) => {
                     prepare_refused = true;
                     println!("  引擎配置准备失败，拒绝连接：{err}");
                     None
-                }
-                Err(err) => {
-                    println!("  分流规则应用失败（按原配置启动）：{err}");
-                    Some(settings.to_engine(&p))
                 }
             }
         });
