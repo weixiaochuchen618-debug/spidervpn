@@ -690,6 +690,7 @@ mod windows_canary {
         let mut template = W::FWPM_FILTER_ENUM_TEMPLATE0::default();
         template.providerKey = &mut owner;
         template.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        template.actionMask = 0xFFFF_FFFF; // include BLOCK and PERMIT; provider key does the scoping
         let mut handle: HANDLE = null_mut();
         let rc = unsafe { W::FwpmFilterCreateEnumHandle0(engine.0, &template, &mut handle) };
         assert_eq!(rc, 0, "无法枚举隔离测试 provider 规则：0x{rc:08X}");
