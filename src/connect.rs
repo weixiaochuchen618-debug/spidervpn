@@ -120,6 +120,58 @@ pub fn effective_mode(cfg: &AppConfig, engine: &EngineConfig) -> crate::config::
         .unwrap_or(cfg.mode)
 }
 
+/// 连接前的无副作用幂等检查。必须先于运行时配置和探测凭据的生成。
+///
+/// Ok(true)：现有引擎、模式、代理接管全部与目标相符，可直接 AlreadyDone；
+/// Ok(false)：没有活的引擎，允许准备新配置；
+/// Err：引擎还活着但当前状态与目标不一致，先断开，不能覆盖运行时文件。
+pub fn preflight_before_prepare(
+    cfg: &AppConfig,
+    root: &Path,
+    store: &ProxyStore,
+    alive: &dyn Fn(i64) -> bool,
+    legacy_running: bool,
+) -> Result<bool, String> {
+    let runtime_path = root.join("runtime.json");
+    let engine_alive = read_engine_pid_opt(&runtime_path).map(alive).unwrap_or(false);
+    if !engine_alive {
+        return Ok(false);
+    }
+    let line = cfg.current_line()
+        .ok_or_else(|| "当前引擎仍在运行，但线路已不存在；请先断开".to_string())?;
+    let runtime_engine = root.join("runtime-engine.json");
+    let active_mode = crate::engine_config::actual_mode(&runtime_engine)
+        .ok_or_else(|| "当前引擎仍在运行，但无法核验其配置；请先断开，避免覆盖运行时凭据".to_string())?;
+    if active_mode != cfg.mode {
+        return Err("当前引擎仍在运行，但接管模式已变更；请先断开再连接".to_string());
+    }
+    if active_mode != crate::config::Mode::Tun {
+        let plan = proxy::plan_connect(&store.read(), &line.proxy_endpoint, legacy_running);
+        if plan.blocked.is_some() || !plan.changes.is_empty() {
+            return Err("当前引擎仍在运行，但系统代理与本次线路不匹配；请先断开再连接".to_string());
+        }
+    }
+    Ok(true)
+}
+
+/// 无须再次准备配置的 AlreadyDone 分支仍需与正常连接记录保持同一语义。
+pub fn record_already_connected(
+    cfg: &AppConfig,
+    root: &Path,
+    origin: &crate::events::Origin,
+) -> Outcome {
+    let line = cfg.current_line().map(|l| (l.id.clone(), l.name.clone())).unwrap_or_default();
+    let mode = crate::engine_config::actual_mode(&root.join("runtime-engine.json")).unwrap_or(cfg.mode);
+    crate::events::record(
+        root,
+        crate::events::CONNECT,
+        true,
+        &format!("{}（{}，当时已在连接状态）", line.1, mode.label()),
+        &origin.clone().with_obj(format!("line:{}", line.0)),
+    );
+    Outcome::AlreadyDone
+}
+
 /// 连接。**这是唯一入口**：命令行 `--connect` 与界面按钮都从这里进。
 ///
 /// 操作记录就挂在这一层：里面那套事务（写凭据→改代理→起引擎→写运行时记录）
