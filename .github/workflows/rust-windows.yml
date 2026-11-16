@@ -1,0 +1,24 @@
+name: Rust Windows build and tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - fix/first-pass-safety-audit-20261116
+
+permissions:
+  contents: read
+
+jobs:
+  rust-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build with Rust
+        run: cargo build --locked
+      - name: Unit tests (serial due to Windows single-instance test fixtures)
+        run: cargo test --locked --bin spidervpn -- --test-threads=1
+      - name: Integration tests (serial)
+        run: cargo test --locked --tests -- --test-threads=1
