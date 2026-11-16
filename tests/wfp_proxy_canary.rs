@@ -201,7 +201,7 @@ mod windows_canary {
 
     /// 仅验证 ALE_AUTH_CONNECT_V4 在环回场景是否提供下一跳 LUID，
     /// 绝不能把此测试结果冒充真正 Wintun 接口的分类结论。
-    fn install_next_hop_probe(engine: &DynamicEngine, app: &AppId) {
+    fn install_next_hop_probe(engine: &DynamicEngine, app: &AppId, match_empty: bool) {
         let app_cond = W::FWPM_FILTER_CONDITION0 {
             fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
             matchType: W::FWP_MATCH_EQUAL,
@@ -211,13 +211,26 @@ mod windows_canary {
             },
         };
         let mut invalid_luid: u64 = 0;
-        let next_cond = W::FWPM_FILTER_CONDITION0 {
-            fieldKey: W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE,
-            matchType: W::FWP_MATCH_NOT_EQUAL,
-            conditionValue: W::FWP_CONDITION_VALUE0 {
-                r#type: W::FWP_UINT64,
-                Anonymous: W::FWP_CONDITION_VALUE0_0 { uint64: &mut invalid_luid },
-            },
+        let next_cond = if match_empty {
+            // Microsoft ALE reauthorization documentation: unknown interface fields
+            // are represented by FWP_EMPTY, which can be matched with EQUAL.
+            W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE,
+                matchType: W::FWP_MATCH_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_EMPTY,
+                    Anonymous: unsafe { std::mem::zeroed() },
+                },
+            }
+        } else {
+            W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE,
+                matchType: W::FWP_MATCH_NOT_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT64,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { uint64: &mut invalid_luid },
+                },
+            }
         };
         let mut conditions = [app_cond, next_cond];
         let mut name: Vec<u16> = "SpiderVPN temporary next-hop WFP probe"
@@ -372,11 +385,19 @@ mod windows_canary {
         assert!(connect(addr).is_ok(), "探针前本地 TCP 必须能连通");
         let engine = DynamicEngine::open();
         let app = AppId::this_test_exe();
-        install_next_hop_probe(&engine, &app);
+        install_next_hop_probe(&engine, &app, false);
         assert!(connect(addr).is_err(),
             "ALE_AUTH_CONNECT 未把环回下一跳 LUID 纳入 NOT_EQUAL 分类；不能据此部署 TUN 策略");
         drop(engine);
         assert!(connect(addr).is_ok(), "探针关闭动态会话后应恢复网络");
+
+        // FWP_EMPTY 原生过滤器必须能够安装，且在“下一跳已知”的初始
+        // 授权中不应误阻断。该测试不假装已经触发真实 TUN 重新授权。
+        let empty_engine = DynamicEngine::open();
+        install_next_hop_probe(&empty_engine, &app, true);
+        assert!(connect(addr).is_ok(), "非空下一跳错误匹配了 FWP_EMPTY 防泄漏规则");
+        drop(empty_engine);
+        assert!(connect(addr).is_ok());
     }
 
     #[test]
