@@ -5605,7 +5605,12 @@ fn connect_json(ctx: &Ctx) -> String {
             return outcome_json(Ok(outcome));
         }
         Ok(false) => {}
-        Err(e) => return refuse_now(&e),
+        Err(e) => {
+            // 预检拒绝时现有引擎仍可能在工作：不要用 refuse_now 清掉
+            // 它的真实通道自检证据。只记录本次重连被拒，不动运行态。
+            crate::events::record(&ctx.root, crate::events::CONNECT, false, &e, &ctx.origin(None));
+            return refuse(&e);
+        }
     }
     // 探测计划：探测端口（线路端口 +3）被占 → 摘掉探测入站再起引擎（引擎对绑不上的
     // 入站是整体 FATAL），自检届时报「自检跳过」。凭据在这里生成一次，两处共用。
