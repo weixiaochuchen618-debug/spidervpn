@@ -20,7 +20,7 @@ mod windows_canary {
     use std::ptr::{null, null_mut};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as W;
+    use windows_sys::Win32::NetworkManagement::{IpHelper as Ip, WindowsFilteringPlatform as W};
 
     /// 不返回持久句柄：本探针的所有 WFP 对象都归动态会话。
     struct DynamicEngine(HANDLE);
@@ -353,6 +353,69 @@ mod windows_canary {
         assert_ne!(id, 0);
     }
 
+    /// 只读发现 Windows 对 127.0.0.1 的最佳接口，作为“真实已知下一跳”探针。
+    /// 这不是 Wintun 的身份验证，也不会创建/修改路由。
+    fn best_loopback_luid() -> u64 {
+        let mut index = 0u32;
+        // GetBestInterface IPv4 uses the same bytes as inet_addr() in a DWORD.
+        let dst = u32::from_ne_bytes([127, 0, 0, 1]);
+        let rc = unsafe { Ip::GetBestInterface(dst, &mut index) };
+        assert_eq!(rc, 0, "Windows 无法查询 IPv4 loopback 最佳接口：{rc}");
+        assert_ne!(index, 0);
+        let mut luid = 0u64;
+        let rc = unsafe { Ip::ConvertInterfaceIndexToLuid(
+            index, (&mut luid as *mut u64).cast(),
+        ) };
+        assert_eq!(rc, 0, "Windows loopback interface index 无法转为 LUID：{rc}");
+        assert_ne!(luid, 0);
+        luid
+    }
+
+    /// 在 WFP 上安装 APP_ID && NEXTHOP_INTERFACE == 指定 LUID 的正向 soft PERMIT。
+    /// 只有与长期全阻断在同一 sublayer、权重高于 BLOCK 时才可改变许可结果。
+    fn install_ephemeral_tun_luid_permit(engine: &DynamicEngine, app: &AppId, luid: u64) {
+        let mut luid_value = luid;
+        let mut conditions = [
+            W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
+                matchType: W::FWP_MATCH_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_BYTE_BLOB_TYPE,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { byteBlob: app.0 },
+                },
+            },
+            W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE,
+                matchType: W::FWP_MATCH_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT64,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { uint64: &mut luid_value },
+                },
+            },
+        ];
+        let mut name: Vec<u16> = "SpiderVPN temporary positive next-hop permit"
+            .encode_utf16().chain(Some(0)).collect();
+        let mut raw = W::FWPM_FILTER0::default();
+        raw.displayData.name = name.as_mut_ptr();
+        raw.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+        raw.weight = W::FWP_VALUE0 {
+            r#type: W::FWP_UINT8,
+            Anonymous: W::FWP_VALUE0_0 { uint8: 14 },
+        };
+        raw.numFilterConditions = conditions.len() as u32;
+        raw.filterCondition = conditions.as_mut_ptr();
+        raw.action = W::FWPM_ACTION0 {
+            r#type: W::FWP_ACTION_PERMIT,
+            Anonymous: W::FWPM_ACTION0_0 { filterType: windows_sys::core::GUID::default() },
+        };
+        raw.flags = 0;
+        let mut filter_id = 0u64;
+        let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null_mut(), &mut filter_id) };
+        assert_eq!(rc, 0, "无法安装临时下一跳正向许可：0x{rc:08X}");
+        assert_ne!(filter_id, 0);
+    }
+
     fn begin_txn(engine: &DynamicEngine) {
         let rc = unsafe { W::FwpmTransactionBegin0(engine.0, 0) };
         assert_eq!(rc, 0, "开始 WFP 原子迁移事务失败：0x{rc:08X}");
@@ -512,6 +575,36 @@ mod windows_canary {
         drop(baseline);
         assert!(connect(trusted_addr).is_ok() && connect(other_addr).is_ok());
         let _ = std::fs::remove_file(ready);
+    }
+
+    #[test]
+    #[ignore = "使用真实 Windows loopback 接口 LUID 验证正向 WFP TUN 许可的匹配语义；不创建 TUN"]
+    fn positive_next_hop_permit_matches_only_the_actual_loopback_luid() {
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _drain = ListenerDrain::start(&listener);
+        let endpoint = listener.local_addr().unwrap();
+        assert!(connect(endpoint).is_ok());
+        let baseline = DynamicEngine::open();
+        let app = AppId::this_test_exe();
+        install_legacy_block(&baseline, &app);
+        assert!(connect(endpoint).is_err(), "默认阻断不生效");
+
+        let actual_luid = best_loopback_luid();
+        let wrong = DynamicEngine::open();
+        install_ephemeral_tun_luid_permit(&wrong, &app, actual_luid ^ 1);
+        assert!(connect(endpoint).is_err(),
+            "错误下一跳 LUID 的 PERMIT 意外放行，将造成 TUN 直连泄漏");
+        drop(wrong);
+
+        let correct = DynamicEngine::open();
+        install_ephemeral_tun_luid_permit(&correct, &app, actual_luid);
+        assert!(connect(endpoint).is_ok(),
+            "正确 loopback LUID 的 PERMIT 不匹配，TUN 方案可能不可用");
+        drop(correct);
+        assert!(connect(endpoint).is_err(), "动态下一跳许可退出后没有恢复全阻断");
+        drop(baseline);
+        assert!(connect(endpoint).is_ok(), "规则清理后 loopback 应恢复");
     }
 
     #[test]
