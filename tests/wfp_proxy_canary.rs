@@ -26,6 +26,16 @@ mod windows_canary {
     struct DynamicEngine(HANDLE);
 
     impl DynamicEngine {
+        /// 模拟产品的常规/持久 WFP 基础设施所在会话。
+        /// 只在隔离 CI 测试中使用：下方 TemporaryProviderLayout 负责删除所有对象。
+        fn open_regular() -> Self {
+            let mut handle: HANDLE = null_mut();
+            let rc = unsafe { W::FwpmEngineOpen0(null(), 10, null(), null(), &mut handle) };
+            assert_eq!(rc, 0, "打开非动态 WFP 基础设施测试会话失败：0x{rc:08X}");
+            assert!(!handle.is_null());
+            Self(handle)
+        }
+
         fn open() -> Self {
             let mut session = W::FWPM_SESSION0::default();
             session.flags = W::FWPM_SESSION_FLAG_DYNAMIC;
@@ -653,7 +663,7 @@ mod windows_canary {
     fn install_provider_block(
         engine: &DynamicEngine, app: &AppId,
         provider: &windows_sys::core::GUID, sublayer: &windows_sys::core::GUID,
-    ) {
+    ) -> u64 {
         let mut owner = *provider;
         let mut conditions = [W::FWPM_FILTER_CONDITION0 {
             fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
@@ -684,6 +694,7 @@ mod windows_canary {
         let rc = unsafe { W::FwpmFilterAdd0(engine.0, &filter, null_mut(), &mut id) };
         assert_eq!(rc, 0, "动态测试 provider block 安装失败：0x{rc:08X}");
         assert_ne!(id, 0);
+        id
     }
 
     fn provider_filter_count(engine: &DynamicEngine, provider: &windows_sys::core::GUID) -> usize {
@@ -715,6 +726,61 @@ mod windows_canary {
         total
     }
 
+    /// 非动态基础设施测试必须主动清理所有对象；使用固定作用域 RAII
+    /// 即使断言失败也会尝试删除，避免把测试防火墙留给其它任务。
+    struct TemporaryProviderLayout<'a> {
+        engine: &'a DynamicEngine,
+        provider: windows_sys::core::GUID,
+        sublayer: windows_sys::core::GUID,
+        block_id: u64,
+    }
+    impl Drop for TemporaryProviderLayout<'_> {
+        fn drop(&mut self) {
+            let filter_rc = unsafe { W::FwpmFilterDeleteById0(self.engine.0, self.block_id) };
+            let sub_rc = unsafe { W::FwpmSubLayerDeleteByKey0(self.engine.0, &self.sublayer) };
+            let provider_rc = unsafe { W::FwpmProviderDeleteByKey0(self.engine.0, &self.provider) };
+            if filter_rc != 0 || sub_rc != 0 || provider_rc != 0 {
+                eprintln!("CI 隔离 WFP 对象清理异常: filter={filter_rc:08X}, sub={sub_rc:08X}, provider={provider_rc:08X}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "仅隔离 Windows CI：常规会话的 BLOCK 子层允许独立动态会话临时 PERMIT，且不污染 provider 枚举"]
+    fn regular_guard_sublayer_accepts_dynamic_unowned_lease() {
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+        let trusted = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let allowed = trusted.local_addr().unwrap();
+        let denied = other.local_addr().unwrap();
+        let _a = ListenerDrain::start(&trusted);
+        let _b = ListenerDrain::start(&other);
+        assert!(connect(allowed).is_ok() && connect(denied).is_ok());
+        let (provider, sublayer) = private_guard_ids(allowed.port());
+        let baseline = DynamicEngine::open_regular();
+        create_temp_provider_sublayer(&baseline, &provider, &sublayer);
+        let app = AppId::this_test_exe();
+        let block_id = install_provider_block(&baseline, &app, &provider, &sublayer);
+        let layout = TemporaryProviderLayout { engine: &baseline, provider, sublayer, block_id };
+        assert!(connect(allowed).is_err() && connect(denied).is_err());
+        assert_eq!(provider_filter_count(&baseline, &provider), 1);
+
+        // 核心差别：临时许可在单独的动态会话，子层在非动态常规会话。
+        // 真正的持久 Guard 也是独立于 lease 会话的。
+        let permit = DynamicEngine::open();
+        let _permit_id = install_proxy_permit_in_layer(&permit, &app, allowed.port(), sublayer);
+        assert_eq!(provider_filter_count(&baseline, &provider), 1,
+            "临时无 provider 许可不允许污染 v1 持久规则列表");
+        assert!(connect(allowed).is_ok(), "独立动态租约无法放行可信代理");
+        assert!(connect(denied).is_err(), "临时租约不能绕过其它端口");
+        drop(permit);
+        assert!(connect(allowed).is_err() && connect(denied).is_err(),
+            "动态租约退出后必须恢复基础 BLOCK");
+        drop(layout);
+        drop(baseline);
+        assert!(connect(allowed).is_ok() && connect(denied).is_ok());
+    }
+
     #[test]
     #[ignore = "仅 Windows CI：同一动态会话验证 NULL provider 的过滤器不污染有归属 BLOCK 的枚举"]
     fn dynamic_permit_is_excluded_from_persistent_provider_enumeration() {
@@ -731,7 +797,7 @@ mod windows_canary {
         let baseline = DynamicEngine::open();
         create_temp_provider_sublayer(&baseline, &provider, &sublayer);
         let app = AppId::this_test_exe();
-        install_provider_block(&baseline, &app, &provider, &sublayer);
+        let _ = install_provider_block(&baseline, &app, &provider, &sublayer);
         assert_eq!(provider_filter_count(&baseline, &provider), 1);
         assert!(connect(trusted_addr).is_err() && connect(other_addr).is_err());
 
