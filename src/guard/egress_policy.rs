@@ -164,12 +164,127 @@ impl EgressPolicy {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 持久规则 v2 的确定性身份与安全预检（当前仍无任何生产 WFP 写入调用）。
+// ---------------------------------------------------------------------------
+
+use sha2::{Digest, Sha256};
+
+/// 一条经过规则规格编译的候选 BLOCK。一个 predicate 必须对应一条 WFP filter；
+/// 不能把 OR 语义的多个条件塞进同一条 WFP filter 产生错误的 AND。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopedBlock {
+    pub family: IpFamily,
+    pub predicate: DenyTerm,
+    pub filter_key: super::wfp::Guid,
+}
+
+/// 纯函数返回的 v2 规则身份，不是“已安装”也不是“已保护”的证据。
+/// 每条 key 与 v1（无条件 APP_ID BLOCK）使用完全独立的版本命名空间。
+pub fn scoped_key(app_id: &[u8], family: IpFamily, predicate: DenyTerm) -> super::wfp::Guid {
+    let mut hash = Sha256::new();
+    hash.update(super::wfp::PROVIDER_GUID.to_hyphenated().as_bytes());
+    hash.update(b"/wfp-v2/scoped-block/");
+    hash.update(match family { IpFamily::V4 => b"ipv4/", IpFamily::V6 => b"ipv6/" });
+    hash.update((app_id.len() as u64).to_le_bytes());
+    hash.update(app_id);
+    match predicate {
+        DenyTerm::Any => hash.update(b"deny-any"),
+        DenyTerm::RemoteAddressNot(ip) => {
+            hash.update(b"remote-address-not/");
+            match ip {
+                IpAddr::V4(v) => { hash.update([4]); hash.update(v.octets()); }
+                IpAddr::V6(v) => { hash.update([6]); hash.update(v.octets()); }
+            }
+        }
+        DenyTerm::RemotePortNot(port) => {
+            hash.update(b"remote-port-not/");
+            hash.update(port.to_be_bytes());
+        }
+        DenyTerm::ProtocolNotTcp => hash.update(b"protocol-not-tcp"),
+        DenyTerm::NextHopNot(luid) => {
+            hash.update(b"next-hop-not/");
+            hash.update(luid.to_le_bytes());
+        }
+        DenyTerm::MissingNextHop => hash.update(b"next-hop-missing"),
+    }
+    let bytes = hash.finalize();
+    let mut guid_bytes = [0u8; 16];
+    guid_bytes.copy_from_slice(&bytes[..16]);
+    super::wfp::Guid::from_bytes_le(guid_bytes)
+}
+
+/// 编译为可以进入下一阶段原生过滤器构造的候选集合。
+///
+/// **TUN 暂时硬拒绝**：即便纯模型包含 MissingNextHop 约束，当前 WFP
+/// 未证实有覆盖重新授权空字段的原生条件。擅自省略它相当于允许泄漏。
+/// 拒绝发生在任何写入 WFP 之前；不允许回退成不完整的 TUN 规则集。
+pub fn compile_scoped_blocks(policy: EgressPolicy, app_id: &[u8]) -> Result<Vec<ScopedBlock>, String> {
+    if app_id.is_empty() || app_id.len() % 2 != 0 {
+        return Err("非法的 WFP APP_ID，不生成任何持久规则".into());
+    }
+    if matches!(policy, EgressPolicy::TunInterface { .. }) {
+        return Err("TUN 下一跳 LUID 空字段及重新授权的原生阻断尚未完成验证，拒绝编译不完整的持久规则".into());
+    }
+    let mut result = Vec::new();
+    for family in [IpFamily::V4, IpFamily::V6] {
+        for predicate in policy.candidate_blocks(family) {
+            let key = scoped_key(app_id, family, predicate);
+            if result.iter().any(|f: &ScopedBlock| f.filter_key == key) {
+                return Err("v2 过滤器身份冲突，整组拒绝".into());
+            }
+            result.push(ScopedBlock { family, predicate, filter_key: key });
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tcp(remote: &str, luid: Option<u64>) -> Flow {
         Flow { remote: remote.parse().unwrap(), protocol: NetworkProtocol::Tcp, next_hop_luid: luid }
+    }
+
+    #[test]
+    fn scoped_identity_is_stable_distinct_from_v1_and_covers_both_families() {
+        let app: Vec<u8> = "trader.exe\\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let policy = EgressPolicy::local_proxy("127.0.0.1:17890").unwrap();
+        let rules = compile_scoped_blocks(policy, &app).unwrap();
+        assert_eq!(rules.len(), 4, "3 个独立 IPv4 BLOCK + 1 个全 IPv6 BLOCK");
+        assert_eq!(rules.iter().filter(|r| r.family == IpFamily::V4).count(), 3);
+        assert!(rules.iter().any(|r| r.family == IpFamily::V6 && r.predicate == DenyTerm::Any));
+        for (i, r) in rules.iter().enumerate() {
+            assert_eq!(r.filter_key, scoped_key(&app, r.family, r.predicate));
+            let layer = if r.family == IpFamily::V4 {
+                super::super::wfp::Layer::V4
+            } else {
+                super::super::wfp::Layer::V6
+            };
+            assert_ne!(r.filter_key, super::super::wfp::filter_key(&app, layer, false),
+                "v2 身份绝不覆盖历史持久 v1 key");
+            assert!(rules[..i].iter().all(|prev| prev.filter_key != r.filter_key));
+        }
+        let different_port = compile_scoped_blocks(
+            EgressPolicy::local_proxy("127.0.0.1:17891").unwrap(), &app).unwrap();
+        assert_ne!(rules[1].filter_key, different_port[1].filter_key,
+            "端口变化必须触发 v2 身份变化，不能沿用旧端口授权");
+    }
+
+    #[test]
+    fn tun_cannot_compile_to_a_leaky_partial_rule_set() {
+        let app = vec![0x54, 0x00];
+        assert!(compile_scoped_blocks(EgressPolicy::tun_interface(Some(42)), &app).is_err());
+        assert!(compile_scoped_blocks(EgressPolicy::tun_interface(None), &app).is_ok(),
+            "无有效下一跳时是 DenyAll，必须能生成两条全阻断");
+    }
+
+    #[test]
+    fn invalid_app_id_must_never_build_any_scoped_filter() {
+        assert!(compile_scoped_blocks(EgressPolicy::DenyAll, &[]).is_err());
+        assert!(compile_scoped_blocks(EgressPolicy::DenyAll, &[1]).is_err());
+        assert_eq!(compile_scoped_blocks(EgressPolicy::DenyAll, &[1, 0]).unwrap().len(), 2);
     }
 
     #[test]
