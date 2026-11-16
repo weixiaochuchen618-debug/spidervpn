@@ -2455,6 +2455,32 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rejects_missing_or_non_object_line_config() {
+        let root = std::env::temp_dir().join(format!(
+            "tcrs-prepare-fail-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("bad-line.json");
+        let out = root.join("runtime-engine.json");
+
+        let missing = prepare_engine_config(
+            &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+            Transport::Udp, Mode::Proxy, &out, "", None, None,
+        ).unwrap_err();
+        assert!(missing.contains("无法读取线路引擎配置"), "{missing}");
+        assert!(!out.exists(), "读取失败不许生成运行时配置");
+
+        std::fs::write(&line, "[]").unwrap();
+        let invalid_root = prepare_engine_config(
+            &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+            Transport::Udp, Mode::Proxy, &out, "", None, None,
+        ).unwrap_err();
+        assert!(invalid_root.contains("根节点必须是 JSON 对象"), "{invalid_root}");
+        assert!(!out.exists(), "非法配置不许生成运行时配置");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn empty_split_generates_byte_identical_config() {
         // 没有分流规则时，生成结果必须与本功能上线前**一字不差**。
         let out =
