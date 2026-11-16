@@ -38,6 +38,7 @@ pub mod egress_policy;
 pub mod evidence;
 pub mod identity;
 pub mod state;
+pub mod tun_identity;
 pub mod wfp;
 pub mod wfp_win;
 
