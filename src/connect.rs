@@ -140,7 +140,16 @@ pub fn preflight_before_prepare(
     let line = cfg.current_line()
         .ok_or_else(|| "当前引擎仍在运行，但线路已不存在；请先断开".to_string())?;
     let runtime_engine = root.join("runtime-engine.json");
-    let active_mode = crate::engine_config::actual_mode(&runtime_engine)
+    // 旧线路如果不需要派生规则，prepare_engine_config 直接返回原线路文件，
+    // 此时 runtime-engine.json 不存在也是合法的运行态。兼容这条路径，
+    // 但原线路也无法读取时仍拒绝重建。
+    let active_config_path = if runtime_engine.exists() {
+        runtime_engine
+    } else {
+        cfg.current_engine_path(root)
+            .ok_or_else(|| "当前引擎仍在运行，但无法定位其线路配置；请先断开".to_string())?
+    };
+    let active_mode = crate::engine_config::actual_mode(&active_config_path)
         .ok_or_else(|| "当前引擎仍在运行，但无法核验其配置；请先断开，避免覆盖运行时凭据".to_string())?;
     if active_mode != cfg.mode {
         return Err("当前引擎仍在运行，但接管模式已变更；请先断开再连接".to_string());
