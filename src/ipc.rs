@@ -5664,15 +5664,9 @@ fn connect_json(ctx: &Ctx) -> String {
                 probe_port,
             ) {
                 Ok(path) => path,
-                // 连接方式派生失败同样拒绝：静默回落到标准连接等于骗用户。
-                Err(err)
-                    if crate::engine_config::is_transport_refusal(&err)
-                        || crate::engine_config::is_mode_refusal(&err)
-                        || crate::engine_config::has_probe_inbound_file(&p) =>
-                {
-                    return refuse_now(&format!("引擎配置准备失败：{err}"));
-                }
-                Err(_) => p.clone(),
+                // 配置准备失败不允许退回原线路文件。原文件可能缺少最新分流、
+                // DNS 或接口约束；继续连接会使运行时行为与页面配置不一致。
+                Err(err) => return refuse_now(&format!("引擎配置准备失败：{err}")),
             };
             engine_settings.to_engine(&effective)
         }
