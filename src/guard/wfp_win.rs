@@ -415,7 +415,10 @@ mod imp {
         _blob: Box<W::FWP_BYTE_BLOB>,
         _weight: Box<u64>,
         _provider_key: Box<windows_sys::core::GUID>,
-        _conditions: Box<[W::FWPM_FILTER_CONDITION0; 1]>,
+        _conditions: Box<[W::FWPM_FILTER_CONDITION0]>,
+        // v2 地址条件要求整个 IPv6 数组保持有效；下一跳值则必须有稳定 u64 指针。
+        _scoped_v6: Option<Box<W::FWP_BYTE_ARRAY16>>,
+        _scoped_luid: Option<Box<u64>>,
     }
 
     impl RawFilter {
@@ -434,6 +437,8 @@ mod imp {
                 _blob: Box::new(W::FWP_BYTE_BLOB { size: app_id.len() as u32, data: std::ptr::null_mut() }),
                 _weight: Box::new(FILTER_WEIGHT_BLOCK),
                 _provider_key: Box::new(to_win(PROVIDER_GUID)),
+                _scoped_v6: None,
+                _scoped_luid: None,
                 _conditions: Box::new([W::FWPM_FILTER_CONDITION0 {
                     fieldKey: to_win(CONDITION_ALE_APP_ID),
                     matchType: MATCH_EQUAL,
@@ -483,8 +488,134 @@ mod imp {
             boxed
         }
 
+        /// 仅构造候选 WFP v2 代理规则（**不调用 BFE，不安装**）。
+        /// 实际持久迁移只能在隔离真实流量与事务回滚均通过后启用。
+        /// TUN 仍被硬拒绝：不允许缺省略过 FWP_EMPTY/重新授权保护。
+        pub fn scoped_v2_proxy(
+            name: &str,
+            app_id: &[u8],
+            spec: &super::super::egress_policy::ScopedBlock,
+        ) -> Result<Box<RawFilter>, String> {
+            use super::super::egress_policy::{scoped_key, DenyTerm, IpFamily};
+            if app_id.is_empty() || app_id.len() % 2 != 0 {
+                return Err("WFP v2 APP_ID 必须是非空 UTF-16LE 字节".to_string());
+            }
+            let layer = match spec.family {
+                IpFamily::V4 => Layer::V4,
+                IpFamily::V6 => Layer::V6,
+            };
+            if spec.filter_key != scoped_key(app_id, spec.family, spec.predicate) {
+                return Err("WFP v2 规则 key 与条件不一致，拒绝安装".to_string());
+            }
+            let mut new_filter = RawFilter::block(name, app_id, layer);
+            // 不改变 v1 现有构造器的内容。仅在独立 v2 候选中重算 key 与谓词条件。
+            new_filter.raw.filterKey = to_win(spec.filter_key);
+            let mut conditions = vec![unsafe { std::ptr::read(&new_filter._conditions[0]) }];
+            let predicate = match spec.predicate {
+                DenyTerm::Any => None,
+                DenyTerm::RemoteAddressNot(ip) => {
+                    let value = match (spec.family, ip) {
+                        (IpFamily::V4, std::net::IpAddr::V4(ip)) => W::FWP_CONDITION_VALUE0 {
+                            r#type: W::FWP_UINT32,
+                            Anonymous: W::FWP_CONDITION_VALUE0_0 {
+                                uint32: u32::from_be_bytes(ip.octets()),
+                            },
+                        },
+                        (IpFamily::V6, std::net::IpAddr::V6(ip)) => {
+                            new_filter._scoped_v6 = Some(Box::new(W::FWP_BYTE_ARRAY16 {
+                                byteArray16: ip.octets(),
+                            }));
+                            let ptr: *mut W::FWP_BYTE_ARRAY16 =
+                                &mut **new_filter._scoped_v6.as_mut().unwrap();
+                            W::FWP_CONDITION_VALUE0 {
+                                r#type: W::FWP_BYTE_ARRAY16_TYPE,
+                                Anonymous: W::FWP_CONDITION_VALUE0_0 { byteArray16: ptr },
+                            }
+                        }
+                        _ => return Err("IPv4/IPv6 地址与过滤层不匹配，拒绝候选规则".to_string()),
+                    };
+                    Some(W::FWPM_FILTER_CONDITION0 {
+                        fieldKey: W::FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                        matchType: W::FWP_MATCH_NOT_EQUAL,
+                        conditionValue: value,
+                    })
+                }
+                DenyTerm::RemotePortNot(port) => Some(W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_REMOTE_PORT,
+                    matchType: W::FWP_MATCH_NOT_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT16,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint16: port },
+                    },
+                }),
+                DenyTerm::ProtocolNotTcp => Some(W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_PROTOCOL,
+                    matchType: W::FWP_MATCH_NOT_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT8,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint8: 6 },
+                    },
+                }),
+                DenyTerm::NextHopNot(_) | DenyTerm::MissingNextHop => {
+                    return Err("真实 TUN 下一跳与 FWP_EMPTY 重新授权未完成，拒绝 v2 持久构造".to_string());
+                }
+            };
+            if let Some(condition) = predicate {
+                conditions.push(condition);
+            }
+            new_filter._conditions = conditions.into_boxed_slice();
+            new_filter.raw.numFilterConditions = new_filter._conditions.len() as u32;
+            new_filter.raw.filterCondition = new_filter._conditions.as_mut_ptr();
+            Ok(new_filter)
+        }
+
         pub fn as_ptr(&self) -> *const W::FWPM_FILTER0 {
             &self.raw
+        }
+    }
+
+    #[cfg(test)]
+    mod scoped_v2_tests {
+        use super::*;
+        use super::super::super::egress_policy::{
+            compile_scoped_blocks, scoped_key, DenyTerm, EgressPolicy, IpFamily, ScopedBlock,
+        };
+
+        fn app() -> Vec<u8> {
+            "trader.exe".encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect()
+        }
+
+        #[test]
+        fn native_candidate_fields_are_owned_and_match_scoped_v2_ids() {
+            let app = app();
+            let candidates = compile_scoped_blocks(
+                EgressPolicy::local_proxy("127.0.0.1:17890").unwrap(), &app).unwrap();
+            assert_eq!(candidates.len(), 4);
+            for candidate in candidates {
+                let raw = RawFilter::scoped_v2_proxy("Trader", &app, &candidate).unwrap();
+                let projection = unsafe { filter_raw_from(raw.as_ptr()) };
+                assert_eq!(projection.filter_key, candidate.filter_key);
+                assert_eq!(projection.provider_key, PROVIDER_GUID);
+                assert_eq!(projection.flags & FILTER_FLAG_PERSISTENT, FILTER_FLAG_PERSISTENT);
+                let num = if candidate.predicate == DenyTerm::Any { 1 } else { 2 };
+                assert_eq!(projection.num_conditions, num);
+                assert_eq!(projection.conditions[0].field_key, CONDITION_ALE_APP_ID);
+                if num == 2 {
+                    assert_eq!(projection.conditions[1].match_type, W::FWP_MATCH_NOT_EQUAL);
+                }
+            }
+        }
+
+        #[test]
+        fn invalid_or_tun_predicates_fail_before_any_native_wfp_write() {
+            let app = app();
+            let bad = ScopedBlock {
+                family: IpFamily::V4, predicate: DenyTerm::NextHopNot(42),
+                filter_key: scoped_key(&app, IpFamily::V4, DenyTerm::NextHopNot(42)),
+            };
+            assert!(RawFilter::scoped_v2_proxy("Trader", &app, &bad).is_err());
+            let altered = ScopedBlock { filter_key: Guid::nil(), ..bad };
+            assert!(RawFilter::scoped_v2_proxy("Trader", &app, &altered).is_err());
         }
     }
 
