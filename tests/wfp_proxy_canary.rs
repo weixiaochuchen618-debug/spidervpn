@@ -294,7 +294,7 @@ mod windows_canary {
     /// 动态 PERMIT 不带 CLEAR_ACTION_RIGHT，仍允许其它安全产品阻断连接；
     /// 它只应在同一 sublayer 中提前命中、绕过我们的宽泛 BLOCK。
     fn install_ephemeral_proxy_permit(engine: &DynamicEngine, app: &AppId, port: u16) {
-        install_proxy_permit_in_layer(engine, app, port, W::FWPM_SUBLAYER_UNIVERSAL);
+        let _ = install_proxy_permit_in_layer(engine, app, port, W::FWPM_SUBLAYER_UNIVERSAL);
     }
 
     /// 使用指定子层，验证 NULL provider 临时许可不会进入永久保护
@@ -302,7 +302,7 @@ mod windows_canary {
     fn install_proxy_permit_in_layer(
         engine: &DynamicEngine, app: &AppId, port: u16,
         sublayer: windows_sys::core::GUID,
-    ) {
+    ) -> u64 {
         let mut conditions = [
             W::FWPM_FILTER_CONDITION0 {
                 fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
@@ -360,6 +360,7 @@ mod windows_canary {
         let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null_mut(), &mut id) };
         assert_eq!(rc, 0, "安装非持久精确代理 PERMIT 失败：0x{rc:08X}");
         assert_ne!(id, 0);
+        id
     }
 
     /// 只读发现 Windows 对 127.0.0.1 的最佳接口，作为“真实已知下一跳”探针。
@@ -715,7 +716,7 @@ mod windows_canary {
     }
 
     #[test]
-    #[ignore = "仅 Windows CI：验证动态无归属 PERMIT 不会进入 v1 provider 枚举或污染 BLOCK 证据"]
+    #[ignore = "仅 Windows CI：同一动态会话验证 NULL provider 的过滤器不污染有归属 BLOCK 的枚举"]
     fn dynamic_permit_is_excluded_from_persistent_provider_enumeration() {
         assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
         let trusted = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -734,16 +735,21 @@ mod windows_canary {
         assert_eq!(provider_filter_count(&baseline, &provider), 1);
         assert!(connect(trusted_addr).is_err() && connect(other_addr).is_err());
 
-        let permit = DynamicEngine::open();
-        install_proxy_permit_in_layer(&permit, &app, trusted_addr.port(), sublayer);
+        // 这个“隔离 provider”用例刻意在*同一动态会话*中创建子层与许可：
+        // Windows 不允许另一动态会话引用前一动态会话拥有的子层
+        // (FWP_E_WRONG_SESSION / 0x8032000C)。
+        // 真正生产路径是“已有持久子层 + 新动态 lease”，必须另行验证。
+        let permit_id = install_proxy_permit_in_layer(
+            &baseline, &app, trusted_addr.port(), sublayer,
+        );
         assert_eq!(provider_filter_count(&baseline, &provider), 1,
             "临时许可不应被 v1 provider 枚举为多余规则");
-        assert!(connect(trusted_addr).is_ok(), "临时许可未在正式 provider 子层中放行可信端点");
+        assert!(connect(trusted_addr).is_ok(), "临时许可未在自有 provider 子层中放行可信端点");
         assert!(connect(other_addr).is_err(), "临时许可意外绕开旧 BLOCK");
-        drop(permit);
+        delete_filter(&baseline, permit_id);
         assert_eq!(provider_filter_count(&baseline, &provider), 1);
         assert!(connect(trusted_addr).is_err() && connect(other_addr).is_err(),
-            "lease 结束后必须恢复旧持久阻断的语义");
+            "移除临时许可后必须恢复旧全阻断规则的语义");
         drop(baseline);
         assert!(connect(trusted_addr).is_ok() && connect(other_addr).is_ok());
     }
