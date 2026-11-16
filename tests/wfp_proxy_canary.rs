@@ -390,6 +390,94 @@ mod windows_canary {
         matches!(server.recv_from(&mut buffer), Ok((n, _)) if &buffer[..n] == b"vpn-wfp-test")
     }
 
+    // 用当前 Rust 测试 exe 充当独立 WFP lease 进程。只有显式 child 标记
+    // 才能安装；没有标记就原样返回，普通测试永不启动常驻进程。
+    #[test]
+    #[ignore = "供 crash canary 子进程独立调用，普通测试禁止运行"]
+    fn wfp_soft_permit_child() {
+        if std::env::var("SPIDERVPN_WFP_LEASE_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+        let port: u16 = std::env::var("SPIDERVPN_WFP_LEASE_PORT").unwrap()
+            .parse().expect("子进程必须得到端口");
+        let signal = std::path::PathBuf::from(
+            std::env::var_os("SPIDERVPN_WFP_LEASE_READY").expect("子进程必须得到握手路径"));
+        let session = DynamicEngine::open();
+        let app = AppId::this_test_exe();
+        install_ephemeral_proxy_permit(&session, &app, port);
+        std::fs::write(&signal, b"ready").expect("已安装 WFP 动态 PERMIT 才能声明就绪");
+        // 父进程会强制 kill；该会话绝不能通过显式 Drop 才关闭。
+        loop { std::thread::sleep(Duration::from_millis(100)); }
+    }
+
+    struct KillChild(std::process::Child);
+    impl Drop for KillChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "CI 在隔离 Windows 中实际杀死持有动态 WFP PERMIT 的独立进程，验证 RPC rundown"]
+    fn ephemeral_permit_disappears_after_ungraceful_owner_process_kill() {
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+        let trusted = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let trusted_addr = trusted.local_addr().unwrap();
+        let other_addr = other.local_addr().unwrap();
+        assert!(connect(trusted_addr).is_ok() && connect(other_addr).is_ok());
+
+        let baseline = DynamicEngine::open();
+        let app = AppId::this_test_exe();
+        install_legacy_block(&baseline, &app);
+        assert!(connect(trusted_addr).is_err() && connect(other_addr).is_err());
+
+        let ready = std::env::temp_dir().join(format!(
+            "spidervpn-wfp-lease-{}-{}.signal", std::process::id(), trusted_addr.port()));
+        let _ = std::fs::remove_file(&ready);
+        let mut child = KillChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "windows_canary::wfp_soft_permit_child", "--nocapture"])
+                .env("SPIDERVPN_WFP_LEASE_CHILD", "1")
+                .env("SPIDERVPN_WFP_LEASE_PORT", trusted_addr.port().to_string())
+                .env("SPIDERVPN_WFP_LEASE_READY", &ready)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn().expect("创建独立动态 WFP lease 子进程失败")
+        );
+        let start = Instant::now();
+        while !ready.exists() {
+            if let Ok(Some(status)) = child.0.try_wait() {
+                panic!("动态 PERMIT 子进程提前退出（{status}），不得据此声称 fail-closed");
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "子进程未安装并确认动态 PERMIT");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(connect(trusted_addr).is_ok(), "子进程临时 PERMIT 未放行指定端口");
+        assert!(connect(other_addr).is_err(), "临时 PERMIT 意外放行了其他端口");
+
+        // kill，不能通过 Drop 正常关闭 WFP 句柄；WFP 必须因 owner 进程结束清理。
+        child.0.kill().expect("模拟持有 PERMIT 进程突然崩溃");
+        child.0.wait().expect("等待子进程完全退出");
+        let start = Instant::now();
+        loop {
+            if connect(trusted_addr).is_err() { break; }
+            assert!(start.elapsed() < Duration::from_secs(5),
+                "owner 已退出但新连接仍能通过原 PERMIT，存在断线泄漏");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(connect(other_addr).is_err());
+        drop(baseline);
+        assert!(connect(trusted_addr).is_ok() && connect(other_addr).is_ok());
+        let _ = std::fs::remove_file(ready);
+    }
+
     #[test]
     #[ignore = "CI 仅针对测试 exe 的 WFP 动态双会话；验证常驻 BLOCK + 临时精确 PERMIT 的仲裁和撤销"]
     fn persistent_style_block_plus_ephemeral_permit_fails_closed_on_session_exit() {
