@@ -198,8 +198,67 @@ mod windows_canary {
         assert_ne!(id, 0);
     }
 
+    /// 仅验证 ALE_AUTH_CONNECT_V4 在环回场景是否提供下一跳 LUID，
+    /// 绝不能把此测试结果冒充真正 Wintun 接口的分类结论。
+    fn install_next_hop_probe(engine: &DynamicEngine, app: &AppId) {
+        let app_cond = W::FWPM_FILTER_CONDITION0 {
+            fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
+            matchType: W::FWP_MATCH_EQUAL,
+            conditionValue: W::FWP_CONDITION_VALUE0 {
+                r#type: W::FWP_BYTE_BLOB_TYPE,
+                Anonymous: W::FWP_CONDITION_VALUE0_0 { byteBlob: app.0 },
+            },
+        };
+        let mut invalid_luid: u64 = 0;
+        let next_cond = W::FWPM_FILTER_CONDITION0 {
+            fieldKey: W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE,
+            matchType: W::FWP_MATCH_NOT_EQUAL,
+            conditionValue: W::FWP_CONDITION_VALUE0 {
+                r#type: W::FWP_UINT64,
+                Anonymous: W::FWP_CONDITION_VALUE0_0 { uint64: &mut invalid_luid },
+            },
+        };
+        let mut conditions = [app_cond, next_cond];
+        let mut name: Vec<u16> = "SpiderVPN temporary next-hop WFP probe"
+            .encode_utf16().chain(Some(0)).collect();
+        let mut raw = W::FWPM_FILTER0::default();
+        raw.displayData.name = name.as_mut_ptr();
+        raw.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+        raw.weight = W::FWP_VALUE0 {
+            r#type: W::FWP_UINT8,
+            Anonymous: W::FWP_VALUE0_0 { uint8: 13 },
+        };
+        raw.numFilterConditions = conditions.len() as u32;
+        raw.filterCondition = conditions.as_mut_ptr();
+        raw.action = W::FWPM_ACTION0 {
+            r#type: W::FWP_ACTION_BLOCK,
+            Anonymous: W::FWPM_ACTION0_0 { filterType: windows_sys::core::GUID::default() },
+        };
+        let mut id = 0u64;
+        let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null_mut(), &mut id) };
+        assert_eq!(rc, 0, "下一跳 LUID 探针无法安装：0x{rc:08X}");
+        assert_ne!(id, 0);
+    }
+
     fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
         TcpStream::connect_timeout(&addr, Duration::from_millis(700))
+    }
+
+    #[test]
+    #[ignore = "原生下一跳 LUID 探针，仅隔离 Windows 运行器显式执行"]
+    fn next_hop_luid_is_present_for_ipv4_loopback_authorization() {
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(connect(addr).is_ok(), "探针前本地 TCP 必须能连通");
+        let engine = DynamicEngine::open();
+        let app = AppId::this_test_exe();
+        install_next_hop_probe(&engine, &app);
+        assert!(connect(addr).is_err(),
+            "ALE_AUTH_CONNECT 未把环回下一跳 LUID 纳入 NOT_EQUAL 分类；不能据此部署 TUN 策略");
+        drop(engine);
+        assert!(connect(addr).is_ok(), "探针关闭动态会话后应恢复网络");
     }
 
     #[test]
