@@ -5594,6 +5594,24 @@ fn connect_json(ctx: &Ctx) -> String {
         Some(c) => c,
         None => return refuse_now("找不到配置文件（config.json），请先导入线路"),
     };
+    // 已连接时不能先重写 runtime-engine.json：sing-box 仍在用旧探测凭据，
+    // 若磁盘被新凭据覆盖，就会变成「运行配置与记录不一致」。
+    let preflight_store = crate::proxy::ProxyStore::system();
+    match crate::connect::preflight_before_prepare(
+        cfg, &ctx.root, &preflight_store, &crate::probe::pid_alive, ctx.legacy_running,
+    ) {
+        Ok(true) => {
+            let outcome = crate::connect::record_already_connected(cfg, &ctx.root, &ctx.origin(None));
+            return outcome_json(Ok(outcome));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            // 预检拒绝时现有引擎仍可能在工作：不要用 refuse_now 清掉
+            // 它的真实通道自检证据。只记录本次重连被拒，不动运行态。
+            crate::events::record(&ctx.root, crate::events::CONNECT, false, &e, &ctx.origin(None));
+            return refuse(&e);
+        }
+    }
     // 探测计划：探测端口（线路端口 +3）被占 → 摘掉探测入站再起引擎（引擎对绑不上的
     // 入站是整体 FATAL），自检届时报「自检跳过」。凭据在这里生成一次，两处共用。
     let endpoint = endpoint_of(&live);
@@ -5664,15 +5682,9 @@ fn connect_json(ctx: &Ctx) -> String {
                 probe_port,
             ) {
                 Ok(path) => path,
-                // 连接方式派生失败同样拒绝：静默回落到标准连接等于骗用户。
-                Err(err)
-                    if crate::engine_config::is_transport_refusal(&err)
-                        || crate::engine_config::is_mode_refusal(&err)
-                        || crate::engine_config::has_probe_inbound_file(&p) =>
-                {
-                    return refuse_now(&format!("引擎配置准备失败：{err}"));
-                }
-                Err(_) => p.clone(),
+                // 配置准备失败不允许退回原线路文件。原文件可能缺少最新分流、
+                // DNS 或接口约束；继续连接会使运行时行为与页面配置不一致。
+                Err(err) => return refuse_now(&format!("引擎配置准备失败：{err}")),
             };
             engine_settings.to_engine(&effective)
         }
@@ -8383,6 +8395,37 @@ fn serve_with(
 /// （`lines/<id>.json.tmp`、`config.json.tmp`），rename 失败或互相覆盖配置——
 /// 后写者赢、前一条线路凭空消失。`busy()` 只挡「已经连上」，挡不住「正在连」，
 /// 所以配对这两条也必须在白名单里（界面走 `Step::Long`、管道走同一道门）。
+/// 不属于长操作、但需要独占配置或本地记录读改写的命令。
+///
+/// 只在 UI/管道入口尝试 try_lock，锁被长操作持有时立即拒绝；
+/// 不把这些即时操作升级为 is_long_command（否则会卡住 WebView UI）。
+pub fn is_short_write_command(line: &str) -> bool {
+    matches!(
+        command_name(line).as_deref(),
+        Some("use")
+            | Some("remove")
+            | Some("rename-line")
+            | Some("split-add")
+            | Some("split-remove")
+            | Some("split-reset-trade-domains")
+            | Some("agents-save")
+            | Some("agents-lane")
+            | Some("exit-set")
+            | Some("set-transport")
+            | Some("set-mode")
+            | Some("set-engine")
+            | Some("line-network-set")
+            | Some("settings")
+            | Some("delete-cleanup-retry")
+            | Some("provider-add")
+            | Some("provider-remove")
+            | Some("server-rename")
+            | Some("server-remove")
+            | Some("server-cleanup")
+            | Some("recovery-import")
+    )
+}
+
 pub fn is_long_command(line: &str) -> bool {
     matches!(
         command_name(line).as_deref(),
@@ -8461,6 +8504,18 @@ fn respond(
             // 锁中毒也要继续服务：一个命令 panic 不该让控制接口从此不可用。
             let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
             handler(line, ctx)
+        } else if is_short_write_command(line) {
+            // 短命令必须立即响应：不能在 UI 上等一个可能花数分钟的 SSH 事务。
+            match gate.try_lock() {
+                Ok(_guard) => handler(line, ctx),
+                Err(std::sync::TryLockError::Poisoned(e)) => {
+                    let _guard = e.into_inner();
+                    handler(line, ctx)
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    refuse("当前有其他操作正在进行，配置修改未执行，请稍后重试")
+                }
+            }
         } else {
             handler(line, ctx)
         }
@@ -10980,6 +11035,23 @@ mod tests {
         let _ = ping(&name, 100);
         let _ = server.join();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn short_configuration_writes_are_separate_from_long_commands() {
+        for cmd in [
+            "use", "remove", "split-add", "split-remove", "split-reset-trade-domains",
+            "agents-save", "agents-lane", "exit-set", "set-transport", "set-mode",
+            "set-engine", "rename-line", "line-network-set", "settings",
+        ] {
+            let line = serde_json::json!({"cmd": cmd}).to_string();
+            assert!(is_short_write_command(&line), "写操作缺少互斥分类：{cmd}");
+            assert!(!is_long_command(&line), "短操作不许变成长操作：{cmd}");
+        }
+        for cmd in ["status", "ping", "lines", "split", "agents", "guard-status"] {
+            let line = serde_json::json!({"cmd": cmd}).to_string();
+            assert!(!is_short_write_command(&line), "只读命令不许抢写入锁：{cmd}");
+        }
     }
 
     #[test]

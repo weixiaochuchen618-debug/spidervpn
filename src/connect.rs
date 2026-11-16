@@ -120,6 +120,67 @@ pub fn effective_mode(cfg: &AppConfig, engine: &EngineConfig) -> crate::config::
         .unwrap_or(cfg.mode)
 }
 
+/// 连接前的无副作用幂等检查。必须先于运行时配置和探测凭据的生成。
+///
+/// Ok(true)：现有引擎、模式、代理接管全部与目标相符，可直接 AlreadyDone；
+/// Ok(false)：没有活的引擎，允许准备新配置；
+/// Err：引擎还活着但当前状态与目标不一致，先断开，不能覆盖运行时文件。
+pub fn preflight_before_prepare(
+    cfg: &AppConfig,
+    root: &Path,
+    store: &ProxyStore,
+    alive: &dyn Fn(i64) -> bool,
+    legacy_running: bool,
+) -> Result<bool, String> {
+    let runtime_path = root.join("runtime.json");
+    let engine_alive = read_engine_pid_opt(&runtime_path).map(alive).unwrap_or(false);
+    if !engine_alive {
+        return Ok(false);
+    }
+    let line = cfg.current_line()
+        .ok_or_else(|| "当前引擎仍在运行，但线路已不存在；请先断开".to_string())?;
+    let runtime_engine = root.join("runtime-engine.json");
+    // 旧线路如果不需要派生规则，prepare_engine_config 直接返回原线路文件，
+    // 此时 runtime-engine.json 不存在也是合法的运行态。兼容这条路径，
+    // 但原线路也无法读取时仍拒绝重建。
+    let active_config_path = if runtime_engine.exists() {
+        runtime_engine
+    } else {
+        cfg.current_engine_path(root)
+            .ok_or_else(|| "当前引擎仍在运行，但无法定位其线路配置；请先断开".to_string())?
+    };
+    let active_mode = crate::engine_config::actual_mode(&active_config_path)
+        .ok_or_else(|| "当前引擎仍在运行，但无法核验其配置；请先断开，避免覆盖运行时凭据".to_string())?;
+    if active_mode != cfg.mode {
+        return Err("当前引擎仍在运行，但接管模式已变更；请先断开再连接".to_string());
+    }
+    if active_mode != crate::config::Mode::Tun {
+        let plan = proxy::plan_connect(&store.read(), &line.proxy_endpoint, legacy_running);
+        if plan.blocked.is_some() || !plan.changes.is_empty() {
+            return Err("当前引擎仍在运行，但系统代理与本次线路不匹配；请先断开再连接".to_string());
+        }
+    }
+    Ok(true)
+}
+
+/// 无须再次准备配置的 AlreadyDone 分支仍需与正常连接记录保持同一语义。
+pub fn record_already_connected(
+    cfg: &AppConfig,
+    root: &Path,
+    origin: &crate::events::Origin,
+) -> Outcome {
+    let line = cfg.current_line().map(|l| (l.id.clone(), l.name.clone())).unwrap_or_default();
+    let mode = crate::engine_config::actual_mode(&root.join("runtime-engine.json")).unwrap_or(cfg.mode);
+    crate::events::record(
+        root,
+        crate::events::CONNECT,
+        true,
+        &format!("{}（{}，当时已在连接状态）", line.1, mode.label()),
+        &origin.clone().with_obj(format!("line:{}", line.0)),
+    );
+    Outcome::AlreadyDone
+}
+
 /// 连接。**这是唯一入口**：命令行 `--connect` 与界面按钮都从这里进。
 ///
 /// 操作记录就挂在这一层：里面那套事务（写凭据→改代理→起引擎→写运行时记录）
@@ -524,6 +585,9 @@ pub fn restore_from_journal(
     // 用凭据里记录的端点判断「是否还是我们设的」；凭据里没有就退回配置值。
     let ours = if j.endpoint.is_empty() { fallback_endpoint } else { j.endpoint.as_str() };
     let rp = proxy::plan_restore(&j, &current, ours);
+    for warning in &rp.warnings {
+        eprintln!("系统代理还原提醒：{warning}");
+    }
     if let Some(b) = rp.blocked {
         return Err(b);
     }
@@ -1229,6 +1293,66 @@ mod tests {
             matches!(connect(&cfg_on(next_test_port()), &engine(), &d, false), Ok(Outcome::Done(_))),
             "系统代理模式不需要管理员，非提权下必须照常成功"
         );
+    }
+
+    #[test]
+    fn preflight_recognizes_running_connection_without_derived_config() {
+        let f = fixture("preflight-old-line");
+        let cfg = cfg();
+        let root = f.runtime.parent().unwrap();
+        let line_file = cfg.current_engine_path(root).unwrap();
+        std::fs::create_dir_all(line_file.parent().unwrap()).unwrap();
+        std::fs::write(&line_file, r#"{"inbounds":[{"type":"mixed","tag":"tc-mixed"}]}"#).unwrap();
+        assert!(!root.join("runtime-engine.json").exists());
+        write_runtime(&f.runtime, 4242, 1_700_000_000.0, "Running", false).unwrap();
+        f.store.apply(&[
+            proxy::Change { key: "ProxyEnable", from: "0".into(), to: "1".into() },
+            proxy::Change {
+                key: "ProxyServer", from: "127.0.0.1:7897".into(),
+                to: cfg.current_line().unwrap().proxy_endpoint.clone(),
+            },
+        ]).unwrap();
+        assert_eq!(
+            preflight_before_prepare(&cfg, root, &f.store, &always_alive, false),
+            Ok(true),
+            "老线路无 runtime-engine.json 也应识别正在运行的连接",
+        );
+    }
+
+    #[test]
+    fn preflight_does_not_regenerate_live_engine_configuration() {
+        let f = fixture("preflight-existing");
+        let cfg = cfg();
+        let runtime_engine = f.runtime.with_file_name("runtime-engine.json");
+        std::fs::write(&runtime_engine, r#"{"inbounds":[{"type":"mixed","tag":"tc-mixed"}]}"#).unwrap();
+        write_runtime(&f.runtime, 4242, 1_700_000_000.0, "Running", false).unwrap();
+        f.store.apply(&[
+            proxy::Change { key: "ProxyEnable", from: "0".into(), to: "1".into() },
+            proxy::Change {
+                key: "ProxyServer", from: "127.0.0.1:7897".into(),
+                to: cfg.current_line().unwrap().proxy_endpoint.clone(),
+            },
+        ]).unwrap();
+
+        let root = f.runtime.parent().unwrap();
+        assert_eq!(
+            preflight_before_prepare(&cfg, root, &f.store, &always_alive, false),
+            Ok(true),
+            "运行中且代理匹配时，必须绕过配置及凭据再生成",
+        );
+        let before = std::fs::read(&runtime_engine).unwrap();
+        assert_eq!(std::fs::read(&runtime_engine).unwrap(), before);
+
+        // 即使 PID 存活，代理被第三方改过也不能准备新运行时配置。
+        f.store.apply(&[
+            proxy::Change {
+                key: "ProxyServer", from: cfg.current_line().unwrap().proxy_endpoint.clone(),
+                to: "127.0.0.1:30000".into(),
+            },
+        ]).unwrap();
+        assert!(preflight_before_prepare(&cfg, root, &f.store, &always_alive, false).is_err());
+        assert_eq!(std::fs::read(&runtime_engine).unwrap(), before);
+        assert_eq!(preflight_before_prepare(&cfg, root, &f.store, &never_alive, false), Ok(false));
     }
 
     #[test]

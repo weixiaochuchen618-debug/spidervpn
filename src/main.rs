@@ -914,15 +914,21 @@ fn main() -> ExitCode {
         }
     };
 
+    // 只读命令不得在启动预处理阶段触发 schema 迁移或兼容线路合并。
+    // 此判断必须早于 merge_compatible_lines（它内部通过 config::load 会执行落盘迁移）。
+    let readonly_cmd = READONLY_COMMANDS.iter().any(|flag| std::env::args().any(|a| a == *flag));
+
     // 2.5 老数据结构收口：把「同一台服务器的两条线路」并成一条（幂等，失败不拦启动）。
     //
     // 上一版给每台服务器登记两条线路（`自建 · host` + `自建 · host（兼容连接）`），
     // 而线路卡片上的「标准/兼容」开关对前者是按不动的。现在改成一条线路两套方式，
     // 这里把已经产生的成对线路并掉；并之前先把参数落成附属文件，任何一步失败就停在那里。
-    match servercmd::merge_compatible_lines(&layout.root) {
-        Ok(0) => {}
-        Ok(count) => println!("  已合并 {count} 条重复的兼容连接线路"),
-        Err(error) => eprintln!("  合并重复线路失败（不影响启动）：{error}"),
+    if !readonly_cmd {
+        match servercmd::merge_compatible_lines(&layout.root) {
+            Ok(0) => {}
+            Ok(count) => println!("  已合并 {count} 条重复的兼容连接线路"),
+            Err(error) => eprintln!("  合并重复线路失败（不影响启动）：{error}"),
+        }
     }
 
     // 3. 单实例：名字必须带本程序前缀，不能和旧版共用。
@@ -1066,7 +1072,6 @@ fn main() -> ExitCode {
     let disconnect_only = std::env::args().any(|a| a == "--disconnect");
     // 只读命令绝不写盘：老配置在内存里迁成多线路格式照常展示，落盘留给第一个写命令。
     // （`--status` 跑一趟就把用户配置改了，既违反「默认根只读」，也让验收的「跑前跑后一致」失效。）
-    let readonly_cmd = READONLY_COMMANDS.iter().any(|flag| std::env::args().any(|a| a == *flag));
     // 读配置时顺带完成 schema 1 → 2 的迁移（只做一次，且只在写命令上）。提示也只在真落盘时打。
     let cfg_path = layout.root.join(config::DEFAULT_PATH);
     let loaded = if readonly_cmd {
@@ -2031,6 +2036,28 @@ fn main() -> ExitCode {
             }
         }
         let cfg_ref = cfg.as_ref();
+        if wants_connect {
+            // 和 WebView 共用 Rust 预检：引擎已在运行时禁止重新生成
+            // runtime-engine.json / 探测凭据，避免磁盘与实际 sing-box 状态分叉。
+            let preflight_store = proxy::ProxyStore::system();
+            if let Some(c) = cfg_ref {
+                match connect::preflight_before_prepare(
+                    c, &layout.root, &preflight_store, &probe::pid_alive, legacy_running,
+                ) {
+                    Ok(true) => {
+                        let _ = connect::record_already_connected(c, &layout.root, &cli_origin);
+                        println!("  已处于目标状态，未做改动。");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(false) => {}
+                    Err(msg) => {
+                        println!("  {msg}");
+                        events::record(&layout.root, events::CONNECT, false, &msg, &cli_origin);
+                        return ExitCode::from(exit::CONFIG);
+                    }
+                }
+            }
+        }
         // 探测计划：探测端口（线路端口 +3）被占 → 摘掉探测入站再起引擎
         // （引擎对绑不上的入站是整体 FATAL，不摘掉连"日常能通"都保不住），自检届时报「跳过」。
         // 凭据在这里生成一次，配置注入与自检共用同一份事实。
@@ -2096,19 +2123,12 @@ fn main() -> ExitCode {
                 probe_port,
             ) {
                 Ok(effective) => Some(settings.to_engine(&effective)),
-                // 连接方式派生失败也必须拒绝：选兼容连接却回落到标准连接是静默降级。
-                Err(err)
-                    if engine_config::is_transport_refusal(&err)
-                        || engine_config::is_mode_refusal(&err)
-                        || engine_config::has_probe_inbound_file(&p) =>
-                {
+                // 即使是老线路，配置准备失败也不再静默使用原文件。
+                // 否则可能缺少最新分流、DNS 或接口绑定约束。
+                Err(err) => {
                     prepare_refused = true;
                     println!("  引擎配置准备失败，拒绝连接：{err}");
                     None
-                }
-                Err(err) => {
-                    println!("  分流规则应用失败（按原配置启动）：{err}");
-                    Some(settings.to_engine(&p))
                 }
             }
         });
@@ -2550,13 +2570,27 @@ fn main() -> ExitCode {
     let tray_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tray_ok_ui = tray_ok.clone();
     let ui_handler = move |raw: &str| -> String {
+        let is_long = ipc::is_long_command(raw);
+        let is_short_write = ipc::is_short_write_command(raw);
         let transaction_gate = {
             let ctx = ui_ctx.lock().unwrap_or_else(|e| e.into_inner());
-            ipc::is_long_command(raw).then(|| std::sync::Arc::clone(&ctx.transaction_gate))
+            (is_long || is_short_write).then(|| std::sync::Arc::clone(&ctx.transaction_gate))
         };
-        let _transaction_guard = transaction_gate
-            .as_ref()
-            .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()));
+        let _transaction_guard = match transaction_gate.as_ref() {
+            Some(gate) if is_long => Some(gate.lock().unwrap_or_else(|e| e.into_inner())),
+            Some(gate) => match gate.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return serde_json::json!({
+                        "ok": false,
+                        "errorCode": "busy",
+                        "error": "当前有其他操作正在进行，配置修改未执行，请稍后重试"
+                    }).to_string();
+                }
+            },
+            None => None,
+        };
         let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
         let cmd = parsed.as_ref().and_then(|v| v.get("cmd")).and_then(|c| c.as_str());
         if cmd == Some("pick-file") {
