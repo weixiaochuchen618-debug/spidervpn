@@ -456,6 +456,30 @@ mod windows_canary {
         assert_eq!(rc, 0, "WFP 原子迁移回滚失败：0x{rc:08X}");
     }
 
+    /// Windows may select a TCP ephemeral port excluded from UDP binds (WSAEACCES 10013).
+    /// Reserve UDP first, then try the *same numeric port* for TCP. A different
+    /// UDP port would make the protocol-negative test meaningless: the port rule
+    /// would block it even if the IP_PROTOCOL condition were broken.
+    fn bind_tcp_udp_same_port(ip: std::net::IpAddr) -> (TcpListener, UdpSocket) {
+        let ephemeral = SocketAddr::new(ip, 0);
+        let mut last_tcp_error = None;
+        for _ in 0..64 {
+            let udp = UdpSocket::bind(ephemeral)
+                .expect("Windows UDP loopback listener preflight failed");
+            let endpoint = SocketAddr::new(ip, udp.local_addr().unwrap().port());
+            match TcpListener::bind(endpoint) {
+                Ok(tcp) => {
+                    assert_eq!(tcp.local_addr().unwrap().port(), udp.local_addr().unwrap().port());
+                    return (tcp, udp);
+                }
+                Err(err) => last_tcp_error = Some((endpoint, err)),
+            }
+        }
+        panic!(
+            "64 attempts could not allocate a common loopback TCP/UDP port: {last_tcp_error:?}"
+        );
+    }
+
     fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
         TcpStream::connect_timeout(&addr, Duration::from_millis(700))
     }
@@ -933,14 +957,15 @@ mod windows_canary {
     fn ipv6_proxy_port_is_exact_and_dynamic_filters_are_removed() {
         assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"),
             "需显式设置 SPIDERVPN_WFP_CANARY=1");
-        let trusted = TcpListener::bind("[::1]:0").expect("Windows IPv6 回环必须可用");
+        let (trusted, udp_server) = bind_tcp_udp_same_port(
+            "::1".parse().expect("valid IPv6 loopback"),
+        );
         let other = TcpListener::bind("[::1]:0").expect("IPv6 非白名单端口");
         let trusted_addr = trusted.local_addr().unwrap();
         let other_addr = other.local_addr().unwrap();
+        assert_eq!(trusted_addr.port(), udp_server.local_addr().unwrap().port());
         assert!(connect(trusted_addr).is_ok());
         assert!(connect(other_addr).is_ok());
-        let udp_server = UdpSocket::bind(("[::1]", trusted_addr.port()))
-            .expect("在 IPv6 可信 TCP 代理端口旁建立 UDP 负对照");
         assert!(udp_reaches(&udp_server, udp_server.local_addr().unwrap()),
             "IPv6 UDP 在安装 WFP 前必须真正送达");
 
@@ -964,15 +989,15 @@ mod windows_canary {
     fn proxy_exact_loopback_ip_and_port_are_the_only_allowed_tcp_destination() {
         assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"),
             "需显式设置 SPIDERVPN_WFP_CANARY=1；不在真实交易机器自动运行");
-        let trusted = TcpListener::bind("127.0.0.1:0").expect("允许端点");
+        let (trusted, udp_server) = bind_tcp_udp_same_port(
+            "127.0.0.1".parse().expect("valid IPv4 loopback"),
+        );
         let other = TcpListener::bind("127.0.0.1:0").expect("另一代理端口");
         let trusted_addr = trusted.local_addr().unwrap();
         let other_addr = other.local_addr().unwrap();
+        assert_eq!(trusted_addr.port(), udp_server.local_addr().unwrap().port());
         assert!(connect(trusted_addr).is_ok(), "安装 WFP 前，可信端点本来应可用");
         assert!(connect(other_addr).is_ok(), "安装 WFP 前，另一端点本来应可用");
-        // TCP 与 UDP 可以在同一个数字端口监听。v2 只允许指定 TCP 代理端点。
-        let udp_server = UdpSocket::bind(("127.0.0.1", trusted_addr.port()))
-            .expect("在可信 TCP 代理端口旁建立 UDP 负对照");
         assert!(udp_reaches(&udp_server, udp_server.local_addr().unwrap()),
             "安装前 UDP 负对照必须实际送达，否则不能证明它被规则阻断");
 
