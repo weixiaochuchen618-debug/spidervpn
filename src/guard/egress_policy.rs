@@ -85,12 +85,123 @@ impl EgressPolicy {
     }
 }
 
+/// 一个候选 block 过滤器要拒绝的流量集合。
+///
+/// 多条 block 是逻辑 OR：IP 不同 **或** 端口不同 **或** 协议不同就阻断。
+/// WFP 的 filterCondition 数组本身是 AND，不能错误地把这三项塞进单条 filter。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyTerm {
+    Any,
+    RemoteAddressNot(IpAddr),
+    RemotePortNot(u16),
+    ProtocolNotTcp,
+    NextHopNot(u64),
+    /// 无法得到下一跳值时必须拒绝（ALE 重新授权可能把值置空）。
+    /// 原生 WFP 不能假定 NOT_EQUAL 会匹配缺失字段，必须由隔离测试证明兜底。
+    MissingNextHop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    pub fn of(addr: IpAddr) -> Self {
+        match addr {
+            IpAddr::V4(_) => Self::V4,
+            IpAddr::V6(_) => Self::V6,
+        }
+    }
+}
+
+impl DenyTerm {
+    /// 供纯 Rust 真值表/后续 Windows canary 使用；不是 WFP 真实匹配结果。
+    pub fn matches(self, flow: &Flow) -> bool {
+        match self {
+            DenyTerm::Any => true,
+            DenyTerm::RemoteAddressNot(ip) => flow.remote.ip() != ip,
+            DenyTerm::RemotePortNot(port) => flow.remote.port() != port,
+            DenyTerm::ProtocolNotTcp => flow.protocol != NetworkProtocol::Tcp,
+            DenyTerm::NextHopNot(luid) => flow.next_hop_luid.is_some_and(|actual| actual != luid),
+            DenyTerm::MissingNextHop => flow.next_hop_luid.is_none(),
+        }
+    }
+}
+
+impl EgressPolicy {
+    /// 精确列出每个 IP 族必需的阻断条件。
+    ///
+    /// 注意：TUN 返回两种互补条件，其中 MissingNextHop 尚无经验证的
+    /// FWP_MATCH_NOT_EQUAL 原生等价物，因此 **不得直接安装 TunInterface 方案**。
+    /// Windows 内核分类测试完成之前，生产仍使用旧持久 filter，不升级版本。
+    pub fn candidate_blocks(self, family: IpFamily) -> Vec<DenyTerm> {
+        match self {
+            EgressPolicy::DenyAll => vec![DenyTerm::Any],
+            EgressPolicy::LocalProxy { endpoint } => {
+                if IpFamily::of(endpoint.ip()) != family {
+                    vec![DenyTerm::Any]
+                } else {
+                    vec![
+                        DenyTerm::RemoteAddressNot(endpoint.ip()),
+                        DenyTerm::RemotePortNot(endpoint.port()),
+                        DenyTerm::ProtocolNotTcp,
+                    ]
+                }
+            }
+            EgressPolicy::TunInterface { luid } => vec![
+                DenyTerm::NextHopNot(luid),
+                DenyTerm::MissingNextHop,
+            ],
+        }
+    }
+
+    /// 模型内必须满足：任意流只要不获准，就至少命中一项阻断；否则存在策略漏洞。
+    pub fn model_blocks(self, flow: &Flow) -> bool {
+        self.candidate_blocks(IpFamily::of(flow.remote.ip()))
+            .into_iter().any(|term| term.matches(flow))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tcp(remote: &str, luid: Option<u64>) -> Flow {
         Flow { remote: remote.parse().unwrap(), protocol: NetworkProtocol::Tcp, next_hop_luid: luid }
+    }
+
+    #[test]
+    fn three_separate_blocks_cover_all_proxy_bypass_paths() {
+        let policy = EgressPolicy::local_proxy("127.0.0.1:17890").unwrap();
+        assert_eq!(policy.candidate_blocks(IpFamily::V4).len(), 3);
+        assert_eq!(policy.candidate_blocks(IpFamily::V6), vec![DenyTerm::Any]);
+        let cases = [
+            tcp("127.0.0.1:17890", None),
+            tcp("127.0.0.1:17891", None),
+            tcp("127.0.0.2:17890", None),
+            tcp("203.0.113.7:17890", None),
+            tcp("[::1]:17890", None),
+        ];
+        for flow in cases {
+            assert_eq!(policy.model_blocks(&flow), !policy.permits(&flow), "{flow:?}");
+        }
+        let mut udp = tcp("127.0.0.1:17890", None);
+        udp.protocol = NetworkProtocol::Udp;
+        assert!(policy.model_blocks(&udp));
+    }
+
+    #[test]
+    fn next_hop_missing_must_have_an_explicit_fail_closed_term() {
+        let p = EgressPolicy::tun_interface(Some(42));
+        assert_eq!(p.candidate_blocks(IpFamily::V4), vec![
+            DenyTerm::NextHopNot(42), DenyTerm::MissingNextHop,
+        ]);
+        for hop in [None, Some(1), Some(42), Some(43)] {
+            let flow = tcp("203.0.113.7:443", hop);
+            assert_eq!(p.model_blocks(&flow), !p.permits(&flow), "{flow:?}");
+        }
     }
 
     #[test]
