@@ -136,8 +136,93 @@ mod windows_canary {
         assert_ne!(id, 0);
     }
 
+    /// 与 IPv4 对称的 IPv6 探针：FWP_BYTE_ARRAY16_TYPE 必须指向整个 16 字节。
+    /// 不可把 ::1 当成 IPv4 127.0.0.1 的隐式别名。
+    fn install_filter_v6(engine: &DynamicEngine, app: &AppId, port: u16, kind: DenyKind) {
+        let app_condition = W::FWPM_FILTER_CONDITION0 {
+            fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
+            matchType: W::FWP_MATCH_EQUAL,
+            conditionValue: W::FWP_CONDITION_VALUE0 {
+                r#type: W::FWP_BYTE_BLOB_TYPE,
+                Anonymous: W::FWP_CONDITION_VALUE0_0 { byteBlob: app.0 },
+            },
+        };
+        let mut loopback = W::FWP_BYTE_ARRAY16 { byteArray16: [0; 16] };
+        loopback.byteArray16[15] = 1; // ::1
+        let destination_condition = match kind {
+            DenyKind::WrongIp => W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType: W::FWP_MATCH_NOT_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_BYTE_ARRAY16_TYPE,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { byteArray16: &mut loopback },
+                },
+            },
+            DenyKind::WrongPort => W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType: W::FWP_MATCH_NOT_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT16,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { uint16: port },
+                },
+            },
+            DenyKind::NotTcp => W::FWPM_FILTER_CONDITION0 {
+                fieldKey: W::FWPM_CONDITION_IP_PROTOCOL,
+                matchType: W::FWP_MATCH_NOT_EQUAL,
+                conditionValue: W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT8,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 { uint8: 6 },
+                },
+            },
+        };
+        let mut conditions = [app_condition, destination_condition];
+        let mut name: Vec<u16> = "SpiderVPN temporary IPv6 WFP canary"
+            .encode_utf16().chain(Some(0)).collect();
+        let mut raw = W::FWPM_FILTER0::default();
+        raw.displayData.name = name.as_mut_ptr();
+        raw.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V6;
+        raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+        raw.weight = W::FWP_VALUE0 {
+            r#type: W::FWP_UINT8,
+            Anonymous: W::FWP_VALUE0_0 { uint8: 13 },
+        };
+        raw.numFilterConditions = conditions.len() as u32;
+        raw.filterCondition = conditions.as_mut_ptr();
+        raw.action = W::FWPM_ACTION0 {
+            r#type: W::FWP_ACTION_BLOCK,
+            Anonymous: W::FWPM_ACTION0_0 { filterType: windows_sys::core::GUID::default() },
+        };
+        let mut id = 0u64;
+        let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null_mut(), &mut id) };
+        assert_eq!(rc, 0, "安装动态 IPv6 代理过滤器失败：0x{rc:08X}");
+        assert_ne!(id, 0);
+    }
+
     fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
         TcpStream::connect_timeout(&addr, Duration::from_millis(700))
+    }
+
+    #[test]
+    #[ignore = "仅隔离 Windows CI 显式启用，与 IPv4 canary 对称"]
+    fn ipv6_proxy_port_is_exact_and_dynamic_filters_are_removed() {
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"),
+            "需显式设置 SPIDERVPN_WFP_CANARY=1");
+        let trusted = TcpListener::bind("[::1]:0").expect("Windows IPv6 回环必须可用");
+        let other = TcpListener::bind("[::1]:0").expect("IPv6 非白名单端口");
+        let trusted_addr = trusted.local_addr().unwrap();
+        let other_addr = other.local_addr().unwrap();
+        assert!(connect(trusted_addr).is_ok());
+        assert!(connect(other_addr).is_ok());
+
+        let engine = DynamicEngine::open();
+        let app = AppId::this_test_exe();
+        for kind in [DenyKind::WrongIp, DenyKind::WrongPort, DenyKind::NotTcp] {
+            install_filter_v6(&engine, &app, trusted_addr.port(), kind);
+        }
+        assert!(connect(trusted_addr).is_ok(), "正确 ::1 代理被误阻断");
+        assert!(connect(other_addr).is_err(), "IPv6 上其他代理端口被绕过");
+        drop(engine);
+        assert!(connect(other_addr).is_ok(), "IPv6 过滤器未随动态会话清理");
     }
 
     #[test]
