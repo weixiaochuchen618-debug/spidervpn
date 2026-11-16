@@ -131,7 +131,7 @@ mod windows_canary {
             Anonymous: W::FWPM_ACTION0_0 { filterType: windows_sys::core::GUID::default() },
         };
         let mut id = 0u64;
-        let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null(), &mut id) };
+        let rc = unsafe { W::FwpmFilterAdd0(engine.0, &raw, null_mut(), &mut id) };
         assert_eq!(rc, 0, "安装动态代理过滤器失败：0x{rc:08X}");
         assert_ne!(id, 0);
     }
