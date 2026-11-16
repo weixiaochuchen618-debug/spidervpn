@@ -7008,9 +7008,18 @@ mod crypto_tests {
         // ---------- 真引擎 ----------
 
         fn engine_exe() -> std::path::PathBuf {
-            std::env::var("TC_SING_BOX")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from(r"C:\SpiderVPN\bin\sing-box.exe"))
+            // 查找顺序：环境变量 → 仓库 vendor\（打包用的那一份）→ 已安装目录。
+            // 仓库里没有引擎时这条测试会失败而不是跳过：跳过会让验证变成永远为真。
+            if let Ok(value) = std::env::var("TC_SING_BOX") {
+                return std::path::PathBuf::from(value);
+            }
+            let vendored = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("vendor")
+                .join("sing-box.exe");
+            if vendored.exists() {
+                return vendored;
+            }
+            std::path::PathBuf::from(r"C:\SpiderVPN\bin\sing-box.exe")
         }
 
         /// 跑真引擎的 `check`，返回退出码与输出。
