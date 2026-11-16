@@ -294,6 +294,15 @@ mod windows_canary {
     /// 动态 PERMIT 不带 CLEAR_ACTION_RIGHT，仍允许其它安全产品阻断连接；
     /// 它只应在同一 sublayer 中提前命中、绕过我们的宽泛 BLOCK。
     fn install_ephemeral_proxy_permit(engine: &DynamicEngine, app: &AppId, port: u16) {
+        install_proxy_permit_in_layer(engine, app, port, W::FWPM_SUBLAYER_UNIVERSAL);
+    }
+
+    /// 使用指定子层，验证 NULL provider 临时许可不会进入永久保护
+    /// provider 的枚举（即使两条规则在同一个 sublayer 仲裁）。
+    fn install_proxy_permit_in_layer(
+        engine: &DynamicEngine, app: &AppId, port: u16,
+        sublayer: windows_sys::core::GUID,
+    ) {
         let mut conditions = [
             W::FWPM_FILTER_CONDITION0 {
                 fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
@@ -335,7 +344,7 @@ mod windows_canary {
         let mut raw = W::FWPM_FILTER0::default();
         raw.displayData.name = name.as_mut_ptr();
         raw.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
-        raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+        raw.subLayerKey = sublayer;
         raw.weight = W::FWP_VALUE0 {
             r#type: W::FWP_UINT8,
             Anonymous: W::FWP_VALUE0_0 { uint8: 14 }, // higher priority than broad BLOCK (13)
@@ -605,6 +614,137 @@ mod windows_canary {
         assert!(connect(endpoint).is_err(), "动态下一跳许可退出后没有恢复全阻断");
         drop(baseline);
         assert!(connect(endpoint).is_ok(), "规则清理后 loopback 应恢复");
+    }
+
+    /// 专用临时 provider 与 sublayer：不能碰用户设备上的 SpiderVPN 正式 GUID。
+    fn private_guard_ids(seed: u16) -> (windows_sys::core::GUID, windows_sys::core::GUID) {
+        let make = |suffix| windows_sys::core::GUID {
+            data1: 0x751A_0000 | (seed as u32), data2: suffix,
+            data3: 0x49A0, data4: [0xA1, 0x28, 0x8F, 0x93, 0x11, 0x32, 0x72, 0xC7],
+        };
+        (make(0x0101), make(0x0202))
+    }
+
+    fn create_temp_provider_sublayer(
+        engine: &DynamicEngine, provider: &windows_sys::core::GUID,
+        sublayer: &windows_sys::core::GUID,
+    ) {
+        let mut provider_name: Vec<u16> = "SpiderVPN isolated WFP provider test"
+            .encode_utf16().chain(Some(0)).collect();
+        let mut provider_def = W::FWPM_PROVIDER0::default();
+        provider_def.providerKey = *provider;
+        provider_def.displayData.name = provider_name.as_mut_ptr();
+        let rc = unsafe { W::FwpmProviderAdd0(engine.0, &provider_def, null_mut()) };
+        assert_eq!(rc, 0, "动态测试 provider 创建失败：0x{rc:08X}");
+
+        let mut sublayer_name: Vec<u16> = "SpiderVPN isolated WFP sublayer test"
+            .encode_utf16().chain(Some(0)).collect();
+        let mut owner = *provider;
+        let mut sub = W::FWPM_SUBLAYER0::default();
+        sub.subLayerKey = *sublayer;
+        sub.displayData.name = sublayer_name.as_mut_ptr();
+        sub.providerKey = &mut owner;
+        sub.weight = 0xFFFF;
+        let rc = unsafe { W::FwpmSubLayerAdd0(engine.0, &sub, null_mut()) };
+        assert_eq!(rc, 0, "动态测试 sublayer 创建失败：0x{rc:08X}");
+    }
+
+    fn install_provider_block(
+        engine: &DynamicEngine, app: &AppId,
+        provider: &windows_sys::core::GUID, sublayer: &windows_sys::core::GUID,
+    ) {
+        let mut owner = *provider;
+        let mut conditions = [W::FWPM_FILTER_CONDITION0 {
+            fieldKey: W::FWPM_CONDITION_ALE_APP_ID,
+            matchType: W::FWP_MATCH_EQUAL,
+            conditionValue: W::FWP_CONDITION_VALUE0 {
+                r#type: W::FWP_BYTE_BLOB_TYPE,
+                Anonymous: W::FWP_CONDITION_VALUE0_0 { byteBlob: app.0 },
+            },
+        }];
+        let mut name: Vec<u16> = "SpiderVPN isolated provider baseline block"
+            .encode_utf16().chain(Some(0)).collect();
+        let mut filter = W::FWPM_FILTER0::default();
+        filter.displayData.name = name.as_mut_ptr();
+        filter.providerKey = &mut owner;
+        filter.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        filter.subLayerKey = *sublayer;
+        filter.weight = W::FWP_VALUE0 {
+            r#type: W::FWP_UINT8,
+            Anonymous: W::FWP_VALUE0_0 { uint8: 13 },
+        };
+        filter.numFilterConditions = 1;
+        filter.filterCondition = conditions.as_mut_ptr();
+        filter.action = W::FWPM_ACTION0 {
+            r#type: W::FWP_ACTION_BLOCK,
+            Anonymous: W::FWPM_ACTION0_0 { filterType: windows_sys::core::GUID::default() },
+        };
+        let mut id = 0u64;
+        let rc = unsafe { W::FwpmFilterAdd0(engine.0, &filter, null_mut(), &mut id) };
+        assert_eq!(rc, 0, "动态测试 provider block 安装失败：0x{rc:08X}");
+        assert_ne!(id, 0);
+    }
+
+    fn provider_filter_count(engine: &DynamicEngine, provider: &windows_sys::core::GUID) -> usize {
+        let mut owner = *provider;
+        let mut template = W::FWPM_FILTER_ENUM_TEMPLATE0::default();
+        template.providerKey = &mut owner;
+        template.layerKey = W::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+        let mut handle: W::HANDLE = null_mut();
+        let rc = unsafe { W::FwpmFilterCreateEnumHandle0(engine.0, &template, &mut handle) };
+        assert_eq!(rc, 0, "无法枚举隔离测试 provider 规则：0x{rc:08X}");
+        let mut total = 0usize;
+        loop {
+            let mut entries: *mut *mut W::FWPM_FILTER0 = null_mut();
+            let mut count = 0u32;
+            let rc = unsafe {
+                W::FwpmFilterEnum0(engine.0, handle, 32, &mut entries, &mut count)
+            };
+            assert_eq!(rc, 0, "读取隔离测试 provider 规则失败：0x{rc:08X}");
+            total += count as usize;
+            if !entries.is_null() {
+                let mut mem = entries.cast::<core::ffi::c_void>();
+                unsafe { W::FwpmFreeMemory0(&mut mem); }
+            }
+            if count < 32 { break; }
+        }
+        let rc = unsafe { W::FwpmFilterDestroyEnumHandle0(engine.0, handle) };
+        assert_eq!(rc, 0, "WFP 枚举器关闭失败：0x{rc:08X}");
+        total
+    }
+
+    #[test]
+    #[ignore = "仅 Windows CI：验证动态无归属 PERMIT 不会进入 v1 provider 枚举或污染 BLOCK 证据"]
+    fn dynamic_permit_is_excluded_from_persistent_provider_enumeration() {
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+        let trusted = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let trusted_addr = trusted.local_addr().unwrap();
+        let other_addr = other.local_addr().unwrap();
+        let _drain_a = ListenerDrain::start(&trusted);
+        let _drain_b = ListenerDrain::start(&other);
+        assert!(connect(trusted_addr).is_ok() && connect(other_addr).is_ok());
+
+        let (provider, sublayer) = private_guard_ids(trusted_addr.port());
+        let baseline = DynamicEngine::open();
+        create_temp_provider_sublayer(&baseline, &provider, &sublayer);
+        let app = AppId::this_test_exe();
+        install_provider_block(&baseline, &app, &provider, &sublayer);
+        assert_eq!(provider_filter_count(&baseline, &provider), 1);
+        assert!(connect(trusted_addr).is_err() && connect(other_addr).is_err());
+
+        let permit = DynamicEngine::open();
+        install_proxy_permit_in_layer(&permit, &app, trusted_addr.port(), sublayer);
+        assert_eq!(provider_filter_count(&baseline, &provider), 1,
+            "临时许可不应被 v1 provider 枚举为多余规则");
+        assert!(connect(trusted_addr).is_ok(), "临时许可未在正式 provider 子层中放行可信端点");
+        assert!(connect(other_addr).is_err(), "临时许可意外绕开旧 BLOCK");
+        drop(permit);
+        assert_eq!(provider_filter_count(&baseline, &provider), 1);
+        assert!(connect(trusted_addr).is_err() && connect(other_addr).is_err(),
+            "lease 结束后必须恢复旧持久阻断的语义");
+        drop(baseline);
+        assert!(connect(trusted_addr).is_ok() && connect(other_addr).is_ok());
     }
 
     #[test]
