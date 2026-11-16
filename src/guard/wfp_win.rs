@@ -569,6 +569,95 @@ mod imp {
             Ok(new_filter)
         }
 
+        /// 候选的临时许可：只对精确可信环回 IP+port 的 TCP 新连接放行。
+        /// 不修改任何 WFP 对象；调用者必须通过动态 WFP Session 安装且在
+        /// 引擎寿命终止时关闭该 Session，保证 v1 持久 BLOCK 始终保留。
+        ///
+        /// lease_nonce 必须从一次独立连接会话产生，避免新的许可复用旧 FilterKey。
+        /// 这里并不证明 sing-box 进程身份；必须由调用方先验证 owner PID/exe。
+        pub fn ephemeral_proxy_permit(
+            name: &str, app_id: &[u8], endpoint: std::net::SocketAddr, lease_nonce: &[u8],
+        ) -> Result<Box<RawFilter>, String> {
+            use sha2::{Digest, Sha256};
+            use super::super::egress_policy::EgressPolicy;
+            if !matches!(
+                EgressPolicy::local_proxy(&endpoint.to_string()),
+                Ok(EgressPolicy::LocalProxy { .. })
+            ) {
+                return Err("临时 WFP 许可必须是精确本地代理端点".into());
+            }
+            if app_id.is_empty() || app_id.len() % 2 != 0 || lease_nonce.len() < 16 {
+                return Err("临时 WFP 许可的 APP_ID 或会话 nonce 无效".into());
+            }
+            let layer = if endpoint.is_ipv4() { Layer::V4 } else { Layer::V6 };
+            let mut h = Sha256::new();
+            h.update(b"SpiderVPN/WFP-v2/dynamic-permit");
+            h.update((app_id.len() as u64).to_le_bytes());
+            h.update(app_id);
+            h.update(endpoint.to_string().as_bytes());
+            h.update(lease_nonce);
+            let digest = h.finalize();
+            let mut key_bytes = [0u8; 16];
+            key_bytes.copy_from_slice(&digest[..16]);
+            let permit_key = Guid::from_bytes_le(key_bytes);
+
+            let mut permit = RawFilter::block(name, app_id, layer);
+            // 不得修改已有持久 v1 BLOCK；必须高于旧 BLOCK 0x1000 的权重。
+            permit.raw.filterKey = to_win(permit_key);
+            permit.raw.flags = 0; // 不持久、不禁用、不清空其它安全产品的 action right
+            permit.raw.action.r#type = W::FWP_ACTION_PERMIT;
+            *permit._weight = super::super::wfp::FILTER_WEIGHT_PERMIT;
+
+            let addr_value = match endpoint.ip() {
+                std::net::IpAddr::V4(ip) => W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT32,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 {
+                        uint32: u32::from_be_bytes(ip.octets()),
+                    },
+                },
+                std::net::IpAddr::V6(ip) => {
+                    permit._scoped_v6 = Some(Box::new(W::FWP_BYTE_ARRAY16 {
+                        byteArray16: ip.octets(),
+                    }));
+                    let pointer: *mut W::FWP_BYTE_ARRAY16 =
+                        &mut **permit._scoped_v6.as_mut().unwrap();
+                    W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_BYTE_ARRAY16_TYPE,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { byteArray16: pointer },
+                    }
+                }
+            };
+            let conditions = vec![
+                // ALE_APP_ID is the first condition as in the existing v1 BLOCK builder.
+                unsafe { std::ptr::read(&permit._conditions[0]) },
+                W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    matchType: W::FWP_MATCH_EQUAL,
+                    conditionValue: addr_value,
+                },
+                W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_REMOTE_PORT,
+                    matchType: W::FWP_MATCH_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT16,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint16: endpoint.port() },
+                    },
+                },
+                W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_PROTOCOL,
+                    matchType: W::FWP_MATCH_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT8,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint8: 6 },
+                    },
+                },
+            ];
+            permit._conditions = conditions.into_boxed_slice();
+            permit.raw.numFilterConditions = permit._conditions.len() as u32;
+            permit.raw.filterCondition = permit._conditions.as_mut_ptr();
+            Ok(permit)
+        }
+
         pub fn as_ptr(&self) -> *const W::FWPM_FILTER0 {
             &self.raw
         }
@@ -689,6 +778,64 @@ mod imp {
 
         fn app() -> Vec<u8> {
             "trader.exe".encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect()
+        }
+
+        #[test]
+        fn dynamic_proxy_permit_is_nonpersistent_precise_and_unique_per_lease() {
+            let app = app();
+            let nonce = [0xA5u8; 16];
+            for endpoint in ["127.0.0.1:17890", "[::1]:17890"] {
+                let endpoint: std::net::SocketAddr = endpoint.parse().unwrap();
+                let p = RawFilter::ephemeral_proxy_permit("Trader", &app, endpoint, &nonce).unwrap();
+                assert_eq!(p.raw.flags, 0);
+                assert_eq!(p.raw.action.r#type, W::FWP_ACTION_PERMIT);
+                assert_eq!(p.raw.numFilterConditions, 4);
+                assert_eq!(*p._weight, super::super::super::wfp::FILTER_WEIGHT_PERMIT);
+                assert_eq!(p.raw.weight.r#type, FWP_TYPE_UINT64);
+                assert_eq!(p.raw.subLayerKey, to_win(SUBLAYER_GUID));
+                for c in p._conditions.iter() {
+                    assert_eq!(c.matchType, W::FWP_MATCH_EQUAL);
+                }
+                assert_eq!(p._conditions[0].fieldKey, W::FWPM_CONDITION_ALE_APP_ID);
+                assert_eq!(p._conditions[1].fieldKey, W::FWPM_CONDITION_IP_REMOTE_ADDRESS);
+                assert_eq!(p._conditions[2].fieldKey, W::FWPM_CONDITION_IP_REMOTE_PORT);
+                assert_eq!(p._conditions[3].fieldKey, W::FWPM_CONDITION_IP_PROTOCOL);
+                assert_eq!(unsafe { p._conditions[2].conditionValue.Anonymous.uint16 }, endpoint.port());
+                assert_eq!(unsafe { p._conditions[3].conditionValue.Anonymous.uint8 }, 6);
+                match endpoint.ip() {
+                    std::net::IpAddr::V4(ip) => {
+                        assert_eq!(p._conditions[1].conditionValue.r#type, W::FWP_UINT32);
+                        assert_eq!(unsafe { p._conditions[1].conditionValue.Anonymous.uint32 },
+                            u32::from_be_bytes(ip.octets()));
+                    }
+                    std::net::IpAddr::V6(ip) => {
+                        assert_eq!(p._conditions[1].conditionValue.r#type, W::FWP_BYTE_ARRAY16_TYPE);
+                        assert_eq!(unsafe { (*p._conditions[1].conditionValue.Anonymous.byteArray16).byteArray16 },
+                            ip.octets());
+                    }
+                }
+                let mut alternate = nonce;
+                alternate[0] ^= 1;
+                let other = RawFilter::ephemeral_proxy_permit("Trader", &app, endpoint, &alternate).unwrap();
+                assert_ne!(p.raw.filterKey, other.raw.filterKey, "旧会话不能共享新许可 key");
+                assert_ne!(p.raw.filterKey,
+                    RawFilter::block("Trader", &app, if endpoint.is_ipv4() { Layer::V4 } else { Layer::V6 }).raw.filterKey,
+                    "动态许可不能覆盖 v1 持久 BLOCK filterKey");
+            }
+        }
+
+        #[test]
+        fn dynamic_proxy_permit_rejects_unspecified_untrusted_destinations() {
+            let app = app();
+            let nonce = [0xBBu8; 16];
+            for bad in ["0.0.0.0:17890", "127.0.0.2:17890",
+                        "192.168.1.5:17890", "127.0.0.1:0",
+                        "[::ffff:127.0.0.1]:17890"] {
+                let address: std::net::SocketAddr = bad.parse().unwrap();
+                assert!(RawFilter::ephemeral_proxy_permit("Trader", &app, address, &nonce).is_err(), "{bad}");
+            }
+            assert!(RawFilter::ephemeral_proxy_permit("Trader", &app, "127.0.0.1:17890".parse().unwrap(), &[]).is_err());
+            assert!(RawFilter::ephemeral_proxy_permit("Trader", &[], "127.0.0.1:17890".parse().unwrap(), &nonce).is_err());
         }
 
         #[test]
