@@ -692,6 +692,16 @@ mod imp {
         }
 
         #[test]
+        fn v1_filter_projection_reads_only_the_live_union_member() {
+            let app = app();
+            let raw = RawFilter::block("Trader", &app, Layer::V4);
+            let projected = unsafe { filter_raw_from(raw.as_ptr()) };
+            assert_eq!(projected.provider_context_key, Guid::nil());
+            assert!(super::super::super::wfp::recognize(&projected, &app, Layer::V4).ok(),
+                "修正 v1 union 读取不能破坏旧版规则识别");
+        }
+
+        #[test]
         fn native_candidate_fields_are_owned_and_match_scoped_v2_ids() {
             let app = app();
             let candidates = compile_scoped_blocks(
@@ -805,7 +815,14 @@ mod imp {
             num_conditions: f.numFilterConditions,
             conditions,
             weight,
-            provider_context_key: from_win(f.Anonymous.providerContextKey),
+            // FWPM_FILTER0 的匿名 union：无 HAS_PROVIDER_CONTEXT 时只能读
+            // rawContext(u64)，不得无条件按 providerContextKey(GUID/16B) 读取。
+            // 旧规则若 rawContext 非 0，转成非零 Guid 让原识别判据拒绝它。
+            provider_context_key: if f.flags & W::FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT != 0 {
+                from_win(f.Anonymous.providerContextKey)
+            } else {
+                Guid::from_u128(f.Anonymous.rawContext as u128)
+            },
         }
     }
 
