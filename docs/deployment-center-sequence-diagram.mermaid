@@ -1,0 +1,79 @@
+%% 部署中心主流程时序图（A2/A3），对应架构文档 §4.1。
+%% 契约：docs/ipc-contract-0.1.4.md §4.16。
+%%
+%% 三条要在这张图上看出来的事：
+%%   1. `deployment-start` 回包里的 `Queued:true` 只是「已受理」——这一刻记录还是 Draft，
+%%      真正的 Draft→Queued 发生在监督线程里。短命令不代表任何一步做成。
+%%   2. 每个写步骤都先落 PendingOperation 再发远程写；核对是**只读**的第三次调用。
+%%   3. 页面关掉不影响 pass：执行上下文在引擎线程，不在页面。
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant W as WebUi（UI 线程）
+    participant IPC as ipc::handle_line
+    participant E as deployengine（引擎线程）
+    participant S as deploystore（磁盘）
+    participant R as 服务器（SSH）
+
+    U->>W: 填地址 →「读取指纹并继续」
+    W->>IPC: server-probe（Long，既有命令）
+    IPC->>R: probe_host_key（只读）
+    IPC-->>W: serverProbe{fingerprint, known}
+    U->>W: 核对指纹 + 输入密码 →「开始部署」
+    W->>IPC: deployment-start{spec, fingerprint, password, label}
+    IPC->>S: create(run.json)：State=Draft、Steps 全 Pending、NextAction=OpenForm、Revision=1
+    S-->>IPC: ok
+    IPC->>E: Cmd::Start(runId, Secret)
+    Note over IPC: 短命令到此为止：只投递意图，不发 SSH
+    IPC-->>W: ok, deployment{RunId, Accepted=true, Queued=true, Message}
+    W->>W: 表单绑定 RunId（进入「进行中」视图）
+
+    E->>S: State=Queued、NextAction=WaitQueue、Revision+1
+    E->>E: 拿 lane（lower(host):port）；同 lane 已有 pass 就留在队列
+    E->>S: State=Running、Executor{pid, heartbeat}
+    E->>R: Step0 检查环境与身份（只读）
+    E->>S: Steps[0]=Done(Evidence) + Identity + Plan + PlanDigest、Revision+1
+
+    loop 每个写步骤（Step1 标准连接 / Step2 兼容连接 / Step3 接入本机）
+        E->>S: PendingOperation{Kind, VerifyBy, PlanDigest, Outcome=Pending}
+        Note over E,S: 写命令之前先落盘：崩在这一行之后，重启时才知道「可能写了」
+        E->>R: install / install_transport / add_peer（远程写）
+        E->>R: probe_udp_state / read_transport（只读核对）
+        alt 核对通过
+            E->>S: Steps[i]=Done(Evidence)、清 PendingOperation、Revision+1
+        else 明确未生效 / 脚本报错
+            E->>S: Steps[i]=Failed(Reason)、清 PendingOperation、Revision+1
+        else 核对也说不清
+            E->>S: State=NeedsAttention、Reason=OutcomeUnknown、保留 PendingOperation
+            Note over E,S: 不猜、不重放：唯一动作是「核对原操作」
+        end
+    end
+    E->>S: Step3 核对通过 → State=Complete（或 NeedsAttention/Partial）、FinishedAtUtc
+
+    Note over W,S: 每 1–2 秒（有部署时 1 秒）：snapshot → deployment-list → 投影成 Tasks/Deployments
+
+    U->>W:「后台继续」
+    W->>IPC: deployment-background{runId}
+    IPC->>E: is_active(runId)?
+    alt 引擎确有活动 pass
+        E-->>IPC: true
+        IPC-->>W: ok, deployment{Accepted=true}
+        W->>W: 关闭表单 → 线路页（执行不依赖页面）
+    else 没有执行上下文
+        E-->>IPC: false
+        IPC-->>W: ok=false, errorCode=environment + 原因
+        W->>W: 留在原页显示原因（不得静默跳转、不得弹成功 toast）
+    end
+
+    Note over E,S: 页面已关闭，pass 继续推进并落盘
+    U->>W: 底部任务条 → resumeDeployment{runId}
+    W->>IPC: deployment-get{runId}（只读刷新）
+    IPC->>S: 读 run.json
+    IPC-->>W: ok, deployment{Run}
+    W->>W: 打开部署详情页（只读：不自动登录、不自动续跑）
+    U->>W:「继续部署」（仅当 NextAction 允许）
+    W->>IPC: deployment-continue{runId, password?, verifyOnly?}
+    IPC->>S: 重新从磁盘读该 RunId（不信内存、不信页面传的状态）
+    IPC->>E: Cmd::Continue(runId, Secret, verifyOnly)
+    Note over IPC: 同样是短命令：六步准入通过就回 Accepted
+    IPC-->>W: ok, deployment{RunId, Accepted=true, Queued=?}

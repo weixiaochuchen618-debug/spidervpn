@@ -1,0 +1,88 @@
+{
+  "SchemaVersion": 1,
+  "Kind": "SpiderVPN.DeploymentRun",
+  "RunId": "3f2b9c1e-4a5d-4c8b-9e01-2d7a6b5c4e3f",
+  "AttemptNo": 1,
+  "Label": "自建 · 203.0.113.10",
+  "Target": {
+    "Host": "203.0.113.10",
+    "Port": 22,
+    "User": "root",
+    "ServerRecordId": null
+  },
+  "Identity": {
+    "Fingerprint": "SHA256:AAAA",
+    "AutoTrusted": false
+  },
+  "Plan": {
+    "Interface": "tc1a2b3c4d",
+    "UdpPort": 51820,
+    "Subnet": "10.66.0.0/24",
+    "Mtu": 1420,
+    "ClientPublicKey": "CLIENT-PUBLIC-KEY"
+  },
+  "PlanDigest": "sha256:9f1c",
+  "State": "Complete",
+  "Step": 4,
+  "Reason": null,
+  "NextAction": "ViewLine",
+  "Steps": [
+    {
+      "Index": 0,
+      "Name": "检查服务器环境与身份",
+      "Status": "Done",
+      "StartedAtUtc": "2026-11-09T09:00:00Z",
+      "FinishedAtUtc": "2026-11-09T09:00:30Z",
+      "Evidence": {
+        "arch": "x86_64"
+      },
+      "Error": null
+    },
+    {
+      "Index": 1,
+      "Name": "准备标准连接",
+      "Status": "Done",
+      "StartedAtUtc": "2026-11-09T09:01:00Z",
+      "FinishedAtUtc": "2026-11-09T09:01:30Z",
+      "Evidence": {
+        "arch": "x86_64"
+      },
+      "Error": null
+    },
+    {
+      "Index": 2,
+      "Name": "准备兼容连接",
+      "Status": "Done",
+      "StartedAtUtc": "2026-11-09T09:02:00Z",
+      "FinishedAtUtc": "2026-11-09T09:02:30Z",
+      "Evidence": {
+        "arch": "x86_64"
+      },
+      "Error": null
+    },
+    {
+      "Index": 3,
+      "Name": "接入本机并登记线路",
+      "Status": "Done",
+      "StartedAtUtc": "2026-11-09T09:03:00Z",
+      "FinishedAtUtc": "2026-11-09T09:03:30Z",
+      "Evidence": {
+        "arch": "x86_64"
+      },
+      "Error": null
+    }
+  ],
+  "PendingOperation": null,
+  "Attempts": [],
+  "Executor": {
+    "InstanceId": "8f14e45f-ceea-4f7a-9a5f-2b3c4d5e6f70",
+    "Pid": 12345,
+    "HeartbeatAtUtc": "2026-11-09T09:10:00Z",
+    "Background": false
+  },
+  "CreatedAtUtc": "2026-11-09T09:00:00Z",
+  "StartedAtUtc": "2026-11-09T09:01:00Z",
+  "UpdatedAtUtc": "2026-11-09T09:10:00Z",
+  "FinishedAtUtc": "2026-11-09T09:08:00Z",
+  "Revision": 7
+}

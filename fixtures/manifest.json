@@ -1,0 +1,41 @@
+{
+  "source": "D:\\vpn构建\\spidervpn-0.1.4",
+  "rootSemantics": "SPIDERVPN_ROOT=<fixture>; data root=<fixture>/data",
+  "fixtures": {
+    "root-empty": {},
+    "root-unreadable": {
+      "data/config.json": {
+        "bytes": 23,
+        "sha256": "a37034a99474f83615c5a198d8fbfb335918a9bd227b0d9840b5f0c36838bf7d"
+      }
+    },
+    "root-2lines": {
+      "data/config.json": {
+        "bytes": 565,
+        "sha256": "a63b0d99468843d401945b0d40b7cd5bd244645619d0eae20c4efb9ee4e1724c"
+      },
+      "data/lines/fixture-a.json": {
+        "bytes": 1376,
+        "sha256": "c455540d1a68d22a92d7418e4ec8bf90a20e0155d3c892a02343bfbb4803752a"
+      },
+      "data/lines/fixture-b.json": {
+        "bytes": 1376,
+        "sha256": "c455540d1a68d22a92d7418e4ec8bf90a20e0155d3c892a02343bfbb4803752a"
+      },
+      "data/logs/operations.jsonl": {
+        "bytes": 47572,
+        "sha256": "99ef5b7b5b6deee6dc2427508b8a55b57b6e6c62b5c493f59ca3ab681c063c95"
+      }
+    },
+    "root-dirty-ops": {
+      "data/config.json": {
+        "bytes": 292,
+        "sha256": "687dc549169e7dd6086dafd86986ff4532c2f9b4a0c9bb2d993a41fa79251b28"
+      },
+      "data/logs/operations.jsonl": {
+        "bytes": 1903,
+        "sha256": "f7bd65cbeb390cd95e2c114f90a5010a8adaa42da9e184b69d217e2983d5e1df"
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "product": "SpiderVPN",
+  "data_root": "D:\\vpn构建\\spidervpn-0.1.4\\fixtures\\root-2lines\\data",
+  "schema": 1,
+  "created_by": "rust-rewrite"
+}

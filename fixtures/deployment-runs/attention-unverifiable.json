@@ -1,0 +1,117 @@
+{
+  "SchemaVersion": 1,
+  "Kind": "SpiderVPN.DeploymentRun",
+  "RunId": "7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918",
+  "AttemptNo": 2,
+  "Label": "自建 · 203.0.113.44",
+  "Target": {
+    "Host": "203.0.113.44",
+    "Port": 22,
+    "User": "root",
+    "ServerRecordId": null
+  },
+  "Identity": {
+    "Fingerprint": "SHA256:CCCC",
+    "AutoTrusted": false
+  },
+  "Plan": {
+    "Interface": "tc9f8e7d6c",
+    "UdpPort": 51820,
+    "Subnet": "10.66.0.0/24",
+    "Mtu": 1420,
+    "ClientPublicKey": "CLIENT-PUBLIC-KEY-2"
+  },
+  "PlanDigest": "sha256:7a2d",
+  "State": "NeedsAttention",
+  "Step": 3,
+  "Reason": {
+    "Category": "OutcomeUnknown",
+    "Class": "network",
+    "Code": "PeerStateUnreadable",
+    "Text": "接入本机这一步的结果读不出来，需要先核对。",
+    "At": "2026-11-10T03:15:00Z"
+  },
+  "NextAction": "Reconcile",
+  "Steps": [
+    {
+      "Index": 0,
+      "Name": "检查服务器环境与身份",
+      "Status": "Done",
+      "StartedAtUtc": "2026-11-10T03:00:00Z",
+      "FinishedAtUtc": "2026-11-10T03:00:20Z",
+      "Evidence": {
+        "arch": "x86_64"
+      },
+      "Error": null
+    },
+    {
+      "Index": 1,
+      "Name": "准备标准连接",
+      "Status": "Done",
+      "StartedAtUtc": "2026-11-10T03:01:00Z",
+      "FinishedAtUtc": "2026-11-10T03:02:10Z",
+      "Evidence": {
+        "listenPort": 51820
+      },
+      "Error": null
+    },
+    {
+      "Index": 2,
+      "Name": "准备兼容连接",
+      "Status": "Done",
+      "StartedAtUtc": "2026-11-10T03:03:00Z",
+      "FinishedAtUtc": "2026-11-10T03:04:30Z",
+      "Evidence": {
+        "listenPort": 8443
+      },
+      "Error": null
+    },
+    {
+      "Index": 3,
+      "Name": "接入本机并登记线路",
+      "Status": "Unknown",
+      "StartedAtUtc": "2026-11-10T03:05:00Z",
+      "FinishedAtUtc": null,
+      "Evidence": null,
+      "Error": null
+    }
+  ],
+  "PendingOperation": {
+    "Kind": "AddPeer",
+    "AttemptNo": 2,
+    "StartedAtUtc": "2026-11-10T03:05:00Z",
+    "VerifyBy": "ProbeUdpState",
+    "PlanDigest": "sha256:7a2d",
+    "ClientPublicKey": "CLIENT-PUBLIC-KEY-2",
+    "Outcome": "Unknown"
+  },
+  "Attempts": [
+    {
+      "No": 1,
+      "StartedAtUtc": "2026-11-10T02:50:00Z",
+      "FinishedAtUtc": "2026-11-10T02:55:00Z",
+      "FailedStep": 3,
+      "ErrorCode": "PeerStateUnreadable",
+      "Reconcile": "Needed"
+    },
+    {
+      "No": 2,
+      "StartedAtUtc": "2026-11-10T03:00:00Z",
+      "FinishedAtUtc": null,
+      "FailedStep": 3,
+      "ErrorCode": "PeerStateUnreadable",
+      "Reconcile": "Needed"
+    }
+  ],
+  "Executor": {
+    "InstanceId": "b1a2c3d4",
+    "Pid": 999999,
+    "HeartbeatAtUtc": "2026-11-10T03:06:00Z",
+    "Background": false
+  },
+  "CreatedAtUtc": "2026-11-10T02:49:00Z",
+  "StartedAtUtc": "2026-11-10T02:50:00Z",
+  "UpdatedAtUtc": "2026-11-10T03:06:00Z",
+  "FinishedAtUtc": null,
+  "Revision": 12
+}

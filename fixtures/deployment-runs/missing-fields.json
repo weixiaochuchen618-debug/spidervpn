@@ -1,0 +1,35 @@
+{
+  "SchemaVersion": 1,
+  "Kind": "SpiderVPN.DeploymentRun",
+  "RunId": "5c4d3e2f-1a0b-4c9d-8e7f-6a5b4c3d2e1f",
+  "Label": "自建 · 198.51.100.7",
+  "Target": {
+    "Host": "198.51.100.7",
+    "Port": 22,
+    "User": "root",
+    "ServerRecordId": null
+  },
+  "Identity": {
+    "Fingerprint": "SHA256:BBBB",
+    "AutoTrusted": false
+  },
+  "Plan": {
+    "Interface": "",
+    "UdpPort": 0,
+    "Subnet": "",
+    "Mtu": 0,
+    "ClientPublicKey": null
+  },
+  "PlanDigest": "",
+  "State": "NeedsAttention",
+  "Step": null,
+  "Reason": {
+    "Category": "OutcomeUnknown",
+    "Class": "network",
+    "Code": "TruncatedWrite",
+    "Text": "这条记录写到一半就断了，步骤进度不明。",
+    "At": "2026-11-10T02:00:00Z"
+  },
+  "NextAction": "Reconcile",
+  "PendingOperation": null
+}

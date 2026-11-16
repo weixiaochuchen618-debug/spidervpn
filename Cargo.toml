@@ -1,0 +1,144 @@
+[package]
+name = "spidervpn"
+version = "0.1.4"
+edition = "2021"
+description = "SpiderVPN — Windows 桌面 VPN 客户端：自建服务器部署、线路管理、交易程序直连阻断。"
+license = "MIT"
+repository = "https://github.com/weixiaochuchen618-debug/spidervpn"
+readme = "README.md"
+
+# 原则：本程序从第一天起就与系统上可能存在的旧版客户端不共享任何运行时资源。
+# 隔离契约是机器可查的：Test-Isolation.ps1
+[dependencies]
+# 授权密文（EncryptedAuthorization）不是「一段 RSA 密文」，而是 JWE 紧凑序列化：
+# 密钥封装用 RSA-OAEP(SHA-256)，内容加密用 A256CBC-HS512。所以这一层**确实**需要
+# AES-CBC 与 HMAC——不是为了对称加密而对称加密，是 RFC 7518 那一层内容加密本身。
+aes = "0.8.4"
+base64 = "0.23.1"
+# 注意默认 feature `block-padding` 是 load-bearing：jwe 里的 `decrypt_padded_mut` 与
+# `block_padding::NoPadding` 都靠它带进 `cipher` 的 `block-padding` feature。
+# 千万不要写成 `cbc = { version = "0.1.2", default-features = false }`——
+# 关掉是编译报错（不是静默降级），但别让下一个人白踩一次。
+cbc = "0.1.2"
+hmac = "0.12.1"
+interprocess = "2.4.7"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# SSH 客户端（部署到自己的服务器）。默认 feature 是 `aws-lc-rs`——和 rustls 同一个坑：
+# 本机 mingw 下它连下载都过不去，所以**必须**关默认、显式用 `ring`。
+# `rsa` 打开的是纯 Rust 的 RSA 验签（ssh-key/rsa），不是另一个加密后端：
+# 关掉它，遇到只发 RSA 主机公钥的老服务器会直接连不上。
+russh = { version = "0.65.0", default-features = false, features = ["ring", "rsa"] }
+# russh 是 async 的，本程序其余部分全是同步的：SSH 模块内部起一个 current_thread
+# 运行时、对外只暴露同步函数。这样调用方（CLI/IPC/部署流程）不用染上 async。
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync"] }
+rsa = { version = "0.9.8", features = ["sha2"] }
+# 0.23.1 对齐轮引入：目录里的进程匹配是 0.23.1 的路径正则（process_path_regex），
+# Rust 侧要「求值」它们（运行中徽标、与交易名单的重叠标注）；纯 Rust 依赖，mingw 安全。
+regex = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml = "0.9.34"
+sha2 = "0.10.9"
+# A8 无引擎 UDP 直探：WireGuard 握手要 BLAKE2s（哈希/KDF/MAC1）与
+# ChaCha20-Poly1305（两段密文）。ring 与 rustls 用的是同一个版本，
+# 不引入第二个加密后端；blake2 已在依赖树里（SSH 那一层）。
+blake2 = "0.11.0"
+ring = "0.17.14"
+# WireGuard 密钥对。必须能取出私钥的 32 字节（写配置要用），
+# 所以不用 ring 的 agreement（它不暴露私钥），用 dalek。
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+tao = "0.37.2"
+time = { version = "0.3.55", features = ["parsing"] }
+tray-icon = "0.26"
+winreg = "0.56.0"
+wry = "0.57.1"
+x509-parser = "0.18.1"
+
+# 集成测试要自己铺临时代理键（端到端连接必须有一个可读的代理键），
+# 只能走 winreg：`reg.exe` 在受限环境里会被拦。与被测程序用的是同一个 crate/版本。
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+winreg = "0.56.0"
+
+# ---------------------------------------------------------------------------
+# 交易程序直连阻断（WFP）的 Windows 绑定
+# ---------------------------------------------------------------------------
+#
+# 为什么是 `windows-sys` 而不是 `windows`：本项目只需要 ABI，不需要 trait/生命周期包装；
+# 也**不手写** `extern "system"` + 6 个 `repr(C)` 结构——`FWPM_FILTER0` 的 200 字节里有
+# union 与三层指针，手写靠人肉对齐，错一位就是「删错规则」。`windows-sys` 声明的就是
+# SDK 原样布局（实测 72/64/72/200/40/16 与 0.23.1 的 C# 自检表逐项相同）。
+#
+# 版本**精确锁定**（`=0.61.2`，不是 `^0.61`）：feature 名与结构布局一旦变化，我们靠
+# `tests/guard_wfp_layout.rs` 的 size/offset 断言先红，而不是等到运行时删错东西。
+#
+# ⚠️ 构建前置（Windows GNU 目标）：`windows-sys` 用 `windows-link` 的 raw-dylib 声明，
+# rustc 需要 `dlltool.exe` 才能生成导入库。本机由 WinLibs 提供：
+#     C:\tc-rs-tools\winlibs\mingw64\bin\dlltool.exe
+# - `build.ps1` 已经把这个目录加进 PATH，所以**走脚本构建不会退化**；
+# - 裸 `cargo build` / `cargo test` 必须自己加：
+#       export PATH="$HOME/.cargo/bin:/c/tc-rs-tools/winlibs/mingw64/bin:$PATH"
+#   否则会报 `error calling dlltool 'dlltool.exe': program not found`。
+#   这条是编译期错误（不是运行时才报），漏了不会静默降级。
+#
+# feature 集合逐条对应用途，多开一个都没有：
+#   Win32_Foundation                 HANDLE / BOOL
+#   Win32_Security                   SD/PSECURITY_DESCRIPTOR（Fwpm*Add0 的 sd 参数门控）
+#                                   以及 FWPM_SESSION0/FWPM_FILTER0 的 cfg 门控
+#   Win32_System_Rpc                 FwpmEngineOpen0 的门控（漏了就是「函数不存在」）
+#   Win32_System_SystemInformation   GetTickCount64（开机标识，证据可归属判据）
+#   Win32_Storage_FileSystem         GetFileAttributesW（逐级 reparse point 检查）
+#   Win32_NetworkManagement_WindowsFilteringPlatform   WFP 本体
+#   Win32_System_Threading           OpenProcess/QueryFullProcessImageNameW（T03 前置检查）
+#   Win32_System_Diagnostics_ToolHelp Toolhelp 进程枚举（T03 前置检查）
+#   Win32_UI_Shell                   ShellExecuteExW runas（T03 提权）
+#                                    + SHGetKnownFolderPath（桌面真实位置，A7）
+#   Win32_System_Com                 CoTaskMemFree（释放 SHGetKnownFolderPath 返回的串）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  # 私钥文件的 DACL：ConvertStringSecurityDescriptorToSecurityDescriptorW
+  #                   + SetNamedSecurityInfoW（F1，见 src/secretfile.rs）
+  "Win32_Security_Authorization",
+  "Win32_System_Rpc",
+  "Win32_System_SystemInformation",
+  # A8 按网卡探测：GetBestInterface + if_indextoname（默认出口网卡名）。
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Storage_FileSystem",
+  "Win32_NetworkManagement_WindowsFilteringPlatform",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_UI_Shell",
+  "Win32_System_Com",
+  # 复制邀请码：OpenClipboard/EmptyClipboard/SetClipboardData（A1 界面接线）
+  "Win32_System_DataExchange",
+  # 上面那条要配 GlobalAlloc/Lock 才搬得动一段 UTF-16
+  "Win32_System_Memory",
+] }
+
+# 读桌面快捷方式（.lnk）指向哪个程序 —— 拖放识别（r101）。
+#
+# 为什么这里多了一个 Windows 绑定 crate：`windows-sys` 只有 ABI，不声明 COM
+# **接口**（`IShellLinkW`/`IPersistFile` 的 vtable 与 IID），手写一遍等于把
+# `CLSID_ShellLink` + 十几个槽位的偏移押在运气上。`windows` 是 wry 自己已经在用的
+# 那一份（`cargo tree -i windows` → 只有 0.62.2），这里只是**补 feature**，不引入
+# 第二份 `windows`/`windows-core`。
+#
+#   Win32_UI_Shell              IShellLinkW
+#   Win32_System_Com            CoCreateInstance / CoInitializeEx / IPersistFile / STGM
+#   Win32_Storage_FileSystem    `IShellLinkW::GetPath` 的 `WIN32_FIND_DATAW` 参数门控
+#   Win32_Foundation            HRESULT 常量（RPC_E_CHANGED_MODE）
+#
+# 版本跟着 wry 走（`0.62`），不做精确锁定：一旦和 wry 分叉，`cargo tree -i windows`
+# 会立刻显示两个版本，那本身就是一条要修的红。
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+] }
+
+[[bin]]
+name = "spidervpn"
+path = "src/main.rs"

@@ -1,0 +1,56 @@
+%% 部署中心恢复时序图（T04 + T09），对应架构文档 §4.2 与 §4.3 的四条断言。
+%% 契约：docs/ipc-contract-0.1.4.md §4.16.8。
+%%
+%% 这张图要证明的是「没有任何自动执行」：
+%%   恢复只改判（State/Reason/NextAction 三个字段），把执行权交回给用户；
+%%   唯一的执行入口是用户点「核对原操作」或「继续部署」。
+sequenceDiagram
+    autonumber
+    participant P1 as 上一进程（pass 线程）
+    participant S as deployments\runs\<RunId>.json
+    participant P2 as 新进程（main + deployengine）
+    participant U as 用户
+    participant R as 服务器
+
+    P1->>S: PendingOperation{Kind=TransportInstall, VerifyBy=ReadTransport, Outcome=Pending}
+    P1->>R: install_transport（进行中…）
+    P1--xS: 进程被杀 / 断电（心跳停在 T，Revision=41）
+    Note over S: State=Running、Step=2、PendingOperation.Outcome=Pending<br/>磁盘上留下的是「可能写了、没人核对」
+
+    P2->>P2: instance::acquire 成功 —— 本次启动独占单实例互斥
+    Note over P2: 因此 Executor.Pid != 本进程 ⇒ 原执行者**必然**已死<br/>这是证明，不是启发式
+    P2->>S: load_all()（目录 + 逐文件解析）
+    P2->>P2: recover(run, currentPid, now, is_active)：四条同时成立才动
+    alt 有未核对结论的写
+        P2->>S: State=NeedsAttention、Reason=OutcomeUnknown、NextAction=Reconcile、Revision=42
+    else 只是被打断
+        P2->>S: State=NeedsAttention、Reason=Interrupted、NextAction=RetryStep、Revision=42
+    end
+    P2->>S: 卡在 Running 的那一步 Status=Unknown（界面「未核实」）
+    Note over S: 已 Done / Pending 的步骤一个不动；Paused 完全不碰<br/>绝不保留 Running；绝不自动登录 / 自动续跑 / 自动重放
+
+    alt 改判写盘失败
+        P2->>P2: 记录原样留 Running（没改动 = 没说谎）
+        P2->>P2: 结论写进 EngineShared.recover_error
+        Note over P2: deployment-list 据此把 TasksRead 压成 failed<br/>页面显示「读不出来」，而不是假的「正在部署」
+    end
+
+    U->>P2: 打开任务（resume / resumeDeployment）
+    P2->>S: deployment-get（只读刷新）
+    P2-->>U: 详情页：停在「3/4 准备兼容连接」，主动作「核对原操作」
+    U->>P2:「核对原操作」→ deployment-continue{verifyOnly:true}
+    P2->>R: read_transport（只读，无写）
+    alt 已生效（Some 且 port/SNI 一致）
+        P2->>S: PendingOperation.Outcome=Applied → Steps[2]=Done、清 PendingOperation
+    else 明确未生效（除 ABSENT 无别的）
+        P2->>S: PendingOperation.Outcome=NotApplied、Steps[2]=Pending
+    else 读不到 / 超时
+        P2->>S: 保持 NeedsAttention/OutcomeUnknown（不猜、不重放）
+    end
+
+    U->>P2:「继续部署」→ deployment-continue{runId}
+    P2->>P2: 上游校验（指纹 / 计划摘要）→ 从最后确认检查点推进（不从头）
+    P2->>S: State=Queued → Running
+    P2->>R: 从 Step2 或 Step3 继续
+
+    Note over U,P2: 有部署没跑完时关窗：有托盘 → 缩到托盘（部署继续）；<br/>无托盘 → 拒绝关窗 + 对话框。托盘 Quit 走同一条闸。

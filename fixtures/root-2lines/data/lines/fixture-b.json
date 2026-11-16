@@ -1,0 +1,78 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "server": "192.168.1.1",
+        "tag": "dns-direct",
+        "type": "udp"
+      }
+    ]
+  },
+  "endpoints": [
+    {
+      "tag": "hk",
+      "type": "wireguard"
+    }
+  ],
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "listen_port": 18000,
+      "tag": "tc-mixed",
+      "type": "mixed"
+    },
+    {
+      "listen": "127.0.0.1",
+      "listen_port": 18003,
+      "tag": "tc-check",
+      "type": "socks"
+    }
+  ],
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "outbounds": [
+    {
+      "server": "198.51.100.10",
+      "server_port": 443,
+      "tag": "tc-transport",
+      "type": "vless"
+    },
+    {
+      "default": "tc-transport",
+      "outbounds": [
+        "tc-transport"
+      ],
+      "tag": "trade-exit",
+      "type": "selector"
+    },
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "final": "trade-exit",
+    "rules": [
+      {
+        "inbound": [
+          "tc-check"
+        ],
+        "outbound": "trade-exit"
+      },
+      {
+        "action": "route",
+        "inbound": [
+          "tc-mixed"
+        ],
+        "outbound": "trade-exit"
+      },
+      {
+        "action": "route",
+        "outbound": "trade-exit"
+      }
+    ]
+  }
+}

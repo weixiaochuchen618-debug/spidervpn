@@ -1,0 +1,12 @@
+# 统一行尾：源码一律 LF，只有 Windows 批处理用 CRLF。
+# 服务器侧脚本（assets/tc-pair.py）对行尾敏感——按 CRLF 写入、按 LF 读回会让
+# 指纹核对失败，所以这里必须钉死，不能靠各人的 core.autocrlf。
+* text=auto eol=lf
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+*.exe binary
+*.dll binary
+*.png binary
+*.ico binary

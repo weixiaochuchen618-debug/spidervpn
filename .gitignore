@@ -1,0 +1,27 @@
+# 构建产物
+/target/
+/dist/
+*.pdb
+
+# 随包分发的引擎（体积大，不进仓库；打包时从 vendor\ 取）
+/vendor/*.exe
+/vendor/*.dll
+
+# 测试与报告
+/__pycache__/
+**/__pycache__/
+*.pyc
+/reports/
+/reports-tmp/
+
+# 本机数据（绝不入库）
+/data/
+*.tcrecovery
+*.sha256
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

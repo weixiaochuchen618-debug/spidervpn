@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "decision_ref": "isolation.contract.json",
+  "principle": "本程序是独立应用。与旧版客户端共享任何运行时资源，都视为缺陷。",
+  "legacy": {
+    "product_name": "TradeChannel",
+    "install_dir": "C:\\tradechannel",
+    "data_root": "%ProgramData%\\TradeChannel",
+    "mutex_prefix": "Global\\TradeChannelGuard-",
+    "webview_udf": "%LocalAppData%\\TradeChannel\\WebView2",
+    "pipe_prefix": "TradeChannel.",
+    "window_class_prefix": "TradeChannel.",
+    "scheduled_task_prefix": "TradeChannel.UIStartup",
+    "shortcut_name": "TradeChannel.lnk",
+    "status": "frozen"
+  },
+  "rewrite": {
+    "product_name": "SpiderVPN",
+    "install_dir": "C:\\SpiderVPN",
+    "data_root": "C:\\SpiderVPN\\data",
+    "mutex_prefix": "Global\\SpiderVPN-",
+    "webview_udf": "C:\\SpiderVPN\\data\\WebView2",
+    "pipe_prefix": "SpiderVPN.",
+    "window_class_prefix": "SpiderVPN.",
+    "scheduled_task_prefix": "SpiderVPN.",
+    "shortcut_name": "SpiderVPN.lnk",
+    "listen_port": "ephemeral"
+  },
+  "must_differ": [
+    "install_dir",
+    "data_root",
+    "mutex_prefix",
+    "webview_udf",
+    "pipe_prefix",
+    "window_class_prefix",
+    "scheduled_task_prefix",
+    "shortcut_name"
+  ],
+  "proxy_policy": {
+    "rule": "检测到旧版客户端正在运行时，拒绝接管系统代理/TUN 并提示，不得静默夺权。",
+    "detect": [
+      "Global\\TradeChannelGuard-* 互斥被占用",
+      "TradeChannel.exe 进程存在"
+    ],
+    "on_conflict": "refuse_and_explain"
+  },
+  "forbidden_in_rewrite_tree": [
+    "%ProgramData%\\TradeChannel",
+    "C:\\tradechannel",
+    "Global\\TradeChannelGuard-",
+    "TradeChannel.UIStartup"
+  ],
+  "scan_allowlist": [
+    {
+      "file": "src/isolation.rs",
+      "reason": "隔离检查本身必须知道旧版资源名才能比较；它只声明常量，不构造可用路径。"
+    },
+    {
+      "file": "tests/round2-exclusive-a.ps1",
+      "reason": "验收脚本：A–E 对比段需要真引擎，故指向 旧版的 sing-box；只用于测试对照，不进产物、产品运行时不引用它。"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+    "name":  "dpapi-foreign-entropy",
+    "warning":  "test fixture, never use for real pairing",
+    "machineBound":  true,
+    "generatedBy":  "tools/dpapi_tool.c（熵是 SomeOther.App.v1，不是本程序的固定熵）",
+    "generatedOn":  "ELEVEN\\X1carbon",
+    "entropyUtf8":  "SomeOther.App.v1",
+    "plain":  "{\"TunnelPrivateKey\":\"-----BEGIN PRIVATE KEY----- MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7 -----END PRIVATE KEY-----\",\"RetryInvite\":\"TCI1.test\"}",
+    "protectedB64":  "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAATNZAe0I0EkKCZbKpJNx6tQAAAAACAAAAAAAQZgAAAAEAACAAAABXH6oSVK/38P44K03CuHY3vCeyhrvVQ0Qm7eziGtYFWwAAAAAOgAAAAAIAACAAAAADKnd+eiPs33bm7L8nqMbRutbIlUqb04cG/3VyiUW4iqAAAABQA7hlLGMVhKLvezgc8HyOjSjAnvq1mgkwAqD+UJosi3OtS5NkDsHxRQIkW1xxl5kLBCvahX9KNRSFjoKyARTdrYRFRhpUKqZgaQLxlyU95h/8NaN6Xf+uQuGLyNijJEjsi3gdYmJozRTLpoVsNul3LgL2kNKL+M+zYgezIfLCU1RGRBitzyftDCEXDfQtEwtk1s1Sz8qkMykJ5mlHnYQLQAAAAC4Gp3hdZLT5ALRxM5EN6VyzHBhPeNx0H7MmV6FDLXBlrtUrQEpuRSxBMhEFkp83ESbrKGbQhARy+g5fJhpLoNM=",
+    "expectedErrorCode":  "PairingPrivateUnavailable"
+}

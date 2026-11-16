@@ -1,0 +1,55 @@
+{
+  "ok": true,
+  "state": "Disconnected",
+  "title": "未连接",
+  "detail": "选择线路后点击连接",
+  "action": "Connect",
+  "enabled": true,
+  "check": "通过（HTTP 204）",
+  "checkAtUtc": "2026-10-29T09:31:12Z",
+  "latencyMs": null,
+  "measuredAtUtc": null,
+  "exitEvidence": "forwarded-unverified",
+  "exitObservedIp": null,
+  "isAdmin": true,
+  "linesRead": "ok",
+  "linesReadError": "",
+  "line": "夹具线路 A",
+  "lineCount": 2,
+  "endpoint": "127.0.0.1:18010",
+  "mode": "TUN",
+  "modeChoice": "tun",
+  "tunAvailable": true,
+  "lines": [
+    {"id":"fixture-a","name":"夹具线路 A","endpoint":"127.0.0.1:18010","transport":"tcp","transportSelected":true,"selected":true},
+    {"id":"fixture-b","name":"夹具线路 B","endpoint":"127.0.0.1:18020","transport":"udp","transportSelected":false,"selected":false}
+  ],
+  "selected": "fixture-a",
+  "providers": [
+    {"slot":1,"name":"Clash 夹具","kind":"clashverge","directory":"C:\\fixtures\\clash","dailyPort":17895,"tradePort":17895,"domains":["a.example.com"],"dailyTag":"provider","tradeTag":"provider-trade","entryNote":"使用夹具独立入口 127.0.0.1:17895","effectiveState":"effective","effectiveRole":"trade","effectiveReason":"交易出口已指向它；日常上网不经过它"}
+  ],
+  "entryNote": "使用夹具独立入口 127.0.0.1:17895",
+  "processes": [{"value":"TDXW.exe","target":"trade"}],
+  "domains": [{"value":"example.com","target":"direct"}],
+  "exitDaily": "direct",
+  "exitDailyMembers": [
+    {"value":"direct","label":"本地直连"},
+    {"value":"provider","label":"代理软件（Clash 夹具 127.0.0.1:17895）"}
+  ],
+  "exitTrade": "provider-trade",
+  "exitTradeMembers": [
+    {"value":"direct","label":"本地直连"},
+    {"value":"hk","label":"交易线路（夹具线路 A）"},
+    {"value":"provider-trade","label":"代理软件（Clash 夹具 127.0.0.1:17895）"}
+  ],
+  "events": [
+    {"ts":"2026-10-29T09:31:12Z","action":"断开","ok":true,"detail":"停止夹具引擎并还原临时代理","src":"ui","actor":"pid:1001","obj":"line:fixture-a"},
+    {"ts":"2026-10-29T09:30:02Z","action":"连接","ok":true,"detail":"夹具线路 A（TUN）","src":"cli","actor":"pid:1002","obj":"line:fixture-a"},
+    {"ts":"2026-10-29T08:12:44Z","action":"连接","ok":false,"detail":"夹具端口已被占用"},
+    {"ts":"2026-10-28T22:58:31Z","action":"导入线路","ok":true,"detail":"夹具线路 B","src":"auto","actor":"pid:1001","obj":"line:fixture-b"}
+  ],
+  "trayAvailable": true,
+  "autoStart": false,
+  "autoConnect": false,
+  "closeToTray": false
+}

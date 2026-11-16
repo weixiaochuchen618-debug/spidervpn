@@ -1,0 +1,18 @@
+{
+  "schema": 2,
+  "mode": "proxy",
+  "auto_start": false,
+  "auto_connect": false,
+  "close_to_tray": false,
+  "selected": "",
+  "lines": [],
+  "exits": {
+    "trade": null,
+    "daily": null
+  },
+  "split": {
+    "processes": [],
+    "domains": []
+  },
+  "engine": null
+}

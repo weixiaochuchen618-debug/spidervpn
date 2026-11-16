@@ -1,0 +1,10 @@
+{
+    "name":  "dpapi-current-user",
+    "warning":  "test fixture, never use for real pairing",
+    "machineBound":  true,
+    "generatedBy":  "tools/dpapi_tool.c（Win32 CryptProtectData，CRYPTPROTECT_UI_FORBIDDEN，当前用户作用域）",
+    "generatedOn":  "ELEVEN\\X1carbon",
+    "entropyUtf8":  "TradeChannel.Pairing.v1",
+    "plain":  "{\"TunnelPrivateKey\":\"-----BEGIN PRIVATE KEY----- MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7 -----END PRIVATE KEY-----\",\"RetryInvite\":\"TCI1.test\"}",
+    "protectedB64":  "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAATNZAe0I0EkKCZbKpJNx6tQAAAAACAAAAAAAQZgAAAAEAACAAAADDvBOZwxJEZyv4QpDMGRZRZOGXr1FjTIWJKLx3SHamBQAAAAAOgAAAAAIAACAAAADDP7bZeK3xHjdxKSyTt+JjaBkzFmzOnzCPCL/EGzW83aAAAADJkKHpncylzsqEzwDGKc0R7JXrd0nBWRHMS4Dk98hx7594SEtJp5YuXy6DnPzgqpLr9YfUwjhvN6InwyQdu83w1zntWnCM2a5sHjkuv2sPT3xNA/0Q1QQ2MiVVXCSmrQZY3jLV3cK7zqwX/ecmNE0LO8Em2+EIYGPd5HuLovtf5ygdF42K1lGFeLirX0wxFPINK27V+Lk+DAD3nZexEOE5QAAAAC4aRmgKNS26KQ5tCth4MgD417XqKXZLrSDeq2Sw07Lrdfr4CJ2CQXqIE28BGggE7dcSjjnFCmFZqtE7J66QMEU="
+}

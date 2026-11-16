@@ -1,0 +1,30 @@
+{
+  "schema": 2,
+  "mode": "proxy",
+  "auto_start": false,
+  "auto_connect": false,
+  "close_to_tray": false,
+  "selected": "fixture-a",
+  "lines": [
+    {
+      "id": "fixture-a",
+      "name": "夹具线路 A",
+      "proxy_endpoint": "127.0.0.1:18010"
+    },
+    {
+      "id": "fixture-b",
+      "name": "夹具线路 B",
+      "proxy_endpoint": "127.0.0.1:18020",
+      "transport": "tcp"
+    }
+  ],
+  "exits": {
+    "trade": null,
+    "daily": null
+  },
+  "split": {
+    "processes": [],
+    "domains": []
+  },
+  "engine": null
+}
