@@ -15,7 +15,7 @@ fn canary_only_runs_on_windows() {}
 
 #[cfg(windows)]
 mod windows_canary {
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
     use std::time::Duration;
@@ -245,6 +245,19 @@ mod windows_canary {
         TcpStream::connect_timeout(&addr, Duration::from_millis(700))
     }
 
+    /// 每次创建一个新的 UDP socket，避免复用安装过滤器之前已获准的 ALE 流。
+    /// 检查实际送达服务端，而不只看 connect()/send() 的表面返回值。
+    fn udp_reaches(server: &UdpSocket, destination: SocketAddr) -> bool {
+        let bind = if destination.is_ipv4() { "127.0.0.1:0" } else { "[::1]:0" };
+        let client = UdpSocket::bind(bind).expect("为当前探针建立新 UDP socket");
+        server.set_read_timeout(Some(Duration::from_millis(450))).unwrap();
+        if client.connect(destination).is_err() || client.send(b"vpn-wfp-test").is_err() {
+            return false;
+        }
+        let mut buffer = [0u8; 128];
+        matches!(server.recv_from(&mut buffer), Ok((n, _)) if &buffer[..n] == b"vpn-wfp-test")
+    }
+
     #[test]
     #[ignore = "原生下一跳 LUID 探针，仅隔离 Windows 运行器显式执行"]
     fn next_hop_luid_is_present_for_ipv4_loopback_authorization() {
@@ -272,6 +285,10 @@ mod windows_canary {
         let other_addr = other.local_addr().unwrap();
         assert!(connect(trusted_addr).is_ok());
         assert!(connect(other_addr).is_ok());
+        let udp_server = UdpSocket::bind(("[::1]", trusted_addr.port()))
+            .expect("在 IPv6 可信 TCP 代理端口旁建立 UDP 负对照");
+        assert!(udp_reaches(&udp_server, udp_server.local_addr().unwrap()),
+            "IPv6 UDP 在安装 WFP 前必须真正送达");
 
         let engine = DynamicEngine::open();
         let app = AppId::this_test_exe();
@@ -280,8 +297,12 @@ mod windows_canary {
         }
         assert!(connect(trusted_addr).is_ok(), "正确 ::1 代理被误阻断");
         assert!(connect(other_addr).is_err(), "IPv6 上其他代理端口被绕过");
+        assert!(!udp_reaches(&udp_server, udp_server.local_addr().unwrap()),
+            "IPv6 同 IP 同端口 UDP 仍可送达，非 TCP 出口没有被挡住");
         drop(engine);
         assert!(connect(other_addr).is_ok(), "IPv6 过滤器未随动态会话清理");
+        assert!(udp_reaches(&udp_server, udp_server.local_addr().unwrap()),
+            "关闭动态会话后 IPv6 UDP 未恢复");
     }
 
     #[test]
@@ -295,6 +316,11 @@ mod windows_canary {
         let other_addr = other.local_addr().unwrap();
         assert!(connect(trusted_addr).is_ok(), "安装 WFP 前，可信端点本来应可用");
         assert!(connect(other_addr).is_ok(), "安装 WFP 前，另一端点本来应可用");
+        // TCP 与 UDP 可以在同一个数字端口监听。v2 只允许指定 TCP 代理端点。
+        let udp_server = UdpSocket::bind(("127.0.0.1", trusted_addr.port()))
+            .expect("在可信 TCP 代理端口旁建立 UDP 负对照");
+        assert!(udp_reaches(&udp_server, udp_server.local_addr().unwrap()),
+            "安装前 UDP 负对照必须实际送达，否则不能证明它被规则阻断");
 
         let engine = DynamicEngine::open();
         let app = AppId::this_test_exe();
@@ -306,9 +332,13 @@ mod windows_canary {
             "正确本地代理 IP+port+TCP 被误阻断，WFP v2 不能发布");
         assert!(connect(other_addr).is_err(),
             "其他 localhost 端口被放行，WFP v2 会留下绕行通道");
+        assert!(!udp_reaches(&udp_server, udp_server.local_addr().unwrap()),
+            "同 IP 同端口的 UDP 流量仍可实际送达，IP_PROTOCOL 防绕过失效");
 
         // BFE 动态会话关闭后，过滤器必须自动全部移除。
         drop(engine);
         assert!(connect(other_addr).is_ok(), "动态规则退出后没有清理");
+        assert!(udp_reaches(&udp_server, udp_server.local_addr().unwrap()),
+            "关闭动态会话后 UDP 必须恢复，不能留下残余过滤器");
     }
 }
