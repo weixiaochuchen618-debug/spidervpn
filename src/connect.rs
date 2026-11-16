@@ -1284,6 +1284,42 @@ mod tests {
     }
 
     #[test]
+    fn preflight_does_not_regenerate_live_engine_configuration() {
+        let f = fixture("preflight-existing");
+        let cfg = cfg();
+        let runtime_engine = f.runtime.with_file_name("runtime-engine.json");
+        std::fs::write(&runtime_engine, r#"{"inbounds":[{"type":"mixed","tag":"tc-mixed"}]}"#).unwrap();
+        write_runtime(&f.runtime, 4242, 1_700_000_000.0, "Running", false).unwrap();
+        f.store.apply(&[
+            proxy::Change { key: "ProxyEnable", from: "0".into(), to: "1".into() },
+            proxy::Change {
+                key: "ProxyServer", from: "127.0.0.1:7897".into(),
+                to: cfg.current_line().unwrap().proxy_endpoint.clone(),
+            },
+        ]).unwrap();
+
+        let root = f.runtime.parent().unwrap();
+        assert_eq!(
+            preflight_before_prepare(&cfg, root, &f.store, &always_alive, false),
+            Ok(true),
+            "运行中且代理匹配时，必须绕过配置及凭据再生成",
+        );
+        let before = std::fs::read(&runtime_engine).unwrap();
+        assert_eq!(std::fs::read(&runtime_engine).unwrap(), before);
+
+        // 即使 PID 存活，代理被第三方改过也不能准备新运行时配置。
+        f.store.apply(&[
+            proxy::Change {
+                key: "ProxyServer", from: cfg.current_line().unwrap().proxy_endpoint.clone(),
+                to: "127.0.0.1:30000".into(),
+            },
+        ]).unwrap();
+        assert!(preflight_before_prepare(&cfg, root, &f.store, &always_alive, false).is_err());
+        assert_eq!(std::fs::read(&runtime_engine).unwrap(), before);
+        assert_eq!(preflight_before_prepare(&cfg, root, &f.store, &never_alive, false), Ok(false));
+    }
+
+    #[test]
     fn second_connect_is_idempotent_when_already_connected() {
         let f = fixture("idem");
         let c = cfg(); // 两次必须同一条线路（cfg() 每次都取新端口）
