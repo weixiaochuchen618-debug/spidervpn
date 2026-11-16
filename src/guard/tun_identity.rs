@@ -36,13 +36,13 @@ fn identify_windows(alias: &str) -> Result<TunCandidate, String> {
         return Err("Windows NET_LUID 结构布局不符合 64 位预期".to_string());
     }
     unsafe {
-        std::ptr::write_unaligned((&mut row.InterfaceLuid as *mut _).cast::<u64>(), luid);
+        std::ptr::write_unaligned(std::ptr::addr_of_mut!(row.InterfaceLuid).cast::<u64>(), luid);
     }
     let rc = unsafe { Ip::GetIfEntry2(&mut row) };
     if rc != 0 {
         return Err(format!("无法回读 TUN 接口状态（Win32={rc}），不授权交易出口"));
     }
-    let readback = unsafe { std::ptr::read_unaligned((&row.InterfaceLuid as *const _).cast::<u64>()) };
+    let readback = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(row.InterfaceLuid).cast::<u64>()) };
     let n = row.Alias.iter().position(|&ch| ch == 0).unwrap_or(row.Alias.len());
     let actual_alias = String::from_utf16_lossy(&row.Alias[..n]);
     if readback != luid || !actual_alias.eq_ignore_ascii_case(alias) {
