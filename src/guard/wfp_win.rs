@@ -575,7 +575,7 @@ mod imp {
         ///
         /// lease_nonce 必须从一次独立连接会话产生，避免新的许可复用旧 FilterKey。
         /// 这里并不证明 sing-box 进程身份；必须由调用方先验证 owner PID/exe。
-        pub fn ephemeral_proxy_permit(
+        fn ephemeral_proxy_permit(
             name: &str, app_id: &[u8], endpoint: std::net::SocketAddr, lease_nonce: &[u8],
         ) -> Result<Box<RawFilter>, String> {
             use sha2::{Digest, Sha256};
@@ -656,6 +656,25 @@ mod imp {
             permit.raw.numFilterConditions = permit._conditions.len() as u32;
             permit.raw.filterCondition = permit._conditions.as_mut_ptr();
             Ok(permit)
+        }
+
+        /// 在调用端遗漏进程归属检查的情况下也不可能从公共入口生成许可。
+        /// 验证当前 TCP LISTEN 所属 PID 和 EXE，出错即拒绝构造。
+        ///
+        /// 重要：这是当前时刻的身份检查，不构成对后续端口重新绑定的永久担保。
+        /// 未来安装方仍须将动态 WFP 会话寿命绑定到引擎进程，并在安装前再次核验。
+        pub fn trusted_ephemeral_proxy_permit(
+            name: &str,
+            app_id: &[u8],
+            endpoint: std::net::SocketAddr,
+            expected_pid: u32,
+            expected_executable: &Path,
+            lease_nonce: &[u8],
+        ) -> Result<Box<RawFilter>, String> {
+            super::super::proxy_identity::verify_proxy_owner(
+                endpoint, expected_pid, expected_executable,
+            )?;
+            Self::ephemeral_proxy_permit(name, app_id, endpoint, lease_nonce)
         }
 
         pub fn as_ptr(&self) -> *const W::FWPM_FILTER0 {
@@ -822,6 +841,29 @@ mod imp {
                     RawFilter::block("Trader", &app, if endpoint.is_ipv4() { Layer::V4 } else { Layer::V6 }).raw.filterKey,
                     "动态许可不能覆盖 v1 持久 BLOCK filterKey");
             }
+        }
+
+        #[test]
+        fn trusted_dynamic_permit_requires_the_real_listener_process() {
+            let app = app();
+            let nonce = [0xD3u8; 16];
+            let exe = std::env::current_exe().unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = listener.local_addr().unwrap();
+            assert!(RawFilter::trusted_ephemeral_proxy_permit(
+                "Trader", &app, endpoint, std::process::id(), &exe, &nonce
+            ).is_ok(), "正确端口、PID、可执行文件才能生成临时许可");
+            assert!(RawFilter::trusted_ephemeral_proxy_permit(
+                "Trader", &app, endpoint, std::process::id() + 1, &exe, &nonce
+            ).is_err(), "错误 PID 不得生成许可");
+            let wrong = std::env::temp_dir().join("not-the-proxy-engine.exe");
+            assert!(RawFilter::trusted_ephemeral_proxy_permit(
+                "Trader", &app, endpoint, std::process::id(), &wrong, &nonce
+            ).is_err(), "错误 EXE 不得生成许可");
+            drop(listener);
+            assert!(RawFilter::trusted_ephemeral_proxy_permit(
+                "Trader", &app, endpoint, std::process::id(), &exe, &nonce
+            ).is_err(), "端口释放后不能复用已失效的可信验证");
         }
 
         #[test]
