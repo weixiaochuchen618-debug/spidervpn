@@ -576,6 +576,9 @@ pub fn restore_from_journal(
     // 用凭据里记录的端点判断「是否还是我们设的」；凭据里没有就退回配置值。
     let ours = if j.endpoint.is_empty() { fallback_endpoint } else { j.endpoint.as_str() };
     let rp = proxy::plan_restore(&j, &current, ours);
+    for warning in &rp.warnings {
+        eprintln!("系统代理还原提醒：{warning}");
+    }
     if let Some(b) = rp.blocked {
         return Err(b);
     }
