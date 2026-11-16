@@ -85,19 +85,39 @@ impl ProxyStore {
     }
 }
 
-/// 还原计划：把系统代理改回接管前的样子。
+/// 按当前接管规则复原「本程序实际写过的值」。
 ///
-/// 关键取舍：**只有当前值仍然是我们设的端点时才还原**。
-/// 如果用户在这期间手动改了代理（或用别的工具改了），那说明他现在的选择优先，
-/// 我们再去覆盖就是在替用户做主。
+/// 不修改 journal 的 schema：老凭据仍可读。通过同一个 plan_connect 纯函数推导
+/// 应用之后的状态，避免在计划与还原中各维护一套 ProxyOverride 拼接算法。
+fn expected_proxy_after_takeover(journal: &ProxyJournal, endpoint: &str) -> ProxySnapshot {
+    let mut expected = ProxySnapshot {
+        enable: journal.saved.enable,
+        server: journal.saved.server.clone(),
+        bypass: journal.saved.bypass.clone(),
+        readable: true,
+    };
+    let plan = plan_connect(&expected, endpoint, false);
+    for change in plan.changes {
+        match change.key {
+            "ProxyEnable" => expected.enable = change.to == "1",
+            "ProxyServer" => expected.server = Some(change.to),
+            "ProxyOverride" => expected.bypass = Some(change.to),
+            _ => {}
+        }
+    }
+    expected
+}
+
+/// 还原计划：只有当前代理服务器还是我们的端点才尝试还原。
+///
+/// 对启用状态和绕过列表逐字段比较「本程序实际写入值」；已被其他程序/用户
+/// 修改的字段绝不回写。连接失败的半写入回滚仍由 rollback_blind 处理。
 pub fn plan_restore(
     journal: &ProxyJournal,
     current: &ProxySnapshot,
     our_endpoint: &str,
 ) -> RestorePlan {
     let mut warnings = Vec::new();
-    // 防御性分支：生产路径上 `connect::restore_from_journal` 已经先分流到盲还原，走不到这里；
-    // 留着是为了让「读不到就别猜」这条纪律在被直接调用时也成立。
     if !current.readable {
         return RestorePlan {
             changes: Vec::new(),
@@ -106,12 +126,7 @@ pub fn plan_restore(
         };
     }
 
-    let still_ours = match &current.server {
-        Some(s) => s == our_endpoint,
-        None => false,
-    };
-
-    if !still_ours {
+    if current.server.as_deref() != Some(our_endpoint) {
         warnings.push(format!(
             "当前代理已不是本程序设置的端点（现在是 {}），不做还原以免覆盖别人的设置",
             current.server.as_deref().unwrap_or("(空)")
@@ -119,14 +134,20 @@ pub fn plan_restore(
         return RestorePlan { changes: Vec::new(), warnings, blocked: None };
     }
 
+    let expected = expected_proxy_after_takeover(journal, our_endpoint);
     let mut changes = Vec::new();
     if current.enable != journal.saved.enable {
-        changes.push(Change {
-            key: "ProxyEnable",
-            from: if current.enable { "1".into() } else { "0".into() },
-            to: if journal.saved.enable { "1".into() } else { "0".into() },
-        });
+        if current.enable == expected.enable {
+            changes.push(Change {
+                key: "ProxyEnable",
+                from: if current.enable { "1".into() } else { "0".into() },
+                to: if journal.saved.enable { "1".into() } else { "0".into() },
+            });
+        } else {
+            warnings.push("ProxyEnable 已由其他程序修改，保留当前值".into());
+        }
     }
+
     let saved_server = journal.saved.server.clone().unwrap_or_default();
     if current.server.clone().unwrap_or_default() != saved_server {
         changes.push(Change {
@@ -135,13 +156,17 @@ pub fn plan_restore(
             to: saved_server,
         });
     }
-    let saved_bypass = journal.saved.bypass.clone().unwrap_or_default();
-    if current.bypass.clone().unwrap_or_default() != saved_bypass {
-        changes.push(Change {
-            key: "ProxyOverride",
-            from: current.bypass.clone().unwrap_or_default(),
-            to: saved_bypass,
-        });
+
+    if current.bypass != journal.saved.bypass {
+        if current.bypass == expected.bypass {
+            changes.push(Change {
+                key: "ProxyOverride",
+                from: current.bypass.clone().unwrap_or_default(),
+                to: journal.saved.bypass.clone().unwrap_or_default(),
+            });
+        } else {
+            warnings.push("ProxyOverride 已由其他程序修改，保留当前值".into());
+        }
     }
 
     RestorePlan { changes, warnings, blocked: None }
@@ -541,6 +566,34 @@ mod tests {
         assert_eq!(enable.to, "0");
         let server = p.changes.iter().find(|c| c.key == "ProxyServer").unwrap();
         assert_eq!(server.to, "127.0.0.1:7897");
+    }
+
+    #[test]
+    fn restore_preserves_user_modified_enable_when_endpoint_is_ours() {
+        let j = journal(true, "127.0.0.1:7897", Some("localhost"));
+        // SpiderVPN 只改服务器和绕过列表，用户随后手动关掉了代理。
+        let current = ProxySnapshot {
+            enable: false, server: Some("127.0.0.1:7890".into()),
+            bypass: Some("localhost;<local>".into()), readable: true,
+        };
+        let plan = plan_restore(&j, &current, "127.0.0.1:7890");
+        assert!(!plan.changes.iter().any(|c| c.key == "ProxyEnable"));
+        assert!(plan.changes.iter().any(|c| c.key == "ProxyServer"));
+        assert!(plan.changes.iter().any(|c| c.key == "ProxyOverride"));
+    }
+
+    #[test]
+    fn restore_preserves_user_modified_bypass_when_endpoint_is_ours() {
+        let j = journal(false, "127.0.0.1:7897", Some("localhost"));
+        let current = ProxySnapshot {
+            enable: true, server: Some("127.0.0.1:7890".into()),
+            bypass: Some("localhost;192.168.*;<local>".into()), readable: true,
+        };
+        let plan = plan_restore(&j, &current, "127.0.0.1:7890");
+        assert!(!plan.changes.iter().any(|c| c.key == "ProxyOverride"));
+        assert!(plan.changes.iter().any(|c| c.key == "ProxyEnable"));
+        assert!(plan.changes.iter().any(|c| c.key == "ProxyServer"));
+        assert!(plan.warnings.iter().any(|w| w.contains("ProxyOverride")));
     }
 
     #[test]
