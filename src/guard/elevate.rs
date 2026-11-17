@@ -592,6 +592,24 @@ fn run_elevated(_exe: &Path, _req: &Path, _res: &Path) -> Result<i32, ElevateErr
     Err(ElevateError::SpawnFailed("当前平台不支持提权".to_string()))
 }
 
+/// 提权子进程不得从父进程的 JSON 自由选择证据存储：
+/// release 必须使用 Registry；仅测试/调试 build 且显式设置
+/// SPIDERVPN_ROOT 时才允许 IsolatedFile。必须在调用 WFP backend 前验证。
+fn validate_elevated_store_kind(kind: StoreKind) -> Result<(), String> {
+    let required = if crate::isolation::dev_root_override().is_some() {
+        StoreKind::IsolatedFile
+    } else {
+        StoreKind::Registry
+    };
+    if kind != required {
+        return Err(format!(
+            "提权请求存储类型 {} 与运行环境预期 {} 不一致",
+            kind.as_str(), required.as_str()
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 提权边界：请求中只信任“要处理的程序路径”，不信任其自称的 WFP AppId。
 // Remove 不需要 AppId，不能因为用户删除了旧 exe 就使解除功能失效。
@@ -692,6 +710,16 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
         );
         return 2;
     };
+    if let Err(reason) = validate_elevated_store_kind(store_kind) {
+        let _ = write_reply_file(
+            res_path,
+            &GuardReply {
+                result: Err(WfpError::InvalidState),
+                notes: vec![reason],
+            },
+        );
+        return 2;
+    }
     let expect = super::Expect {
         boot_id: req.boot_id.clone(),
         config_digest: req.config_digest.clone(),
@@ -797,13 +825,9 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
 /// 生产走 [`super::select`]；隔离环境（`SPIDERVPN_ROOT`）走文件 store——
 /// 子进程继承了父进程的环境变量，所以两边看到的是同一个 store。
 fn evidence_store_for(_req: &GuardRequest) -> Result<Box<dyn EvidenceStore>, String> {
-    let root = std::env::var("SPIDERVPN_ROOT").unwrap_or_default();
-    let root = if root.trim().is_empty() {
-        // 生产：不需要数据根（走注册表）
-        PathBuf::from(".")
-    } else {
-        PathBuf::from(root)
-    };
+    // 由编译模式和隔离测试入口决定，绝不读取未经审查的 release 环境变量。
+    let root = crate::isolation::dev_root_override()
+        .unwrap_or_else(|| PathBuf::from("."));
     super::evidence::select(&root).map_err(|e| e.to_string())
 }
 
@@ -904,6 +928,23 @@ mod tests {
         assert_eq!(guard_apply_main(&files.req, &files.res, &backend), 2);
         assert_eq!(backend.0.load(Ordering::SeqCst), 0,
             "被替换的请求不允许调用任何 WFP 后端动作");
+    }
+
+    #[test]
+    fn valid_but_wrong_elevated_store_kind_is_rejected_before_wfp() {
+        let expected = if crate::isolation::dev_root_override().is_some() {
+            StoreKind::IsolatedFile
+        } else {
+            StoreKind::Registry
+        };
+        let mismatched = if expected == StoreKind::Registry {
+            StoreKind::IsolatedFile
+        } else {
+            StoreKind::Registry
+        };
+        assert!(validate_elevated_store_kind(expected).is_ok());
+        assert!(validate_elevated_store_kind(mismatched).is_err(),
+            "即便 StoreKind 是已知枚举，提权端也不能信任它选择任意证据存储");
     }
 
     #[test]
