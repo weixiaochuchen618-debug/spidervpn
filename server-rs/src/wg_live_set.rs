@@ -80,7 +80,7 @@ fn checked_wg_executable() -> Result<(), LiveError> {
     crate::wg_readonly::trusted_wg_binary(Path::new(WG_BINARY))
         .map_err(|_: ReadError| LiveError::UnsafeBinary)
 }
-pub fn set_one_peer(
+fn set_one_peer(
     interface: &str, grant: &Grant, operation: Change,
 ) -> Result<(), LiveError> {
     let args = peer_command_args(interface, grant, operation)?;
