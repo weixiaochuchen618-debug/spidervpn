@@ -37,6 +37,7 @@ pub mod elevate;
 pub mod egress_policy;
 pub mod evidence;
 pub mod identity;
+pub mod lease_helper;
 pub mod proxy_identity;
 pub mod state;
 pub mod tun_identity;
