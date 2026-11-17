@@ -59,3 +59,58 @@ jobs:
           # Python until authenticated API, ledger migration, TLS, WG and
           # real-host rollback are separately validated.
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
+
+  linux-kernel-netns-sec01-acceptance:
+    # Dedicated privileged integration job: no ignored or skipped security tests.
+    # The disposable hosted VM and its netns are never the user's server.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux WireGuard and netns tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 wireguard-tools
+          test -x /usr/bin/wg
+
+      - name: Compile the dedicated real-kernel Rust integration test
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$PWD/server-rs/target/netns"
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-netns-acceptance --test wg_namespace_e2e --no-run
+
+      - name: Execute root-only audit with actual kernel peers in a disposable netns
+        shell: bash
+        run: |
+          set -euo pipefail
+          iface=spiderci0
+          ns="spider-sec01-$GITHUB_RUN_ID"
+          server_key="$(mktemp)"
+          conf="/etc/wireguard/$iface.conf"
+          cleanup() {
+            sudo rm -f "$conf"
+            sudo ip netns del "$ns" 2>/dev/null || true
+            rm -f "$server_key"
+          }
+          trap cleanup EXIT
+          umask 077
+          /usr/bin/wg genkey > "$server_key"
+          client_pub="$(/usr/bin/wg genkey | /usr/bin/wg pubkey)"
+          sudo install -d -m 0700 -o 0 -g 0 /etc/wireguard
+          test ! -e "$conf"
+          sudo ip netns add "$ns"
+          sudo ip -n "$ns" link add "$iface" type wireguard
+          sudo ip -n "$ns" link set "$iface" up
+          sudo ip netns exec "$ns" /usr/bin/wg set "$iface" private-key "$server_key"
+          printf '[Interface]\nPrivateKey = %s\nAddress = 10.66.0.1/24\n' "$(cat "$server_key")" | sudo tee "$conf" >/dev/null
+          sudo chmod 0600 "$conf"
+          test "$(sudo stat -c '%u:%a' "$conf")" = "0:600"
+          mapfile -t candidates < <(find server-rs/target/netns/debug/deps -maxdepth 1 -type f -name 'wg_namespace_e2e-*' -executable)
+          test "${#candidates[@]}" -eq 1
+          sudo ip netns exec "$ns" /usr/bin/env SPIDERVPN_SEC01_NS_INTERFACE="$iface" SPIDERVPN_SEC01_NS_CLIENT_PUBLIC_KEY="$client_pub" "$PWD/${candidates[0]}" --nocapture
