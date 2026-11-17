@@ -18,21 +18,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Compile Linux authority policy as Rust library (not Python)
+      - name: Verify standalone Linux Rust authority package and pinned dependencies
         shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           set -euo pipefail
-          rustc --edition=2021 --crate-name spidervpn_pair_authority --crate-type lib \
-            -D warnings server-rs/src/lib.rs \
-            -o "$RUNNER_TEMP/libspidervpn_pair_authority.rlib"
-      - name: Run SEC-01 revocation/replay and SEC-08 cross-process lock tests
+          cargo build --locked --manifest-path server-rs/Cargo.toml --all-targets
+
+      - name: Run SEC-01 revocation/replay, legacy audit and SEC-08 process locks
         shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           set -euo pipefail
-          rustc --edition=2021 --crate-name spidervpn_pair_authority \
-            --test -D warnings server-rs/src/lib.rs \
-            -o "$RUNNER_TEMP/spidervpn-pair-authority-tests"
-          "$RUNNER_TEMP/spidervpn-pair-authority-tests" --test-threads=1 --nocapture
+          cargo test --locked --manifest-path server-rs/Cargo.toml -- --test-threads=1 --nocapture
+
       - name: Verify production pairing runtime is not claimed to be migrated
         shell: bash
         run: |
