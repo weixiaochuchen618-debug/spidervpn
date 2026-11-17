@@ -161,13 +161,15 @@ pub fn apply_approved(
         return Err(RecoveryApplyError::InvalidState);
     }
     match check.stage {
-        RecoveryStage::PendingAdd=>
+        RecoveryStage::PendingAdd => {
             store.update(|l|l.confirm_consumed(&review.invite_id,Some(&live)))
-                .map_err(RecoveryApplyError::Store)?,
-        RecoveryStage::RevokingRemove=>
+                .map_err(RecoveryApplyError::Store)?;
+        }
+        RecoveryStage::RevokingRemove => {
             store.update(|l|l.confirm_revocation(&review.invite_id,Some(&live)))
-                .map_err(RecoveryApplyError::Store)?,
-    };
+                .map_err(RecoveryApplyError::Store)?;
+        }
+    }
     Ok(check.stage)
 }
 
