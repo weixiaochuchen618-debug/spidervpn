@@ -302,13 +302,19 @@ impl Drop for GuardIpcFiles {
     }
 }
 impl GuardIpcFiles {
-    fn create() -> Result<Self, String> {
+    fn create(req: &GuardRequest) -> Result<Self, String> {
         use ring::rand::{SecureRandom, SystemRandom};
+        use sha2::{Digest, Sha256};
         let mut token = [0u8; 16];
         SystemRandom::new().fill(&mut token)
             .map_err(|_| "无法生成安全的 Guard IPC 会话标识".to_string())?;
-        let suffix: String = token.iter().map(|b| format!("{b:02x}")).collect();
-        let dir = std::env::temp_dir().join(format!("SpiderVPN-guard-{suffix}"));
+        let nonce: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        // 请求字节的 SHA256 被写入 UAC 子进程命令行中不可变的目录名。
+        // 即便同用户恶意进程可改写请求文件，也不能修改已发起进程的 argv。
+        let encoded = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+        let digest = Sha256::digest(&encoded);
+        let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("SpiderVPN-guard-{nonce}-{hash}"));
         // create_dir 不会重用已有目录；任何碰撞或恶意预占都拒绝。
         std::fs::create_dir(&dir).map_err(|e| format!("创建独立提权目录失败：{e}"))?;
         let files = Self { req: dir.join("req.json"), res: dir.join("res.json"), dir };
@@ -316,6 +322,40 @@ impl GuardIpcFiles {
             .map_err(|e| format!("保护提权请求目录失败：{e}"))?;
         Ok(files)
     }
+}
+
+/// 提权子进程从 argv 所绑定的 SHA256 校验**本次读取的确切字节**，
+/// 同一份字节再反序列化；不得验证完文件路径后又重新从磁盘读一次。
+fn read_attested_guard_request(path: &Path) -> Result<GuardRequest, String> {
+    use sha2::{Digest, Sha256};
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("提权请求不存在：{e}"))?;
+    if !meta.file_type().is_file() || meta.len() == 0
+        || meta.len() as usize > MAX_IPC_FILE_BYTES
+    {
+        return Err("提权请求必须是大小受限的普通文件".into());
+    }
+    let mut input = std::fs::File::open(path)
+        .map_err(|e| format!("读取提权请求失败：{e}"))?;
+    use std::io::Read;
+    let mut data = Vec::new();
+    input.by_ref().take(MAX_IPC_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut data).map_err(|e| e.to_string())?;
+    if data.is_empty() || data.len() > MAX_IPC_FILE_BYTES {
+        return Err("提权请求读取时长度异常".into());
+    }
+    let dirname = path.parent().and_then(|p| p.file_name())
+        .and_then(|v| v.to_str()).ok_or("提权请求目录无效")?;
+    let Some((_, expected_hash)) = dirname.rsplit_once('-') else {
+        return Err("缺少提权请求摘要".into());
+    };
+    let calculated = Sha256::digest(&data);
+    let digest: String = calculated.iter().map(|b| format!("{b:02x}")).collect();
+    if digest != expected_hash {
+        return Err("提权请求内容与 UAC 启动时绑定的 SHA256 不符，拒绝执行".into());
+    }
+    serde_json::from_slice(&data)
+        .map_err(|e| format!("提权请求 JSON 无效：{e}"))
 }
 
 fn validate_guard_ipc_paths(req: &Path, res: &Path) -> Result<(), String> {
@@ -336,11 +376,16 @@ fn validate_guard_ipc_paths(req: &Path, res: &Path) -> Result<(), String> {
     }
     let dir = req.parent().ok_or("提权请求缺少父目录")?;
     let name = dir.file_name().and_then(|v| v.to_str()).unwrap_or("");
-    let Some(hex) = name.strip_prefix("SpiderVPN-guard-") else {
+    let Some(suffix) = name.strip_prefix("SpiderVPN-guard-") else {
         return Err("未知 Guard IPC 目录命名".into());
     };
-    if hex.len() != 32 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Guard IPC 目录必须使用独立的 128-bit 随机标识".into());
+    let Some((nonce, hash)) = suffix.split_once('-') else {
+        return Err("Guard IPC 缺少请求内容摘要".into());
+    };
+    if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit())
+        || hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("Guard IPC 目录必须使用独立随机标识与 SHA256 摘要".into());
     }
     if !std::fs::symlink_metadata(dir)
         .map_err(|e| format!("读取提权目录失败：{e}"))?.file_type().is_dir()
@@ -373,7 +418,7 @@ fn validate_guard_ipc_paths(req: &Path, res: &Path) -> Result<(), String> {
 /// （2026-11-06，r25）。`tests/acceptance-guard.ps1` 的 A2/A3 曾按那条意图写预期，
 /// 因此把「非提权 verify 会弹 UAC → 点否 = Declined」误判成 `NoPermission`。
 pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
-    let files = GuardIpcFiles::create().map_err(ElevateError::SpawnFailed)?;
+    let files = GuardIpcFiles::create(req).map_err(ElevateError::SpawnFailed)?;
     let (req_path, res_path) = (&files.req, &files.res);
     write_json_file(req_path, req).map_err(ElevateError::SpawnFailed)?;
     prepare_reply_file(res_path).map_err(ElevateError::SpawnFailed)?;
@@ -528,7 +573,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
     if validate_guard_ipc_paths(req_path, res_path).is_err() {
         return 2;
     }
-    let req: GuardRequest = match read_json_file(req_path) {
+    let req: GuardRequest = match read_attested_guard_request(req_path) {
         Ok(r) => r,
         Err(e) => {
             let _ = write_reply_file(
@@ -800,20 +845,43 @@ mod tests {
         }
     }
 
+    fn test_ipc_request() -> GuardRequest {
+        GuardRequest {
+            action: GuardAction::Verify, programs: Vec::new(), explicit: true,
+            config_digest: "hash".into(), nonce: "test-nonce".into(),
+            boot_id: "boot".into(), store_kind: "Registry".into(),
+            legacy_running: false, record_version: 1,
+        }
+    }
+
     #[test]
     fn guarded_ipc_rejects_arbitrary_paths_and_reused_names() {
-        let files = GuardIpcFiles::create().unwrap();
+        let files = GuardIpcFiles::create(&test_ipc_request()).unwrap();
         assert!(validate_guard_ipc_paths(&files.req, &files.res).is_ok());
         let bad = files.dir.join("other.json");
         assert!(validate_guard_ipc_paths(&files.req, &bad).is_err());
         assert!(validate_guard_ipc_paths(&files.req, &files.dir.join("req.json")).is_err());
         assert!(validate_guard_ipc_paths(&files.req, &std::env::temp_dir().join("res.json")).is_err());
-        assert!(files.dir.file_name().unwrap().to_string_lossy().len() >= 48);
+        assert!(files.dir.file_name().unwrap().to_string_lossy().len() >= 113);
+    }
+
+    #[test]
+    fn elevated_request_is_bound_to_original_uac_directory_digest() {
+        let req = test_ipc_request();
+        let files = GuardIpcFiles::create(&req).unwrap();
+        write_json_file(&files.req, &req).unwrap();
+        assert_eq!(read_attested_guard_request(&files.req).unwrap(), req);
+        // 恶意进程修改已写请求，UAC argv 绑定的目录摘要并不会改变。
+        let mut forged = req.clone();
+        forged.action = GuardAction::Remove;
+        std::fs::write(&files.req, serde_json::to_vec(&forged).unwrap()).unwrap();
+        assert!(read_attested_guard_request(&files.req).is_err(),
+            "请求文件在 UAC 之后被替换时不能执行 Remove");
     }
 
     #[test]
     fn one_shot_ipc_cannot_overwrite_existing_request_or_response() {
-        let files = GuardIpcFiles::create().unwrap();
+        let files = GuardIpcFiles::create(&test_ipc_request()).unwrap();
         let data = serde_json::json!({"Safe":true});
         write_json_file(&files.req, &data).unwrap();
         assert!(write_json_file(&files.req, &data).is_err(),
