@@ -230,11 +230,12 @@ mod tests {
 
     #[test]
     fn old_consumed_never_silently_gets_a_fake_request_digest() {
-        let json = json!({"SchemaVersion": 1, "Invites": {ID: old_consumed()}});
+        let json = json!({"SchemaVersion": 1, "Invites": {"11111111-1111-4111-8111-111111111111": old_consumed()}});
         let report = audit_legacy_json(json.to_string().as_bytes()).unwrap();
         assert_eq!(report.rows.len(), 1);
         let row = &report.rows[0];
         assert_eq!(row.legacy_state, LegacyState::Consumed);
+        assert_eq!(row.invite_id, ID);
         assert!(row.blockers.contains(&Blocker::MissingRequestDigest));
         assert!(row.blockers.contains(&Blocker::NeedsSignatureVerification));
         assert!(row.blockers.contains(&Blocker::NeedsLiveWireGuardReadback));
@@ -246,7 +247,7 @@ mod tests {
     fn consumed_digest_in_json_still_does_not_imply_cryptographic_trust() {
         let mut record = old_consumed();
         record["RequestDigest"] = json!("b".repeat(64));
-        let json = json!({"SchemaVersion": 1, "Invites": {ID: record}});
+        let json = json!({"SchemaVersion": 1, "Invites": {"11111111-1111-4111-8111-111111111111": record}});
         let report = audit_legacy_json(json.to_string().as_bytes()).unwrap();
         assert!(!report.rows[0].blockers.contains(&Blocker::MissingRequestDigest));
         assert!(report.rows[0].blockers.contains(&Blocker::NeedsSignatureVerification));
@@ -269,7 +270,7 @@ mod tests {
     #[test]
     fn cancelled_stays_cancelled_and_unknown_state_never_becomes_open() {
         let j = json!({"SchemaVersion": 1, "Invites": {
-            ID: {"State": "Cancelled"},
+            "11111111-1111-4111-8111-111111111111": {"State": "Cancelled"},
             "22222222-2222-4222-8222-222222222222": {"State": "Replayed"}
         }});
         let report = audit_legacy_json(j.to_string().as_bytes()).unwrap();
