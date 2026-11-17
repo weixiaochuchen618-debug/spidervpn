@@ -452,6 +452,11 @@ fn validate_guard_ipc_paths(req: &Path, res: &Path) -> Result<(), String> {
         {
             return Err("提权 IPC 路径包含目录联接或重解析点".into());
         }
+        // 路径与 SHA256 均正确也不能信任已经被放宽的 DACL。
+        // 审核发生在提权子进程触碰 Guard backend 之前，失败即拒绝。
+        for path in [dir, req, res] {
+            crate::secretfile::verify_private_ipc_acl(path)?;
+        }
     }
     Ok(())
 }
@@ -1033,6 +1038,35 @@ mod tests {
         assert!(validate_guard_ipc_paths(&files.req, &files.dir.join("req.json")).is_err());
         assert!(validate_guard_ipc_paths(&files.req, &std::env::temp_dir().join("res.json")).is_err());
         assert!(files.dir.file_name().unwrap().to_string_lossy().len() >= 113);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_entry_rejects_widened_reply_acl_before_wfp() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let request = test_ipc_request();
+        let files = GuardIpcFiles::create(&request).unwrap();
+        write_json_file(&files.req, &request).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_ok(),
+            "正常受保护目录/请求/回执必须成功通过实际 DACL 读回");
+
+        // 同账户攻击者能够放宽自己创建的回执 DACL；提权端必须按对象的
+        // 实际状态拒绝，而不是仅信父进程曾调用过 protect。
+        let output = std::process::Command::new("icacls")
+            .arg(&files.res)
+            .arg("/grant")
+            .arg("*S-1-5-11:(M)")
+            .output()
+            .expect("隔离 Windows runner 必须有 icacls");
+        assert!(output.status.success(),
+            "无法构造 ACL 降级负对照：{}", String::from_utf8_lossy(&output.stderr));
+        assert!(crate::secretfile::verify_private_ipc_acl(&files.res).is_err());
+        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_err());
+        let backend = CountingBackend(AtomicUsize::new(0));
+        assert_eq!(guard_apply_main(&files.req, &files.res, &backend), 2);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0,
+            "ACL 被放宽的 IPC 不允许访问 WFP 后端");
     }
 
     #[test]
