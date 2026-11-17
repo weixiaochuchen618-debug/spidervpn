@@ -84,7 +84,7 @@ jobs:
         run: |
           $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
           $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
-          foreach ($filter in @('guard::elevate::tests::', 'guard::identity::tests::', 'secretfile::tests::', 'guard::wfp::tests::')) {
+          foreach ($filter in @('guard::elevate::tests::', 'guard::identity::tests::', 'secretfile::tests::', 'guard::wfp::tests::', 'engine::tests::privileged_engine_cannot_be_selected_from_arbitrary_config_path', 'config::tests::engine_command_line_is_derived_per_line_and_the_hook_overrides_it')) {
             Write-Host "Running GNU Rust tests: $filter"
             & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn $filter -- --test-threads=1
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
