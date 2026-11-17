@@ -2152,7 +2152,17 @@ mod tests {
             !script.contains("transport.env"),
             "transport.env 是身份，不能删：{script}"
         );
-        assert!(!script.contains("/var/lib/tradechannel"), "审计与身份目录不能碰：{script}");
+        // The SEC-01 read-only retirement prelude MUST inspect the root
+        // path; forbidding the literal path anywhere would reject that
+        // necessary denial check. Remove only the exact, separately tested
+        // immutable read-only fence; the original uninstaller must still
+        // never mutate or even reference the legacy audit/identity tree.
+        let readonly_gate = crate::legacy_writer_fence::SHELL_DENY_PRELUDE;
+        assert_eq!(script.matches(readonly_gate).count(), 1,
+            "卸载必须且只能有一个经过验证的只读禁写门禁：{script}");
+        let uninstaller = script.replacen(readonly_gate, "", 1);
+        assert!(!uninstaller.contains("/var/lib/tradechannel"),
+            "卸载正文不得碰审计与身份目录：{uninstaller}");
     }
 
     #[test]
