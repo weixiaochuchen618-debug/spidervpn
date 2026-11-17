@@ -355,8 +355,9 @@ mod tests {
     #[test]
     fn unexpected_binary_in_bin_is_a_hard_error_not_deleted() {
         let path = root("unknown");
-        seal_layout(&path).unwrap();
-        let extra = path.join("bin").join("evil.dll");
+        let bin = path.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let extra = bin.join("evil.dll");
         std::fs::write(&extra, b"not allowed").unwrap();
         assert!(seal_layout(&path).is_err(), "unknown DLL must not be tolerated");
         assert!(extra.exists(), "do not silently delete user files");
