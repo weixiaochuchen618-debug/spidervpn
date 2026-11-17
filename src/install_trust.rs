@@ -59,6 +59,9 @@ fn check_target(target: &Path) -> Result<(), String> {
     // Reject drive roots, UNC, and lexical escapes; do not turn this
     // privileged operation into a generic recursive chmod.
     use std::path::Prefix;
+    if target.to_string_lossy().split(['\\', '/']).any(|s| s == "." || s == "..") {
+        return Err("安装路径不能包含 . 或 ..".into());
+    }
     let mut components = target.components();
     match (components.next(), components.next()) {
         (Some(Component::Prefix(prefix)), Some(Component::RootDir))
@@ -75,8 +78,17 @@ fn check_target(target: &Path) -> Result<(), String> {
 fn no_reparse(path: &Path) -> Result<(), String> {
     use crate::guard::identity::{reparse_chain, IdentityEnv};
     let env = crate::guard::wfp_win::SystemIdentityEnv::new();
-    if reparse_chain(path).iter().any(|p| env.is_reparse_point(p)) {
-        return Err(format!("可信安装路径存在目录联接/重解析点：{}", path.display()));
+    for part in reparse_chain(path) {
+        // Missing final component is allowed BEFORE atomic CreateDirectoryW,
+        // but a dangling symlink is present in symlink_metadata and rejected.
+        match std::fs::symlink_metadata(&part) {
+            Ok(_) if env.is_reparse_point(&part) => {
+                return Err(format!("可信安装路径存在目录联接/重解析点：{}", part.display()));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("无法验证路径 {}：{e}", part.display())),
+        }
     }
     Ok(())
 }
