@@ -16,16 +16,12 @@ use crate::guard::{
     state::{GuardEvidence, RecordError},
 };
 
-const BIN_MANIFEST: &[&str] = &[
-    "spidervpn.exe",
-    "sing-box.exe",
-    "WebView2Loader.dll",
-    "sing-box.LICENSE.txt",
-];
-
-/// Names of the files the thin script is allowed to delete. Keeping this
-/// manifest in Rust avoids PS inventing an unreviewed wildcard deletion.
-pub fn code_file_manifest() -> &'static [&'static str] { BIN_MANIFEST }
+/// The installation allowlist is the one Rust source of truth shared by
+/// install, removal and regression tests. The PS thin wrapper is checked
+/// against this list in CI before any release is considered.
+pub fn code_file_manifest() -> &'static [&'static str] {
+    crate::install_trust::BIN_FILES
+}
 
 fn safe_local_root(root: &Path) -> Result<(), String> {
     // Disallow lexical escapes, UNC and drive roots; must point to the
@@ -350,6 +346,41 @@ mod tests {
         assert!(!owned_launcher_bytes(uninstaller.as_bytes(), other, "卸载SpiderVPN.cmd"));
         assert!(!owned_launcher_bytes(b"@echo off\r\nrem arbitrary custom command\r\n", root, "卸载SpiderVPN.cmd"));
         assert!(!owned_launcher_bytes(ok.as_bytes(), root, "random.cmd"));
+    }
+
+    #[test]
+    fn uninstall_script_manifest_matches_rust_install_manifest_without_duplicates() {
+        let script = include_str!("../package-files/uninstall.ps1");
+        let manifest_line = script.lines()
+            .find(|line| line.trim_start().starts_with("foreach ($n in @('sing-box.exe'"))
+            .expect("thin wrapper must have a fixed bin file deletion list");
+        let ps_names: Vec<_> = manifest_line.split("'").enumerate()
+            .filter_map(|(i, segment)| if i % 2 == 1 { Some(segment) } else { None })
+            .collect();
+        let rust_names = code_file_manifest();
+        assert_eq!(ps_names.len(), rust_names.len());
+        for file in rust_names {
+            assert_eq!(ps_names.iter().filter(|name| *name == file).count(), 1,
+                "every packaged Rust manifest item must be deleted exactly once: {file}");
+        }
+        assert_eq!(ps_names.last().copied(), Some("spidervpn.exe"),
+            "client recovery executable must be the final bin deletion");
+
+        let launchers = script.find("foreach ($n in @('启动SpiderVPN.cmd'")
+            .expect("known root scripts must be handled explicitly");
+        let root_section = &script[launchers..script.find("# 3) ").unwrap()];
+        assert!(!root_section.contains("'uninstall.ps1'"),
+            "never remove recovery uninstaller before deleting other binaries");
+        let final_script_cleanup = script.find("Remove-Item -LiteralPath $uninstaller -Force")
+            .expect("uninstaller must eventually be cleaned");
+        assert!(final_script_cleanup > script.find("foreach ($n in @('sing-box.exe'").unwrap(),
+            "uninstaller may be deleted only after the binary cleanup loop");
+
+        let installer = include_str!("../package-files/install.ps1");
+        for required in ["'sing-box.exe'", "'WebView2Loader.dll'",
+                         "'sing-box.LICENSE.txt'"] {
+            assert!(installer.contains(required), "installer manifest drift: {required}");
+        }
     }
 
     #[test]
