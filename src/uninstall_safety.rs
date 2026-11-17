@@ -297,6 +297,21 @@ mod tests {
     }
 
     #[test]
+    fn wfp_removed_but_marker_storage_failure_still_refuses_uninstall() {
+        let p = root("marker-write-failure");
+        // Make the fake evidence directory a regular file. The WFP backend
+        // succeeds, but the Removed marker cannot be persisted.
+        std::fs::write(p.join("guard"), b"blocking placeholder").unwrap();
+        let store = IsolatedFileStore::new(&p).unwrap();
+        let fake = FakeBackend::new(false, false);
+        assert!(release_guard_with(&p, false, &fake, &store).is_err(),
+            "a marker persistence error must retain the installed executable");
+        assert_eq!(fake.calls(), 1);
+        assert!(p.join("guard").is_file(), "never delete unrelated files");
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
     fn journal_blocks_even_explicit_keep_guard_without_wfp_call() {
         let p = root("journal");
         let data = p.join("data");
