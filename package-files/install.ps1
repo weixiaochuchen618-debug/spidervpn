@@ -11,7 +11,7 @@ SpiderVPN 一键安装：把程序放到固定位置，并建好启动与卸载�
 `--install-seal` 原生命令设置并读回；`bin`/启动脚本只允许管理员写，
 `data` 保留普通用户配置写入。TUN 模式仍需管理员入口启动。
 参数是给测试与高级用法留的：
-  -TargetDir <路径>   换安装位置（默认 C:\SpiderVPN）
+  -TargetDir <路径>   仅开发/调试版支持临时测试目录；正式 Release 固定 C:\SpiderVPN
   -NoDesktop          不建桌面入口（测试用）
   -NoStartMenu        不建开始菜单入口（测试用）
 
@@ -180,6 +180,7 @@ Say '已安装。'
 Say ("  程序：{0}（{1:N0} B）" -f $dstExe, $size)
 Say "  SHA256：$dstHash"
 Say "  数据：C:\SpiderVPN\data（升级不会动它）"
+Say '  权限：程序及引擎由 Rust 验证为受保护；数据目录保留普通用户写入'
 Say "  启动：双击桌面「启动SpiderVPN.cmd」"
 Say '        TUN 模式要接管全部流量（含不读系统代理的交易终端），请用「以管理员身份启动SpiderVPN.cmd」'
 Say "  卸载：$uninstCmd"
