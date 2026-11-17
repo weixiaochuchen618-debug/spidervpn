@@ -36,12 +36,19 @@
 | SEC-07 | 邀请 TLS 证书只初始化不续期，过期误报 pin 错 | 未修复 | `tc-pair.py:352`，`pairing.rs:4556` |
 | SEC-08 | 邀请状态/WG 配置无跨进程锁，固定 tmp | 未修复 | `tc-pair.py:82,238,1286,1333` |
 | SEC-09 | 卸载 Guard exit 3 仍删 exe、残留 sing-box、路径子串匹配 | 未修复 | `uninstall.ps1:90-141` |
-| SEC-10 | 旧 `--guard-apply` 提权请求临时文件/输入信任边界 | 未修复 | `guard/elevate.rs:208-256,361` |
+| SEC-10 | 旧 `--guard-apply` 提权请求临时文件/输入信任边界 | **PR #6 开发中，部分候选已推送，待 CI/双账户验收** | `guard/elevate.rs`、`secretfile.rs` |
 | SEC-11 | UTF-8 `&ts[5..10]`、`value[..43]` 和生产 panic | 未修复 | `uiweb_form.rs:6828`，`pairing.rs:2072` |
 
 **服务器端两个漏洞的旧版复现来自另一 Agent 的离线报告；这次快照确认危险代码仍在，但尚未在最新代码做实机动态利用复现。** 不要声称已实测新版本。
 
 **PR #3 WFP 另外还没完成**：WFP-01 代理精确许可生产仲裁、WFP-02 长期 helper 正式生命周期接入/IPC 权限、WFP-03 Wintun/TUN 故障退出放行、WFP-04 v2 证据/同步/回滚、WFP-05 真机网络泄漏验收。当前只是候选与隔离实验代码，详见 Backlog。
+
+## 3.1 最新活动修复恢复点（SEC-10，2026-11-17）
+
+- 独立 Rust 修复 [PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，从 main `857ea759` 开始；最新已推送提交 `42aedf3d`，Draft，不影响 main 或 WFP PR #3。
+- 已做：提权子进程二次核验 WFP AppId/device path、拒绝虚假 StoreKind；guard 请求使用随机独立 DACL 目录，UAC 启动参数携带请求 SHA256 内容绑定，固定文件名/路径验证，主程序预建空回执避免不同进程文件 owner 权限问题；Rust 对抗单测已编写。
+- 待做：**必须先检查**最新 [MSVC CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44002624491) 与 [GNU CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44002624470) 的状态及失败日志。然后完成 Windows 非管理员与管理员不同账户的实机 ACL/UAC 验收、可信安装目录和配置引擎路径等 SEC-03 工作。没有通过前不得称为 P0 已修复。
+- 真正任务状态写在 [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) 的 “D.1 最新恢复点”。更换 Agent 直接从该条开始，不需要用户重新说明。
 
 ## 4. 新 Agent 首次执行的标准流程（无需用户再解释需求）
 
