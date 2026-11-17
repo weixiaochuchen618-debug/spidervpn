@@ -40,6 +40,7 @@ mod guard;
 mod instance;
 mod ipc;
 mod isolation;
+mod install_trust;
 mod lifecycle;
 // 线路动作（测速 / 保存连接方式）的结果记录：要活过重启，启动时把被中断的动作改判。
 mod lineaction;
@@ -146,6 +147,24 @@ fn main() -> ExitCode {
         eprintln!("数据根  ：{}", isolation::data_root().display());
         eprintln!("已定版的 旧版被冻结，本程序不得与它共用任何运行时资源。");
         return ExitCode::from(exit::ENVIRONMENT);
+    }
+
+    // SEC-03：安装脚本仅负责文件复制；可信代码目录的受保护 ACL、
+    // 数据目录的单独写入权限与 Win32 ACL 读回决策只在 Rust 实现。
+    // 放在锁和正常初始化前：安装时程序本体尚未进入正式运行阶段。
+    if let Some(vals) = arg_values("--install-seal", 1) {
+        return match install_trust::seal_installed_product(
+            std::path::Path::new(&vals[0]),
+        ) {
+            Ok(()) => {
+                println!("  已核验并保护 SpiderVPN 程序目录；数据目录保持独立可写。");
+                ExitCode::SUCCESS
+            }
+            Err(reason) => {
+                eprintln!("  可信安装权限未完成：{reason}");
+                ExitCode::from(exit::ENVIRONMENT)
+            }
+        };
     }
 
     // `--ping`：纯客户端探测，**不建目录、不抢单实例锁**。
@@ -3502,6 +3521,7 @@ const VALUED_ARGS: &[(&str, usize, &str, &str)] = &[
     ("--backup", 1, "--backup <文件>（导出路径；默认写到 数据根\\exports）", "--backup C:\\transport.json"),
     ("--fingerprint", 1, "--fingerprint SHA256:…（首次连接确认用）", "--server-inspect root@1.2.3.4 --fingerprint SHA256:abc…"),
     // 内部提权子进程：由本程序自己起，用户不需要手工输入。放在这里是为了让参数校验认识它。
+    ("--install-seal", 1, "--install-seal <安装目录>（内部安装权限阶段）", "由安装器以管理员权限调用"),
     ("--guard-apply", 2, "--guard-apply <request.json> <response.json>（内部提权子进程）", "不由用户手工执行"),
 ];
 
