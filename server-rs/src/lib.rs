@@ -51,6 +51,9 @@ pub mod recovery_inspect;
 #[cfg(target_os = "linux")]
 pub mod recovery_apply;
 
+#[cfg(all(target_os = "linux", feature = "linux-admin-finalize"))]
+pub mod admin_terminal;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {

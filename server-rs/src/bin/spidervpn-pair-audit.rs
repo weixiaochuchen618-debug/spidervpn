@@ -22,6 +22,8 @@ use spidervpn_pairing_authority::recovery_inspect::{
     inspect_pinned_recovery, RecoveryInspection,
 };
 use spidervpn_pairing_authority::wg_readonly::valid_interface;
+#[cfg(feature = "linux-admin-finalize")]
+use spidervpn_pairing_authority::admin_terminal;
 
 unsafe extern "C" {
     fn geteuid() -> u32;
@@ -33,6 +35,8 @@ enum CliError {
     InvalidArguments,
     Clock,
     InspectionDenied,
+    #[cfg(feature = "linux-admin-finalize")]
+    FinalizationUncertain,
 }
 
 struct InspectRequest {
@@ -119,6 +123,22 @@ fn system_inspect(
         .map_err(|_| ())
 }
 
+#[cfg(feature = "linux-admin-finalize")]
+fn run_local_finalize(args: &[String], uid: u32, now: i64) -> Result<String, CliError> {
+    if uid != 0 { return Err(CliError::RootRequired); }
+    if now < 0 { return Err(CliError::Clock); }
+    if args.len() != 4 || args[0] != "finalize" {
+        return Err(CliError::InvalidArguments);
+    }
+    let mut validation = args.to_vec();
+    validation[0] = "inspect".to_owned();
+    let request = parse(&validation)?;
+    let stage = admin_terminal::finalize_from_root_tty(
+        &request.root, &request.interface, &request.invite_id,
+    ).map_err(|_| CliError::FinalizationUncertain)?;
+    Ok(format!("ledger finalized at {stage:?}; WireGuard peers and config unchanged"))
+}
+
 fn main() {
     let args = std::env::args_os()
         .skip(1)
@@ -129,6 +149,9 @@ fn main() {
         .and_then(|duration| i64::try_from(duration.as_secs()).ok());
     let uid = unsafe { geteuid() };
     let result = match (args, now) {
+        #[cfg(feature = "linux-admin-finalize")]
+        (Ok(args), Some(now)) if args.first().map(String::as_str) == Some("finalize") =>
+            run_local_finalize(&args, uid, now),
         (Ok(args), Some(now)) => run_with(&args, uid, now, system_inspect),
         (Err(_), _) => Err(CliError::InvalidArguments),
         (_, None) => Err(CliError::Clock),
@@ -141,7 +164,16 @@ fn main() {
                 CliError::InvalidArguments => "invalid command or arguments",
                 CliError::Clock => "system time unavailable",
                 CliError::InspectionDenied => "inspection denied (ledger, lock or WireGuard state unverified)",
+                #[cfg(feature = "linux-admin-finalize")]
+                CliError::FinalizationUncertain => "terminal confirmation or finalization denied; inspect persistent ledger state before retry",
             };
+            #[cfg(feature = "linux-admin-finalize")]
+            if matches!(err, CliError::FinalizationUncertain) {
+                eprintln!("spidervpn-pair-audit: {message}");
+            } else {
+                eprintln!("spidervpn-pair-audit: {message}; no recovery action taken");
+            }
+            #[cfg(not(feature = "linux-admin-finalize"))]
             eprintln!("spidervpn-pair-audit: {message}; no recovery action taken");
             std::process::exit(2);
         }
