@@ -17,13 +17,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
+use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
 pub mod lock;
 
 pub mod legacy;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub mod ledger_disk;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Claims {
     pub invite_id: String,
     pub request_id: String,
@@ -33,7 +38,8 @@ pub struct Claims {
     pub recipient_jwk_digest: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Grant {
     pub claims: Claims,
     pub address: Ipv4Addr,
@@ -47,7 +53,7 @@ pub struct Peer {
     pub address: Ipv4Addr,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InviteState {
     Open,
     /// Durable reservation written before any WireGuard changes.
@@ -62,7 +68,8 @@ pub enum InviteState {
     Expired,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Invitation {
     pub expires_unix: i64,
     pub state: InviteState,
@@ -112,29 +119,30 @@ impl AddressPool {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ledger {
-    invitations: BTreeMap<String, Invitation>,
-    revoked_devices: BTreeSet<String>,
-    revoked_keys: BTreeSet<String>,
+    pub(crate) invitations: BTreeMap<String, Invitation>,
+    pub(crate) revoked_devices: BTreeSet<String>,
+    pub(crate) revoked_keys: BTreeSet<String>,
 }
 
-fn lower_uuid(s: &str) -> bool {
+pub(crate) fn lower_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36 && b.iter().enumerate().all(|(i, c)| match i {
         8 | 13 | 18 | 23 => *c == b'-',
         _ => c.is_ascii_digit() || (b'a'..=b'f').contains(c),
     })
 }
-fn wg_key(s: &str) -> bool {
+pub(crate) fn wg_key(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 44 && b[43] == b'=' && b[..43].iter().all(|c|
         c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
 }
-fn hex_sha256(s: &str) -> bool {
+pub(crate) fn hex_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
-fn claims_valid(c: &Claims) -> bool {
+pub(crate) fn claims_valid(c: &Claims) -> bool {
     lower_uuid(&c.invite_id)
         && lower_uuid(&c.request_id)
         && lower_uuid(&c.device_id)
