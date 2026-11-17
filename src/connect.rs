@@ -686,15 +686,13 @@ mod tests {
         }
     }
 
-    /// 每个用例一个不同的端口，且按进程号取基址。
-    ///
-    /// 两层都要：**用例之间**不能同端口（连接现在会真去 bind，同进程并行跑会互抢）；
-    /// **进程之间**也要错开（可能同时有另一个 `cargo test`/真机引擎在跑，撞上就变成看运气的测试）。
+    /// 测试专用端口由 Windows TCP 栈选择，避开系统保留 / 排除的端口段。
+    /// 固定的 PID 派生端口（如 50018）在 CI 上可能报 WSAEACCES 10013。
+    /// 此处只改变测试用例，实际用户线路的端口与连接逻辑完全不变。
     fn next_test_port() -> u16 {
-        use std::sync::atomic::{AtomicU16, Ordering};
-        static N: AtomicU16 = AtomicU16::new(0);
-        let base = 50_000 + (std::process::id() % 200) as u16 * 60;
-        base + N.fetch_add(1, Ordering::Relaxed)
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test TCP allocator must provide a free loopback port");
+        probe.local_addr().expect("test bound port").port()
     }
 
     fn engine() -> EngineConfig {
