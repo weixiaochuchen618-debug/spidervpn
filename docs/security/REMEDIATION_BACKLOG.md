@@ -18,14 +18,14 @@
 
 | ID | 级别 | 当前状态 | 模块与证据 | 首要下一动作 | 关闭条件（简） |
 |---|---|---|---|---|---|
-| **SEC-01** | **P0 / 高** | 🔴 未修复（旧版曾复现） | `assets/tc-pair.py:1195,1230-1246`; `src/deploy.rs:849-891` | Rust 邀请授权/撤销状态机 + 旧记录迁移，拒绝重放 | 撤销后原/换公钥不能复入网，地址无重叠，HTTP 与 CLI 一致 |
+| **SEC-01** | **P0 / 高** | 🟠 Rust 策略核心候选（13/13 Linux 单测绿）；**生产漏洞未修复** | `assets/tc-pair.py:1195,1230-1246`; `src/deploy.rs:849-891` | Rust 邀请授权/撤销状态机 + 旧记录迁移，拒绝重放 | 撤销后原/换公钥不能复入网，地址无重叠，HTTP 与 CLI 一致 |
 | **SEC-02** | **P0 / 高** | 🔴 未修复（旧版曾复现） | `assets/tc-pair.py:1453-1456`; `src/pairhost.rs:36-47` | Rust TLS daemon 并发握手 + 超时 + 低权限服务 | 一条/多条空闲连接不堵塞正常 HTTPS，服务资源可控 |
 | **SEC-03** | **P0 / 高（本地威胁前提）** | 🟠 Rust ACL 候选开发中（未实机安全验收） | `package-files/install.ps1`; `src/engine.rs:163-191`; `src/isolation.rs:31-45` | Rust 安装可信边界/受保护 bin 与特权引擎路径策略 | 非管理员不可替换特权执行目标，配置篡改不能导致任意提权执行 |
 | **SEC-04** | **P1 / 中** | 🟠 部分修复 | `src/secretfile.rs:91-116`; `src/main.rs:642-705` | Rust 密钥导出与敏感文件 ACL 全覆盖，区分保密/防篡改 | 导出私钥无宽 ACL、旧文件迁移、运行正常 |
 | **SEC-05** | **P1 / 中** | 🔴 未修复 | `src/engine.rs:100-136`; `src/connect.rs:531-535,689-720` | Rust 引擎 HANDLE + 创建时间/路径/会话 ID 校验 | PID 复用不误杀陌生进程、不阻塞代理自愈 |
 | **SEC-06** | **P1 / 中** | 🔴 未修复 | `src/uiweb_form.rs:57,705`; `src/deploy.rs:1933,3326` | Rust 单一 TCP 端口白名单 | 443/8443/2443 部署、导出、导入、恢复一致通过 |
 | **SEC-07** | **P1 / 中** | 🔴 未修复 | `assets/tc-pair.py:68,352-357`; `src/pairing.rs:4556-4581` | Rust 证书到期管理/代际轮换，区分 expired 与 pin mismatch | 到期提前预警；不接受过期证书；轮换后新旧邀请有明确语义 |
-| **SEC-08** | **P1 / 中低（可放大 SEC-01）** | 🔴 未修复 | `assets/tc-pair.py:82,235-243,1286,1333` | Rust daemon 同一跨进程锁/交易日志 + 原子更新 | 多进程请求不丢状态、不复活已撤销设备、无相同 IP 双 peer |
+| **SEC-08** | **P1 / 中低（可放大 SEC-01）** | 🟠 Linux Rust flock 锁核心已测；**生产 Python 仍未接线** | `assets/tc-pair.py:82,235-243,1286,1333` | Rust daemon 同一跨进程锁/交易日志 + 原子更新 | 多进程请求不丢状态、不复活已撤销设备、无相同 IP 双 peer |
 | **SEC-09** | **P1 / 中低（Guard 失控影响高）** | 🟠 Rust 安全卸载候选已推送，待最终 CI / 实机 | `package-files/uninstall.ps1:90-101,108-133,133-141` | Rust 卸载预检查/精确清单/Guard 读回 | exit 3 不误删 exe、残留可清、相邻目录不误删 |
 
 ### 必须补的复现/回归清单
@@ -247,3 +247,12 @@ PR/commit/CI: ...
 - [Windows GNU 44031103722](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103722) 已核对 head_sha 一致，**Completed/Success**：Rust GNU 构建、release 安装根保护、Guard/卸载/SEC11 专项全部成功。
 - [Windows MSVC 44031103332](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103332) 已成功完成 Rust Build、PowerShell 脚本语法、SEC09/10/11 专项、全部独立 Rust integration 目标，正在运行模块回归/便携 unit suite；截至写入时 workflow 未终态，**不得提前宣称 MSVC 全绿**。旧 MSVC 原有 8 项环境依赖排除仍保留、无新增 skip。
 - 严禁把 d4f7feb8 的红例删除/改写为成功。SEC-09/11 仅候选、实机 WFP/Windows A/B/C 与生产 unwrap/expect 审查仍未完成，PR6 Draft 不合并 main。
+
+## D.13 SEC-01/SEC-08 Linux Rust 迁移核心第一阶段（2026-11-17）
+
+- **真实根因**：assets/tc-pair.py::authorize_invite(Consumed) 只比 RequestId/JwkDigest 后仍调用 attach_client，缺失原 ClientPublicKey、DeviceId、RequestDigest 一致性与现存 peer 验证；管理端 src/deploy.rs::revoke_script 仅删除 WG 公钥，不给 invites.json 写 Revoked 墓碑。旧邀请可通过申请重放再次写回已被撤销的 WG peer；CONSUME_LOCK 为单 Python 进程锁，不覆盖 SSH/多 HTTP 进程。
+- **仅 Rust 候选，未替代 Python**：新增 server-rs/src/lib.rs 的纯 Rust Open→Pending→Consumed→Revoking→Revoked/Cancelled 状态机，要求重新签名验真后才可调用策略、live WG key+IP 严格匹配后才允许幂等只读重试、撤销前先持久拒绝、后验 WG absence；同邀请换公钥/DeviceId/RequestDigest 拒绝，跨邀请复用已撤销 DeviceId 或原 key 拒绝，未知 live inventory 失败，租约/待撤销 IP 不重复分配。新增 server-rs/src/lock.rs Linux x86_64 基于 flock 的文件锁，受保护 UID/0600/0700、超时、符号链接及硬链接拒绝；独立子进程验证锁。
+- **CI 证据**：[Linux Rust authority 44033771424](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44033771424) 的 head_sha=8e4a2356f93dd456158e30881ab114c96699e238，**Completed/Success，13 passed/0 failed/0 ignored**。工作流 `security-pairing-rust-linux.yml` 使用 rustc 编译 rlib 和 Rust 测试，不执行或更改 Python 接收服务。源文件由 Rust 编译，不引入新 Python 逻辑。
+- **同一 SHA Windows 旧客户端兼容 CI**：当前 [MSVC 44033771576](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44033771576) / [GNU 44033771443](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44033771443) 写入时还在运行；它们是客户端 ABI 回归，不能替代 Linux 真实 WireGuard/TLS 运行。
+- **明确未完成、不能宣称 SEC-01 修复**：当前 src/pairhost.rs 的 systemd ExecStart 仍 `/usr/bin/python3 -I .../tc-pair.py serve`；Rust authority 还没有密码学验签/JWE、生产 JSON schema 与 fsync 事务、旧 invites.json 持久迁移、WG config/wg syncconf 真实操作、Linux TLS、权限分离、恢复流程、Windows 管理端撤销入口接线。所有对在线攻击者的生产风险仍未正式关闭。详细步骤与 S01–S06 见 [SEC01_LINUX_RUST_MIGRATION.md](./SEC01_LINUX_RUST_MIGRATION.md)。
+- **下一步**：采用独立 Linux Rust server Cargo 包，先建旧 records 迁移/严格 schema、跨进程原子 Ledger（必须锁住整个 WG transaction），再做 Rust TLS 与真机虚拟化验收。若采用另一个实现策略仍须保证老邀请消费路径不可再 attach 已撤销的 peer。SEC-01 P0、SEC-02 P0、SEC-08 P1 仍 open，PR #6/#3 Draft、main 不动。
