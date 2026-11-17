@@ -4,6 +4,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Only the newest SHA of a PR needs full MSVC validation; older in-flight
+# runs are superseded, not counted as green or treated as skipped tests.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
