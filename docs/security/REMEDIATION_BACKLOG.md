@@ -315,3 +315,13 @@ PR/commit/CI: ...
 - 同一 SHA 的 [Windows GNU #44042690146](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690146) **Completed/Success**（Rust GNU 构建、Release SPIDERVPN_ROOT 隔离、原 SEC-09/10/11 安全专项）。
 - 同一 SHA 的 [Windows MSVC #44042690238](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690238)：Rust 构建、PowerShell 语法、安全专项、全部集成测试、变更模块回归均已 Success；记录时正在跑最后 `Portable Rust unit suite`，保留原先 8 项环境依赖排除，本轮无新增 skip。必须查询最终 workflow `Completed/Success` 后才可宣称完整 MSVC 绿。
 - 此证据仅表明 Linux Rust 候选单测与现有 Windows 桌面程序自动化兼容，**不是 Linux 线上 Python 接收器、真实 wg set、Windows UAC/WFP 实机安全验收**。发布约束仍不变，Issue #5 Open，PR #3/#6 Draft，不合并 main。
+
+## D.21 SEC-01 中断 WG 事务四态诊断及可信终态补写（2026-11-17）
+
+- **活动 Rust 代码 HEAD** `0f4f87b92372561475afa790e3c27ba68d89823c`、Draft PR #6。原 `468af9e6` Linux 71/71 + Windows MSVC/GNU 同 SHA 均 **Completed/Success**；此次在此基础上新增 `server-rs/src/recovery_inspect.rs`，不修改旧生产 Python、Windows UI/Guard/WFP。
+- 新 Rust 恢复检查器从**持久 LedgerStore 的 Pending/Revoking** 而非任意网络请求字段识别状态；对新增和撤销分别处理“磁盘/内核两侧都完成、仅磁盘完成、仅内核完成、两侧都未完成”四种组合。只返回 `VerifyAndFinalize` / `RepairConfigWithApproval` / `RepairKernelWithApproval` / `RepairBothWithApproval` 供未来本地管理员使用，**不执行修复命令或自动 reattach**；`Open` / `Consumed` / `Revoked` 无法进入恢复。
+- `inspect_pinned_recovery` 真实 Rust 只读入口在 LedgerStore 跨进程锁生效时依次读取 live-before、受保护 root-only `wg.conf`、live-after；前后 live 需一致，可容许**仅目标 peer** 的磁盘/live 差异。目标公钥/IP 任一被其他设备占用、无关 peer 变化、快照损坏或重复、过期未完成 Pending，均 fail closed。
+- `finalize_stable_prepared` 只允许真正已达双方一致终态时，在重新核实 live+config 后持久补写 Pending→Consumed 或 Revoking→Revoked（包括墓碑）。**若还需要修改 WG 内核或 wg.conf，它直接拒绝**，普通 replay 不允许通过此功能补增 peer。
+- **最新 Linux CI**：[44045613147](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44045613147)，head_sha=`0f4f87b9`，**Completed/Success：85 passed / 0 failed / 0 ignored**，继续 `cargo --locked` + `RUSTFLAGS=-D warnings`，新增 14 条 recovery 状态组合、冲突、漂移、只读和终态落盘回归；**没有执行真实 WireGuard 命令或修改服务器**。
+- **当前 Windows 同 SHA**：[MSVC #44045613185](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44045613185) / [GNU #44045613264](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44045613264)，写入时仍需核对终态；旧 MSVC/GNU 绿不能冒充最新 SHA 的结果。
+- **后续阻塞**：只有恢复诊断和“已完成则安全补写账本”已候选通过；管理员显示批准/二次读回的有写副作用的部分修复、真实 Linux WG namespace 测试、旧邀请 RSA/JWE 验签/RequestDigest 迁移、SEC-02 Linux TLS 非特权服务、Windows 管理端 revoke 接线仍未完成。旧 Python 接收器线上路径仍可能重放被撤销设备：SEC-01/02/08 **生产未修复**。继续 Issue #5 Open、PR #3/#6 Draft、main 857ea759 未合并。
