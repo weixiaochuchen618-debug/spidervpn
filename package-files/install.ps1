@@ -7,7 +7,9 @@ SpiderVPN 一键安装：把程序放到固定位置，并建好启动与卸载�
 数据根是程序里的**常量** `C:\SpiderVPN\data`，与安装目录无关——
 所以升级只要覆盖 bin 下的文件，配置、线路、记录都不会丢。
 
-默认装到 `C:\SpiderVPN`（普通用户可写；TUN 模式仍需用管理员入口启动）。
+默认装到 `C:\SpiderVPN`。安装阶段要求管理员权限，权限策略由 Rust
+`--install-seal` 原生命令设置并读回；`bin`/启动脚本只允许管理员写，
+`data` 保留普通用户配置写入。TUN 模式仍需管理员入口启动。
 参数是给测试与高级用法留的：
   -TargetDir <路径>   换安装位置（默认 C:\SpiderVPN）
   -NoDesktop          不建桌面入口（测试用）
@@ -75,8 +77,14 @@ Verify-Packed $srcExe 'spidervpn.exe'
 $srcEngine = Join-Path $SourceDir 'sing-box.exe'
 if (Test-Path -LiteralPath $srcEngine) { Verify-Packed $srcEngine 'sing-box.exe' }
 
+# SEC-03：先在 Rust/Win32 里原子创建或收紧程序根与 bin 的 ACL，
+# 再复制文件。普通用户未提权直接拒绝，不能装出“成功但 bin 可改”的版本。
+# 此脚本不决定谁可写、也不直接使用 icacls 改安全权限。
+& $srcExe --install-seal $TargetDir
+if ($LASTEXITCODE -ne 0) {
+    Bad 'Rust 安装权限预检失败：未复制任何新程序文件。请以管理员身份运行可信安装包。'
+}
 $bin = Join-Path $TargetDir 'bin'
-$null = New-Item -ItemType Directory -Path $bin -Force
 $dstExe = Join-Path $bin 'spidervpn.exe'
 try {
     Copy-Item -LiteralPath $srcExe -Destination $dstExe -Force
@@ -147,6 +155,13 @@ if (-not $NoStartMenu) {
     [IO.File]::WriteAllText($p2, "@echo off`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$TargetDir\uninstall.ps1`"`r`npause`r`n", $gbk)
     $made.Add($p1)
     $made.Add($p2)
+}
+
+# 复制后的完整程序文件、DLL、启动脚本与卸载入口二次读回安全 ACL。
+# 不允许“前置 ACL 成功，后续文件仍继承宽权限”便宣称安全安装。
+& $dstExe --install-seal $TargetDir
+if ($LASTEXITCODE -ne 0) {
+    Bad 'Rust 安装权限最终验收失败：程序目录未确认安全，不能宣称安装成功。'
 }
 
 # WebView2 运行时：缺了界面起不来。只提示，不拦（Win10/11 一般自带）
