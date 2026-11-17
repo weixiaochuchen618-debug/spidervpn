@@ -354,3 +354,9 @@
 
 - [Draft PR #14](https://github.com/weixiaochuchen618-debug/spidervpn/pull/14) HEAD `5652e64cf5f8ccf726b624bd5bd9da52aeeb9452`；同 SHA [Linux #44083063095](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44083063095) 完整 workflow 两 job **Completed/Success**。118 library、5 CLI、5 admin TTY、11 legacy cutover、5 offline retire tests + 1 真 WG netns + 5 真 root 文件系统退役全 pass，0 failed/ignored。新增 5 个 cross-crate Windows Rust SSH guard tests 真正在 Linux test-only 引入原 Windows Rust 源文件编译，包含真实 `/bin/sh` 执行，验证标志缺失时仍执行旧正文，有标志时 exit73 且**原命令的副作用未发生**。
 - Windows [MSVC #44083063101](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44083063101)、[GNU #44083063202](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44083063202) 在最后查询时仍进行中，后续精确 HEAD 再查，不可声称三 CI 全绿。当前管理侧还没有把真实 VPS root cutover marker 经独立授权安装，所有 Python 非协作写入口仍然可能不遵守此协议。ISSUE #5 / SEC-01/02/08 仍 Open，PR #14 Draft，不合并 main。索引 [Backlog D.36-D.37](./REMEDIATION_BACKLOG.md)。
+
+
+## 40. PR #14 同 SHA GNU Success、MSVC 新专项 Success 但完整工作流未终态（2026-11-17）
+
+- Linux [#44083063095](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44083063095) 与 GNU [#44083063202](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44083063202) 对最新 `5652e64cf5f8ccf726b624bd5bd9da52aeeb9452` 均 Completed/Success。MSVC [#44083063101](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44083063101) 的 `Build with Rust`、旧 SEC-10、**新增 SEC-01 writer gate 定向用例**、Rust integration tests 已标 Completed/Success，但整条 workflow 仍 in_progress，下一 Agent 首先核验最终结论。无 UI/WFP 改动，无真实 Linux / Windows 配对服务迁移。
+- 已更新 [Issue #5](https://github.com/weixiaochuchen618-debug/spidervpn/issues/5) 留存与 CI SHA 一一对应的证据。SEC-01/02/08 和 Issue #5 仍 Open，Draft PR #14 保持 Draft，main `857ea759` 无修改；后续必须解决非协作旧写者的服务器级真实栅栏、可信历史撤销与 Rust TLS/HTTP 接管，不能将客户端协作拒绝当成安全生产验收。
