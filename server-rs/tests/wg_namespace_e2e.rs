@@ -12,7 +12,6 @@ use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use spidervpn_pairing_authority::{AddressPool, Claims, InviteState, Refusal};
 use spidervpn_pairing_authority::ledger_disk::LedgerStore;
-use spidervpn_pairing_authority::recovery_inspect::{finalize_stable_prepared, RecoveryStage};
 use spidervpn_pairing_authority::wg_conf_audit::read_verified_snapshot;
 use spidervpn_pairing_authority::wg_readonly::LiveWgReader;
 
@@ -74,6 +73,37 @@ fn expect_finalize_requires_real_root_tty(root: &Path) {
     assert_eq!(before,fs::read(root.join("authority-ledger.json")).unwrap());
     assert_eq!(before_live,LiveWgReader::new(IFACE).unwrap().snapshot().unwrap());
 }
+#[cfg(feature = "linux-admin-finalize")]
+fn expect_pty_finalizes_exact_terminal_state(root: &Path, stage: &str, key: &str) {
+    let generation = {
+        let store = open(root);
+        store.generation().unwrap()
+    };
+    let expected = format!("FINALIZE {INV} {generation} {stage}\n");
+    let cli = env!("CARGO_BIN_EXE_spidervpn-pair-audit");
+    // CI-only PTY driver: exercises a genuine controlling /dev/tty for the
+    // Rust child, not a production approval issuer. Local root can script a
+    // PTY; the security principal is root, not proof of a human at keyboard.
+    let command = format!("{cli} finalize {} {IFACE} {INV}",root.display());
+    let mut child = Command::new("/usr/bin/script")
+        .args(["-qec",&command,"/dev/null"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().expect("open a CI-only pseudo-terminal");
+    std::thread::sleep(Duration::from_millis(120));
+    {
+        let mut stdin=child.stdin.take().unwrap();
+        stdin.write_all(expected.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    }
+    let output=child.wait_with_output().unwrap();
+    let text=String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(),"authorized root PTY finalization should succeed: {text}");
+    assert!(text.contains("ledger finalized at"),"terminal finalizer emitted no success");
+    assert!(!text.contains(key),"never print WireGuard public keys in CLI transcript");
+}
+
 fn expect_denied(root: &Path) {
     let output=cli(root);
     assert_eq!(output.status.code(),Some(2));
@@ -132,13 +162,16 @@ fn root_audit_observes_real_wireguard_and_refuses_revoked_replay() {
     expect_report(&root,"PendingAdd","VerifyAndFinalize",&key);
     #[cfg(feature = "linux-admin-finalize")]
     expect_finalize_requires_real_root_tty(&root);
-    let mut store=open(&root);
+    #[cfg(feature = "linux-admin-finalize")]
+    expect_pty_finalizes_exact_terminal_state(&root,"PendingAdd",&key);
+    let store=open(&root);
     assert_eq!(read_verified_snapshot(IFACE).unwrap().len(),1);
-    assert_eq!(finalize_stable_prepared(&mut store,IFACE,INV,now+1).unwrap(),RecoveryStage::PendingAdd);
     assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Consumed(_))));
     assert!(store.view().unwrap().retry(&original,Some(&read_verified_snapshot(IFACE).unwrap())).is_ok());
     drop(store);
     expect_denied(&root);
+    #[cfg(feature = "linux-admin-finalize")]
+    expect_finalize_requires_real_root_tty(&root);
 
     let mut store=open(&root);
     store.update(|l|l.begin_revocation(INV)).unwrap();
@@ -152,12 +185,15 @@ fn root_audit_observes_real_wireguard_and_refuses_revoked_replay() {
     #[cfg(feature = "linux-admin-finalize")]
     expect_finalize_requires_real_root_tty(&root);
 
-    let mut store=open(&root);
-    assert_eq!(finalize_stable_prepared(&mut store,IFACE,INV,now+2).unwrap(),RecoveryStage::RevokingRemove);
+    #[cfg(feature = "linux-admin-finalize")]
+    expect_pty_finalizes_exact_terminal_state(&root,"RevokingRemove",&key);
+    let store=open(&root);
     assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Revoked(_))));
     assert_eq!(store.view().unwrap().retry(&original,Some(&[])),Err(Refusal::Revoked));
     drop(store);
     expect_denied(&root);
+    #[cfg(feature = "linux-admin-finalize")]
+    expect_finalize_requires_real_root_tty(&root);
     assert!(LiveWgReader::new(IFACE).unwrap().snapshot().unwrap().is_empty());
     fs::remove_dir_all(root).unwrap();
 }
