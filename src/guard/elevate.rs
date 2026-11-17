@@ -243,18 +243,13 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
     }
     // 只允许本次调用写一次：不存在“上一笔的回复”可以覆盖/复用。
     // 先创建空文件，再收紧 DACL，最后才写 JSON；不留敏感窗口。
-    let mut file = std::fs::OpenOptions::new()
-        .write(true).create_new(true).open(path)
-        .map_err(|e| format!("建立独立临时文件失败：{e}"))?;
+    // Windows 原生创建同时携带受保护 DACL；不允许先创建开放文件再补权限。
+    let mut file = crate::secretfile::create_private_ipc_file(path)
+        .map_err(|e| format!("建立受保护临时文件失败：{e}"))?;
     if let Err(err) = require_single_link(&file) {
         drop(file);
         let _ = std::fs::remove_file(path);
         return Err(err);
-    }
-    if let Err(err) = crate::secretfile::tighten(path) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(format!("提权临时文件 ACL 收紧失败：{err}"));
     }
     if let Err(err) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
         drop(file);
@@ -267,14 +262,9 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
 /// 普通权限主进程先创建“受保护的空回执”，保证它仍是文件 owner。
 /// 提权后的管理员可向这份文件写入，但绝不创建一个主程序无法读取的新文件。
 fn prepare_reply_file(path: &Path) -> Result<(), String> {
-    let file = std::fs::OpenOptions::new()
-        .write(true).create_new(true).open(path)
-        .map_err(|e| format!("建立提权回执占位文件失败：{e}"))?;
-    if let Err(err) = crate::secretfile::tighten(path) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(format!("提权回执文件 DACL 收紧失败：{err}"));
-    }
+    // 创建这一瞬间就应用 owner/admin/SYSTEM 私有 DACL，文件不曾可由他人打开。
+    let file = crate::secretfile::create_private_ipc_file(path)
+        .map_err(|e| format!("建立受保护提权回执文件失败：{e}"))?;
     drop(file);
     Ok(())
 }
@@ -368,11 +358,9 @@ impl GuardIpcFiles {
         let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         let dir = std::env::temp_dir().join(format!("SpiderVPN-guard-{nonce}-{hash}"));
         // create_dir 不会重用已有目录；任何碰撞或恶意预占都拒绝。
-        std::fs::create_dir(&dir).map_err(|e| format!("创建独立提权目录失败：{e}"))?;
-        let files = Self { req: dir.join("req.json"), res: dir.join("res.json"), dir };
-        crate::secretfile::protect_ipc_directory(&files.dir)
-            .map_err(|e| format!("保护提权请求目录失败：{e}"))?;
-        Ok(files)
+        crate::secretfile::create_private_ipc_dir(&dir)
+            .map_err(|e| format!("创建受保护独立提权目录失败：{e}"))?;
+        Ok(Self { req: dir.join("req.json"), res: dir.join("res.json"), dir })
     }
 }
 
