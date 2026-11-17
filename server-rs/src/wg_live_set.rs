@@ -145,14 +145,43 @@ fn expected_after(
     Ok(peers)
 }
 
-/// The only production-capable live mutation entrypoint. It requires a
-/// trusted, already durable LedgerStore Pending/Revoking state, a stable
-/// exact live+wg.conf pre-snapshot, a safe atomic config update, the *one
-/// targeted peer* wg command, and a fresh stable live+config post-snapshot.
-/// Commit the final durable state only after all conditions hold.
-pub fn apply_and_confirm(
-    store: &mut LedgerStore, interface: &str,
-    grant: &Grant, operation: Change,
+/// Adapter for the protected file writer and the fixed-argv WG command.
+/// The transaction implementation is separately testable with a FakeOps
+/// that cannot execute any system command or modify any network device.
+trait MutationOps {
+    fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError>;
+    fn write(&mut self, store: &LedgerStore, grant: &Grant, change: Change)
+        -> Result<bool, ApplyError>;
+    fn mutate(&mut self, grant: &Grant, change: Change)
+        -> Result<(), ApplyError>;
+}
+
+struct SystemOps<'a> { interface: &'a str }
+impl MutationOps for SystemOps<'_> {
+    fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError> {
+        read_verified_snapshot(self.interface).map_err(ApplyError::Readback)
+    }
+    fn write(&mut self, store: &LedgerStore, grant: &Grant, change: Change)
+        -> Result<bool, ApplyError>
+    {
+        write_pinned_config(store, self.interface, grant, change)
+            .map_err(ApplyError::Config)
+    }
+    fn mutate(&mut self, grant: &Grant, change: Change)
+        -> Result<(), ApplyError>
+    {
+        set_one_peer(self.interface, grant, change).map_err(ApplyError::Live)
+    }
+}
+
+/// The only finalization path: with the same durable authority lock held,
+/// validate the exact pending grant, compare pre-state, write config,
+/// mutate just the target peer, read back, then finally commit the ledger.
+/// Any error leaves a *nonterminal* Pending/Revoking state. A repeat request
+/// is NOT permission to redo the update without trusted reconciliation.
+fn apply_with_ops(
+    store: &mut LedgerStore, grant: &Grant,
+    operation: Change, ops: &mut impl MutationOps,
 ) -> Result<(), ApplyError> {
     let ledger = store.view().map_err(ApplyError::Ledger)?;
     let prepared = match (operation, ledger.state(&grant.claims.invite_id)) {
@@ -161,14 +190,11 @@ pub fn apply_and_confirm(
         _ => false,
     };
     if !prepared { return Err(ApplyError::Live(LiveError::InvalidArguments)); }
-    let before = read_verified_snapshot(interface).map_err(ApplyError::Readback)?;
+    let before = ops.snapshot()?;
     let expected = expected_after(&before, grant, operation).map_err(ApplyError::Live)?;
-    let changed = write_pinned_config(store, interface, grant, operation)
-        .map_err(ApplyError::Config)?;
-    if changed {
-        set_one_peer(interface, grant, operation).map_err(ApplyError::Live)?;
-    }
-    let after = read_verified_snapshot(interface).map_err(ApplyError::Readback)?;
+    let changed = ops.write(store, grant, operation)?;
+    if changed { ops.mutate(grant, operation)?; }
+    let after = ops.snapshot()?;
     require_exact_match(&expected, &after).map_err(ApplyError::Readback)?;
     match operation {
         Change::Add => {
@@ -183,6 +209,16 @@ pub fn apply_and_confirm(
         }
     }
     Ok(())
+}
+
+/// A production-capable entrypoint but not wired to the current server:
+/// the caller must verify the signed request BEFORE creating the grant, and
+/// the existing Python service must be stopped during a trusted migration.
+pub fn apply_and_confirm(
+    store: &mut LedgerStore, interface: &str,
+    grant: &Grant, operation: Change,
+) -> Result<(), ApplyError> {
+    apply_with_ops(store, grant, operation, &mut SystemOps { interface })
 }
 
 #[cfg(test)]
@@ -203,6 +239,137 @@ mod tests {
             },
             address:Ipv4Addr::new(10,66,0,2),
         }
+    }
+
+    struct FakeOps {
+        live: Vec<Peer>,
+        disk: Vec<Peer>,
+        writes: usize,
+        changes: usize,
+        fail_write: bool,
+        fail_change: bool,
+        fail_readback: bool,
+    }
+    impl FakeOps {
+        fn new() -> Self {
+            Self {
+                live:vec![], disk:vec![], writes:0, changes:0,
+                fail_write:false, fail_change:false, fail_readback:false
+            }
+        }
+    }
+    impl MutationOps for FakeOps {
+        fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError> {
+            if self.fail_readback {
+                return Err(ApplyError::Live(LiveError::TimedOut));
+            }
+            require_exact_match(&self.live,&self.disk).map_err(ApplyError::Readback)?;
+            Ok(self.live.clone())
+        }
+        fn write(&mut self, store: &LedgerStore, grant: &Grant, op: Change)
+            -> Result<bool, ApplyError>
+        {
+            let state = store.view().map_err(ApplyError::Ledger)?
+                .state(&grant.claims.invite_id);
+            assert!(matches!(
+                (op,state),
+                (Change::Add,Some(InviteState::Pending(g))) if g == grant
+            ) || matches!(
+                (op,state),
+                (Change::Remove,Some(InviteState::Revoking(g))) if g == grant
+            ), "external write must only occur AFTER the durable deny state");
+            self.writes += 1;
+            if self.fail_write { return Err(ApplyError::Config(AtomicError::Io)); }
+            let next = expected_after(&self.disk,grant,op).map_err(ApplyError::Live)?;
+            let changed = next != self.disk;
+            self.disk = next;
+            Ok(changed)
+        }
+        fn mutate(&mut self, grant: &Grant, op: Change) -> Result<(), ApplyError> {
+            self.changes += 1;
+            if self.fail_change { return Err(ApplyError::Live(LiveError::CommandFailed)); }
+            self.live = expected_after(&self.live,grant,op).map_err(ApplyError::Live)?;
+            Ok(())
+        }
+    }
+    fn temp_ledger(tag: &str) -> (std::path::PathBuf, LedgerStore, Grant) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        let path=std::env::temp_dir().join(format!(
+            "spidervpn-sec01-mutops-{tag}-{}",std::process::id()));
+        let _=std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::set_permissions(&path,
+            std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::ledger_disk::bootstrap_for_test(&path).unwrap();
+        let mut store=LedgerStore::open_existing(&path,Duration::ZERO).unwrap();
+        let g=grant();
+        store.update(|l|l.insert_open(&g.claims.invite_id,600)).unwrap();
+        store.update(|l|l.reserve(g.claims.clone(),100,
+            crate::AddressPool{
+                network:Ipv4Addr::new(10,66,0,0),prefix:24,
+            },Some(&[]))).unwrap();
+        (path,store,g)
+    }
+    #[test]
+    fn complete_add_then_revoke_commits_ledger_only_after_successful_readback() {
+        let (p,mut store,g)=temp_ledger("complete");
+        let mut ops=FakeOps::new();
+        apply_with_ops(&mut store,&g,Change::Add,&mut ops).unwrap();
+        assert!(matches!(store.view().unwrap().state(&g.claims.invite_id),
+            Some(InviteState::Consumed(_))));
+        assert_eq!((ops.writes,ops.changes),(1,1));
+        let no_replay=apply_with_ops(&mut store,&g,Change::Add,&mut ops);
+        assert!(matches!(no_replay,Err(ApplyError::Live(LiveError::InvalidArguments))));
+        assert_eq!(ops.changes,1);
+        store.update(|l|l.begin_revocation(&g.claims.invite_id)).unwrap();
+        apply_with_ops(&mut store,&g,Change::Remove,&mut ops).unwrap();
+        assert!(matches!(store.view().unwrap().state(&g.claims.invite_id),
+            Some(InviteState::Revoked(_))));
+        assert!(ops.live.is_empty());
+        assert!(ops.disk.is_empty());
+        drop(store);std::fs::remove_dir_all(p).unwrap();
+    }
+    #[test]
+    fn config_write_failure_prevents_kernel_mutation_and_ledger_finalization() {
+        let (p,mut store,g)=temp_ledger("writefail");
+        let mut ops=FakeOps::new();
+        ops.fail_write=true;
+        assert!(matches!(apply_with_ops(&mut store,&g,Change::Add,&mut ops),
+            Err(ApplyError::Config(AtomicError::Io))));
+        assert_eq!(ops.changes,0);
+        assert!(matches!(store.view().unwrap().state(&g.claims.invite_id),
+            Some(InviteState::Pending(_))));
+        drop(store);std::fs::remove_dir_all(p).unwrap();
+    }
+    #[test]
+    fn kernel_error_after_disk_write_keeps_deny_ledger_and_requires_recovery() {
+        let (p,mut store,g)=temp_ledger("setfail");
+        let mut ops=FakeOps::new();
+        ops.fail_change=true;
+        assert!(matches!(apply_with_ops(&mut store,&g,Change::Add,&mut ops),
+            Err(ApplyError::Live(LiveError::CommandFailed))));
+        assert_eq!(ops.writes,1);
+        assert_ne!(ops.live,ops.disk);
+        assert!(matches!(store.view().unwrap().state(&g.claims.invite_id),
+            Some(InviteState::Pending(_))));
+        assert!(apply_with_ops(&mut store,&g,Change::Add,&mut ops).is_err());
+        assert_eq!(ops.changes,1, "never blindly retry failed kernel changes");
+        drop(store);std::fs::remove_dir_all(p).unwrap();
+    }
+    #[test]
+    fn revocation_failure_does_not_clear_tombstone_or_regrant_device() {
+        let (p,mut store,g)=temp_ledger("revokefail");
+        let mut ops=FakeOps::new();
+        apply_with_ops(&mut store,&g,Change::Add,&mut ops).unwrap();
+        store.update(|l|l.begin_revocation(&g.claims.invite_id)).unwrap();
+        ops.fail_change=true;
+        assert!(matches!(apply_with_ops(&mut store,&g,Change::Remove,&mut ops),
+            Err(ApplyError::Live(LiveError::CommandFailed))));
+        assert!(matches!(store.view().unwrap().state(&g.claims.invite_id),
+            Some(InviteState::Revoking(_))));
+        assert!(store.view().unwrap().retry(&g.claims,Some(&ops.live)).is_err());
+        drop(store);std::fs::remove_dir_all(p).unwrap();
     }
 
     #[test]
