@@ -744,8 +744,12 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
                 // 安装/核验成功 → 清掉「已解除」标记（Q8：下次连接重新启用）
                 let _ = store.clear_removed();
             }
-            let _ = write_reply_file(res_path, &GuardReply { result: Ok(ev), notes: Vec::new() });
-            0
+            // 回执是调用方确认这次提升操作的唯一返回通道。
+            // 如果 WFP/证据写入成功但回执失败，绝不能退出 0 假装全程成功。
+            match write_reply_file(res_path, &GuardReply { result: Ok(ev), notes: Vec::new() }) {
+                Ok(()) => 0,
+                Err(_) => 6,
+            }
         }
     }
 }
@@ -976,6 +980,20 @@ mod tests {
         std::fs::write(&files.req, serde_json::to_vec(&forged).unwrap()).unwrap();
         assert!(read_attested_guard_request(&files.req).is_err(),
             "请求文件在 UAC 之后被替换时不能执行 Remove");
+    }
+
+    #[test]
+    fn response_write_failure_is_never_treated_as_success() {
+        // 删除/替换回执后，已成功执行的高权限动作也不能返回“成功”。
+        let files = GuardIpcFiles::create(&test_ipc_request()).unwrap();
+        let reply = GuardReply {
+            result: Err(WfpError::InvalidState),
+            notes: vec!["test".into()],
+        };
+        assert!(write_reply_file(&files.res, &reply).is_err());
+        prepare_reply_file(&files.res).unwrap();
+        assert!(write_reply_file(&files.res, &reply).is_ok());
+        assert!(write_reply_file(&files.res, &reply).is_err());
     }
 
     #[test]
