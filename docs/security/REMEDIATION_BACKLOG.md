@@ -233,3 +233,10 @@ PR/commit/CI: ...
 - **SEC-09 清单归一**：install_trust.rs::BIN_FILES 为唯一 Rust 包文件白名单，uninstall_safety.rs 直接复用；Rust 新测试解析 package-files/uninstall.ps1 固定删除清单，确保没有缺项/重复，并确认主程序 spidervpn.exe 位于最后，uninstall.ps1 留到其余文件成功移除后才清理。提交 b839dace、0d3bbc69、f9d7dbbc。未改 UI、连接或 WFP 持久 BLOCK 实现。
 - **最新同 SHA CI 未决**：Windows MSVC/GNU 都显式运行 SEC-11 UTF-8 和密钥形状测试，最新 Rust 代码 HEAD d4f7feb8b5aed21759704b318121e2bfd8972934；[MSVC 44030514834](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514834) 与 [GNU 44030514840](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514840) 写入时未获得终态；必须核对最终 head_sha/结论，不得援引旧 SHA。
 - **未完成**：SEC-11 生产 unwrap/expect 逐项可触发性审查、更多 Unicode/fuzz；SEC-09/03/10 的 A/B/C 真机权限、安装/升级/卸载、WFP 持久 BLOCK 网络验证和包来源签名均没有完整证据。SEC-09/11 仍部分候选，PR #6 Draft 不合并 main，Issue #5 保持 Open。
+
+## D.11 SEC-11 专项红例与修正（2026-11-17）
+
+- 初版候选 d4f7feb8 的 [MSVC CI 44030514834](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514834) / [GNU CI 44030514840](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514840) **Completed/Failure**：生产 Rust build 已成功，但 test-bin 编译 E0425 七次，因为 WireGuard key 测试被错误插进 pairing::line::tests 里，无法解析私有 pairing::tunnel::wireguard_key。**这是本轮测试放错作用域，不是一个新增产品漏洞，也不能将旧 SHA 视为 CI 绿。**
+- 提交 ce3c00fe 将原断言原样移至 pairing::tunnel::sec11_key_tests；提交 e32c7567/c658c122 同步 MSVC/GNU 两工作流的精确过滤名，不删、不 skip 测试。此前中间候选因仅保留最新 SHA 自动取消，不能计入成功/失败。
+- **当前最新 Rust HEAD**：c658c12249568ccbfe02c13a436cdaa27ffe5776；对应 [MSVC CI 44031103332](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103332) / [GNU CI 44031103722](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103722) 写入时仍在运行。最新 SHA 双 CI 必须 Completed/Success 才能把本轮自动化验证标为完成。
+- 手工 Windows A/B/C 实机 SEC-03/09/10、WFP 真机网络、SEC-11 生产 unwrap/expect 审计和 Linux P0 SEC-01/02 仍待处理；main 不动、PR #6 保持 Draft、Issue #5 Open。
