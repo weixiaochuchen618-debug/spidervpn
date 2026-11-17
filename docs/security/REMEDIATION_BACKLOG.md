@@ -196,3 +196,15 @@ PR/commit/CI: ...
 - **Windows MSVC [44018620435](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620435)**：head_sha = a14016cd；**Completed / Success**，Rust Build、SEC-10+SEC-03 专项、全部独立 tests/*.rs 集成目标、相关模块回归、便携 Rust 单元 suite 各步骤均 Success。便携 suite 保留原有的 8 条环境依赖排除，**本轮未添加任何 skip**；不得据此宣称“无排除、跨账户真实 Windows 测试全通过”。
 - **本轮确定保留的失败证据**：54f09333 的 MSVC 44017844701 2/4 因 D:PAI 控制标记误拒，修复后在当前 SHA 的 SEC-03 专项已通过；未删除测试、未放宽额外 AU/WD/OW ACE。
 - **仍未完成**：Win11 A/B/C 三账户 I01–I12、真实安装/升级/卸载/回滚、源包签名与信任、现有文件句柄竞争、普通用户拥有旧目录的 Owner Rights 实际测试、WFP 持久 BLOCK 实机不退化。SEC-03/SEC-10 仍 P0 未完成安全验收，PR #6 与 PR #3 不合并到 main。
+
+
+## D.7 SEC-09 Rust 卸载 fail-closed 候选（2026-11-17）
+
+- **任务选择**：SEC-09（P1），依赖之前 SEC-03 受保护 bin 安装根。活动 Rust 分支 fix/sec10-guard-elevation-identity-p0-20261117 / [Draft PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，从 main 857ea759 分出、**尚未合并**。本轮最新候选提交 15079f9184de6bffa8beb66546cc3996c528c6c9；后续 Agent 先核对 GitHub 实时 SHA。
+- **真实风险**：旧 package-files/uninstall.ps1 在 guard-remove exit 3（配置缺失、无法断言持久 BLOCK 已解除）仍继续删除 EXE；只删除 spidervpn.exe/WebView2Loader.dll，留下 sing-box.exe；PointsHere 采用 Contains(TargetDir) 可能把 C:\SpiderVPN2 当作本安装并递归删整个开始菜单目录。
+- **Rust 代码候选**：src/uninstall_safety.rs 新增 --uninstall-preflight <TargetDir> [--keep-guard]，管理员身份、真实运行 exe 安装路径、reparse/卷根验证、proxy-journal.json 必须已消失（无 FORCE 绕过）；默认直接调用现有 WindowsWfp::remove() 事务**只解除本程序 Provider 所属对象，不以 config.json 是否存在推断**，并要求 BFE ready、Provider 和 SubLayer 均不存在、无 read_error；写 HKLM Removed 标记、invalidate 旧 Evidence，读回确认。任何步骤失败返回非零且 PowerShell **不删除任何 EXE/入口**。显式 --keep-guard 不触碰 WFP，但仍检查代理 journal。
+- **精确归属和残留**：--uninstall-owns-shortcut <path> <TargetDir> 只按安装器实际产生的完整 .cmd 模板判断，取消旧 Contains(TargetDir)；PowerShell 只删被 Rust 认定属于本次安装的快捷方式，不递归删除含其他文件的开始菜单目录。固定 bin 清单补 sing-box.exe 及 sing-box.LICENSE.txt，未知文件/data 默认保留，删除操作仍由薄 PowerShell 入口实施。
+- **专项测试**：Rust uninstall_safety::tests::（无配置、WFP 失败/回读残留、KeepGuard/journal、模板严格比较、manifest）+ tests/uninstall-preflight-e2e.rs（真实 Rust CLI 拒绝错根/缺参，不碰 WFP + 旧脚本静态契约），Windows MSVC/GNU 专项已接入；MSVC CI 新增仅解析而不执行 PowerShell 脚本语法的步骤，旧八项环境依赖排除未变。为了减少多次开发提交造成 CI runner 堆积，MSVC 流水线现在与 GNU 一样取消较早 SHA 的并发跑次，**不取消最新 SHA 的测试**。
+- **CI 待终态**：本轮 SHA 15079f91 的 [MSVC 44025960134](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44025960134) / [GNU 44025961008](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44025961008) 写入时仍在运行。不能宣称最终 SHA 通过；失败必须读 job logs 修复，不新增 skip 或弱化安全判断。
+- **安全边界未闭环**：需要 [SEC09_UNINSTALL_ACCEPTANCE.md](./SEC09_UNINSTALL_ACCEPTANCE.md) U01–U14 的隔离 Windows A/B/C 卸载/重复安装/旧 owner/UAC/WFP 过滤器现场和异常退出试验。单一 CI admin Runner 不能替代实机；普通用户双击卸载入口在 SEC-03 管理员安装后可能要求明确管理员提权，**不得宣称 UX 完全不变**。WFP remove 与脚本删除之间仍有潜在竞态；-KeepGuard 则明确选择保留阻断规则及相应恢复风险。
+- **状态**：SEC-09 P1 部分候选、未完成实机 DoD；SEC-03/SEC-10 P0 仍开放，PR #3/#6 Draft，main 不变。
