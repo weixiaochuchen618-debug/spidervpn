@@ -273,3 +273,13 @@ PR/commit/CI: ...
 - **Windows GNU [#44034700188](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700188)**：head_sha 匹配、**Completed/Success**，包括原 Rust build.ps1、release SPIDERVPN_ROOT 隔离和原 SEC-09/10/11 专项；独立 Linux 代码暂未进入 Windows 客户端进程。
 - **Windows MSVC [#44034700266](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700266)**：同 HEAD 的 Rust 编译、SEC-09/10/11 安全专项、全部独立 Rust integration 测试已 Success，记录时模块回归/Portable unit suite 未全部完成，**不得提前声明整个 MSVC Workflow Success**。保留原先 8 项环境依赖排除，未新增 skip。下一 Agent 请先核对 CI 终态并补记。
 - **安全状态**：这些自动回归都不代表旧 Python pairing receiver 已换 Rust 或真实 WG/TLS/设备撤销安全验收；SEC-01/02/08 生产条件未满足，SEC-03/09/10 Windows A/B/C 实机也未完成。PR #3/#6 Draft、main 857ea759 未合并、Issue #5 Open。
+
+## D.16 SEC-01 Rust 持久授权事务与故障后禁止旧内存重放（2026-11-17）
+
+- **代码分支 HEAD** `07dc06f83d3f14361f822f4a519203eddc96c987`、Draft PR #6；client/main 未改，PR #3 WFP 实验未改。
+- **新 Rust 服务端组件**：`server-rs/src/ledger_disk.rs`（只从已有受保护磁盘账本开启，缺失/异常不默认空；限定 0700 目录/0600 账本、单硬链接、拒绝软链接、严格版本 generation/状态/DeviceId/Key/IP/tombstone 约束；create_new 临时文件→数据 fsync→原子 rename→父目录 fsync）和 `server-rs/src/transaction.rs`（Rust fake PeerControl 的可替换编排）。前者 7 项，后者 5 项回归，均未与 Python/真实 WG/Windows 原连接代码接线。
+- **事务安全不变式**：在外部 WireGuard add/remove 前**已经写盘并 fsync** Pending/Revoking；新鲜 WG readback 成功后才落 Consumed/Revoked；失败永久保留阻断状态待人工/可信恢复，用户重复点击或断网不能直接再调用 add。`retry_read_only` 不允许重附 peer。跨进程 flock 必须覆盖全部步骤，不能只在 JSON 保存时锁。
+- **发现并修复的故障窗口**：rename 成功但父目录 fsync 失败，磁盘有可能是新 Pending，内存依然是旧 Open。最新 LedgerStore 在任何存储提交错误后变成 `Poisoned`，同一 store 的 view/generation/update 全部返回错误，必须关闭并重新读取/检验磁盘状态，阻止旧内存状态覆盖已落盘的撤销记录。cfg(test) 注入 post-rename 故障并证明了 fail closed；未加入生产可开关后门。
+- **最新 Linux Rust CI**：[44036991021](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036991021) 与 HEAD 07dc06f8 匹配，Completed/Success，**32 passed/0 failed/0 ignored**（旧安全测试 19 + ledger/txn/poison 13）。版本演化证据：[26 测试 #44036202223](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036202223)、[31 测试 #44036699347](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036699347)，仅最终 32 项用于当前 HEAD。
+- **Windows 同 SHA**：[MSVC #44036991126](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036991126) 与 [GNU #44036991031](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036991031) 写入时仍未得到最终双结论，需以后续实际 workflow head_sha + completed/success 更新。
+- **未修复生产风险**：在线服务仍为 Python `tc-pair.py serve`，Windows revoke_script 仍直接删 WG Peer，无 Rust/TLS/真正 WireGuard 系统进程；旧邀请可信迁移、JWS/JWE 验签、反回滚外部锚定、非特权服务、真实 Linux kill -9/断电/WG 操作和 Windows A/B/C 验收均未完成。SEC-01/02/08 仍为仅 Rust 候选、不得标完成；PR #6 Draft，不合并 main，Issue #5 Open。
