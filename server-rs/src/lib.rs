@@ -48,6 +48,9 @@ pub mod wg_live_set;
 #[cfg(target_os = "linux")]
 pub mod recovery_inspect;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod recovery_apply;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {
