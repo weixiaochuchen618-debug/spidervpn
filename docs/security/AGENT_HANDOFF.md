@@ -218,3 +218,9 @@
 - **Windows 同 SHA**：[MSVC #44042690238](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690238)、[GNU #44042690146](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690146) 记录时未整体终态。后续先核对 HEAD/SHA/run 结论；MSVC 自带 8 项原有环境依赖排除未增加 skip。Linux 完整 71 项通过不代表 Windows 或真实服务全绿。
 - **重要 P0 闸门**：当前 systemd 仍调用 Python `tc-pair.py serve`，原 `deploy.rs::revoke_script` 仍只操作 WG peer 而不写 Rust tombstone；任何入网请求的 RS256/JWE 实际可信验证、旧邀请签名/RequestDigest/Revoked 安全迁移、SEC-02 Linux Rust TLS + 账号权限、真实 WireGuard namespace/断电/并发测试，全部未完成。配置先落盘但内核更改失败时会使 conf/live 暂时不一致并保持 Pending/Revoking，**不能自动盲目 retry**；须实现由可信 Ledger+现场快照约束的显式 reconciliation 才能恢复。**SEC-01/02/08 生产仍 Open**，PR #3/#6 Draft、main 不合并、Issue #5 Open。
 - 后续方案见 [SEC01_LINUX_RUST_MIGRATION 第六阶段](./SEC01_LINUX_RUST_MIGRATION.md)、[REMEDIATION_BACKLOG D.19](./REMEDIATION_BACKLOG.md)。可在 GitHub Linux CI 中继续测试 fake WG 与 Linux 临时目录；真实内核必须先用隔离 VM/namespace、受控 root 与可回滚镜像，不操作用户真服务器。
+
+## 22. 本轮最新 CI 终态交接（2026-11-17）
+
+- Rust 源码最新 HEAD `468af9e675bbf118464e1094306c6a055039324d` / Draft PR #6。Linux [#44042690148](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690148)：Completed/Success、**71 passed / 0 failed / 0 ignored**；Windows GNU [#44042690146](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690146)：同 SHA **Completed/Success**。
+- Windows MSVC [#44042690238](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690238)：同 SHA 的 Rust build、SEC-09/10/11 专项、集成和变更模块测试已经成功，**最后 Portable Rust unit suite（原 8 项环境依赖排除）仍在执行**。下一代理先核对终态，不得将 GNU/Linux 成功说成 MSVC 成功。
+- 继续行动的 P0 优先级：SEC-01 部分成功/部分失败后的 **受信任显式 reconcile**（读 durable Pending/Revoking、固定 WG config+kernel 双快照、证明 expected grant、不在普通申请 retry 时悄悄重附 peer）；真实 WG Linux namespace 适配测试；RS256/JWE、旧 Consumed 遗留 RequestDigest 信任迁移；后续 SEC-02 非特权 Rust TLS HTTP 与 Windows 管理端 revoke 联动。当前 Python systemd 不可虚报迁移，SEC-01/02/08 仍 Open。main 未动，PR #3/#6 Draft，Issue #5 Open。
