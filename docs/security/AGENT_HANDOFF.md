@@ -249,3 +249,11 @@
 - `src/connect.rs` 的 `#[cfg(test)] next_test_port()` 从固定 PID 派生 50000+区间改为由 OS 原生 `TcpListener::bind("127.0.0.1:0")` 分配可绑定的 loopback 测试端口，再从 local_addr 获取。**只有测试辅助函数变更**；正式连接参数和默认端口、UI、WFP、权限模块未变。没有禁用任何断言、重试掩盖失败或跳过测试。
 - 新 SHA 对应 Linux [#44049297016](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44049297016) **Completed/Success：91 tests**。同 SHA Windows MSVC [#44049296975](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44049296975) 和 GNU [#44049297040](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44049297040) 记录时尚在执行；下一个 Agent 必须比对真实 head_sha 和最终 conclusion。详细见 [Backlog D.23](./REMEDIATION_BACKLOG.md)。
 - 即使 MSVC 测试绿，SEC-01/02/08 生产仍未修复：Python 接收器未迁 Rust、RSA/JWE 可信迁移、root-only 管理批准和真实 WG adapter/namespace、TLS 非特权及 Win revoke tombstone 未完成。main 857ea759 仍不动，Issue #5 Open，PR #3/#6 Draft。
+
+
+## 26. SEC-01 root-only Linux Rust 只读诊断入口（2026-11-17，最新恢复点）
+
+- 本轮独立分支 `fix/sec01-root-only-audit-cli-20261117`，基于 PR #6 的 `e380e82056c6eecbf237f5661b50af52964c8b9d` 建立**叠加 Draft PR #7**；代码提交 `1224512392e95f0e17d70b9160817ba323a41207`，不碰正式 main、WFP PR #3、原有 Rust WFP 持久 BLOCK、UI 和 Windows 连接交互。
+- 新增 Linux Rust `server-rs/src/bin/spidervpn-pair-audit.rs`，只支持 root 本地 `inspect`：读取已有保护账本及三份 live/config 快照，输出 Safe `stage/action/flags`；无 `approve`/恢复写入命令，不能代替旧 Python 接收器的安全迁移。现有 `AdministratorApproval` 仍无生产颁发入口，不能说已完成提权授权。
+- **Linux 同 SHA 证据** [CI #44051677137](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44051677137) Completed/Success：91 库测试 + 5 二进制测试、0 failed/ignored；非 root 调用 Rust CLI 的拒绝 E2E 成功，严格 `--locked`/`-D warnings` 编译通过。Windows 同 SHA [MSVC #44051677144](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44051677144) / [GNU #44051677093](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44051677093) 仍须查询最终运行结果。旧基线 `e380e820` 的 Linux/MSVC/GNU 三条 CI 均已核对 Completed/Success。
+- **状态不得关闭**：本轮只有受限只读审查 CLI 候选。真实 root/Linux namespace/WireGuard、管理员审批与实际恢复、RS256/JWE 兼容可信迁移、生产 Python 替换、SEC-02 TLS 限流、Windows revoke tombstone 与 WFP/多账户真机验收均缺。SEC-01/02/08 继续 Open，Issue #5 Open，PR #7/#6/#3 Draft，main `857ea759` 不合并。详见 [Backlog D.24](./REMEDIATION_BACKLOG.md)。

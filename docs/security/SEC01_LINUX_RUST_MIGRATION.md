@@ -114,3 +114,11 @@
 - **自动化**：[Linux CI #44048267737](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44048267737) 与最新 SHA 匹配，**Completed/Success：91 tests passed、0 failed、0 ignored**，`cargo --locked`、`RUSTFLAGS=-D warnings`。新 6 项测试覆盖 Pending/Revoking 八种组合、单侧修复及不误伤其他 peer、错误批准、代数或快照变化、配置写失败先阻断内核、内核写失败仍留 Revoking、过期 Pending 拒绝。过渡 SHA `0301b343` 因 final-state match 返回类型不一致 E0308 红，已修；过渡 `64ab0a99` 因单次批准消费后测试旧变量再次使用 E0382 红，已修。未降低严格警告或删测试。
 - 同 SHA Windows [MSVC #44048267726](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44048267726) 与 [GNU #44048267756](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44048267756) 记录时仍运行中，待核对最终结果。
 - **仍未实现的生产边界**：RecoveryIo 当前仅在 Rust CI 以 fake 内核/文件状态执行；尚未实现具有可审核身份和双确认的真实 root-only 管理 CLI，也未把 trait 接入真实 `/etc/wireguard` 原子写入/`wg set`，也未在 Linux network namespace 做端到端测试；不能将 test-only approval 放进 Python server。主生产服务仍为 `tc-pair.py serve`，老设备 revoke_script 未记持久 Rust tombstone，缺 RS256/JWE/旧邀请可信迁移、SEC-02 非 root Rust TLS。SEC-01/02/08 继续 Open，PR #3/#6 Draft，main 不合并。
+
+
+## 第九阶段：Linux root-only Rust 只读恢复检查 CLI（无生产接线）
+
+- [Draft PR #7](https://github.com/weixiaochuchen618-debug/spidervpn/pull/7) 是基于 PR #6 HEAD `e380e820` 的**依赖式差异 PR**，新增可编译 Rust binary `spidervpn-pair-audit`。命令只含 root-only `inspect`，绝不将 `recovery_apply::AdministratorApproval` 的测试签发函数开放给 HTTP/CLI；没有 `approve`、`repair` 和自动 `wg set`。
+- CLI 使用原 SEC-08 进程互斥锁、保护的 LedgerStore、Linux `wg show ... allowed-ips` 和仅 root 可读的 `wg.conf` 三份读回；出错统一拒绝，合法结果只显示 InviteId、Pending/Revoking 阶段、只读恢复建议和 live/config 存在布尔值。保护锁文件可能会在受保护目录内新建，其他持久状态和 WG 不修改；不声称是真正的零写入进程。
+- 同代码 HEAD `1224512392e95f0e17d70b9160817ba323a41207` 的 [Linux Rust CI #44051677137](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44051677137)：Completed/Success，91 现有库回归+5 CLI 测试成功，非 root 真实 binary 运行收到 exit 2 / root required；没有演练 root+真实 WG 的成功路径，也没有测试真实设备撤销防重放。
+- 上线前必须另行完成真实隔离 Linux namespace 中 root 读回、权限/失败注入、显式二次审批+不可重放 ticket、可信签名/迁移以及实际 Python receiver 替换；不合并到 main、不关闭 SEC-01 P0。
