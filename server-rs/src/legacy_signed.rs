@@ -194,6 +194,13 @@ mod tests {
         assert!(run(&f).is_err());
         f=fixture(); f["pinnedJwk"]["n"]=json!("AQAB");
         assert_eq!(run(&f),Err(ProofError::PinnedKey));
+        // A different but fully valid RSA signer must also fail; this is
+        // distinct from simply rejecting a malformed pinned modulus.
+        let foreign:Value=serde_json::from_str(
+            include_str!("../../tests/fixtures/pairing/dotnet-jwt-1.json")).unwrap();
+        f=fixture();
+        f["pinnedJwk"]=foreign["publicJwk"].clone();
+        assert_eq!(run(&f),Err(ProofError::Signature));
     }
     #[test]
     fn valid_signed_authorization_cannot_be_transplanted_to_other_legacy_device(){
