@@ -158,6 +158,16 @@ fn main() -> ExitCode {
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(exit::ENVIRONMENT) };
     }
 
+    // `--guard-lease-serve`：长期受监督 WFP 会话的内部入口。
+    // 必须先于单实例互斥，且绝不接管现有界面/连接流程。
+    // 父进程启动与就绪核验正式接线前，不作为可用生产功能。
+    if let Some(vals) = arg_values(guard::lease_helper::LEASE_FLAG, 2) {
+        let req = std::path::PathBuf::from(&vals[0]);
+        let reply = std::path::PathBuf::from(&vals[1]);
+        let code = guard::lease_helper::serve(&req, &reply);
+        return ExitCode::from(code as u8);
+    }
+
     // `--guard-apply`：一次性提权子进程的内部入口。
     // 必须放在单实例锁之前——父进程正持有那把锁，子进程再抢会被误判成「重复启动」。
     if let Some(vals) = arg_values("--guard-apply", 2) {
@@ -3490,6 +3500,7 @@ const VALUED_ARGS: &[(&str, usize, &str, &str)] = &[
     ("--fingerprint", 1, "--fingerprint SHA256:…（首次连接确认用）", "--server-inspect root@1.2.3.4 --fingerprint SHA256:abc…"),
     // 内部提权子进程：由本程序自己起，用户不需要手工输入。放在这里是为了让参数校验认识它。
     ("--guard-apply", 2, "--guard-apply <request.json> <response.json>（内部提权子进程）", "不由用户手工执行"),
+    ("--guard-lease-serve", 2, "--guard-lease-serve <request.json> <reply.json>（内部长期提权辅助进程）", "不由用户手工执行"),
 ];
 
 /// 不带值的开关。
