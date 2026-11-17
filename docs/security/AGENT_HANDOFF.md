@@ -53,6 +53,7 @@
 - 最新活动提交 `94affb04`：发布版 Rust 不再接受 `SPIDERVPN_ROOT` 控制安装根/HKLM Guard 证据，提权端拒绝格式正确但与运行环境不符的 StoreKind；GNU CI 新增无 test/debug 编译配置的 Release 根覆盖检测；Windows 测试直接读回 SDDL，验证受保护的 IPC 目录与两个文件显式 BA、SY、OW 且没有 AU/BU。最新两套 CI **等待结果**。
 - 实机跨账户测试（A 普通用户、B 独立管理员、C 第二普通用户）必须按照 [SEC10_WINDOWS_UAC_ACCEPTANCE.md](./SEC10_WINDOWS_UAC_ACCEPTANCE.md) 的 UAC-01～12 执行，当前**尚未完成**；成功的代码静态/单测不得称为跨账户 UAC 已验收。
 - **新的真实风险及修复**：旧版 Guard 请求/回执及随机目录先创建后 SetNamedSecurityInfoW，存在低权限进程在 DACL 收紧前抢占句柄的窗口；Rust 最新 `3f0ef0c5` 用原生 Win32 CreateDirectoryW/CreateFileW 在对象创建时直接附加保护 DACL，创建失败拒绝，禁止重用预占目录/文件，并增加宽权限父目录下的创建瞬间 ACL 验证。最新 CI **待完成**，仍需独立 Windows A/B/C 账户真实 UAC/ACL 验证，不得宣布漏洞全闭环。
+- **SEC-03 本轮新增候选**：PR #6 head `a81da3e1` 使发布版 Rust 忽略 `SPIDERVPN_ENGINE_ARGS` 测试环境钩子；管理员 TUN 引擎启动前检查配置所选 EXE 实际指向 SpiderVPN exe 同目录的 `sing-box.exe`，拒绝任意目录 exe，普通代理模式不更改；新增 Rust 负向测试。**尚未证明随包文件不可被标准用户替换**，安装器保护 root/bin、升级/卸载兼容与真实 UAC 测试必须继续完成。提交 CI [MSVC](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44009947271) / [GNU](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44009947357) 待验证。
 - 真正任务状态写在 [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) 的 “D.1 最新恢复点”。更换 Agent 直接从该条开始，不需要用户重新说明。
 
 ## 4. 新 Agent 首次执行的标准流程（无需用户再解释需求）
