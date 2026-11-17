@@ -67,3 +67,11 @@
 2. 实现完整 RS256/JWE 合法性和与已有客户端 `pairing.rs` 的互操作，然后写入经过验签的旧授权与 tombstone。不能仅凭旧 JSON 字段或 SessionId 合成缺失的 RequestDigest。
 3. 最后把 Python HTTP 接收器/Windows revoke 管理入口与 Rust 单元实机双向接通，保证从不可知旧状态迁移到新状态过程中不会有同时工作的旧消费服务。
 4. 完成非 root Linux systemd TLS/HTTP 连接限时限并发，真实 WFP/Windows A/B/C 另行验收；所有门槛未完成前保持 PR Draft，不合并 main。
+
+## 第四阶段：只读 WireGuard 现场快照适配器（无生产接线）
+
+- **当前候选 Rust 代码 HEAD** `e4ec09e46631139d0900a9c4872770f92958b175`，活动 Draft PR #6：新增 `server-rs/src/wg_readonly.rs`，仅通过 Rust `std::process::Command` 直接调用固定绝对路径 `/usr/bin/wg`，参数固定为 `show <validated interface> allowed-ips`，无 shell、无外部输入拼接、无动态 PATH 执行。执行前检查文件必须是 root 持有的普通可执行文件，拒绝符号链接、组/其他账户可写的二进制；不接受特殊接口 `all`、`interfaces`、选项形式、空白、非 ASCII、超长接口。
+- **读取来源的隐私约束**：WireGuard 官方 `wg(8)` 文档明确 `dump` 包含接口私钥字段，因此本模块**禁止调用 `wg ... dump`**，只读取 peer 公钥和 AllowedIPs；可核对 [wg(8) 官方说明](https://man7.org/linux/man-pages/man8/wg.8.html)。命令清空继承环境、禁用 stdin、忽略 stderr、限制最长 3s、最多 512 KiB stdout，以并行读取 stdout 避免阻塞管道。命令超时、退出非零、不可读或超限直接拒绝，不得视为空列表。
+- **严格解析与失败关闭**：`parse_allowed_ips` 只接收完整 `公钥<TAB>RFC1918单一IPv4/32<LF>` 行。重复公钥/IP、无换行、损坏 UTF-8、额外字段、`(none)`、IPv6、多 CIDR、/24 或 /0、非私有地址、非规范 IP、超 4096 peer 都拒绝，**不会跳过坏记录后把缺失 peer 误报为撤销成功**。空输出仅在外部 `wg` 命令明确成功后可作为 live 空接口解释。
+- **Linux 自动验证**：[Rust #44038827553](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44038827553) head_sha=e4ec09e4，**Completed/Success，39 passed、0 failed、0 ignored**（前 32 + WG 读取器 7 项）。CI 用假输出/本地 `sleep`/`false` 测超时与非零退出，**不会执行真实 `/usr/bin/wg`、修改网络配置或用户服务器**。Windows 同 SHA [MSVC #44038827565](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44038827565) / [GNU #44038827585](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44038827585)，记录时仍需查询最终状态。
+- **不可越过的限制**：模块只有 `LiveWgReader::snapshot`，刻意不实现带 `add/remove` 的 Rust `transaction::PeerControl`；仅能证明 live 内核表里的已知 IPv4/32 peer，不证明磁盘 `wg.conf`、旧授权签名、外部并发更改或服务器防火墙/路由正确。后续需要验证实际 `wg.conf` 内容、安全地实现固定参数的增删 peer 和回滚/读回，并做隔离 Linux 网络命名空间测试；不能直接用于生产授权或改动当前 Python receiver。SEC-01/02/08 仍未生产修复，PR Draft，main 不合并。
