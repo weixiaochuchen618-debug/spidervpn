@@ -947,8 +947,16 @@ mod tests {
 
     #[test]
     fn guarded_ipc_rejects_arbitrary_paths_and_reused_names() {
-        let files = GuardIpcFiles::create(&test_ipc_request()).unwrap();
-        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_ok());
+        let request = test_ipc_request();
+        let files = GuardIpcFiles::create(&request).unwrap();
+        // 子进程只会在 apply() 已创建请求和空回执后启动；不存在的
+        // 文件在 SystemIdentityEnv::is_reparse_point 中必须被保守拒绝。
+        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_err(),
+            "不存在的 IPC 文件必须拒绝，不能放松安全检查来满足测试");
+        write_json_file(&files.req, &request).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_ok(),
+            "真实启动顺序中已创建的受保护请求/回执应该通过路径安全校验");
         let bad = files.dir.join("other.json");
         assert!(validate_guard_ipc_paths(&files.req, &bad).is_err());
         assert!(validate_guard_ipc_paths(&files.req, &files.dir.join("req.json")).is_err());
