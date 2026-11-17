@@ -34,6 +34,21 @@ jobs:
           set -euo pipefail
           cargo test --locked --manifest-path server-rs/Cargo.toml -- --test-threads=1 --nocapture
 
+      - name: Compile and test opt-in Rust root-only terminal finalization policy
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-admin-finalize --lib admin_terminal::tests -- --test-threads=1
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-admin-finalize --bin spidervpn-pair-audit -- --test-threads=1
+          set +e
+          result=$(cargo run --quiet --locked --manifest-path server-rs/Cargo.toml --features linux-admin-finalize --bin spidervpn-pair-audit -- finalize /var/lib/spidervpn-pair wg0 11111111-1111-4111-8111-111111111111 2>&1)
+          code=$?
+          set -e
+          test "$code" -eq 2
+          printf '%s\n' "$result" | grep -F 'root privileges required'
+
       - name: SEC-01 root-only recovery inspection CLI denies unprivileged invocation
         shell: bash
         env:
@@ -83,7 +98,7 @@ jobs:
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="$PWD/server-rs/target/netns"
-          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-netns-acceptance --test wg_namespace_e2e --no-run --message-format=json > "$RUNNER_TEMP/sec01-build.json"
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-netns-acceptance,linux-admin-finalize --test wg_namespace_e2e --no-run --message-format=json > "$RUNNER_TEMP/sec01-build.json"
           test_bin="$(jq -r 'select(.reason=="compiler-artifact" and .target.name=="wg_namespace_e2e") | .executable // empty' "$RUNNER_TEMP/sec01-build.json" | tail -n1)"
           test -n "$test_bin"
           test -x "$test_bin"

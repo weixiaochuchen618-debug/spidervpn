@@ -61,6 +61,19 @@ fn expect_report(root: &Path, stage: &str, action: &str, key: &str) {
     assert_eq!(before_live,LiveWgReader::new(IFACE).unwrap().snapshot().unwrap(),
         "CLI must not mutate kernel peers");
 }
+#[cfg(feature = "linux-admin-finalize")]
+fn expect_finalize_requires_real_root_tty(root: &Path) {
+    let before = fs::read(root.join("authority-ledger.json")).unwrap();
+    let before_live = LiveWgReader::new(IFACE).unwrap().snapshot().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_spidervpn-pair-audit"))
+        .args(["finalize",root.to_str().unwrap(),IFACE,INV])
+        .output().unwrap();
+    assert_eq!(output.status.code(),Some(2),"non-interactive root must not authorize finalize");
+    assert!(output.stdout.is_empty(),"no status success output without TTY");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("terminal confirmation or finalization denied"));
+    assert_eq!(before,fs::read(root.join("authority-ledger.json")).unwrap());
+    assert_eq!(before_live,LiveWgReader::new(IFACE).unwrap().snapshot().unwrap());
+}
 fn expect_denied(root: &Path) {
     let output=cli(root);
     assert_eq!(output.status.code(),Some(2));
@@ -117,6 +130,8 @@ fn root_audit_observes_real_wireguard_and_refuses_revoked_replay() {
     expect_report(&root,"PendingAdd","RepairKernelWithApproval",&key);
     set_peer(&key,true);
     expect_report(&root,"PendingAdd","VerifyAndFinalize",&key);
+    #[cfg(feature = "linux-admin-finalize")]
+    expect_finalize_requires_real_root_tty(&root);
     let mut store=open(&root);
     assert_eq!(read_verified_snapshot(IFACE).unwrap().len(),1);
     assert_eq!(finalize_stable_prepared(&mut store,IFACE,INV,now+1).unwrap(),RecoveryStage::PendingAdd);
@@ -134,6 +149,8 @@ fn root_audit_observes_real_wireguard_and_refuses_revoked_replay() {
     expect_report(&root,"RevokingRemove","RepairConfigWithApproval",&key);
     write_conf(&conf,&base,None);
     expect_report(&root,"RevokingRemove","VerifyAndFinalize",&key);
+    #[cfg(feature = "linux-admin-finalize")]
+    expect_finalize_requires_real_root_tty(&root);
 
     let mut store=open(&root);
     assert_eq!(finalize_stable_prepared(&mut store,IFACE,INV,now+2).unwrap(),RecoveryStage::RevokingRemove);
