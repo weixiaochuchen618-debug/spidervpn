@@ -49,3 +49,22 @@ fn required_arguments_are_checked_before_gui_startup() {
             "invalid internal args must report usage error, not start UI");
     }
 }
+
+
+#[test]
+fn package_uninstall_script_honors_rust_gate_before_any_deletion() {
+    let script = include_str!("../package-files/uninstall.ps1");
+    let gate = script.find("--uninstall-preflight").expect("Rust WFP preflight");
+    let owned = script.find("--uninstall-owns-shortcut").expect("Rust launcher identity");
+    let first_cleanup = script.find("Remove-Item").expect("uninstall file cleanup");
+    assert!(gate < owned && owned < first_cleanup,
+        "never clean launchers/binaries before Rust WFP and ownership gates");
+    assert!(!script.contains("elseif ($guardCode -eq 3)"),
+        "config-missing WFP failure must never be treated as permission to delete");
+    assert!(!script.contains(".Contains($TargetDir)"),
+        "substring path ownership can delete neighboring installations");
+    assert!(script.contains("'sing-box.exe'"), "bundled engine must not survive uninstall");
+    assert!(script.contains("'sing-box.LICENSE.txt'"));
+    assert!(!script.contains("Read-Host '  确实要继续卸载吗？输入 FORCE 继续'"),
+        "unrestored proxy journal must not have a FORCE bypass");
+}
