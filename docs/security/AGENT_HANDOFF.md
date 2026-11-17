@@ -121,3 +121,13 @@
 - **代码和设计恢复点**：src/install_trust.rs Rust Win32 安装 ACL（含 D:PAI、硬链接、已有 data 独立 AU Modify）、tests/install-seal-e2e.rs，以及 package-files/install.ps1 的复制前后 Rust --install-seal 调用；本轮没有改变 UI、连接编排或持久 WFP BLOCK 代码。对旧数据仅改变根目录权限，不重写配置内容。
 - **当前仍不通过实机安全 DoD**：缺少 Win11 A/B/C 不同账户的真实 UAC/修改和所有者验证 [SEC03 I01–I12](./SEC03_INSTALL_ACL_ACCEPTANCE.md)，安装包来源/签名、执行对象句柄绑定、既有安装文件竞争、真实升级卸载回滚，及 [SEC10 UAC-01～12](./SEC10_WINDOWS_UAC_ACCEPTANCE.md)。下一轮先做隔离 Windows VM 安全验收，再推进 SEC-09 卸载兼容及 SEC-01 Rust 服务器漏洞；**SEC-03 和 SEC-10 不能宣称完全修复，更不能合并 PR 到 main**。
 - **任务清单唯一真相**：[REMEDIATION_BACKLOG.md D.4–D.6](./REMEDIATION_BACKLOG.md)。旧 SHA 54f09333 MSVC 红例 D:PAI 的根因和修复必须保留，不能抹除失败记录。
+
+
+## 12. 新增 SEC-09 Rust 安全卸载候选与当前恢复点（2026-11-17）
+
+- **本轮任务**：SEC-09（P1，但 Guard exit3 误删有高影响），依赖 SEC-03 受保护安装 root/bin。活动分支 fix/sec10-guard-elevation-identity-p0-20261117 / [Draft PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，最终候选最新提交 15079f9184de6bffa8beb66546cc3996c528c6c9。main 不变、PR #3 不合并，SEC-03/SEC-10 P0 实机未验收。
+- **修复内容**：src/uninstall_safety.rs 新增 Rust --uninstall-preflight 和 --uninstall-owns-shortcut（管理员身份、运行二进制与固定根一致、拒绝 reparse，先验证 proxy-journal 已清除）。没有 config.json 时也必须通过 WFP backend 原生 remove/回读确认 provider/sublayer 都不存在；读写 HKLM Removed 标记与废弃 Evidence，任何失败保留 exe。显式 --keep-guard 不改变原 WFP BLOCK，但 journal 未还原不允许卸载。Rust 精确匹配安装器生成的 .cmd 内容，代替 PS 的 Contains(TargetDir)；PowerShell 仅调用 Rust 并清理固定清单，补删 sing-box.exe、LICENSE，目录中未知文件不会递归删。
+- **测试设计**：src/uninstall_safety.rs 测试没有 config.json/失败不删/保护残留/keep guard/journal/路径误匹配/manifest；tests/uninstall-preflight-e2e.rs 真 CLI 不可信安装根和缺参拒绝、对包内 PS 的 Rust 安全闸门静态契约。MSVC/GNU workflow 直接跑 Rust uninstall_safety::tests，MSVC 另用 pwsh 语法解析器检查脚本但绝不执行真实卸载。MSVC workflow 新增与 GNU 一致的“只取消旧 SHA PR 运行”，最新 SHA 不增删任何既有测试。
+- **CI 仍待终态**：本轮最新 SHA 15079f91 的 [MSVC 44025960134](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44025960134) / [GNU 44025961008](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44025961008)，必须查看最终 workflow conclusion，若失败读 job logs 修复，保留测试断言，绝不以旧 SHA 成功冒充。前一基线 a14016cd 的双 CI 成功仅可证明 SEC-03 候选。
+- **真实安全验收**：新增 [SEC09_UNINSTALL_ACCEPTANCE.md](./SEC09_UNINSTALL_ACCEPTANCE.md) U01–U14，需要隔离 Windows 11 A 普通/B 独立管理员/C 第二普通用户；WFP 持久 BLOCK readback、UAC、旧数据恢复、完整卸载残留和回滚均未验证。默认拒绝带未还原 journal 的强制卸载是有意安全收紧；普通用户双击“卸载”入口在受保护安装后需要管理员权限，必须实机验证兼容，不得称完全无变化。
+- **精确恢复顺序**：先读 [REMEDIATION_BACKLOG D.7](./REMEDIATION_BACKLOG.md) → 核对 PR6 HEAD/MSVC/GNU 终态 → 如果 CI 失败修 Rust → 对照新 U01–U14 复审未测项目。SEC-09 暂标橙色“部分候选”，PR #6 继续 Draft、不能合并 main。
