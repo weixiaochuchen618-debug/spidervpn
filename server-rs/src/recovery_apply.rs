@@ -301,6 +301,8 @@ mod tests {
             Err(RecoveryApplyError::StaleReview)));
         ops.live.clear();
         store.update(|l|l.insert_open("99999999-9999-4999-8999-999999999999",600)).unwrap();
+        // Each attempt requires a fresh, single-use approval.
+        approval=approve_for_test(&review);
         assert!(matches!(apply_approved(&mut store,&review,approval,200,&mut ops),
             Err(RecoveryApplyError::StaleReview)));
         assert_eq!((ops.disk_calls,ops.kernel_calls),(0,0));
