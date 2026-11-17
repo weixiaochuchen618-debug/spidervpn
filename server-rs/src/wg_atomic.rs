@@ -88,7 +88,7 @@ fn read_current(path: &Path) -> Result<(Vec<u8>, Stamp), AtomicError> {
         .open(path).map_err(|_| AtomicError::UnsafeConfig)?;
     let before = verify_file(&file)?;
     let mut buf = Vec::new();
-    file.by_ref().take((MAX_CONF+1) as u64)
+    std::io::Read::by_ref(&mut file).take((MAX_CONF+1) as u64)
         .read_to_end(&mut buf).map_err(|_| AtomicError::Io)?;
     if buf.len() > MAX_CONF { return Err(AtomicError::UnsafeConfig); }
     if stamp(&file.metadata().map_err(|_| AtomicError::Io)?) != before {
