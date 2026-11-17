@@ -32,13 +32,14 @@ impl EngineHandle {
     }
 }
 
-/// SEC-03 第一层边界：在**管理员 TUN** 模式下，低权限配置文件不得
+/// SEC-03 第一层边界：在**管理员** 模式下，低权限配置文件不得
 /// 指定任意目录里的可执行文件来替换管理员将要启动的引擎。
 ///
 /// 此检查仅锁定与 SpiderVPN 自身同目录的 `sing-box.exe`，不更改普通
-/// 用户的代理模式。它不是“安装目录安全”证明：若安装目录依旧可由
+/// 权限用户的代理模式；管理员身份无论 Proxy/TUN 都必须核对。
+/// 它不是“安装目录安全”证明：若安装目录依旧可由
 /// 普通用户改写，SEC-03 必须继续通过保护安装目录和 ACL 实机验收。
-pub fn validate_privileged_tun_engine(
+pub fn validate_privileged_engine(
     requested: &std::path::Path,
     frontend_executable: &std::path::Path,
 ) -> Result<(), String> {
@@ -46,7 +47,7 @@ pub fn validate_privileged_tun_engine(
         .ok_or_else(|| "无法确认 SpiderVPN 主程序目录".to_string())?;
     let bundled = bin_dir.join("sing-box.exe");
     if !bundled.is_file() || !requested.is_file() {
-        return Err("管理员 TUN 模式要求随包的 sing-box.exe 存在且是普通文件".into());
+        return Err("管理员 模式要求随包的 sing-box.exe 存在且是普通文件".into());
     }
     let trusted = std::fs::canonicalize(&bundled)
         .map_err(|e| format!("无法确认随包 sing-box.exe 身份：{e}"))?;
@@ -54,7 +55,7 @@ pub fn validate_privileged_tun_engine(
         .map_err(|e| format!("无法确认所选引擎程序身份：{e}"))?;
     if selected != trusted {
         return Err(
-            "管理员 TUN 模式只允许使用与 SpiderVPN 程序同目录的 sing-box.exe；             配置指定了其他可执行程序，已在启动前拒绝".into(),
+            "管理员 模式只允许使用与 SpiderVPN 程序同目录的 sing-box.exe；             配置指定了其他可执行程序，已在启动前拒绝".into(),
         );
     }
     #[cfg(windows)]
@@ -63,7 +64,7 @@ pub fn validate_privileged_tun_engine(
         let env = crate::guard::wfp_win::SystemIdentityEnv::new();
         for path in [frontend_executable, &bundled, requested] {
             if reparse_chain(path).iter().any(|part| env.is_reparse_point(part)) {
-                return Err("管理员 TUN 模式的引擎或主程序路径存在重解析点，拒绝跟随链接".into());
+                return Err("管理员 模式的引擎或主程序路径存在重解析点，拒绝跟随链接".into());
             }
         }
     }
@@ -280,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn privileged_tun_engine_cannot_be_selected_from_arbitrary_config_path() {
+    fn privileged_engine_cannot_be_selected_from_arbitrary_config_path() {
         let dir = tmp_dirs("privileged-identity");
         let bin = dir.join("bin");
         let custom = dir.join("custom");
@@ -292,12 +293,12 @@ mod tests {
         for file in [&frontend, &bundled, &injected] {
             std::fs::write(file, b"test executable").unwrap();
         }
-        assert!(validate_privileged_tun_engine(&bundled, &frontend).is_ok());
-        assert!(validate_privileged_tun_engine(&injected, &frontend).is_err(),
-            "配置指定的其他 exe 即使同名，也不能被管理员 TUN 任意执行");
-        assert!(validate_privileged_tun_engine(&bin.join("missing.exe"), &frontend).is_err());
+        assert!(validate_privileged_engine(&bundled, &frontend).is_ok());
+        assert!(validate_privileged_engine(&injected, &frontend).is_err(),
+            "配置指定的其他 exe 即使同名，也不能被管理员 任意执行");
+        assert!(validate_privileged_engine(&bin.join("missing.exe"), &frontend).is_err());
         std::fs::remove_file(&bundled).unwrap();
-        assert!(validate_privileged_tun_engine(&bundled, &frontend).is_err(),
+        assert!(validate_privileged_engine(&bundled, &frontend).is_err(),
             "缺少随包引擎时不能默默回退到用户可写配置路径");
         let _ = std::fs::remove_dir_all(dir);
     }
