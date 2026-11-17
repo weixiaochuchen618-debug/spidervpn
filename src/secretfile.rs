@@ -175,7 +175,13 @@ pub fn verify_private_ipc_acl(path: &Path) -> Result<(), String> {
         )
     };
     let acl = if ok != 0 && !rendered.is_null() {
-        unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(rendered, len as usize)) }
+        // Windows API's returned length may include multiple trailing UTF-16 NULs.
+        // Strip only terminators; embedded NULs / unexpected ACL tokens still fail.
+        unsafe {
+            String::from_utf16_lossy(std::slice::from_raw_parts(rendered, len as usize))
+                .trim_end_matches('\0')
+                .to_owned()
+        }
     } else {
         unsafe {
             if !rendered.is_null() { LocalFree(rendered as HLOCAL); }
