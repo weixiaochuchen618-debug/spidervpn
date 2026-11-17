@@ -188,6 +188,7 @@ pub fn verify_private_ipc_acl(path: &Path) -> Result<(), String> {
         LocalFree(descriptor as HLOCAL);
     }
 
+    let verification = (|| -> Result<(), String> {
     let mut remaining = acl.strip_prefix("D:P")
         .ok_or_else(|| "Guard IPC DACL 未禁止继承".to_string())?;
     let mut seen = 0u8;
@@ -218,6 +219,8 @@ pub fn verify_private_ipc_acl(path: &Path) -> Result<(), String> {
         return Err("Guard IPC DACL 缺少 SYSTEM/Administrators/Owner Rights".into());
     }
     Ok(())
+    })();
+    verification.map_err(|reason| format!("{reason}; 当前 Windows DACL = {acl}"))
 }
 
 /// 原子写一个含秘密的文本文件：临时文件 → 收紧 → 写入 → 落盘 → 改名。
