@@ -13,7 +13,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -183,7 +183,7 @@ pub fn read_pinned_conf(interface: &str) -> Result<Vec<Peer>, ConfigError> {
     if !valid_interface(interface) { return Err(ConfigError::InvalidInterface); }
     validate_root()?;
     let path: PathBuf = Path::new(ROOT).join(format!("{interface}.conf"));
-    let mut file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW)
+    let file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW)
         .open(&path).map_err(|_| ConfigError::Io)?;
     let before = file.metadata().map_err(|_| ConfigError::Io)?;
     if !before.file_type().is_file() || before.uid() != 0
