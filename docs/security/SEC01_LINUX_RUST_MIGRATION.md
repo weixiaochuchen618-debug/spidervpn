@@ -166,3 +166,10 @@
 - [Draft PR #12](https://github.com/weixiaochuchen618-debug/spidervpn/pull/12) 叠加在 PR #11，代码 SHA `16c4176ed302871e2cb41787954a0f667f90d202`。扩展 Linux Rust `legacy_cutover` 仅增加**更多拒绝依据**：必须从 root-only 防符号链接的旧 `server.json` 验证非默认服务端口与 Endpoint 完整一致，再检查当前 Linux network namespace 的 `/proc/net/tcp` 与 `tcp6` 上该端口是否处于 LISTEN。任一监听、文件或内核库存不可核实、双次检查的端口发生变化均拒绝。没有打开/停止 TCP 端口、杀进程、修改部署、编辑配对账本或任何 WireGuard 行为。
 - 独立原 7 项预检测试增加四项：正确/伪造 port，IPv4/IPv6 监听行，坏 proc 截断拒绝，**实际 Rust `TcpListener` 创建的内核监听**状态探测。Linux [#44077594144](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077594144) 当前 SHA 核心 113 tests success，独立 WireGuard netns 工作流 Job 与 Windows MSVC/GNU 仍须精确核对。
 - **不构成 root 排他写者栅栏**：不能排除别名旧服务监听别的未可信记录的端口、不合作 root actor、另一个 netns 或快照之后重启。生产 Python 仍在服务器上且不参与 Rust SEC-08 锁；SEC-01/SEC-02/SEC-08 未验收，不合并 main。
+
+
+## 第十六阶段：root-only 原子脚本退役 Rust 候选（默认关闭，无线下部署）
+
+- 新的 [Draft PR #13](https://github.com/weixiaochuchen618-debug/spidervpn/pull/13) HEAD `6295b6c87e36ba9c1df2d906f56e021302905d0c`，从 PR #12 起叠加。后续 root-only `stage_offline_legacy_retirement` 拟在旧 systemd 已永久 mask/停止、真正无脚本进程和 TCP IPv4/IPv6 listener、父目录及脚本 root owner/mode/nlink 均可信的条件下，安全退役 `/var/lib/tradechannel/pairing-rs/tc-pair.py` 这条**被 Windows SSH 管理函数自动上传/执行**的旧路径。采用 Linux `renameat2(RENAME_EXCHANGE)` 让旧脚本与预先 fsync 的空 0700 directory 一次性交换：交换后即使瞬间断电，旧路径也不会有可被 `>` 重新创建旧脚本的“缺失窗口”；原脚本存放 .stage 后以 `RENAME_NOREPLACE` 成为保护的 .retired 备份，目录各关键点 fsync。不允许用 symlink `/dev/null` 导致错误 chmod。
+- **功能实际未部署**：`linux-legacy-retire` Cargo feature 默认关闭，`legacy_retire` 没有任何 CLI/SSH/HTTP 调用；测试只在 CI 普通隔离临时目录尝试 swap，不会碰生产 `/var/lib/tradechannel`。它防普通旧路径调用，但不防不合作 root、另一路脚本副本或切换前短暂写入。报告 `authorizes_migration`/`authorizes_new_listener` 永远 false，不可当审批。仍要完整 root/systemd 停服和 Windows SSH 禁写之后才能接续 TLS Rust receiver。
+- 同 SHA [Linux #44079535756](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44079535756) 核心 113+CLI 5+preflight 11+TTY 5+新原子退役 5 tests success，单独真实 WireGuard kernel/netns 1 success，0 failed/ignored，严格 Rust --locked/-D warnings。MSVC/GNU CI 终态待核对，不能借旧 SHA。SEC-01/02/08 未验收，Issue #5 Open，所有 PR Draft，main 未合并。
