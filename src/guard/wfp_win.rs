@@ -1144,6 +1144,42 @@ mod imp {
         permitted_filters: Vec<u64>,
     }
 
+    /// 动态许可是提权操作：不能信任父进程或请求文件直接提交的 APP_ID。
+    /// 重新走正式交易名单的路径、reparse、WFP AppId 校验，并拒绝重复身份。
+    /// 必须在打开 WFP 动态会话和安装任何 PERMIT 之前完整执行。
+    fn validate_lease_identities(
+        ids: &[super::super::identity::ProgramIdentity],
+    ) -> Result<(), String> {
+        use super::super::identity::{resolve_entry, MAX_PROGRAMS};
+        if ids.is_empty() || ids.len() > MAX_PROGRAMS {
+            return Err(format!("许可名单必须包含 1 至 {MAX_PROGRAMS} 条有效程序身份"));
+        }
+        let env = SystemIdentityEnv::new();
+        let mut seen = std::collections::HashSet::new();
+        for identity in ids {
+            if identity.name.trim().is_empty() {
+                return Err("交易程序名称为空，拒绝创建许可".into());
+            }
+            let path = identity.path.to_str().ok_or_else(|| {
+                "交易程序路径包含无法表达的 Unicode，拒绝创建许可".to_string()
+            })?;
+            let expected = resolve_entry(&identity.name, Some(path), &env)
+                .map_err(|e| format!("交易程序「{}」身份复核失败：{}", identity.name, e.reason()))?;
+            if expected.app_id != identity.app_id
+                || expected.device_path != identity.device_path
+            {
+                return Err(format!(
+                    "交易程序「{}」路径、设备身份与传入 APP_ID 不一致，拒绝动态许可",
+                    identity.name
+                ));
+            }
+            if !seen.insert(expected.app_id) {
+                return Err("交易程序 APP_ID 在许可名单中重复，拒绝生成歧义规则".into());
+            }
+        }
+        Ok(())
+    }
+
     impl DynamicProxyLease {
         /// 唯一允许构造临时代理许可的内部入口，拒绝在持久阻断缺失时开放通道。
         pub fn acquire(
@@ -1156,6 +1192,7 @@ mod imp {
             if ids.is_empty() || lease_nonce.len() < 16 {
                 return Err("保护名单为空或许可会话 nonce 不足，拒绝临时放行".into());
             }
+            validate_lease_identities(ids)?;
             // 与现有 install/sync/remove 使用完全相同的跨进程互斥，
             // 保证检查持久 BLOCK → 安装许可之间不会被另一笔 Guard 变更打断。
             // 仅保护创建时的原子前置检查；lease 运行期间不能长期占有互斥。
@@ -1265,6 +1302,41 @@ mod imp {
     #[cfg(test)]
     mod dynamic_proxy_lease_tests {
         use super::*;
+
+        #[test]
+        fn lease_rejects_forged_appid_and_device_path_before_bfe_writes() {
+            use super::super::super::identity::resolve_entry;
+            let exe = std::env::current_exe().unwrap();
+            let good = resolve_entry("Trader", exe.to_str(), &SystemIdentityEnv::new())
+                .expect("用于测试的可执行文件必须可被 Windows 识别");
+            assert!(validate_lease_identities(&[good.clone()]).is_ok());
+
+            let mut forged_app = good.clone();
+            forged_app.app_id[0] ^= 1;
+            assert!(validate_lease_identities(&[forged_app]).is_err());
+
+            let mut forged_device = good.clone();
+            forged_device.device_path.push_str("-other");
+            assert!(validate_lease_identities(&[forged_device]).is_err());
+
+            assert!(validate_lease_identities(&[good.clone(), good]).is_err(),
+                "重复程序身份不能导致重复许可");
+        }
+
+        #[test]
+        fn lease_rejects_empty_invalid_and_oversized_identities() {
+            use super::super::super::identity::{ProgramIdentity, MAX_PROGRAMS};
+            let exe = std::env::current_exe().unwrap();
+            let identity = ProgramIdentity {
+                name: String::new(),
+                path: exe,
+                app_id: vec![1, 0],
+                device_path: String::new(),
+            };
+            assert!(validate_lease_identities(&[]).is_err());
+            assert!(validate_lease_identities(&[identity.clone()]).is_err());
+            assert!(validate_lease_identities(&vec![identity; MAX_PROGRAMS + 1]).is_err());
+        }
 
         #[test]
         fn supervised_process_handle_rejects_invalid_pid_and_accepts_current() {
