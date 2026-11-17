@@ -125,11 +125,11 @@ fn validate_transport_paths(request: &Path, response: &Path) -> Result<(), Strin
     {
         return Err("租约 IPC 目录必须使用独立的随机十六进制标识".into());
     }
-    let actual = std::fs::canonicalize(dir)
+    // canonicalize 在 Windows 上可能自动加 \\?\ 前缀，不能直接与原 PathBuf
+    // 比较，否则有效的普通目录也会被误判为不安全。
+    // 确认目录存在，随后用 Win32 FILE_ATTRIBUTE_REPARSE_POINT 逐级排除 junction。
+    std::fs::canonicalize(dir)
         .map_err(|e| format!("租约 IPC 目录不可访问：{e}"))?;
-    if actual != dir {
-        return Err("租约 IPC 目录路径存在非规范化或重解析跳转".into());
-    }
     // Windows 目录联接/junction 也需要拒绝（不能只靠 std::is_symlink）。
     #[cfg(windows)]
     {
