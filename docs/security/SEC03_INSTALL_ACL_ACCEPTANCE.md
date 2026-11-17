@@ -22,9 +22,9 @@ Rust 安装阶段负责 Win32 受保护 DACL 的创建、收紧与现场读回�
 | I04 | C | 改写 bin、管理员启动脚本与卸载脚本 | 均拒绝；原文件 SHA256 不变 |
 | I05 | A | 编辑 data/config.json、导入线路、连接/断开 | 数据可正常读写，代理连接与还原逻辑不变 |
 | I06 | B | 管理员 Proxy/TUN 分别选择其他目录的 EXE | 拒绝任意引擎提权执行，不启动外部程序 |
-| I07 | A/B | 预置 junction/symlink/未知 DLL 后安装 | 拒绝链接/未知执行代码，不自动删除未知文件 |
+| I07 | A/B | 预置 junction/symlink、跨目录硬链接引擎或未知 DLL 后安装 | 拒绝链接/未知执行代码，不覆盖硬链接目标，不自动删除未知文件 |
 | I08 | A/B | A 拥有旧版宽权限 bin，B 升级收紧 | A 即使仍是历史 Owner 也无法恢复写权限 |
-| I09 | B | 重复安装与升级 | 二进制更新、data 完整、ACL 继续受保护、程序能启动 |
+| I09 | B | 重复安装与升级 | 二进制更新、既有 data/config.json 可继续由 A 写入、ACL 受保护、程序能启动 |
 | I10 | A/B | 原 Proxy/TUN、Guard install/verify、异常退出 | WFP 持久 BLOCK 与 Proxy 恢复不变 |
 | I11 | B | 缺包文件、改包 SHA、破坏 DLL | 安装中止，无假成功 |
 | I12 | B | 卸载/回滚 | 需先完成 SEC-09 的 Guard 安全卸载，不能删掉仍需解除持久 BLOCK 的唯一客户端 |
