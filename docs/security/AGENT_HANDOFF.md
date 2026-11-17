@@ -139,3 +139,13 @@
 - **本轮最后两个对抗修正**：78a25ac0 防止 proxy-journal.json 的 PermissionDenied/元数据读取错误被 Path::exists() 错当不存在，符号链接/硬链接记录不得通过；4a063de4 用隔离假 backend 验证 WFP 删除虽成功但 Removed 标记不能写时，程序文件仍必须保留，不得误报卸载成功。没有更改原持久 BLOCK 的 WFP 代码。
 - **最新测试**：[MSVC 44026418209](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418209) / [GNU 44026418218](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418218)；写入时尚无最终绿/红结论，先读失败 Job logs，禁止删安全断言、增加 skip、把旧 SHA 当最新验收。安全脚本仅作为 Rust --uninstall-preflight / --uninstall-owns-shortcut 的薄入口。
 - **状态约束**：SEC-09 是部分候选，不能宣称实机安全卸载已通过。U01–U14、SEC-03 I01–I12、SEC-10 UAC-01～12 和 WFP 真实断线检查缺失；仍不合并 main、PR #6/#3 持续 Draft。任务账本 D.7–D.8 为主。
+
+## 14. SEC-11 UTF-8 及 SEC-09 安装/卸载清单一致性（2026-11-17）
+
+- 活动 Rust 开发分支 fix/sec10-guard-elevation-identity-p0-20261117 / Draft PR #6；**最新候选代码 SHA d4f7feb8b5aed21759704b318121e2bfd8972934**。main 857ea759、PR #3 Draft 未更改。新旧任务继承 docs/security/REMEDIATION_BACKLOG.md D.4–D.10，绝不能将旧版双 CI 绿冒充最新候选通过。
+- 先复核上轮 Rust SEC-09 SHA 4a063de4 的 CI：[MSVC 44026418209](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418209)、[GNU 44026418218](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418218) 均最终 Completed/Success。MSVC 沿用原 8 项环境依赖测试排除，本次未新增 skip。SEC-09 依旧未完成 Windows A/B/C 安全验收。
+- SEC-11 已复现的真正崩溃点：src/uiweb_form.rs::short_time 原先 len≥16 且 byte[10]==T 即切片 [5..10]，攻击者构造 aaaa你bbbT... 时 byte5 在汉字内部而 byte10 为 T，导致 panic；提交 d90df394 使用 str::get(..16) 并严格验证 ASCII 日期时间格式，非标准值原样显示，新增确定性单测。
+- SEC-11 WireGuard shape 加固提交 ac282e43：src/pairing.rs::tunnel::wireguard_key 改为纯字节、严格 ASCII/44 字节/末尾 = 验证，新增 emoji/中文/错误填充测试。**旧代码的第43字节切片在 len=44 且 ends_with('=') 条件下事实上始终落在字符边界，不应将其伪称已复现 panic**。
+- SEC-09 清单一致性候选：Rust src/install_trust.rs::BIN_FILES 为唯一代码目录允许清单，src/uninstall_safety.rs::code_file_manifest 复用它。测试用 include_str 解析 package-files/uninstall.ps1 的清理列表，确保不缺、不重复和主 exe 最后删除；包装器则先删引擎/DLL/许可证，最后删 exe 及 uninstall.ps1，失败时尽可能保留重新卸载的能力。提交 b839dace、0d3bbc69、f9d7dbbc。
+- 两个 Rust CI 已加 SEC-11 独立过滤，最新 SHA d4f7feb8 对应 [MSVC 44030514834](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514834) / [GNU 44030514840](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514840)，本条写入时正在运行。后续先查终态及失败 job logs，不删测试、不加 skip；CI 即便全绿也不能关闭 SEC-11 的其他生产 panic/unwrap 审查，也不能视作 SEC-03/09/10 真实 Windows/WFP 安全验收。
+- 继续任务优先级：完成最新 SHA 自动化回归后，SEC-11 生产 unwrap/expect 与其它 UTF-8 截断点、SEC-01/02 Linux Rust 服务端核心漏洞；实机 A/B/C 与 WFP 仍是明确人工验收阻塞。PR #6 与 PR #3 保持 Draft，不合并 main。
