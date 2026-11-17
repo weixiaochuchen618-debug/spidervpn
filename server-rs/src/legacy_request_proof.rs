@@ -216,7 +216,8 @@ mod tests {
         f=fixture();
         let signed=f["originalSignedPairRequest"].as_str().unwrap().to_owned();
         let mut p:Vec<String>=signed.split('.').map(str::to_owned).collect();
-        p[2].replace_range(12..13,if p[2].as_bytes()[12]==b'A'{"B"}else{"A"});
+        let flip = if p[2].as_bytes()[12] == b'A' { "B" } else { "A" };
+        p[2].replace_range(12..13, flip);
         f["originalSignedPairRequest"]=json!(p.join("."));
         assert_eq!(run(&f),Err(RequestProofError::InvalidOriginalRequest));
     }
