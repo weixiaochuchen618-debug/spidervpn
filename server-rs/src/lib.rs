@@ -30,6 +30,9 @@ pub mod ledger_disk;
 #[cfg(target_os = "linux")]
 pub mod transaction;
 
+#[cfg(target_os = "linux")]
+pub mod wg_readonly;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {
