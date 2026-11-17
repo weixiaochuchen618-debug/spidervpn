@@ -21,6 +21,8 @@ use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 pub mod lock;
 
+pub mod legacy;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claims {
     pub invite_id: String,
