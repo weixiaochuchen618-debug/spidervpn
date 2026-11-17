@@ -1568,7 +1568,7 @@ pub fn transport_script(spec: &Spec, host: &str, identity: &TransportIdentity) -
     // 配置用**模板**注入，真正的值由脚本在 source 完身份文件之后替换：
     // 服务器上已有身份时以它为准，本地这份可能已经过时。
     let config = config_template(spec.port);
-    TRANSPORT_SCRIPT
+    let rendered = TRANSPORT_SCRIPT
         .replace("@@CONFIG@@", &config)
         .replace("@@IFACE@@", &spec.interface)
         .replace("@@HOST@@", host.trim())
@@ -1589,7 +1589,8 @@ pub fn transport_script(spec: &Spec, host: &str, identity: &TransportIdentity) -
         .replace("@@ARM64_ARCHIVE@@", ARM64.archive)
         .replace("@@ARM64_BIN@@", ARM64.binary)
         .replace("@@ARM64_LIB@@", ARM64.library)
-        .replace("@@ARM64_ELF@@", &ARM64.elf_machine.to_string())
+        .replace("@@ARM64_ELF@@", &ARM64.elf_machine.to_string());
+    crate::legacy_writer_fence::guard_legacy_mutation_script(&rendered)
 }
 
 /// 服务端装好之后回显的参数。**以服务器上那份为准**，不是本地生成的那份。
@@ -2043,7 +2044,7 @@ impl TransportBackup {
 pub fn identity_restore_script(spec: &Spec, backup: &TransportBackup, force: bool) -> String {
     let _ = spec;
     let identity = &backup.identity;
-    format!(
+    let rendered = format!(
         r#"set -eu
 umask 077
 CONF_DIR='{conf_dir}'
@@ -2082,7 +2083,8 @@ echo "TC_DONE=1"
         uuid = identity.uuid,
         port = identity.port,
         server_name = identity.server_name,
-    )
+    );
+    crate::legacy_writer_fence::guard_legacy_mutation_script(&rendered)
 }
 
 /// 恢复身份：把备份写回服务器，再用既有安装脚本重新渲染配置并重启服务。
@@ -2150,7 +2152,17 @@ mod tests {
             !script.contains("transport.env"),
             "transport.env 是身份，不能删：{script}"
         );
-        assert!(!script.contains("/var/lib/tradechannel"), "审计与身份目录不能碰：{script}");
+        // The SEC-01 read-only retirement prelude MUST inspect the root
+        // path; forbidding the literal path anywhere would reject that
+        // necessary denial check. Remove only the exact, separately tested
+        // immutable read-only fence; the original uninstaller must still
+        // never mutate or even reference the legacy audit/identity tree.
+        let readonly_gate = crate::legacy_writer_fence::SHELL_DENY_PRELUDE;
+        assert_eq!(script.matches(readonly_gate).count(), 1,
+            "卸载必须且只能有一个经过验证的只读禁写门禁：{script}");
+        let uninstaller = script.replacen(readonly_gate, "", 1);
+        assert!(!uninstaller.contains("/var/lib/tradechannel"),
+            "卸载正文不得碰审计与身份目录：{uninstaller}");
     }
 
     #[test]
@@ -2688,6 +2700,32 @@ TC_DONE=1\n";
             assert!(script.find("exit 73").unwrap() < script.find("IFACE=").unwrap());
             assert!(script.contains("TC_ERROR=LegacyWriterFenced"));
         }
+    }
+
+    #[test]
+    fn sec01_install_transport_restore_are_guarded_before_all_mutations() {
+        let policy=crate::legacy_writer_fence::SHELL_DENY_PRELUDE;
+        let s=spec();
+        let install=install_script(&s);
+        let transport=transport_script(&s,"203.0.113.10",&sample_identity());
+        let restore=identity_restore_script(&s,&sample_backup(),false);
+        for (name,script) in [
+            ("wireguard install", install.as_str()),
+            ("transport install", transport.as_str()),
+            ("identity restore", restore.as_str()),
+        ] {
+            assert!(script.starts_with(&format!("set -eu\n{policy}")), "{name}");
+            assert_eq!(script.matches("TC_ERROR=LegacyWriterFenced").count(),1,
+                "{name} must have exactly one strict retirement guard");
+            let first_write=["mkdir -p","cat >","apt-get install","systemctl restart",
+                "mv \"", "wg syncconf","chmod "]
+                .into_iter().filter_map(|cmd|script.find(cmd)).min()
+                .expect("writer should contain at least one persistent side effect");
+            assert!(script.find("exit 73").unwrap() < first_write, "{name}");
+        }
+        assert!(install.contains("wg-quick@$IFACE"), "original WG installation retained");
+        assert!(transport.contains("@@CONFIG@@")==false, "transport render still applies");
+        assert!(restore.contains("IdentityDiffers"), "restore conflict check retained");
     }
 
     // ---- 撤销设备 ----
@@ -3436,7 +3474,7 @@ pub fn install_script(spec: &Spec) -> String {
         ..
     } = spec;
     let table = format!("tc_{interface}");
-    format!(
+    let rendered = format!(
         r#"set -eu
 umask 077
 IFACE='{interface}'
@@ -3521,7 +3559,8 @@ echo "TC_IFACE_ADDRESS=$IFACE_ADDR"
 echo "TC_SUBNET=$SUBNET"
 echo "TC_DONE=1"
 "#
-    )
+    );
+    crate::legacy_writer_fence::guard_legacy_mutation_script(&rendered)
 }
 
 /// 部署成功后服务器那边的事实。客户端配置要用它。
