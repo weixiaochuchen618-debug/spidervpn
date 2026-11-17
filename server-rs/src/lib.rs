@@ -33,6 +33,9 @@ pub mod transaction;
 #[cfg(target_os = "linux")]
 pub mod wg_readonly;
 
+#[cfg(target_os = "linux")]
+pub mod wg_conf_audit;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {
