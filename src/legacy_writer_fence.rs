@@ -47,6 +47,22 @@ pub(crate) fn guard_ssh_command(original: &str) -> String {
     safe
 }
 
+/// Keep the original shell strict-mode declaration first, placing the
+/// retirement denial before any prior command, config write or service
+/// restart. No new SSH round-trip and no server-side state mutation.
+pub(crate) fn guard_legacy_mutation_script(original: &str) -> String {
+    if let Some(body) = original.strip_prefix("set -eu\n") {
+        let mut guarded = String::with_capacity(original.len() + SHELL_DENY_PRELUDE.len());
+        guarded.push_str("set -eu\n");
+        guarded.push_str(SHELL_DENY_PRELUDE);
+        guarded.push_str(body);
+        guarded
+    } else {
+        // A changed template must not silently lose the gate.
+        guard_ssh_command(original)
+    }
+}
+
 pub(crate) fn remote_says_fenced(exit_code: u32, stderr: &str) -> bool {
     exit_code == FENCED_EXIT_CODE
         && stderr.lines().any(|line| line.trim() == FENCED_ERROR)
@@ -157,6 +173,50 @@ mod tests {
         fs::remove_file(&unit).unwrap();
 
         fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn existing_posix_deployment_body_is_unchanged_after_retirement_gate() {
+        let original = "set -eu\numask 077\nmkdir -p /var/tmp/old-peer-writer\n";
+        let guarded = guard_legacy_mutation_script(original);
+        assert!(guarded.starts_with("set -eu\nif [ -e "), "{guarded}");
+        assert!(guarded.contains("exit 73\nfi\numask 077\nmkdir -p"), "{guarded}");
+        assert_eq!(guarded.matches("TC_ERROR=LegacyWriterFenced").count(), 1);
+        assert_eq!(guarded.replacen(SHELL_DENY_PRELUDE, "", 1), original);
+        let unexpected = guard_legacy_mutation_script("touch /tmp/old-writer\n");
+        assert!(unexpected.starts_with("if [ -e "));
+        assert!(unexpected.ends_with("touch /tmp/old-writer\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_strict_posix_shell_will_not_run_deployment_body_when_retired() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        let root = std::env::temp_dir().join(format!(
+            "spider-deploy-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = root.join("marker");
+        let executed = root.join("executed");
+        let prelude = SHELL_DENY_PRELUDE.replace(CUTOVER_MARKER, marker.to_str().unwrap())
+            .replace(OLD_SCRIPT, root.join("tc-pair.py").to_str().unwrap())
+            .replace(SERVICE_UNIT, root.join("tc-pair.service").to_str().unwrap());
+        let original = format!("set -eu\nprintf created > '{}'\n", executed.display());
+        let wrapped = guard_legacy_mutation_script(&original)
+            .replacen(SHELL_DENY_PRELUDE, &prelude, 1);
+        assert_eq!(Command::new("/bin/sh").arg("-c").arg(&wrapped)
+            .status().unwrap().code(), Some(0));
+        assert_eq!(fs::read(&executed).unwrap(), b"created");
+        fs::remove_file(&executed).unwrap();
+        fs::write(&marker,b"root-retired").unwrap();
+        let refused = Command::new("/bin/sh").arg("-c").arg(&wrapped).output().unwrap();
+        assert_eq!(refused.status.code(), Some(73));
+        assert_eq!(refused.stderr, b"TC_ERROR=LegacyWriterFenced\n");
+        assert!(!executed.exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
