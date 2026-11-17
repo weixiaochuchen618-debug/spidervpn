@@ -12,7 +12,8 @@
 
 use crate::{claims_valid, Grant, InviteState, Peer};
 use crate::ledger_disk::{LedgerStore, StoreError};
-use crate::wg_conf_audit::{read_verified_snapshot, require_exact_match, ConfigError};
+use crate::wg_conf_audit::{read_pinned_conf, read_verified_snapshot, require_exact_match, ConfigError};
+use crate::wg_readonly::{LiveWgReader, ReadError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryStage { PendingAdd, RevokingRemove }
@@ -118,6 +119,40 @@ pub fn inspect_recovery(
         config_has_peer: config == Presence::Exact,
         kernel_has_peer: kernel == Presence::Exact,
     })
+}
+
+/// Inspect two live inventories bracketing the disk read; the live side
+/// must be unchanged, but the target peer is ALLOWED to differ from disk
+/// so the operator can diagnose an interrupted config/kernel transaction.
+fn bracket_recovery_inspection(
+    store: &LedgerStore, invite_id: &str,
+    before: &[Peer], durable: &[Peer], after: &[Peer], now_unix: i64,
+) -> Result<RecoveryInspection, RecoveryError> {
+    require_exact_match(before, after)
+        .map_err(|_| RecoveryError::UnrelatedDrift)?;
+    inspect_recovery(store, invite_id, after, durable, now_unix)
+}
+
+/// Read-only local-admin audit: live-before -> protected wg.conf ->
+/// live-after; never calls a mutating WireGuard command. This does NOT
+/// work with remote-provided JSON snapshots or cached values.
+/// A future administrator CLI should surface this inspection and require
+/// a second, explicit approval before implementing any suggested repair.
+#[derive(Debug)]
+pub enum PinnedInspectError {
+    Live(ReadError),
+    Config(ConfigError),
+    Recovery(RecoveryError),
+}
+pub fn inspect_pinned_recovery(
+    store: &LedgerStore, interface: &str, invite_id: &str, now_unix: i64,
+) -> Result<RecoveryInspection, PinnedInspectError> {
+    let reader = LiveWgReader::new(interface).map_err(PinnedInspectError::Live)?;
+    let before = reader.snapshot().map_err(PinnedInspectError::Live)?;
+    let disk = read_pinned_conf(interface).map_err(PinnedInspectError::Config)?;
+    let after = reader.snapshot().map_err(PinnedInspectError::Live)?;
+    bracket_recovery_inspection(store, invite_id, &before, &disk, &after, now_unix)
+        .map_err(PinnedInspectError::Recovery)
 }
 
 /// Terminal-only local reconciliation. This cannot create or remove a WG
@@ -342,6 +377,24 @@ mod tests {
         finalize_from_verified_peers(&mut store,INV,100,&[]).unwrap();
         assert!(matches!(finalize_from_verified_peers(&mut store,INV,100,&[]),
             Err(FinalizeError::Inspection(RecoveryError::NotRecoverableState))));
+        finish(dir,store);
+    }
+
+    #[test]
+    fn bracketed_live_inventory_must_remain_stable_around_disk_read(){
+        let (dir,store,g)=fixture("bracket",true);
+        let target=[peer(&g)];
+        let unrelated=Peer {
+            public_key:format!("{}=","B".repeat(43)),
+            address:Ipv4Addr::new(10,66,0,5),
+        };
+        assert!(matches!(bracket_recovery_inspection(
+            &store,INV,&target,&[],&[target[0].clone(),unrelated],200
+        ),Err(RecoveryError::UnrelatedDrift)));
+        let result=bracket_recovery_inspection(
+            &store,INV,&target,&[],&target,200
+        ).unwrap();
+        assert_eq!(result.action,RecoveryAction::RepairKernelWithApproval);
         finish(dir,store);
     }
 
