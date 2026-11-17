@@ -303,6 +303,23 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
+    /// 让测试自己的随机目录**显式拥有宽松可继承的旧版 ACL**。
+    /// GitHub Windows Runner 的 %TEMP% 可能天然禁止继承，因此不能把
+    /// "普通新建文件一定有 (I)" 当成测试前提。
+    /// 仅用于临时测试目录，正式产品逻辑不会调用。
+    #[cfg(windows)]
+    fn grant_test_inheritable_users_modify(dir: &Path) {
+        let output = std::process::Command::new("icacls")
+            .arg(dir)
+            .arg("/grant")
+            .arg("*S-1-5-11:(OI)(CI)(M)")
+            .output()
+            .expect("Windows runner 必须提供 icacls");
+        assert!(output.status.success(),
+            "无法在隔离测试目录建立旧版宽松 ACL：{}",
+            String::from_utf8_lossy(&output.stderr));
+    }
+
     /// 新写的私钥文件：只有管理员/SYSTEM/所有者能碰，而且不再继承父目录的 ACE。
     ///
     /// 判据用「没有 `(I)`」而不是「没有 BUILTIN\Users」：父目录不同，继承来的组也不同
@@ -335,6 +352,9 @@ mod tests {
     #[test]
     fn tightening_closes_a_file_that_inherited_the_loose_acl() {
         let dir = temp_dir("tighten");
+        // 真实构造旧版 Authenticated Users:(M) 继承权限，而非假定
+        // Windows Runner 的用户 TEMP 目录本来就有松 ACL。
+        grant_test_inheritable_users_modify(&dir);
         let path = dir.join("client.conf");
         std::fs::write(&path, "PrivateKey = abc").unwrap();
         let before = acl_of(&path);
@@ -367,6 +387,9 @@ mod tests {
     #[test]
     fn the_root_scan_covers_all_three_private_key_files() {
         let root = temp_dir("root");
+        // 创建受控的旧安装目录宽 ACL：确保四个文件**确实都**
+        // 继承 Authenticated Users 的写权限，回归才有安全意义。
+        grant_test_inheritable_users_modify(&root);
         let server = root.join("servers").join("9f1c2a44-0b7d-4c1e-9a2b-3c4d5e6f7a8b");
         let lines = root.join("lines");
         std::fs::create_dir_all(&server).unwrap();
@@ -386,6 +409,8 @@ mod tests {
         for path in [&conf, &key, &line] {
             let acl = acl_of(path);
             assert!(!acl.contains("(I)"), "{} 没被收紧：\n{acl}", path.display());
+            assert!(!acl.contains("Authenticated Users"),
+                "{} 仍泄露给旧版宽松账户组：\n{acl}", path.display());
         }
         // config.json 不在私钥落点名单里：不收紧，也不该被创建/删除。
         let plain_acl = acl_of(&plain);
