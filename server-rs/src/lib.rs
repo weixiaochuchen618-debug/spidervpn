@@ -27,6 +27,9 @@ pub mod legacy;
 #[cfg(target_os = "linux")]
 pub mod ledger_disk;
 
+#[cfg(target_os = "linux")]
+pub mod transaction;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {
