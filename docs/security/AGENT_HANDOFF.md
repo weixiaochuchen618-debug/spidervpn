@@ -168,3 +168,14 @@
 - **最关键的边界**：此 Rust core 未被运行时调用，Python `src/pairhost.rs::UNIT` 仍启动 `tc-pair.py serve` 且默认 root；未完成 Rust 加密验签/JWE、JSON schema 及原子持久迁移、WG 实际 sync/readback、TLS 非 root 资源限流、管理端 revoke 接线/隔离 Linux 端到端。**SEC-01/02 P0 仍未修复生产，SEC-08 P1 也仅候选**。不能因为 Linux CI 绿标 completed。
 - **后续六阶段完整规格**：[SEC01_LINUX_RUST_MIGRATION.md](./SEC01_LINUX_RUST_MIGRATION.md) S01–S06。优先从旧 invites.json 持久迁移和跨进程 Rust 事务完整接线开始，后续服务端 TLS 并发/超时管理为 SEC-02 独立 P0。不要直接把 Python 换成 Rust 而丢掉当前客户端的 RSA-3072、RS256、RSA-OAEP-256/A256CBC-HS512 字节兼容性。
 - **保留发布冻结**：SEC-03/09/10 Windows A/B/C UAC/WFP 实机与原持久 BLOCK 回归尚缺；WFP 实验 PR #3 默认关闭；PR #6 仍 Draft，main 不合并，Issue #5 open。
+
+## 17. SEC-01 Rust Cargo 旧邀请审计与 19 项 Linux 绿（2026-11-17）
+
+- **当前最新 Rust 源码 SHA**：3d01dda610d33f38cb5f7aa7e95479ecf97b9ac4，活动分支 fix/sec10-guard-elevation-identity-p0-20261117，Draft PR #6；main 仍 857ea7593941ce79f6507db5b1ced076c3a077ba，PR #3 仍未合并。
+- **上一阶段**：server-rs/src/lib.rs 是 SEC-01 无副作用授权状态机，server-rs/src/lock.rs 是 SEC-08 Linux x86_64 跨进程 lock。最新独立 Cargo 包 server-rs/Cargo.toml/Cargo.lock 锁定 serde 1.0.229、serde_json 1.0.154。代码的主 Windows Cargo.toml 不变，服务端依赖独立。
+- **新增只读审计**：server-rs/src/legacy.rs::audit_legacy_json（4MiB / 4096 邀请上限，schema 校验，未知 state fail closed，无 Token 或签名正文泄露）。旧 Python Consumed 记录没有 RequestDigest，因此 Rust 必须真实验证原授权 JWS 才能回填；未知与缺字段不允许自动迁移，不能伪造已授权身份。Cancelled/Expired 永不被视作 Open。
+- **最新 Linux 构建/测试证据**：[Linux Cargo #44034700193](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700193)，head_sha=3d01dda6，Completed/Success；19 tests passed、0 failed、0 ignored，含原 13 条重放/锁测试与新增 6 条旧 JSON audit，`cargo --locked` 和 `RUSTFLAGS=-D warnings`。此前单独 rustc 无法链接 serde_json 的过渡红例现已修正，不得删除/跳过测试。
+- **最新 Windows 客户端回归**：[MSVC 44034700266](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700266)、[GNU 44034700188](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700188) 同源码 SHA，写入时未拿到终态；先检查 GitHub Actions 实际结果。Windows 即使全绿也不能证明 Linux 接收服务安全。
+- **要谨记的 P0 停止线**：当前服务端仍通过 `src/pairhost.rs` 的 systemd UNIT 使用 `/usr/bin/python3 -I .../tc-pair.py serve`，重放漏洞生产路径未替换；Rust 尚无正式 JSON 持久迁移、WG 真实增删与事务回滚、签名/JWE 密文互操作、TLS 限并发/超时、非 root 账户和客户端管理端撤销接线。这些缺失时 SEC-01/02/08 不能关；不得将 19 tests 当作零风险证明。
+- **后续详细方案**：[SEC01_LINUX_RUST_MIGRATION.md](./SEC01_LINUX_RUST_MIGRATION.md) S01–S06，结合 [REMEDIATION_BACKLOG D.13–D.14](./REMEDIATION_BACKLOG.md)。优先补专用 Rust disk ledger 的原子/fsync 落盘与老 JSON 格式可信重验，然后 Linux WG 真实事务、TLS 的 Rust 认证握手。对恶意重新发放全新 InviteId+DeviceId+Key 的攻击者无法凭旧墓碑识别真人，需严格审批控制，不要宣称百分百阻断。
+- 另有 SEC-03/09/10 Windows A/B/C UAC/WFP 现场验收未完成；WFP PR #3 实验默认关闭。Issue #5 不关，PR #3/#6 继续 Draft、main 不合并。
