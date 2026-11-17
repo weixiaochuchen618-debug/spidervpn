@@ -484,8 +484,9 @@ pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
 fn run_elevated(exe: &Path, req: &Path, res: &Path) -> Result<i32, ElevateError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, WaitForSingleObject, INFINITE,
+        GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -523,10 +524,21 @@ fn run_elevated(exe: &Path, req: &Path, res: &Path) -> Result<i32, ElevateError>
     let handle: HANDLE = info.hProcess;
     // 等它结束（上限 120 秒）。超时 = 无法确认，不是成功。
     let wait = unsafe { WaitForSingleObject(handle, (ELEVATE_WAIT_TIMEOUT_SECS * 1000) as u32) };
-    if wait != 0 {
+    if wait != WAIT_OBJECT_0 {
+        // 之前超时仅丢失 handle，但高权限子进程可能仍继续改变 WFP。
+        // 尽力终止并等待其退出；无法终止时按“未知、未保护”对待，不认成功。
+        if wait == WAIT_TIMEOUT {
+            unsafe {
+                TerminateProcess(handle, 1);
+                WaitForSingleObject(handle, 5_000);
+            }
+        }
         unsafe { CloseHandle(handle) };
-        let _ = INFINITE; // 保留常量引用，避免误改成无限等待
-        return Err(ElevateError::Timeout);
+        return if wait == WAIT_TIMEOUT {
+            Err(ElevateError::Timeout)
+        } else {
+            Err(ElevateError::ChildFailed(-1))
+        };
     }
     let mut code: u32 = 1;
     let got = unsafe { GetExitCodeProcess(handle, &mut code) };
