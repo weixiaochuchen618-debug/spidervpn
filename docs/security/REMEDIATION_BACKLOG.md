@@ -256,3 +256,13 @@ PR/commit/CI: ...
 - **同一 SHA Windows 旧客户端兼容 CI**：当前 [MSVC 44033771576](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44033771576) / [GNU 44033771443](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44033771443) 写入时还在运行；它们是客户端 ABI 回归，不能替代 Linux 真实 WireGuard/TLS 运行。
 - **明确未完成、不能宣称 SEC-01 修复**：当前 src/pairhost.rs 的 systemd ExecStart 仍 `/usr/bin/python3 -I .../tc-pair.py serve`；Rust authority 还没有密码学验签/JWE、生产 JSON schema 与 fsync 事务、旧 invites.json 持久迁移、WG config/wg syncconf 真实操作、Linux TLS、权限分离、恢复流程、Windows 管理端撤销入口接线。所有对在线攻击者的生产风险仍未正式关闭。详细步骤与 S01–S06 见 [SEC01_LINUX_RUST_MIGRATION.md](./SEC01_LINUX_RUST_MIGRATION.md)。
 - **下一步**：采用独立 Linux Rust server Cargo 包，先建旧 records 迁移/严格 schema、跨进程原子 Ledger（必须锁住整个 WG transaction），再做 Rust TLS 与真机虚拟化验收。若采用另一个实现策略仍须保证老邀请消费路径不可再 attach 已撤销的 peer。SEC-01 P0、SEC-02 P0、SEC-08 P1 仍 open，PR #6/#3 Draft、main 不动。
+
+## D.14 SEC-01 独立 Linux Rust Cargo + 旧邀请只读审计（2026-11-17）
+
+- **代码 HEAD**：3d01dda610d33f38cb5f7aa7e95479ecf97b9ac4，活动分支 fix/sec10-guard-elevation-identity-p0-20261117 / Draft PR #6。新增独立 server-rs/Cargo.toml 与锁定的 server-rs/Cargo.lock（原仓库已经使用的 serde 1.0.229、serde_json 1.0.154 及同版本依赖），不修改桌面客户端的 Cargo.toml/原版 WFP/连接逻辑。
+- **Rust 旧记录审计**：server-rs/src/legacy.rs::audit_legacy_json 只在内存解析 SchemaVersion=1、Invites 对象且限制输入 4MiB / 4096 邀请。`Consumed` 旧记录本来**没有保存 RequestDigest**，所以即使有 RequestId/JwkDigest/Signature，也不能自动移入可信 Consumed；回报 MissingRequestDigest、NeedsSignatureVerification、NeedsLiveWireGuardReadback，绝不合成或接受未经验证的摘要。无效 ID/公钥/网段、未知 State、已 Cancelled/Expired、秘密 Token 不写入报告，均有专门测试。
+- **最新 Linux CI**：[security-pairing-rust-linux #44034700193](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700193) head_sha=3d01dda6，**Completed/Success，19 tests passed、0 failed、0 ignored**，Cargo --locked + RUSTFLAGS -D warnings。包含 SEC01/08 原核心 13 + Legacy audit 6。工作流验证运行时仍使用 Python，**这是预迁移安全基础，不是生产修复**。
+- **暂存过渡故障记录**：新增 serde JSON 源码后、旧工作流仍使用原生 rustc 未加依赖时 CI 红（过渡 SHA），现按单独 Cargo 包和锁定依赖修复，并保留所有测试；不得把过渡红例算成漏洞加剧或伪造 green。
+- **最新 Windows 同 SHA 回归**：[MSVC 44034700266](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700266) / [GNU 44034700188](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700188) 写入时在运行。即便双绿也仅证明现有客户端不受影响；不能覆盖 Linux WG/TLS 真机。
+- **后续 P0 核心**：实现受保护 Linux 持久 JSON 原子落盘+真实旧记录迁移/墓碑迁移（不可静默重置权限），RSA-3072 / RS256 / RSA-OAEP-256 / A256CBC-HS512 协议兼容 Rust 接口；实现 WG 本机状态只读/事务增删+回读；迁移 18443 TLS Rust daemon 和非特权服务/限时限并发（SEC-02），Windows 撤销 CLI 接入 Rust Revoking→Revoked。详见 SEC01_LINUX_RUST_MIGRATION.md S01–S06。
+- **状态冻结**：SEC-01 P0/SEC-08 P1 均部分候选（生产缺陷仍存在），SEC-02 P0 未修复，SEC-03/09/10 Windows 实机仍未验收，main 不合并，PR #3/#6 Draft，Issue #5 保持 Open。
