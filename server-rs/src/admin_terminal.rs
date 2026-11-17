@@ -14,7 +14,7 @@
 #![cfg(all(target_os = "linux", feature = "linux-admin-finalize"))]
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
