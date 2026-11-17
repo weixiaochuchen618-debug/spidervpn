@@ -413,3 +413,11 @@
 - 首 SHA `45c5f86` 的 [Linux #44203320571](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320571) core **Failure**，root netns Job Success：新增 CLI Rust unit test 连续两次 `unwrap()` 移动同一 `Result`，真实 E0382 编译错误。已修复为 `as_deref()` 保留两个原始断言，不删除/skip 任何测试；[Draft PR #17](https://github.com/weixiaochuchen618-debug/spidervpn/pull/17) 新代码 HEAD **`de8e2e222a31c0290385a0126c0f2538571c33d0`**。
 - 新 SHA [Linux #44203644974](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644974)、[MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970)、[GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) **需要重新查询终态及原始日志**。保留前轮失败记录，不把父 PR #16 绿套用到此 SHA。真实 root/systemd VPS 退役和撤销迁移仍未验收，Issue #5 Open / PR Draft，main/UI/WFP 不动；见 Backlog D.45。
 
+
+
+## 48. PR #17 新 SHA Linux Core/Netns 完整 Success 与 6 项新 CLI 真实执行（2026-11-18）
+
+- 代码 `de8e2e222a31c0290385a0126c0f2538571c33d0` 的 [Linux workflow #44203644974](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644974) **两个 Job Completed/Success**；121 lib/0 failed/ignored、六个新增 `spidervpn-pair-retire` binary unit tests/0 failed/ignored、真实非 root 运行 exit2，真 WG kernel netns 与 sudo root 临时目录退役原子文件系统回归都通过。旧首版 `45c5f86` E0382 红已按事实记录并保留。
+- [MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970) / [GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) 还需查询**同一 SHA**最终完整 Job；不要用旧 PR #16 的结果替代。详见 [Backlog D.46](./REMEDIATION_BACKLOG.md)。
+- 绝不能把 opt-in root 离线退役候选解释成生产的 Rust daemon/security DoD：真实 root 的 systemd 停服/持久 mask/reboot/故障回滚、老版 SSH 与其它 root 隔离、受信撤销 tombstone 与 TLS 监听接管均未验收；Issue #5 Open，PR #17 Draft，main 不变。
+

@@ -542,3 +542,11 @@ PR/commit/CI: ...
 - 新准确 SHA 已触发 [Linux #44203644974](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644974)、[MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970)、[GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991)，**本条记录时仍在运行**；必须核查每条 Job / 新 CLI six tests / 既有全量回归终态。
 - 不构成 production 安全验收；不可自动在实际 VPS 上停止旧 Python、打开新 Rust TLS、导入旧 revoked/consumed 或合并 main。SEC-01/02/08、Issue #5 OPEN，PR #17 Draft。详细见 D.44。
 
+
+
+## D.46 PR #17 E0382 修复后 Linux 全流程双 Job 成功（2026-11-18）
+
+- 精确 Rust HEAD `de8e2e222a31c0290385a0126c0f2538571c33d0`，[Linux #44203644974](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644974) **Completed/Success 两 Job**：真实 WireGuard netns 与 root 临时目录文件系统原子退役验收 Success，Rust core 全流程 Success（121 library pass/0 failed/ignored、5 CLI pass、既有管理 TTY + legacy cutover/retire 专项通过，保持 `cargo --locked` / `RUSTFLAGS=-D warnings`）。
+- Linux 原始日志确认新 `spidervpn-pair-retire` **6 项 Rust CLI tests 全部通过、0 failed、0 ignored**，包括拒绝非 root、错误参数、缺授权、重复 shutdown 检查、故障后 fail-closed、非 ASCII/CRLF/EOF；普通 Linux runner 真执行同一 CLI `retire` 后 exit2、`root privileges required`，未在生产 VPS 上执行改动。旧首 SHA `45c5f86` 的 Rust E0382 red 继续按 D.45 真实保留，没有跳过。
+- 同 SHA [MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970) / [GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) 本条记录时仍在运行；不能当作 full success。SEC-01/02/08、Issue #5 OPEN，PR #17 Draft、main/UI/WFP 不改。Linux CI **不等于**在真实 VPS root stop/mask/reboot/rollback 或绝对隔离非协作 root writer。
+
