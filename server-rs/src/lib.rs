@@ -30,6 +30,9 @@ pub mod legacy_signed;
 /// Independently pinned original PairRequest evidence, still never import.
 pub mod legacy_request_proof;
 
+#[cfg(target_os="linux")]
+pub mod legacy_cutover;
+
 #[cfg(target_os = "linux")]
 pub mod ledger_disk;
 
