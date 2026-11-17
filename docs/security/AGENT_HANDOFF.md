@@ -112,3 +112,12 @@
 - **测试和 CI 现状**：tests/install-seal-e2e.rs + install_trust::tests::；MSVC/GNU 专项均已注册。旧 MSVC [44017844701](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44017844701) 有 2/4 正常路径 ACL 单测因 Windows D:PAI 标记被误拒，提交 c4b9618b 修正只接受 D:P / D:PAI 两种受保护控制标记（其余 ACE 逐字比对）；新增硬链接拒绝提交 d4bf342a；旧 data 升级时显式保护目录为 AU Modify 且保留内容提交 a14016cd。**这些提交之后的当前 SHA CI 仍需终态核对**：[MSVC 44018620435](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620435)、[GNU 44018620441](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620441)。不能引用旧 SHA 的成功或取消。
 - **实机 DoD 缺失**：[SEC03_INSTALL_ACL_ACCEPTANCE.md](./SEC03_INSTALL_ACL_ACCEPTANCE.md) I01–I12，A 普通/B 独立管理员/C 第二普通用户的实际覆盖/改 ACL/UAC/升级/卸载与 WFP 持久阻断。完整 A/B/C 测试前 SEC-03 保持橙色“候选开发中”，SEC-10 也未完成。特别注意既有卸载脚本 SEC-09 与受保护 bin 新管理员权限要求的兼容，不能在 Guard 未核验解除时删除 EXE。安装包来源/签名、旧安装 TOCTOU、真实跨用户 ACL 尚未证明，绝不可合并 main。
 - **唯一任务状态**：继续看 [REMEDIATION_BACKLOG.md §D.4-D.5](./REMEDIATION_BACKLOG.md)。新 Agent 若见 CI 红例必须读失败 job logs 修 Rust/测试（不删断言、不增 skip），红例修复后重新匹配最新 SHA 的 MSVC/GNU。后续优先收口 SEC-03 安装、卸载和 A/B/C 实机，再推进 SEC-01 Rust 服务安全。
+
+
+## 11. 本轮最终 CI 结果 / 不可越过的安全门槛（2026-11-17）
+
+- **最新活动 Rust PR #6 HEAD**：a14016cd4a921b2e8639de22ab9f70add9d62a17，依旧 Draft / Open / 未合并；正式 main 仍为 857ea7593941ce79f6507db5b1ced076c3a077ba，PR #3 WFP 亦仍 Draft / 未合并。
+- **同一 HEAD 已有两套 CI 成功证据**：[MSVC 44018620435](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620435) Completed / Success（Build、SEC-03/SEC-10 专项、全部 Rust integration 目标、模块回归、便携单元 suite 各步骤均绿）；[GNU 44018620441](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620441) Completed / Success（GNU release 构建、环境覆盖隔离、安装 ACL / Guard / WFP 专项）。**MSVC 便携单元 suite 仍有原始 8 项环境依赖排除**，本轮未新增 skip。
+- **代码和设计恢复点**：src/install_trust.rs Rust Win32 安装 ACL（含 D:PAI、硬链接、已有 data 独立 AU Modify）、tests/install-seal-e2e.rs，以及 package-files/install.ps1 的复制前后 Rust --install-seal 调用；本轮没有改变 UI、连接编排或持久 WFP BLOCK 代码。对旧数据仅改变根目录权限，不重写配置内容。
+- **当前仍不通过实机安全 DoD**：缺少 Win11 A/B/C 不同账户的真实 UAC/修改和所有者验证 [SEC03 I01–I12](./SEC03_INSTALL_ACL_ACCEPTANCE.md)，安装包来源/签名、执行对象句柄绑定、既有安装文件竞争、真实升级卸载回滚，及 [SEC10 UAC-01～12](./SEC10_WINDOWS_UAC_ACCEPTANCE.md)。下一轮先做隔离 Windows VM 安全验收，再推进 SEC-09 卸载兼容及 SEC-01 Rust 服务器漏洞；**SEC-03 和 SEC-10 不能宣称完全修复，更不能合并 PR 到 main**。
+- **任务清单唯一真相**：[REMEDIATION_BACKLOG.md D.4–D.6](./REMEDIATION_BACKLOG.md)。旧 SHA 54f09333 MSVC 红例 D:PAI 的根因和修复必须保留，不能抹除失败记录。
