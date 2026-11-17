@@ -99,19 +99,28 @@ if (Test-Path -LiteralPath $sm) {
         Remove-Item -LiteralPath $sm -Force
     }
 }
-foreach ($n in @('启动SpiderVPN.cmd', '以管理员身份启动SpiderVPN.cmd', '卸载SpiderVPN.cmd', 'uninstall.ps1', '用户速查.md')) {
+# 保留卸载脚本到最后；删除中途出错时仍有可重复执行的恢复入口。
+foreach ($n in @('启动SpiderVPN.cmd', '以管理员身份启动SpiderVPN.cmd', '卸载SpiderVPN.cmd', '用户速查.md')) {
     $p = Join-Path $TargetDir $n
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
 }
 
 # 3) 只清理本安装的固定 bin 文件清单，不递归删除未知文件或用户数据
-foreach ($n in @('spidervpn.exe', 'sing-box.exe', 'WebView2Loader.dll', 'sing-box.LICENSE.txt')) {
+# 先移除引擎/DLL/许可证，最后才移除主 EXE；
+# 任一 Remove-Item 失败都会立即停止，保留尚未删的 EXE 便于安全重试。
+foreach ($n in @('sing-box.exe', 'WebView2Loader.dll', 'sing-box.LICENSE.txt', 'spidervpn.exe')) {
     $p = Join-Path $bin $n
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; Say "  已删：$p" }
 }
 if (Test-Path -LiteralPath $bin) {
     $left = @(Get-ChildItem -LiteralPath $bin -Force -ErrorAction SilentlyContinue)
     if ($left.Count -eq 0) { Remove-Item -LiteralPath $bin -Force }
+}
+
+# 删除完主程序之后才移除卸载脚本本身：中途失败保留救援入口。
+$uninstaller = Join-Path $TargetDir 'uninstall.ps1'
+if (Test-Path -LiteralPath $uninstaller) {
+    Remove-Item -LiteralPath $uninstaller -Force
 }
 
 # 4) 数据：默认保留；要删必须明确表示
