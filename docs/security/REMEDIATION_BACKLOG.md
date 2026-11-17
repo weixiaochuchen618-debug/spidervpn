@@ -266,3 +266,10 @@ PR/commit/CI: ...
 - **最新 Windows 同 SHA 回归**：[MSVC 44034700266](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700266) / [GNU 44034700188](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700188) 写入时在运行。即便双绿也仅证明现有客户端不受影响；不能覆盖 Linux WG/TLS 真机。
 - **后续 P0 核心**：实现受保护 Linux 持久 JSON 原子落盘+真实旧记录迁移/墓碑迁移（不可静默重置权限），RSA-3072 / RS256 / RSA-OAEP-256 / A256CBC-HS512 协议兼容 Rust 接口；实现 WG 本机状态只读/事务增删+回读；迁移 18443 TLS Rust daemon 和非特权服务/限时限并发（SEC-02），Windows 撤销 CLI 接入 Rust Revoking→Revoked。详见 SEC01_LINUX_RUST_MIGRATION.md S01–S06。
 - **状态冻结**：SEC-01 P0/SEC-08 P1 均部分候选（生产缺陷仍存在），SEC-02 P0 未修复，SEC-03/09/10 Windows 实机仍未验收，main 不合并，PR #3/#6 Draft，Issue #5 保持 Open。
+
+## D.15 SEC-01 Rust Cargo 最新跨平台回归（2026-11-17）
+
+- **最新 Rust 候选 HEAD**：3d01dda610d33f38cb5f7aa7e95479ecf97b9ac4。Linux [#44034700193](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700193) **Completed/Success，19/19 Rust tests 0 skipped**。
+- **Windows GNU [#44034700188](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700188)**：head_sha 匹配、**Completed/Success**，包括原 Rust build.ps1、release SPIDERVPN_ROOT 隔离和原 SEC-09/10/11 专项；独立 Linux 代码暂未进入 Windows 客户端进程。
+- **Windows MSVC [#44034700266](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700266)**：同 HEAD 的 Rust 编译、SEC-09/10/11 安全专项、全部独立 Rust integration 测试已 Success，记录时模块回归/Portable unit suite 未全部完成，**不得提前声明整个 MSVC Workflow Success**。保留原先 8 项环境依赖排除，未新增 skip。下一 Agent 请先核对 CI 终态并补记。
+- **安全状态**：这些自动回归都不代表旧 Python pairing receiver 已换 Rust 或真实 WG/TLS/设备撤销安全验收；SEC-01/02/08 生产条件未满足，SEC-03/09/10 Windows A/B/C 实机也未完成。PR #3/#6 Draft、main 857ea759 未合并、Issue #5 Open。
