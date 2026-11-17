@@ -295,3 +295,10 @@
 - Rust 离线双重证据验收：**管理端独立可信 JWK** 验 `SignedAuthorization` + **原设备 PairRequest JWS** 验签，同时检查真正**独立**的原设备 RSA JWK 摘要与旧 RecipientJwkDigest、原请求签名及管理授权签名的共同 ClientRequest SHA-256 七行摘要、RequestId/DeviceId/WG Key/InviteId/ServerBinding。注意客户端的自签请求不能自带唯一信任锚；`independently_pinned_recipient_digest` 必须从旧 JSON 之外经过独立认证的事实获得，缺了便拒绝。所有正向返回报告 **still blocks import**，绝不调 LedgerStore/WG。
 - [Linux #44074337077](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337077) 当前 SHA 普通核心 job 已通过 102 lib + 5 CLI、5 独立新的双签名测试、5 原 root-only 终态测试；同 SHA 独立 real WG kernel/netns job 与 Windows MSVC [#44074337005](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337005) GNU [#44074337010](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337010) 写入时尚未取得最终结果。下个 Agent **先查最新 HEAD/CI 完整状态，失败不跳过**。
 - 下一阶段**不是**基于本报告自动切换服务；必须获取独立历史 revoke/设备接收私钥所有权证据和真实不可重放迁移事务，替换旧 Python 权限写路径并做真实 VPS A/B/断电回滚。SEC-01/02/08、Issue #5 仍 Open，PR #3/#6/#7/#8/#9/#10 Draft；依据 [Backlog D.29](./REMEDIATION_BACKLOG.md) 续作。
+
+
+## 32. PR #10 Linux 全工作流 Success，Windows 仍待最终结果（2026-11-17）
+
+- 当前 Rust HEAD `e4b8b62fbec4e30bfb10c15f107bb21e2fe1f55f`。同 SHA [Linux #44074337077](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337077) 两 Job Completed/Success，102 Rust library + 5 CLI + 5 feature admin + 1 real kernel netns E2E 均通过，0 failed/ignored，严格 --locked/-D warnings。
+- 同 SHA [MSVC #44074337005](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337005)、[GNU #44074337010](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337010) 还没完成，后续必须核查终态。没有改变 UI、连接流程、WFP Persistent BLOCK、Python 生产配对 receiver、main。
+- **非常关键的不可发布点**：原 Python 持久旧记录并不等于独立可信的客户端密钥证明；即使有双签名的测试样本与成功审计，也不能将过往 Consumed 授权静默导入、补建 peer、恢复已撤销设备。无可信历史证据需拒绝/人工重新配对，SEC-01 P0 不得关闭。详见 [D.30](./REMEDIATION_BACKLOG.md)。
