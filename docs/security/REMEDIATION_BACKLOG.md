@@ -523,3 +523,13 @@ PR/commit/CI: ...
 - **回归与差异确认**：相对父 PR #15 仅修改 `src/deploy.rs`、`src/legacy_writer_fence.rs`、`.github/workflows/rust-windows.yml`、`.github/workflows/security-guard-gnu.yml`。MSVC 现在对每一条单独 `cargo test` 后都检查 `$LASTEXITCODE`。无 UI、连接/代理、`assets/tc-pair.py` 或 WFP 持久 BLOCK 改动；main `857ea7593941ce79f6507db5b1ced076c3a077ba` 未变。
 - **SEC-01/02/08 不关闭**：通过的只是新版 Windows 客户端在**已独立启动退役条件**的旧 SSH 入口拒绝；真实生产 Linux root、旧客户端与非协作写者、systemd/mask/reboot/power-loss、可信撤销/tombstone 迁移、Rust TLS 监听服务接管均未通过，无法凭 CI 推断零漏洞或安全合并。Issue #5 Open，全部相关 PR Draft，WFP-05 真机未验收。
 
+
+
+## D.44 SEC-01/08 受控 root TTY 离线退役 CLI 候选（2026-11-18）
+
+- **活动候选**：[Draft PR #17](https://github.com/weixiaochuchen618-debug/spidervpn/pull/17)，base [PR #16](https://github.com/weixiaochuchen618-debug/spidervpn/pull/16)，branch `fix/sec01-root-tty-offline-retire-cli-20261118`，首个 Rust HEAD `45c5f86fae1c55d7eb2418b589b4f32f4f530557`。从已验证的 PR #16 `ed8d7a98` 分出，正式 main 不变；代码改动仅 `server-rs/Cargo.toml`、`server-rs/src/bin/spidervpn-pair-retire.rs` 及原 Linux CI workflow。
+- **具体问题与新代码**：此前 `legacy_retire::stage_offline_legacy_retirement` 虽已有 root-only 原子 RENAME_EXCHANGE + quarantine + fsync，但没有带人类确认与终态检查的独立可执行运维入口。新增 **default-disabled** `linux-legacy-retire-cli` feature 及其 required-features bin `spidervpn-pair-retire`，只接受固定 `retire` 参数，不收用户路径、`--yes` 或环境 token。先检查有效 root UID，然后 Rust 只读 preflight 证明旧 unit 永久 mask/inactive/dead/zero PID、旧 Python 进程不存在、旧 TCP4/TCP6 端口无监听；接着通过真实 `/dev/tty` 在 45s 内读取精确 ASCII 确认文本，不接受 stdin；确认后第二次重新观察，最后才调用已有 retire primitive 自身的前后重复检查和文件系统原子退役。未知/错误/中断状态全部拒绝并要求人工检查，不自动打开旧脚本。
+- **明确权限边界**：该 CLI 是**离线退役能力候选而非可信 server cutover 或生产修复**。必须先由独立 root 运维确认 stop/mask，且相同 root/旧客户端仍可手动改目录、调用别名脚本、绕过 Rust flock。成功返回不导入旧 Consumed/Revoked、不会创建 peer、监听 TLS、变更 WireGuard、放行 HTTP 或自动授权新客户端。root + 控制 TTY 不证明所有 SSH 写者受控；不能把它当成 server 侧真正的全局锁。
+- **新增验收**：Rust CLI 六类定向单测覆盖非 root/多余参数在任何 IO 前拒绝、首轮 shutdown 失败、空 TTY/错误同意不执行、人工停留后的第二次 shutdown 失败、retire 结果不授权迁移、失败/不完整 witness、UTF-8/CRLF/超长/EOF 终端输入。Linux CI 用 `--locked`、`RUSTFLAGS=-D warnings` 编译 bin、运行全部测试，并由 CI 非 root 调用同一 binary 验证 exit 2；原 WG netns、sudo 临时目录 root filesystem 退役测试保留，不删除/跳过任何测试。
+- **本条建立时 CI 仍运行**：精确 SHA [Linux #44203320571](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320571)、[MSVC #44203320563](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320563)、[GNU #44203320555](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320555)，必须逐个检查最终状态与失败日志；不能继承 PR #16 绿。无真实 VPS root/stop/mask/reboot/power-loss/rollback 或历史 revocation 可信迁移；SEC-01/02/08 和 Issue #5 OPEN、全部安全 PR Draft，main `857ea759` / UI / WFP 持久 BLOCK 均不变。
+

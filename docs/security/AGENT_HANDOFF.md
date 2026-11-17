@@ -398,3 +398,11 @@
 - Linux 121 library passed、0 failed/ignored，并通过实际 WG netns 和 root 退役测试。MSVC 最后一轮 1429 passed / 0 failed / 1 ignored（原有）/ 8 filtered out（原有环境依赖）；GNU 编译成功、专项 pass，但已有 Rust warnings，不是 `-D warnings` 零告警认证。没有跳过新失败，MSVC 的前后两次专测已加独立 `$LASTEXITCODE` 判断。
 - 当前项目安全账本状态仍为 **SEC-01/02/08 未通过生产 DoD、Issue #5 Open、PR #16 Draft、不合并 main**。下一步集中于 Linux root 级旧 Python/SSH 非协作写者、服务切换与重启回滚、可信撤销历史及真实 TLS/HTTP 接管；不能把这个客户端 opt-in 检查充当服务器级独占锁。main `857ea759`、UI/正常连接及 WFP persistent BLOCK 均未改；[Backlog D.43](./REMEDIATION_BACKLOG.md) 为详细证据。
 
+
+
+## 46. 新 Draft PR #17：受控 root TTY 离线旧 Python 脚本退役 CLI（2026-11-18）
+
+- 继续 SEC-01/SEC-08 P0，在 [PR #16](https://github.com/weixiaochuchen618-debug/spidervpn/pull/16) 成功的 `ed8d7a9817998fabebdb05d7dc40a9ac8a034804` 上创建 [Draft PR #17](https://github.com/weixiaochuchen618-debug/spidervpn/pull/17)，代码 HEAD `45c5f86fae1c55d7eb2418b589b4f32f4f530557`。新 Rust feature-gated `spidervpn-pair-retire` CLI 要 root、固定 verb、预检、真实控制终端 45s 限时精确确认、确认后再次预检，再调用既有只在 opt-in 编译的 Linux atomic retired-path primitive；不开放默认执行路径、网络/API/WireGuard、UI/WFP、生产 Python 或 main。
+- **新 CI 正在执行，绝不提前宣称绿**：[Linux #44203320571](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320571)、[MSVC #44203320563](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320563)、[GNU #44203320555](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320555)。优先按准确 SHA 查询 Linux `spidervpn-pair-retire` compile + six new tests + 非 root CLI、WG real netns/root temp filesystem；失败必须修复源码再测，所有已有测试保留。Windows CI 需要确认完整 MSVC/GNU；即使三绿也不能等同 VPS 实机 root 退役。
+- 这不是完整服务器端 writer fence：真正 root/老版 SSH 可绕过、unit mask 是独立前提，撤销历史/tombstone 不可信仍不能迁入，Rust TLS 未接管。发行/合并闸门原样：SEC-01/02/08 / Issue #5 未验收、所有 PR Draft，main `857ea759` 未变。参见 [Backlog D.44](./REMEDIATION_BACKLOG.md)。
+
