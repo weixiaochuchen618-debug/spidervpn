@@ -159,3 +159,10 @@
 - 已定位线上接收器实装为 `tc-pair.service`，`User=root`、Python `tc-pair.py serve`。旧脚本与 Rust 尚未共享一个跨进程独占锁；不能直接在原线上旧服务未退出时启用 Rust 新授权处理器。新增 [Draft PR #11](https://github.com/weixiaochuchen618-debug/spidervpn/pull/11) / `server-rs/src/legacy_cutover.rs`，仅在 Linux root 下只读观察**持久 systemd mask + inactive/dead/pid-zero + 无可见 tc-pair.py writer**，两次观察相互比对；进程权限/外部状态异常一律拒绝。
 - 独立 `spidervpn-pair-cutover` 需显式编译 feature `linux-cutover-preflight`（默认关闭），无自启与写入口。绝不执行 `systemctl stop/mask`、不修改配对账本/WireGuard/生产 Python，也不授权旧 Consumed 导入或启动新的 Rust TLS listener。任何预检成功只意味着这些条件在读回时短暂成立，**不证明没有 root 人工重启、别名进程、额外命名空间或时间竞态**。
 - 当前 HEAD `cd3cd51f53ff1df55d67150d89d3601eb1cfcd47`，同 SHA [Linux #44075947553](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44075947553) 109 Rust 核心、5 CLI、额外 7 preflight unit、5 opt-in TTY admin、1 真 WG netns 全成功，0 skipped/failed；Windows MSVC/GNU 对应运行仍待 final。真正生产替代必须先具备可审核的旧 writer 停用/栅栏、可信历史撤销、root 导入事务、TLS/JWE/HTTP、VPS kill/reboot 和回滚验收；SEC-01 未修复。
+
+
+## 第十五阶段：旧 Python 配对监听端口的真实套接字拒绝证据（预集成）
+
+- [Draft PR #12](https://github.com/weixiaochuchen618-debug/spidervpn/pull/12) 叠加在 PR #11，代码 SHA `16c4176ed302871e2cb41787954a0f667f90d202`。扩展 Linux Rust `legacy_cutover` 仅增加**更多拒绝依据**：必须从 root-only 防符号链接的旧 `server.json` 验证非默认服务端口与 Endpoint 完整一致，再检查当前 Linux network namespace 的 `/proc/net/tcp` 与 `tcp6` 上该端口是否处于 LISTEN。任一监听、文件或内核库存不可核实、双次检查的端口发生变化均拒绝。没有打开/停止 TCP 端口、杀进程、修改部署、编辑配对账本或任何 WireGuard 行为。
+- 独立原 7 项预检测试增加四项：正确/伪造 port，IPv4/IPv6 监听行，坏 proc 截断拒绝，**实际 Rust `TcpListener` 创建的内核监听**状态探测。Linux [#44077594144](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077594144) 当前 SHA 核心 113 tests success，独立 WireGuard netns 工作流 Job 与 Windows MSVC/GNU 仍须精确核对。
+- **不构成 root 排他写者栅栏**：不能排除别名旧服务监听别的未可信记录的端口、不合作 root actor、另一个 netns 或快照之后重启。生产 Python 仍在服务器上且不参与 Rust SEC-08 锁；SEC-01/SEC-02/SEC-08 未验收，不合并 main。

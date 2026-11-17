@@ -311,3 +311,10 @@
 - Linux [CI #44075947553](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44075947553) 两 Job Completed/Success，同 SHA：109 library + 5 CLI，新增 7 preflight unit tests + 原 5 admin TTY tests + 1 real kernel WG netns test，0 failed/ignored，Cargo --locked/-D warnings。新 CLI 的真实非 root 拒绝 exit2 已执行。**真实 root 且无 mask 场景暂未在 CI E2E 验证**，不能推断系统级服务迁移成功。
 - 同 SHA Windows [MSVC #44075947516](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44075947516)、[GNU #44075947502](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44075947502) 还需核对最终状态；不要把旧 SHA 绿色当最新绿。下一步继续设计**真正不可并行的 root/systemd 切换栅栏**、真实 Linux root 服务 stop/mask/reboot 验证和 trusted revoke/tombstone 迁移；没有这条完整链不许启用 Rust 消费接口。
 - 此 PR 仅预集成，SEC-01/02/08 与 Issue #5 继续 Open，相关 #3/#6/#7/#8/#9/#10/#11 全部 Draft，正式 main `857ea759` 不合并。详情见 [Backlog D.31](./REMEDIATION_BACKLOG.md)。
+
+
+## 34. SEC-01 旧服务端口监听否决新增 PR #12（2026-11-17）
+
+- 续作 [Draft PR #12](https://github.com/weixiaochuchen618-debug/spidervpn/pull/12)（base #11），HEAD `16c4176ed302871e2cb41787954a0f667f90d202`。保留 PR #11 系统层 root mask/inactive/dead 和 `/proc/<pid>/cmdline` 双重只读预检，进一步通过旧 Python root-only `server.json` 中规范的真实 `Port` 与 `Endpoint` 映射，前后两次读取完整 `/proc/net/tcp`、`/proc/net/tcp6`，凡 LIVE LISTEN socket 命中端口（即便脚本已改名）就拒绝。任意文件、所有权、字节长度、格式或快照漂移也拒绝。
+- `legacy_cutover.rs` 默认发版无此命令，opt-in `linux-cutover-preflight` 的报告依然不授予导入/新 HTTP 监听或 WireGuard 写操作；更不可信地推断旧 revoke 历史。新增实际 Linux `TcpListener` 动态端口内核观察 + 假 IPv4/IPv6 及坏记录和旧配置端口测试。Linux [#44077594144](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077594144) 核心 Job 113 library + 5 CLI + 5 admin policy + 11 cutover policy success（0 failed/ignored，`--locked`/`-D warnings`）；该工作流 netns Job 以及 [MSVC #44077593890](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077593890)、[GNU #44077593911](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077593911) 仍需查最终结论。
+- **下一优先项**：确立真正可审计的 root/systemd 切换栅栏，停止且防重启旧 Python 任何写入口，完成独立 revoke/tombstone 证据和旧账本转换逻辑的 fail-closed 设计；仅快照没有解决真实排他。当前 PR #12 不能合并 main 或关闭 SEC-01。主分支 main `857ea759`，Issue #5 OPEN，PR #3/#6/#7/#8/#9/#10/#11/#12 Draft。
