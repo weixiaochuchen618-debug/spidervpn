@@ -1,0 +1,15 @@
+[package]
+name = "spidervpn-pairing-authority"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Rust Linux pairing authority migration candidate; not deployed"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Exactly the already-vetted versions in the Windows client's Cargo.lock.
+# Old invitation JSON is only *audited*, never blindly authorized.
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
