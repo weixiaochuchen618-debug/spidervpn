@@ -2685,7 +2685,7 @@ TC_DONE=1\n";
         ] {
             let prelude = crate::legacy_writer_fence::SHELL_DENY_PRELUDE;
             assert!(script.starts_with(&format!("set -eu\n{prelude}")), "{script}");
-            assert!(script.find("exit 73").unwrap() < script.find("CONF=").unwrap());
+            assert!(script.find("exit 73").unwrap() < script.find("IFACE=").unwrap());
             assert!(script.contains("TC_ERROR=LegacyWriterFenced"));
         }
     }
