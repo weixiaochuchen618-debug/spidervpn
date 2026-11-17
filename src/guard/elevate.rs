@@ -824,6 +824,60 @@ mod tests {
         assert!(validate_elevated_programs(&req, &FakeIdentityEnv).is_err());
     }
 
+    struct CountingBackend(std::sync::atomic::AtomicUsize);
+    impl super::super::GuardBackend for CountingBackend {
+        fn available(&self) -> bool { true }
+        fn read(&self, _: &[ProgramIdentity], _: &super::super::Expect)
+            -> Result<GuardEvidence, WfpError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(WfpError::InvalidState)
+        }
+        fn install(&self, _: &[ProgramIdentity], _: &super::super::Expect)
+            -> Result<GuardEvidence, WfpError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(WfpError::InvalidState)
+        }
+        fn sync(&self, _: &[ProgramIdentity], _: &super::super::Expect)
+            -> Result<GuardEvidence, WfpError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(WfpError::InvalidState)
+        }
+        fn remove(&self) -> Result<GuardEvidence, WfpError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(WfpError::InvalidState)
+        }
+    }
+
+    #[test]
+    fn elevated_entry_rejects_modified_request_before_any_wfp_backend_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut req = test_ipc_request();
+        let files = GuardIpcFiles::create(&req).unwrap();
+        write_json_file(&files.req, &req).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+        req.action = GuardAction::Remove;
+        std::fs::write(&files.req, serde_json::to_vec(&req).unwrap()).unwrap();
+
+        let backend = CountingBackend(AtomicUsize::new(0));
+        assert_eq!(guard_apply_main(&files.req, &files.res, &backend), 2);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0,
+            "被替换的请求不允许调用任何 WFP 后端动作");
+    }
+
+    #[test]
+    fn unknown_elevated_store_is_rejected_before_any_wfp_backend_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut req = test_ipc_request();
+        req.store_kind = "ForgedStore".into();
+        let files = GuardIpcFiles::create(&req).unwrap();
+        write_json_file(&files.req, &req).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+        let backend = CountingBackend(AtomicUsize::new(0));
+        assert_eq!(guard_apply_main(&files.req, &files.res, &backend), 2);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0,
+            "未知 StoreKind 必须在更改 WFP 前拒绝");
+    }
+
     #[test]
     fn user_cancel_is_declined_not_failure() {
         assert_eq!(classify_spawn_error(1223), ElevateError::Declined);
