@@ -55,6 +55,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & cargo test --locked --bin spidervpn sec01_install_transport_restore_are_guarded_before_all_mutations -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo test --locked --bin spidervpn sec01_sourced_transport_reads_refuse_retired_pairing_host -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Rust integration tests (each integration target, no duplicate binary unit tests)
         shell: pwsh

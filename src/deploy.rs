@@ -1797,6 +1797,15 @@ fi
 echo "TC_DONE=1"
 "#;
 
+/// The remote transport.env is a sourced shell script, not inert data.
+/// Apply the legacy retirement fence before even a nominally read-only
+/// probe; an old script with side effects must not execute after cutover.
+fn guarded_transport_probe_script() -> String {
+    crate::legacy_writer_fence::guard_legacy_mutation_script(
+        &TRANSPORT_PROBE_SCRIPT.replace("@@CONF_DIR@@", TRANSPORT_CONF_DIR),
+    )
+}
+
 /// 读服务器上的兼容连接参数。`Ok(None)` = 还没装（不是错误）。
 pub fn read_transport<'a>(
     target: &Target,
@@ -1805,7 +1814,7 @@ pub fn read_transport<'a>(
     timeout: Duration,
 ) -> Result<Option<TransportInstalled>, Error> {
     let auth = auth.into();
-    let script = TRANSPORT_PROBE_SCRIPT.replace("@@CONF_DIR@@", TRANSPORT_CONF_DIR);
+    let script = guarded_transport_probe_script();
     let output = ssh::exec(target, auth, Some(expected), &script, timeout)?;
     parse_transport(&output.stdout).map_err(|message| {
         let mut detail = message;
@@ -1839,6 +1848,13 @@ echo "TC_SERVER_NAME=$SERVER_NAME"
 echo "TC_IDENTITY_SHA=$(sha256sum "$IDENTITY" | cut -d' ' -f1)"
 echo "TC_DONE=1"
 "#;
+
+// Export also sources transport.env; refuse it on retired servers as well.
+fn guarded_transport_export_script() -> String {
+    crate::legacy_writer_fence::guard_legacy_mutation_script(
+        &TRANSPORT_EXPORT_SCRIPT.replace("@@CONF_DIR@@", TRANSPORT_CONF_DIR),
+    )
+}
 
 /// 从服务器读回来的身份（含私钥）与它所在文件的哈希。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1957,7 +1973,7 @@ pub fn export_transport<'a>(
     timeout: Duration,
 ) -> Result<Option<TransportExport>, Error> {
     let auth = auth.into();
-    let script = TRANSPORT_EXPORT_SCRIPT.replace("@@CONF_DIR@@", TRANSPORT_CONF_DIR);
+    let script = guarded_transport_export_script();
     let output = ssh::exec(target, auth, Some(expected), &script, timeout)?;
     parse_transport_export(&output.stdout).map_err(|message| {
         let mut detail = message;
@@ -2726,6 +2742,25 @@ TC_DONE=1\n";
         assert!(install.contains("wg-quick@$IFACE"), "original WG installation retained");
         assert!(transport.contains("@@CONFIG@@")==false, "transport render still applies");
         assert!(restore.contains("IdentityDiffers"), "restore conflict check retained");
+    }
+
+
+    #[test]
+    fn sec01_sourced_transport_reads_refuse_retired_pairing_host() {
+        let prelude = crate::legacy_writer_fence::SHELL_DENY_PRELUDE;
+        let probe_original = TRANSPORT_PROBE_SCRIPT.replace("@@CONF_DIR@@", TRANSPORT_CONF_DIR);
+        let export_original = TRANSPORT_EXPORT_SCRIPT.replace("@@CONF_DIR@@", TRANSPORT_CONF_DIR);
+        for (name, original, guarded) in [
+            ("transport probe", probe_original, guarded_transport_probe_script()),
+            ("identity export", export_original, guarded_transport_export_script()),
+        ] {
+            assert!(guarded.starts_with(&format!("set -eu\n{prelude}")), "{name}");
+            assert_eq!(guarded.matches("TC_ERROR=LegacyWriterFenced").count(), 1, "{name}");
+            assert_eq!(guarded.replacen(prelude, "", 1), original,
+                "{name} must preserve the old non-retired workflow byte-for-byte");
+            assert!(guarded.find("exit 73").unwrap() < guarded.find(". \"$IDENTITY\"").unwrap(),
+                "{name} must deny before executing sourced remote data");
+        }
     }
 
     // ---- 撤销设备 ----

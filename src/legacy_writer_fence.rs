@@ -219,6 +219,50 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_shell_denies_sourceable_read_only_transport_before_side_effects() {
+        use std::fs::{self, Permissions};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "spider-legacy-source-fence-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, Permissions::from_mode(0o700)).unwrap();
+        let identity = root.join("transport.env");
+        let marker = root.join("retired-marker");
+        let side_effect = root.join("executed");
+        // An "identity file" is shell code when sourced: nominal reads can write.
+        fs::write(&identity, format!("printf sourced > '{}'\n", side_effect.display())).unwrap();
+        let original = format!("set -eu\nIDENTITY='{}'\n. \"$IDENTITY\"\necho TC_DONE=1\n",
+            identity.display());
+        let guarded = guard_legacy_mutation_script(&original);
+        let script = guarded
+            .replace(CUTOVER_MARKER, marker.to_str().unwrap())
+            .replace(OLD_SCRIPT, root.join("tc-pair.py").to_str().unwrap())
+            .replace(SERVICE_UNIT, root.join("tc-pair.service").to_str().unwrap());
+        let execute = || Command::new("/bin/sh").arg("-c").arg(&script).output().unwrap();
+
+        // Before a separately managed cutover the original read is unchanged.
+        let permitted = execute();
+        assert!(permitted.status.success(), "{:?}", permitted.stderr);
+        assert_eq!(fs::read(&side_effect).unwrap(), b"sourced");
+        fs::remove_file(&side_effect).unwrap();
+
+        // Retirement prevents executing sourced shell contents at all.
+        fs::write(&marker, b"retired").unwrap();
+        let denied = execute();
+        assert_eq!(denied.status.code(), Some(73));
+        assert_eq!(denied.stderr, b"TC_ERROR=LegacyWriterFenced\n");
+        assert!(denied.stdout.is_empty());
+        assert!(!side_effect.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn no_server_marker_creation_or_implicit_migration_authority() {
         // Marker existence is supplied ONLY by independently managed root
