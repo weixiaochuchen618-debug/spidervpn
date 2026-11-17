@@ -2143,15 +2143,14 @@ fn main() -> ExitCode {
             store: &store,
             apply: &connect::write_proxy,
             spawn: &|e: &engine::EngineConfig| {
-                // 管理员 TUN 不允许让低权限 config.json 决定执行任意 exe。
-                // 从本次引擎配置判断实际 TUN/代理模式，避免信任全局 mode。
-                // 不改变正常非提权代理模式的自定义引擎路径功能。
-                if cfg_ref.is_some_and(|c|
-                    connect::effective_mode(c, e) == config::Mode::Tun
-                ) && probe::elevated() {
+                // 管理员进程的任意引擎模式都必须拒绝 config.json
+                // 指定外部可执行文件；不能靠把 TUN 改成 Proxy 绕过。
+                // 使用实际 HKLM 提权判定，不受测试用 FORCE_NONADMIN 钩子影响。
+                // 普通权限代理模式保持原有自定义引擎行为。
+                if probe::is_elevated() {
                     let frontend = std::env::current_exe()
                         .map_err(|err| format!("无法确认 SpiderVPN 主程序身份：{err}"))?;
-                    engine::validate_privileged_tun_engine(
+                    engine::validate_privileged_engine(
                         std::path::Path::new(&e.binary), &frontend,
                     )?;
                 }
