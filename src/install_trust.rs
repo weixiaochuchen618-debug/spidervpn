@@ -33,7 +33,7 @@ const ROOT_FILES: &[&str] = &[
     "uninstall.ps1",
     "用户速查.md",
 ];
-const BIN_FILES: &[&str] = &[
+pub(crate) const BIN_FILES: &[&str] = &[
     "spidervpn.exe",
     "sing-box.exe",
     "WebView2Loader.dll",
