@@ -249,18 +249,20 @@ mod tests {
         fail_write: bool,
         fail_change: bool,
         fail_readback: bool,
+        fail_post_change_readback: bool,
     }
     impl FakeOps {
         fn new() -> Self {
             Self {
                 live:vec![], disk:vec![], writes:0, changes:0,
-                fail_write:false, fail_change:false, fail_readback:false
+                fail_write:false, fail_change:false, fail_readback:false,
+                fail_post_change_readback:false
             }
         }
     }
     impl MutationOps for FakeOps {
         fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError> {
-            if self.fail_readback {
+            if self.fail_readback || (self.fail_post_change_readback && self.changes > 0) {
                 return Err(ApplyError::Live(LiveError::TimedOut));
             }
             require_exact_match(&self.live,&self.disk).map_err(ApplyError::Readback)?;
@@ -369,6 +371,38 @@ mod tests {
         assert!(matches!(store.view().unwrap().state(&g.claims.invite_id),
             Some(InviteState::Revoking(_))));
         assert!(store.view().unwrap().retry(&g.claims,Some(&ops.live)).is_err());
+        drop(store);std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn live_readback_error_after_successful_kernel_change_keeps_pending() {
+        let (p,mut store,g)=temp_ledger("readbackfail");
+        let mut ops=FakeOps::new();
+        ops.fail_post_change_readback=true;
+        assert!(matches!(apply_with_ops(&mut store,&g,Change::Add,&mut ops),
+            Err(ApplyError::Live(LiveError::TimedOut))));
+        assert_eq!((ops.writes,ops.changes),(1,1));
+        assert_eq!(ops.live,ops.disk);
+        assert!(matches!(store.view().unwrap().state(&g.claims.invite_id),
+            Some(InviteState::Pending(_))));
+        drop(store);std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn revoking_after_partial_removal_can_be_confirmed_without_new_wg_call() {
+        let (p,mut store,g)=temp_ledger("resume-removed");
+        let mut ops=FakeOps::new();
+        apply_with_ops(&mut store,&g,Change::Add,&mut ops).unwrap();
+        store.update(|l|l.begin_revocation(&g.claims.invite_id)).unwrap();
+        // Simulate a crash after the peer disappeared from both config
+        // and kernel, before the final Revoked ledger fsync.
+        ops.live.clear();
+        ops.disk.clear();
+        let prior_calls=ops.changes;
+        apply_with_ops(&mut store,&g,Change::Remove,&mut ops).unwrap();
+        assert_eq!(ops.changes,prior_calls, "never issue a second remove");
+        assert!(matches!(store.view().unwrap().state(&g.claims.invite_id),
+            Some(InviteState::Revoked(_))));
         drop(store);std::fs::remove_dir_all(p).unwrap();
     }
 
