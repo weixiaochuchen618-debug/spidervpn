@@ -149,3 +149,11 @@
 - SEC-09 清单一致性候选：Rust src/install_trust.rs::BIN_FILES 为唯一代码目录允许清单，src/uninstall_safety.rs::code_file_manifest 复用它。测试用 include_str 解析 package-files/uninstall.ps1 的清理列表，确保不缺、不重复和主 exe 最后删除；包装器则先删引擎/DLL/许可证，最后删 exe 及 uninstall.ps1，失败时尽可能保留重新卸载的能力。提交 b839dace、0d3bbc69、f9d7dbbc。
 - 两个 Rust CI 已加 SEC-11 独立过滤，最新 SHA d4f7feb8 对应 [MSVC 44030514834](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514834) / [GNU 44030514840](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514840)，本条写入时正在运行。后续先查终态及失败 job logs，不删测试、不加 skip；CI 即便全绿也不能关闭 SEC-11 的其他生产 panic/unwrap 审查，也不能视作 SEC-03/09/10 真实 Windows/WFP 安全验收。
 - 继续任务优先级：完成最新 SHA 自动化回归后，SEC-11 生产 unwrap/expect 与其它 UTF-8 截断点、SEC-01/02 Linux Rust 服务端核心漏洞；实机 A/B/C 与 WFP 仍是明确人工验收阻塞。PR #6 与 PR #3 保持 Draft，不合并 main。
+
+## 15. SEC-11 测试编译红例与最新重跑（2026-11-17）
+
+- **本轮真实失败**：候选 Rust SHA d4f7feb8 的 [MSVC 44030514834](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514834) 与 [GNU 44030514840](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514840) 均 Failure；原因是我将 SEC-11 WireGuard key 单元测试误放在 pairing::line::tests 内，它无法调用 pairing::tunnel::wireguard_key，rustc E0425。Rust 生产 Build 已通过但 test-bin 未编译。此错误是新增测试作用域问题，不是旧版 WireGuard 逻辑引发的新漏洞。
+- **修正**：ce3c00fe 将同样的 7 条测试断言整体移到 pairing::tunnel::sec11_key_tests；e32c7567/c658c122 改正 MSVC/GNU 显式 test filter，**不跳过失败、不删除断言**。上次 SEC-09 SHA 4a063de4 双 CI Success 仍有效，但不能用于证明新代码。
+- **最新恢复点**：活动 Draft PR #6 源码 HEAD c658c12249568ccbfe02c13a436cdaa27ffe5776；对应 [MSVC 44031103332](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103332) / [GNU 44031103722](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103722) 当前尚无完整结论。先检查双方 workflow 状态和失败日志再做下一次写码，只有 head_sha 一致且 Completed/Success 才更新验收。
+- **仍须保留**：SEC-11 short_time 确实能因为 UTF-8 非边界 panic、wireguard_key 旧版在 44 字节与结尾 ASCII 等号约束下不一定能 panic；错误性质应分开。实机 SEC-03/09/10、真实 WFP 阻断、SEC-11 剩余生产 unwrap/expect 与服务器 P0 SEC-01/02 全部未验收。维持 PR #6/#3 Draft，main 857ea759 不动。
+- 任务账本详细证据见 REMEDIATION_BACKLOG.md D.10–D.11。
