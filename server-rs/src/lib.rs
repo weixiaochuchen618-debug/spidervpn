@@ -33,6 +33,10 @@ pub mod legacy_request_proof;
 #[cfg(target_os="linux")]
 pub mod legacy_cutover;
 
+/// Offline filesystem writer retirement primitive, opt-in and NOT deployed.
+#[cfg(all(target_os="linux", feature="linux-legacy-retire"))]
+pub mod legacy_retire;
+
 #[cfg(target_os = "linux")]
 pub mod ledger_disk;
 

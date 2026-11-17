@@ -65,6 +65,17 @@ jobs:
           test "$code" -eq 2
           printf '%s\n' "$output" | grep -F 'NO migration or listener authorization'
 
+      - name: SEC-01 atomic offline legacy Python entrypoint retirement regression (feature off by default)
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-legacy-retire --lib legacy_retire::tests -- --test-threads=1
+          # No production CLI or service route has been exposed for retirement.
+          grep -F 'required-features = ["linux-cutover-preflight"]' server-rs/Cargo.toml >/dev/null
+          ! grep -F 'linux-legacy-retire' src/pairhost.rs
+
       - name: SEC-01 root-only recovery inspection CLI denies unprivileged invocation
         shell: bash
         env:
