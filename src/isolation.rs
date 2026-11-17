@@ -275,14 +275,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_root_override_policy_is_disabled_in_non_test_release() {
-        assert!(cfg!(test), "这里是 Rust 测试构建");
-        // 与 dev_root_override() 的编译条件保持同一来源；正式 release
-        // （无 test/debug_assertions）绝不接受用户环境变量作为可信安装根。
-        assert!(!(!cfg!(test) && !cfg!(debug_assertions) && cfg!(any(test, debug_assertions))));
-    }
-
-    #[test]
     fn data_root_is_not_legacy() {
         // 默认配置下必须通过；这条一旦失败说明常量写错了。
         assert_eq!(check(), Ok(()));
