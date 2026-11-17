@@ -146,3 +146,14 @@ PR/commit/CI: ...
 4. 以此文件作为唯一权威任务状态；技术方案更改附日期/理由/风险；新 Agent 的第一条提交只允许当前选中的任务及其回归测试。
 5. **不要在新会话单凭过去总结“已推送”或“已修复”**：先从 GitHub 重新读 HEAD、CI、文件和未合并 PR。
 
+
+
+## D.2 本次续接（2026-11-17：SEC-03/SEC-10 特权 IPC DACL 读回与连接回归）
+
+- **活动 PR 不变**：[PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，分支 `fix/sec10-guard-elevation-identity-p0-20261117`，最新本轮提交 `c72ea69260bd195a192ef0fa2565b825f6a89364`（以 GitHub 实时 HEAD 为准），**Draft、不合并 main**。main 仍为 `857ea759`；WFP [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) 持续 Draft，默认关闭实验、持久 BLOCK 不变。
+- **旧 MSVC 红例**：[44010494382](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44010494382) 的 `mode-e2e` 两项失败：Windows Runner 有管理员权限，旧测试导入系统 `PING.EXE`；而 SEC-03 管理员引擎白名单正确拒绝外部 EXE。没有禁用校验或放松安全断言。
+- **真实测试夹具变更**：`8262db63` 修改 `tests/mode-e2e.rs`，在隔离测试根创建 `bin/spidervpn.exe`，并将系统 ping 复制为 `bin/sing-box.exe`，依然由真实 Rust 二进制运行 `--connect/--disconnect`。后续 [MSVC 44011375375](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44011375375) 运行到 `runtime-engine-e2e` 后又失败两项同类型夹具，说明先前 `mode-e2e` 已通过，**不是所有集成测试都通过**。`87a7cd34` 同样修正 `runtime-engine-e2e` 的隔离随包引擎，仍验证“引擎秒退”和“坏成员连接时运行时文件保留”；`c72ea692` 处理 `transport-e2e` 的正常重连场景。纯测试布局变更，不修改正式连接交互。
+- **SEC-10 Rust 候选增强**：`253392e8` 在 `src/secretfile.rs` 新增 `verify_private_ipc_acl`，通过 Windows 原生 API 读取对象当前 DACL 并严格解析，只允许受保护的 SY、BA、OW 全控制 ACE，拒绝多余继承/宽权限；`a5eebd39` 让 `guard::elevate::validate_guard_ipc_paths` 在执行任何 WFP backend 前核验随机目录及 req/res 三个对象的真实 DACL；新反向测试故意通过 `icacls` 为回执加入 AU 修改权限，要求 `guard_apply_main` 返回失败，计数后端 0 次调用。这是候选边界加固，**不能替代 A/B/C 不同 Windows 账户 ACL/UAC 测试**。
+- **专项 CI 保障**：`31d9e55c` 将 Guard/受保护 IPC/引擎白名单专项 Rust MSVC 测试前置在全量集成测试之前。GNU 专项仍包含 `guard::elevate::tests::`、`secretfile::tests::`。新 SHA 的完整 CI 结果尚待读取，之前 GNU Success（`5bbf743a` [44010491449](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44010491449)）**不能用于声明新候选已验证**。新运行在 GitHub Actions 的 `Rust Windows build and tests` / `SEC-10 Windows GNU Rust privilege-boundary validation` 下，以 workflow run 的 `head_sha` 匹配最终提交。
+- **仍然阻塞 P0 完成**：受保护安装 `C:\SpiderVPN\bin`、旧安装升级/卸载迁移、标准账户 A / 独立管理员 B / 第二普通账户 C 的 UAC-01～12 [真实验收](./SEC10_WINDOWS_UAC_ACCEPTANCE.md)、不同账户可执行文件替换与 DLL/脚本劫持测试。未通过前 SEC-03/SEC-10 状态保持 **P0 开发中 / 未完整安全验收**，不得勾选 Issue #5 或合并 main。
+- **下一操作**：查询最新 PR #6 HEAD 的 Windows MSVC/GNU 运行结果；失败读取 job 日志并继续修 Rust 或保持原断言修正隔离夹具；待 CI 全绿再做受保护安装根安全实现与实机 A/B/C 验收。保持 WFP v1 持久 BLOCK、UI 和生产连接流程原样。
