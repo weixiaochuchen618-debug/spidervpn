@@ -72,7 +72,7 @@ jobs:
           $sourceFile = Join-Path $env:RUNNER_TEMP "spidervpn-root-release-probe.rs"
           $binaryFile = Join-Path $env:RUNNER_TEMP "spidervpn-root-release-probe.exe"
           Set-Content -Path $sourceFile -Value $body -Encoding utf8
-          & rustc +stable-x86_64-pc-windows-gnu --edition=2021 -C debug-assertions=no -o $binaryFile $sourceFile
+          & rustc +stable-x86_64-pc-windows-gnu --edition=2021 --crate-name spidervpn_root_release_probe -C debug-assertions=no -o $binaryFile $sourceFile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:SPIDERVPN_ROOT = "C:\AttackerControlled\Ignored"
           & $binaryFile
