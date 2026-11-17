@@ -216,3 +216,11 @@ PR/commit/CI: ...
 - **新负例**：提交 4a063de4 进一步模拟 WFP 事务已经成功删除 Provider，但 HKLM Removed 标记存储失败；Rust preflight 必须返回错误，不能让 PowerShell 删除最后一个可修复的 EXE。此测试使用隔离文件证据 Store/假 WFP backend，无需实机调用 WFP。
 - **最新候选 SHA**：4a063de4fbb49debd7c8f04d6072ba99be3c9326；与此前 D.7 的 15079f91 比多了上面两组 fail-closed 检查。正式 CI 请核对 head_sha 一致：[MSVC 44026418209](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418209)、[GNU 44026418218](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418218)，写入时仍在执行。多个此前较早 SHA 的 CI 因仅保留最新 PR 验证而取消，它们不能算失败也不能算通过。
 - **安全验收状态不变**：I01–I14 Windows 实机未执行，SEC-09 仍为橙色候选、不是“已验证安全卸载”；SEC-03/SEC-10 P0 仍未实机过关。main 不合并，PR #3/#6 Draft。
+
+
+## D.9 SEC-09 最新双 CI 自动回归结果（2026-11-17）
+
+- **代码 HEAD**：4a063de4fbb49debd7c8f04d6072ba99be3c9326；main 与 PR #3 未动，PR #6 仍 Draft，SEC-09 仍为部分候选。
+- **Windows GNU [44026418218](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418218)**：核对 head_sha 匹配，**Completed/Success**，包括 Rust GNU 编译、发布安装根拒绝环境覆盖、Rust uninstall_safety / Guard IPC / WFP identity 专项。
+- **Windows MSVC [44026418209](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418209)**：核对 head_sha 匹配，Rust 构建、PowerShell 卸载脚本语法解析、SEC-09/10 安全专项、所有 Rust 集成目标、模块回归已经分别 **Success**；写入时便携单元 suite 仍在执行，**不可宣称整个 workflow 终态 Success**。便携 suite 保留原先 8 项环境依赖排除，本轮未新增跳过。需重新查询最终结论并补录。
+- **不等于实机验收**：所有 WFP 删除/异常注入测试采用 fake backend，不曾在 CI Runner 上真的删除持久 WFP。Windows A/B/C 权限与 I01–I12、U01–U14、UAC-01～12、TUN 断线与真实交易程序网络仍未验收；不合并 main。
