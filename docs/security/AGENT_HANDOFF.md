@@ -131,3 +131,11 @@
 - **CI 仍待终态**：本轮最新 SHA 15079f91 的 [MSVC 44025960134](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44025960134) / [GNU 44025961008](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44025961008)，必须查看最终 workflow conclusion，若失败读 job logs 修复，保留测试断言，绝不以旧 SHA 成功冒充。前一基线 a14016cd 的双 CI 成功仅可证明 SEC-03 候选。
 - **真实安全验收**：新增 [SEC09_UNINSTALL_ACCEPTANCE.md](./SEC09_UNINSTALL_ACCEPTANCE.md) U01–U14，需要隔离 Windows 11 A 普通/B 独立管理员/C 第二普通用户；WFP 持久 BLOCK readback、UAC、旧数据恢复、完整卸载残留和回滚均未验证。默认拒绝带未还原 journal 的强制卸载是有意安全收紧；普通用户双击“卸载”入口在受保护安装后需要管理员权限，必须实机验证兼容，不得称完全无变化。
 - **精确恢复顺序**：先读 [REMEDIATION_BACKLOG D.7](./REMEDIATION_BACKLOG.md) → 核对 PR6 HEAD/MSVC/GNU 终态 → 如果 CI 失败修 Rust → 对照新 U01–U14 复审未测项目。SEC-09 暂标橙色“部分候选”，PR #6 继续 Draft、不能合并 main。
+
+
+## 13. SEC-09 最新代码/CI 恢复锚点（2026-11-17）
+
+- **最新代码 HEAD**：4a063de4fbb49debd7c8f04d6072ba99be3c9326，仍是 Draft PR #6 未合并；请根据 GitHub 实时 HEAD 核对。main 857ea759、PR #3 Draft 不变。
+- **本轮最后两个对抗修正**：78a25ac0 防止 proxy-journal.json 的 PermissionDenied/元数据读取错误被 Path::exists() 错当不存在，符号链接/硬链接记录不得通过；4a063de4 用隔离假 backend 验证 WFP 删除虽成功但 Removed 标记不能写时，程序文件仍必须保留，不得误报卸载成功。没有更改原持久 BLOCK 的 WFP 代码。
+- **最新测试**：[MSVC 44026418209](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418209) / [GNU 44026418218](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418218)；写入时尚无最终绿/红结论，先读失败 Job logs，禁止删安全断言、增加 skip、把旧 SHA 当最新验收。安全脚本仅作为 Rust --uninstall-preflight / --uninstall-owns-shortcut 的薄入口。
+- **状态约束**：SEC-09 是部分候选，不能宣称实机安全卸载已通过。U01–U14、SEC-03 I01–I12、SEC-10 UAC-01～12 和 WFP 真实断线检查缺失；仍不合并 main、PR #6/#3 持续 Draft。任务账本 D.7–D.8 为主。
