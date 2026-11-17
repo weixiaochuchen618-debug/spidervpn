@@ -390,3 +390,11 @@
 - PR #16 Rust HEAD `ed8d7a9817998fabebdb05d7dc40a9ac8a034804`，同 SHA [Linux #44100469714](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469714) 完整 Completed/Success，两个 Job 均通过：**121 Rust library / 0 failed / 0 ignored**、新真 POSIX shell / sourceable transport.env 防副作用拒绝测试通过、真实 WG netns 和 root 离线退役通过。
 - 新 [MSVC #44100469733](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469733) 与 [GNU #44100469724](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469724) **仍在运行**，需复核编译、专项和完整结果，任何失败都要修 Rust / CI 本身后新 SHA 重跑，不能跳过。原首版 PR #16 `11155352` 的 MSVC 逐项检查遗漏已在当前 HEAD 补正。
 - 主干 main `857ea759` 不改，WFP 持久 BLOCK / 原 UI、正常连接流程不改；无 VPS 真实 root 迁移/可信撤销/正式 Rust TLS，PR Draft、Issue #5 Open。详见 [Backlog D.42](./REMEDIATION_BACKLOG.md)。
+
+
+## 45. PR #16 同一 HEAD 三工作流均终态 Success；生产验收仍关闭禁止（2026-11-17）
+
+- 代码 [Draft PR #16](https://github.com/weixiaochuchen618-debug/spidervpn/pull/16) HEAD `ed8d7a9817998fabebdb05d7dc40a9ac8a034804`。**同一 SHA** 的 [Linux #44100469714](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469714)、[Windows GNU #44100469724](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469724)、[Windows MSVC #44100469733](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469733) 全部 **Completed/Success**，日志确证本次 `read_transport` / `export_transport` sourceable 脚本门禁 Rust 用例在 GNU/MSVC 正式跑过，Linux 在真实 `/bin/sh` 复现了侧作用并在 marker 后拒绝。
+- Linux 121 library passed、0 failed/ignored，并通过实际 WG netns 和 root 退役测试。MSVC 最后一轮 1429 passed / 0 failed / 1 ignored（原有）/ 8 filtered out（原有环境依赖）；GNU 编译成功、专项 pass，但已有 Rust warnings，不是 `-D warnings` 零告警认证。没有跳过新失败，MSVC 的前后两次专测已加独立 `$LASTEXITCODE` 判断。
+- 当前项目安全账本状态仍为 **SEC-01/02/08 未通过生产 DoD、Issue #5 Open、PR #16 Draft、不合并 main**。下一步集中于 Linux root 级旧 Python/SSH 非协作写者、服务切换与重启回滚、可信撤销历史及真实 TLS/HTTP 接管；不能把这个客户端 opt-in 检查充当服务器级独占锁。main `857ea759`、UI/正常连接及 WFP persistent BLOCK 均未改；[Backlog D.43](./REMEDIATION_BACKLOG.md) 为详细证据。
+

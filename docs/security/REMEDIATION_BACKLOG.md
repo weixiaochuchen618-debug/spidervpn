@@ -512,3 +512,14 @@ PR/commit/CI: ...
 - 代码 HEAD `ed8d7a9817998fabebdb05d7dc40a9ac8a034804` 的 [Linux workflow #44100469714](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469714) 两 Job 均 **Completed/Success**。核心 **121 Rust library tests / 0 failed / 0 ignored**，5 CLI 和先前 opt-in 管理、cutover、退役测试均保持成功，`--locked` / `RUSTFLAGS=-D warnings` 不变；真实内核 WG netns 与 root-owned 隔离退役 Job 成功。Linux 原始日志证实 `windows_legacy_ssh_guard_tests::tests::actual_shell_denies_sourceable_read_only_transport_before_side_effects ... ok`，在真 `/bin/sh` 内有 / 无受信 marker 的对抗对照已实际运行。
 - 对应同 SHA [MSVC #44100469733](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469733) / [GNU #44100469724](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469724) **此刻仍 in_progress**，不能当作成功；新 Agent 应核对各自 Build、明确新增 Rust tests 和完整 Job 终态。旧 SHA `11155352` 的运行结果不可替代当前 SHA。
 - PR #16、父级 PR 仍是 Draft、main 不动；Linux 内核 CI 是隔离 runner 而不是 VPS 实际退役。SEC-01/02/08 / Issue #5 未关闭。
+
+
+## D.43 PR #16 最新 SHA Linux / GNU / MSVC 完整成功与实际日志核证（2026-11-17）
+
+- **当前 Rust HEAD**：`ed8d7a9817998fabebdb05d7dc40a9ac8a034804`，独立 [Draft PR #16](https://github.com/weixiaochuchen618-debug/spidervpn/pull/16)，base PR #15，未合并 main。
+- 精确同 SHA [Linux #44100469714](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469714) **Completed/Success**，两个 Job 均 Success。121 Rust library passed / 0 failed / 0 ignored，新的 Windows Rust 源码在 Linux test-only 通过真实 `/bin/sh` sourceable transport.env 拒绝前执行副作用与 marker 后零副作用对照；真实 WG kernel/netns 与 root 退役专项通过，保留 `--locked`、Linux `RUSTFLAGS=-D warnings`。
+- 精确同 SHA [Windows GNU #44100469724](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469724) **Completed/Success**；原始日志确认 `deploy::tests::sec01_sourced_transport_reads_refuse_retired_pairing_host ... ok`。存在原仓既有 Rust warnings（例如 unused、duplicated attribute），不是零 warnings 承诺；本次没有忽略失败测试。
+- 精确同 SHA [Windows MSVC #44100469733](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44100469733) **Completed/Success**：Rust build、SEC-10、SEC-01 新旧门禁专项、全部 integration targets、变更模块回归和最后 Portable unit suite 步骤均 Success；实际单测末行 **1429 passed, 0 failed, 1 ignored, 8 filtered out**。1 ignored 与 8 个环境依赖过滤来自**原有** CI/fixture 范围，不是本轮新增跳过，更不能称为未经排除的全部 Windows 实机安全验收。
+- **回归与差异确认**：相对父 PR #15 仅修改 `src/deploy.rs`、`src/legacy_writer_fence.rs`、`.github/workflows/rust-windows.yml`、`.github/workflows/security-guard-gnu.yml`。MSVC 现在对每一条单独 `cargo test` 后都检查 `$LASTEXITCODE`。无 UI、连接/代理、`assets/tc-pair.py` 或 WFP 持久 BLOCK 改动；main `857ea7593941ce79f6507db5b1ced076c3a077ba` 未变。
+- **SEC-01/02/08 不关闭**：通过的只是新版 Windows 客户端在**已独立启动退役条件**的旧 SSH 入口拒绝；真实生产 Linux root、旧客户端与非协作写者、systemd/mask/reboot/power-loss、可信撤销/tombstone 迁移、Rust TLS 监听服务接管均未通过，无法凭 CI 推断零漏洞或安全合并。Issue #5 Open，全部相关 PR Draft，WFP-05 真机未验收。
+
