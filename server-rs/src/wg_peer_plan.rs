@@ -34,13 +34,23 @@ pub enum PlanError {
     ResultTooLarge,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Plan {
     /// Contains the server PRIVATE KEY copied from the original config.
     /// Never log, serialize to an API response, or derive Debug for this.
     pub(crate) bytes: Vec<u8>,
     pub(crate) expected_peers: Vec<Peer>,
     pub(crate) changed: bool,
+}
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The raw config includes PrivateKey/PresharedKey. Never emit it.
+        f.debug_struct("Plan")
+            .field("changed", &self.changed)
+            .field("config_bytes", &"<redacted>")
+            .field("expected_peer_count", &self.expected_peers.len())
+            .finish()
+    }
 }
 impl Plan {
     pub fn changed(&self) -> bool { self.changed }
