@@ -156,7 +156,7 @@ fn expected_status(
 /// This entrypoint is deliberately not invoked from production Python. A
 /// future Rust adapter MUST invoke it only after durable authorization and
 /// MUST execute syncconf and verify live+disk state before final ledger commit.
-pub fn write_pinned_config(
+pub(crate) fn write_pinned_config(
     store: &LedgerStore, interface: &str, grant: &Grant, operation: Change,
 ) -> Result<bool, AtomicError> {
     if !valid_interface(interface) { return Err(AtomicError::UnsafeConfig); }
