@@ -52,3 +52,18 @@
 - [Linux Cargo CI #44034700193](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700193) head_sha=3d01dda6，Completed/Success，合计 **19 passed、0 failed、0 ignored**（旧 SEC01/08 13 项与只读 migration audit 6 项），脚本还明确核对生产 `pairhost.rs` 的 systemd ExecStart **仍为 Python**，不会虚报线上迁移。
 - **过渡红例**：在新增 serde_json 模块后、切换工作流至 Cargo 之前，直接 rustc 命令无法链接独立 crate 的新依赖，旧 SHA 的 Linux workflow 出现 Failed；以当前独立 Cargo `--locked` 同 SHA 成功为准，**没有删测试或 skip**。
 - 当前生产持久化、原子迁移、签名验证、Linux 真 WG 和在线 TLS daemon 均未完成，S01 仍是第一步的一部分，SEC-01/02/08 不能关闭。
+
+## 第三阶段：Rust 事务账本和可注入 WireGuard 事务编排（预接线）
+
+- **Rust 代码**：活动 Draft PR #6 新增 server-rs/src/ledger_disk.rs（version=1、generation 持续递增、serde 严格解码、只接受 owner-only Linux 0700 根与 0600 普通单链接文件、O_NOFOLLOW，临时文件 create_new+fsync+rename+父目录 fsync），并在 server-rs/src/lib.rs 将 Ledger/Claims/Grant 等模型支持严格持久格式。缺文件、未知 schema、无效 grant/UUID、公钥/身份重复、地址冲突、Revoked 缺墓碑、权限过宽、symlink/hardlink 都 fail closed，不恢复默认空账本。**生产初始化仅允许未来经过原始 JWS/WG 可信迁移的导入器做**；现在只有 cfg(test) 内的 bootstrap。
+- **重要模糊 fsync 故障**：如果原子 rename 已替换成功、但目录 fsync 返回错误，磁盘可能已是 Pending，新版 LedgerStore 在任何存储写失败后 `poisoned = true`；同一对象的 view/generation/update 全部拒绝，防止旧 Open/Consumed 内存状态覆盖新持久状态。只有关闭并重新打开、重验全盘账本后才能恢复。cfg(test) 的 post-rename 故障注入证明了这一边界，正式运行代码没有可由用户开启的绕过旋钮。
+- **事务编排**：server-rs/src/transaction.rs 定义抽象 PeerControl {snapshot, add, remove}，enroll 必须先 snapshot→durably commit Pending→add peer→重新 snapshot→durably commit Consumed；revoke 必须先 durably commit Revoking→remove peer→重新 snapshot→durably commit Revoked；retry_read_only 只读严格身份+WG live match，**绝不 add peer**。所有操作借 LedgerStore 的同一把 Linux 跨进程锁保持事务边界。PeerControl 当前仅用 CI fake-WG，**没有真实 Linux wg 命令调用**。
+- **自动化证据**：[Linux Rust #44036202223](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036202223) SHA 95d69ec9、26 tests passed；[Linux Rust #44036699347](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036699347) SHA bbb23e43、31 tests passed；**最新** [Linux Rust #44036991021](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036991021) SHA 07dc06f8，Completed/Success，**32 tests passed、0 failed、0 ignored**，含重启/revoke、错误 readback、真实跨进程文件锁、权限/链接拒绝和 post-rename 失败后拒绝旧内存状态。
+- **明确未覆盖的安全事实**：原子文件落盘不等于抗恶意回滚（有权写目录者仍可能恢复旧有效文件）；待实现签名绑定/可信导入及外部锚点、完整真实 WG 接口和同机多进程极端压力测试。暂不保证突然断电/磁盘故障之后的全部真实 Linux 服务器网络行为。Python systemd 仍是生产接收器，SEC-01 P0 保持 Open。
+
+## 下一步代码/验收门槛（不需要用户本地协助的部分）
+
+1. Rust 接口绑定实际可信 WG live snapshot、wg-quick strip/wg syncconf（不得调用 shell 拼接用户参数），构造不会泄漏机密的错误码和恢复诊断。首次只能在容器/虚拟 WireGuard 测试环境执行，不能操作真实用户的服务器。
+2. 实现完整 RS256/JWE 合法性和与已有客户端 `pairing.rs` 的互操作，然后写入经过验签的旧授权与 tombstone。不能仅凭旧 JSON 字段或 SessionId 合成缺失的 RequestDigest。
+3. 最后把 Python HTTP 接收器/Windows revoke 管理入口与 Rust 单元实机双向接通，保证从不可知旧状态迁移到新状态过程中不会有同时工作的旧消费服务。
+4. 完成非 root Linux systemd TLS/HTTP 连接限时限并发，真实 WFP/Windows A/B/C 另行验收；所有门槛未完成前保持 PR Draft，不合并 main。
