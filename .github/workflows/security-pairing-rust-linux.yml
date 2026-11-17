@@ -1,0 +1,43 @@
+name: SEC-01 Linux Rust pairing authority policy (pre-integration)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: \${{ github.workflow }}-\${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-pairing-authority-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile Linux authority policy as Rust library (not Python)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 --crate-name spidervpn_pair_authority --crate-type lib \
+            -D warnings server-rs/src/lib.rs \
+            -o "$RUNNER_TEMP/libspidervpn_pair_authority.rlib"
+      - name: Run SEC-01 revocation/replay and SEC-08 cross-process lock tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 --crate-name spidervpn_pair_authority \
+            --test -D warnings server-rs/src/lib.rs \
+            -o "$RUNNER_TEMP/spidervpn-pair-authority-tests"
+          "$RUNNER_TEMP/spidervpn-pair-authority-tests" --test-threads=1 --nocapture
+      - name: Verify production pairing runtime is not claimed to be migrated
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This core is a migration candidate only. Production remains
+          # Python until authenticated API, ledger migration, TLS, WG and
+          # real-host rollback are separately validated.
+          grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
