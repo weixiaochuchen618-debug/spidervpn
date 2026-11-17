@@ -19,7 +19,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::Peer;
-use crate::wg_readonly::{parse_allowed_ips, valid_interface, ReadError};
+use crate::wg_readonly::{parse_allowed_ips, valid_interface, LiveWgReader, ReadError};
 
 const ROOT: &str = "/etc/wireguard";
 const MAX_CONF_BYTES: usize = 1024 * 1024;
@@ -143,6 +143,14 @@ pub fn parse_wg_quick_conf(bytes: &[u8]) -> Result<Vec<Peer>, ConfigError> {
 pub fn require_exact_match(live: &[Peer], durable: &[Peer])
     -> Result<(), ConfigError>
 {
+    if live.len() > 4096 || durable.len() > 4096 {
+        return Err(ConfigError::InvalidPeers(ReadError::TooManyPeers));
+    }
+    for peer in live.iter().chain(durable.iter()) {
+        if peer.public_key.len() != 44 || !peer.address.is_private() {
+            return Err(ConfigError::InvalidPeers(ReadError::InvalidPublicKey));
+        }
+    }
     if live.len() != durable.len() { return Err(ConfigError::SnapshotMismatch); }
     let to_lines = |peers: &[Peer]| -> String {
         let mut out = String::new();
@@ -224,6 +232,30 @@ pub fn verify_live_config(interface: &str, live: &[Peer])
     require_exact_match(live, &durable)
 }
 
+/// Compare live-before, durable config and live-after snapshots. A peer
+/// inserted/removed or a route changed during the read must fail, not be
+/// mistaken for a stable empty interface. The caller must still hold the
+/// transaction lock; this does not defend against malicious root-level
+/// changes or a root actor not honoring that lock.
+fn require_stable_views(
+    before: &[Peer], durable: &[Peer], after: &[Peer],
+) -> Result<Vec<Peer>, ConfigError> {
+    require_exact_match(before, durable)?;
+    require_exact_match(before, after)?;
+    Ok(after.to_vec())
+}
+
+/// The strongest available pre-integration read-only API. It does not
+/// perform any WG mutations, and is deliberately not PeerControl.
+pub fn read_verified_snapshot(interface: &str) -> Result<Vec<Peer>, ConfigError> {
+    if !valid_interface(interface) { return Err(ConfigError::InvalidInterface); }
+    let reader = LiveWgReader::new(interface).map_err(ConfigError::InvalidPeers)?;
+    let before = reader.snapshot().map_err(ConfigError::InvalidPeers)?;
+    let durable = read_pinned_conf(interface)?;
+    let after = reader.snapshot().map_err(ConfigError::InvalidPeers)?;
+    require_stable_views(&before, &durable, &after)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +335,28 @@ mod tests {
         let b=Peer{public_key:key('B'),address:Ipv4Addr::new(10,66,0,3)};
         assert_eq!(require_exact_match(&[a.clone(),b.clone()], &[b.clone(),a.clone()]),Ok(()));
         assert!(require_exact_match(&[a.clone(),a], &[b.clone(),b]).is_err());
+    }
+
+    #[test]
+    fn concurrent_live_snapshot_change_is_a_denial_not_a_verified_absence() {
+        let first = vec![Peer { public_key: key('A'), address: Ipv4Addr::new(10, 66, 0, 2) }];
+        let added = vec![
+            first[0].clone(),
+            Peer { public_key: key('B'), address: Ipv4Addr::new(10, 66, 0, 3) },
+        ];
+        assert_eq!(require_stable_views(&first, &first, &added),
+            Err(ConfigError::SnapshotMismatch));
+        assert_eq!(require_stable_views(&first, &[], &[]),
+            Err(ConfigError::SnapshotMismatch));
+        assert_eq!(require_stable_views(&first, &first, &first), Ok(first.clone()));
+    }
+
+    #[test]
+    fn forged_overlarge_live_snapshot_is_rejected_before_allocation() {
+        let peer = Peer { public_key: key('A'), address: Ipv4Addr::new(10, 66, 0, 2) };
+        let oversized = vec![peer; 4097];
+        assert_eq!(require_exact_match(&oversized, &oversized),
+            Err(ConfigError::InvalidPeers(ReadError::TooManyPeers)));
     }
 
     #[test]
