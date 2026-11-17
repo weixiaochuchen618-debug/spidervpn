@@ -101,7 +101,7 @@ pub fn parse_allowed_ips(bytes: &[u8]) -> Result<Vec<Peer>, ReadError> {
 
 /// Explicit absolute executable, root owned, normal file, not group/other
 /// writable. Never resolve from PATH and never invoke a shell.
-fn trusted_wg_binary(path: &Path) -> Result<(), ReadError> {
+pub(crate) fn trusted_wg_binary(path: &Path) -> Result<(), ReadError> {
     if path != Path::new(WG_BINARY) { return Err(ReadError::UnsafeExecutable); }
     let meta = fs::symlink_metadata(path).map_err(|_| ReadError::UnsafeExecutable)?;
     if !meta.file_type().is_file() || meta.uid() != 0
