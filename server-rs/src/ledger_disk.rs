@@ -267,7 +267,7 @@ impl LedgerStore {
 /// Test-only bootstrap: the production importer must verify signatures,
 /// old tombstones, and WG inventory before creating any production ledger.
 #[cfg(test)]
-fn bootstrap_for_test(root: &Path) -> Result<(), StoreError> {
+pub(crate) fn bootstrap_for_test(root: &Path) -> Result<(), StoreError> {
     let _lock = lock::acquire_for(root, Duration::from_secs(1))?;
     let path = root.join(LEDGER_NAME);
     let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600)
