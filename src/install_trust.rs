@@ -153,15 +153,12 @@ pub fn seal_layout(root: &Path) -> Result<(), String> {
 
     let data = root.join("data");
     no_reparse(&data)?;
-    // On a legacy installation preserve existing data ACLs and contents;
-    // a fresh install explicitly grants the existing non-admin write model.
-    if !data.exists() {
-        directory(&data, DATA_DIR_SDDL)?;
-    } else if !std::fs::symlink_metadata(&data)
-        .map_err(|e| e.to_string())?.file_type().is_dir()
-    {
-        return Err("现有 data 路径不是实体目录；拒绝安装".into());
-    }
+    // Seal data separately regardless of whether this is a fresh install
+    // or an upgrade. Otherwise changing root's inherited ACL can silently
+    // remove a legacy standard user's ability to edit config.json.
+    // Only the directory DACL is updated: contents and separately protected
+    // private-key file ACLs are never deleted or rewritten here.
+    directory(&data, DATA_DIR_SDDL)?;
 
     for entry in std::fs::read_dir(&bin)
         .map_err(|e| format!("读取代码目录失败：{e}"))?
@@ -365,6 +362,21 @@ mod tests {
         std::fs::write(&config, r#"{"mode":"proxy"}"#).unwrap();
         assert!(std::fs::read_to_string(config).unwrap().contains("proxy"));
         seal_layout(&path).expect("idempotent, no data wipe");
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn upgrading_legacy_data_keeps_existing_config_and_nonadmin_write_acl() {
+        let path = root("old-data");
+        let data = path.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let config = data.join("config.json");
+        std::fs::write(&config, b"preserve pre-upgrade data").unwrap();
+        seal_layout(&path).unwrap();
+        verify(&data, DATA_DIR_SDDL).unwrap();
+        assert_eq!(std::fs::read(&config).unwrap(), b"preserve pre-upgrade data");
+        std::fs::write(&config, b"still editable").unwrap();
+        assert_eq!(std::fs::read(&config).unwrap(), b"still editable");
         std::fs::remove_dir_all(path).unwrap();
     }
 
