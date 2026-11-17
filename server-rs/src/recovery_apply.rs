@@ -15,7 +15,7 @@ use crate::recovery_inspect::{inspect_recovery, RecoveryAction, RecoveryError, R
 use crate::wg_conf_audit::{require_exact_match, ConfigError};
 
 #[derive(Debug)]
-pub(crate) enum RecoveryApplyError {
+pub enum RecoveryApplyError {
     Store(StoreError),
     Inspection(RecoveryError),
     Snapshot(ConfigError),
@@ -27,7 +27,7 @@ pub(crate) enum RecoveryApplyError {
 
 /// A real root-owned backend must refuse races at filesystem rename and
 /// kernel mutation boundaries. No such backend is enabled in this release.
-pub(crate) trait RecoveryIo {
+pub trait RecoveryIo {
     fn live(&mut self) -> Result<Vec<Peer>, &'static str>;
     fn disk(&mut self) -> Result<Vec<Peer>, &'static str>;
     fn repair_disk(&mut self, grant: &Grant, stage: RecoveryStage) -> Result<(), &'static str>;
@@ -35,7 +35,7 @@ pub(crate) trait RecoveryIo {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RecoveryReview {
+pub struct RecoveryReview {
     invite_id: String,
     generation: u64,
     inspection: RecoveryInspection,
@@ -45,7 +45,7 @@ pub(crate) struct RecoveryReview {
 
 /// Deliberately opaque; only tests can issue one. Adding a real issuer
 /// requires an independently reviewed local authenticated admin CLI.
-pub(crate) struct AdministratorApproval {
+pub struct AdministratorApproval {
     generation: u64,
     invite_id: String,
     action: RecoveryAction,
@@ -80,7 +80,7 @@ fn snapshot(io: &mut impl RecoveryIo) -> Result<(Vec<Peer>,Vec<Peer>),RecoveryAp
 }
 
 /// Review has no side effects and cannot serve as a capability or identity.
-pub(crate) fn prepare_review(
+pub fn prepare_review(
     store: &LedgerStore, invite_id: &str, now: i64,
     io: &mut impl RecoveryIo,
 ) -> Result<RecoveryReview,RecoveryApplyError> {
@@ -97,7 +97,7 @@ pub(crate) fn prepare_review(
 /// All updates are performed under the SAME LedgerStore cross-process lock.
 /// A retry must prepare a new review and seek a new approval; there is no
 /// implicit rollback, blind retry or silent re-add after partial failure.
-pub(crate) fn apply_approved(
+pub fn apply_approved(
     store: &mut LedgerStore, review: &RecoveryReview,
     approval: &AdministratorApproval, now: i64,
     io: &mut impl RecoveryIo,
