@@ -129,3 +129,10 @@
 - 独立 Rust root-only 诊断功能 [Draft PR #7](https://github.com/weixiaochuchen618-debug/spidervpn/pull/7) 新增 `server-rs/tests/wg_namespace_e2e.rs`，编译由 `linux-netns-acceptance` feature 和专属工作流 job 明确开启，防止常规非 root 运行尝试修改宿主网卡。此 job 在 GitHub 临时 VM 上创建 disposable netns+WG 接口，受保护 `/etc/wireguard/spiderci0.conf`，测试结束移除。Rust CLI 本身只读、需 root；写状态/内核 peer 的部分全部仅由专属测试夹具和已有经验证测试 API 执行。
 - [Linux CI #44062802733](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44062802733) 与 `5a8eb6047c1f1e3074fe66a075e9d295c0054a32` 一致，Completed/Success：lib 91 + CLI 5 + actual kernel netns 1，均 0 failed/0 ignored；此前因 Cargo 可执行文件自定义目录定位错误与真实日期期满夹具而失败的 CI 被完整保留，未跳过失败。严格 `--locked`/`-D warnings`。
 - **仍不具备生产可操作的安全修复链**：本集成测试证实只读诊断+已完成终态补写在真实内核 fixture 可运行，不能证明 root-only 显式审批身份、安全 `RecoveryIo` 生产实现、真服务器 TLS/旧消费请求迁移、Windows 管理端同步或外部 root 不合作并发安全。先完善审核与可信迁移，再安排隔离 VPS 部署/回滚。SEC-01 P0 保持未修复。
+
+
+## 第十一阶段：默认关闭的 root-only 本地终态确认与 Ledger 补写（生产未接）
+
+- 基于 PR #7 的真实 Linux kernel/netns 绿色回归，单独建立 [Draft PR #8](https://github.com/weixiaochuchen618-debug/spidervpn/pull/8)。Rust 新 `admin_terminal` 模块只编译在 opt-in `linux-admin-finalize` 下。root + 控制终端 `/dev/tty` 才允许 45s 内确认，请求为 `FINALIZE InviteId Generation Stage`；不支持标准输入重定向、HTTP 或自动授权。再次严格三重 WG live/config/live readback + 重查代数和其它 peer，无偏差才调用原 `finalize_stable_prepared`。**只能补写已发生的终态，不运行 wg set、不修订 wg.conf**，且全部时间等待持有 SEC-08 独占 flock。
+- Rust 测试包含拒绝路径、不可回放的 generation/stage challenge、短输入超时和漂移的 fail-closed；CI 的 root/PTy 测试由测试代码生成专用伪终端，只证明 root 可以进行真实 TTY 交互，**不证明 root 是自然人、不能防恶意 root**。最新候选 HEAD `b8cac95971ca468948c401f4ebce2b961989f0c4`，同 SHA Linux/MSVC/GNU CI 尚需最终结果。过渡红例 `-D warnings` 无用 import 已由 `e2e86e00` 删除，未跳测。
+- 本能力不等于生产管理员审批/可恢复任意中断状态，更不等于 Python receiver 安全迁移。必须继续实机授权、可信签名迁移、真实 root/I/O 容错/断电以及 Windows revoke 同步验收，SEC-01 仍为未修复。
