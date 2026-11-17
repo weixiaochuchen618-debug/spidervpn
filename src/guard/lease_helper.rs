@@ -215,6 +215,162 @@ fn write_reply(path: &Path, reply: &LeaseReply) -> Result<(), String> {
     Ok(())
 }
 
+/// 父进程必须检查回执来自本次会话且 filter_count 与请求完全一致；
+/// "Ready" 文件本身不能证明子进程仍活着，启动器还必须检查 hProcess。
+fn read_ready(path: &Path, nonce: &str, expected_count: usize) -> Result<Option<()>, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("读取租约 Ready 状态失败：{e}")),
+    };
+    if !meta.file_type().is_file() || meta.len() == 0 || meta.len() > 4096 {
+        return Err("租约回执不是有效的普通小文件".into());
+    }
+    let reply: LeaseReply = serde_json::from_slice(
+        &std::fs::read(path).map_err(|e| e.to_string())?,
+    ).map_err(|e| format!("租约回执无效：{e}"))?;
+    if reply.schema != LEASE_SCHEMA || reply.nonce != nonce {
+        return Err("租约 Ready 回执版本或 nonce 不匹配".into());
+    }
+    if reply.state != LeaseState::Ready {
+        return Err(format!("租约 helper 拒绝启动：{}", reply.reason));
+    }
+    if reply.filter_count != expected_count || !reply.reason.is_empty() {
+        return Err("租约 Ready 报告的过滤器数量或状态异常".into());
+    }
+    Ok(Some(()))
+}
+
+fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
+    let data = serde_json::to_vec(&LeaseAck {
+        schema: LEASE_SCHEMA, nonce: nonce.into(), accepted,
+    }).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+        .open(path).map_err(|e| format!("建立唯一租约确认文件失败：{e}"))?;
+    use std::io::Write;
+    file.write_all(&data).and_then(|_| file.sync_all())
+        .map_err(|e| format!("写租约确认失败：{e}"))
+}
+
+/// 启动器显式返回的子进程句柄。释放 handle 不会结束 Windows 进程；
+/// helper 自己负责在 sing-box 或主程序退出时撤销动态 WFP 许可。
+#[cfg(windows)]
+pub struct LeaseChild {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    pub directory: PathBuf,
+}
+#[cfg(windows)]
+impl LeaseChild {
+    pub fn running(&self) -> bool {
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT }
+    }
+}
+#[cfg(windows)]
+impl Drop for LeaseChild {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle); }
+            self.handle = std::ptr::null_mut();
+        }
+        // 仅在 helper 已结束时清理，避免删除它尚未读取的 ack.json。
+        // 应由未来生产连接管理器保留 LeaseChild 至断开，以便回收临时目录。
+    }
+}
+
+/// 从非提权主程序启动长期 helper。**目前不在正式连接路径调用**。
+/// 这条能力仅为后续隔离实机验收准备，避免在尚未验证 TUN 时改变交互。
+#[cfg(windows)]
+pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    if request.controller_pid != std::process::id() {
+        return Err("只有正在运行的发起进程可以申请本次动态租约".into());
+    }
+    let random = SystemRandom::new();
+    let mut bytes = [0u8; 16];
+    random.fill(&mut bytes).map_err(|_| "生成动态许可 nonce 失败".to_string())?;
+    let nonce = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let mut req = request.clone();
+    req.nonce = nonce.clone();
+    validate_request(&req)?;
+    let directory = std::env::temp_dir().join(format!("spidervpn-lease-{nonce}"));
+    std::fs::create_dir(&directory)
+        .map_err(|e| format!("创建独立租约目录失败：{e}"))?;
+    let request_path = directory.join("request.json");
+    let reply_path = directory.join("reply.json");
+    let ack_path = directory.join("ack.json");
+    validate_transport_paths(&request_path, &reply_path)?;
+    let data = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+    if data.len() > MAX_LEASE_IPC_BYTES {
+        return Err("交易保护租约名单超过 IPC 大小限制".into());
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+        .open(&request_path).map_err(|e| format!("创建独立租约请求失败：{e}"))?;
+    use std::io::Write;
+    file.write_all(&data).and_then(|_| file.sync_all())
+        .map_err(|e| format!("写入租约请求失败：{e}"))?;
+    drop(file);
+
+    let to_wide = |s: &std::ffi::OsStr| -> Vec<u16> {
+        s.encode_wide().chain(Some(0)).collect()
+    };
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_w = to_wide(exe.as_os_str());
+    let args_w = to_wide(std::ffi::OsStr::new(&format!(
+        "{LEASE_FLAG} \"{}\" \"{}\"", request_path.display(), reply_path.display(),
+    )));
+    let verb_w: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb_w.as_ptr();
+    info.lpFile = exe_w.as_ptr();
+    info.lpParameters = args_w.as_ptr();
+    info.nShow = SW_HIDE;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(format!("无法启动提权 WFP helper（Win32={code}）"));
+    }
+    if info.hProcess.is_null() {
+        return Err("启动 WFP helper 后未获取进程句柄".into());
+    }
+    let child = LeaseChild { handle: info.hProcess, directory };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if unsafe { WaitForSingleObject(child.handle, 0) } != WAIT_TIMEOUT {
+            return Err("长期 WFP helper 在 Ready 前已退出，未启用临时许可".into());
+        }
+        match read_ready(&reply_path, &nonce, req.programs.len()) {
+            Ok(Some(())) => {
+                // Ready 只是第一阶段；必须写 nonce-bound ACK 并确认进程尚存活。
+                write_ack(&ack_path, &nonce, true)?;
+                if !child.running() {
+                    return Err("租约确认后 helper 已退出，拒绝报告连接已受保护".into());
+                }
+                return Ok(child);
+            }
+            Err(e) => {
+                let _ = write_ack(&ack_path, &nonce, false);
+                return Err(e);
+            }
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            let _ = write_ack(&ack_path, &nonce, false);
+            return Err("长期 WFP helper 就绪超时，拒绝将其视为已保护".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn reply(nonce: &str, state: LeaseState, reason: String, count: usize) -> LeaseReply {
     LeaseReply { schema: LEASE_SCHEMA, nonce: nonce.to_owned(), state, reason, filter_count: count }
 }
@@ -371,6 +527,28 @@ mod tests {
         assert!(read_ack(&path, &base.nonce).is_err());
         std::fs::write(&path, b"{bad-json").unwrap();
         assert!(read_ack(&path, &base.nonce).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_ready_rejects_replayed_nonce_wrong_count_and_rejected_status() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-lease-{:016x}", std::process::id() as u64 + 2,
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let path = root.join("reply.json");
+        let _ = std::fs::remove_file(&path);
+        let nonce = sample().nonce;
+        assert!(read_ready(&path, &nonce, 1).unwrap().is_none());
+        let good = reply(&nonce, LeaseState::Ready, String::new(), 1);
+        std::fs::write(&path, serde_json::to_vec(&good).unwrap()).unwrap();
+        assert!(read_ready(&path, &nonce, 1).unwrap().is_some());
+        assert!(read_ready(&path, &nonce, 2).is_err());
+        assert!(read_ready(&path, "ffffffffffffffffffffffffffffffff", 1).is_err());
+        std::fs::write(&path, serde_json::to_vec(&reply(
+            &nonce, LeaseState::Rejected, "not protected".into(), 0
+        )).unwrap()).unwrap();
+        assert!(read_ready(&path, &nonce, 1).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
