@@ -41,6 +41,7 @@ mod instance;
 mod ipc;
 mod isolation;
 mod install_trust;
+mod uninstall_safety;
 mod lifecycle;
 // 线路动作（测速 / 保存连接方式）的结果记录：要活过重启，启动时把被中断的动作改判。
 mod lineaction;
@@ -162,6 +163,39 @@ fn main() -> ExitCode {
             }
             Err(reason) => {
                 eprintln!("  可信安装权限未完成：{reason}");
+                ExitCode::from(exit::ENVIRONMENT)
+            }
+        };
+    }
+
+    // SEC-09：卸载安全闸门独立于 config.json；默认先由 Rust 清理并回读
+    // 本程序自己的 WFP Provider，失败必须保留 EXE。显式 --keep-guard
+    // 仅跳过这一动作，不允许跳过未还原的系统代理 journal。
+    if let Some(vals) = arg_values("--uninstall-preflight", 1) {
+        let keep_guard = argv.iter().any(|a| a == "--keep-guard");
+        return match uninstall_safety::preflight(std::path::Path::new(&vals[0]), keep_guard) {
+            Ok(()) => {
+                println!("  安全卸载预检通过（交易保护：{}）。",
+                    if keep_guard { "按用户要求保留" } else { "Rust 已回读确认解除" });
+                ExitCode::SUCCESS
+            }
+            Err(msg) => {
+                eprintln!("  安全卸载预检拒绝：{msg}");
+                ExitCode::from(exit::ENVIRONMENT)
+            }
+        };
+    }
+
+    // 严格识别安装器真正生成的快捷入口，而不是模糊 Contains 安装根。
+    // 不属于当前安装的 .cmd 一律不删（exit 3 = 非本安装文件）。
+    if let Some(vals) = arg_values("--uninstall-owns-shortcut", 2) {
+        return match uninstall_safety::owns_launcher(
+            std::path::Path::new(&vals[0]), std::path::Path::new(&vals[1]),
+        ) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(exit::CONFIG),
+            Err(msg) => {
+                eprintln!("  无法核验快捷方式归属：{msg}");
                 ExitCode::from(exit::ENVIRONMENT)
             }
         };
@@ -3522,6 +3556,8 @@ const VALUED_ARGS: &[(&str, usize, &str, &str)] = &[
     ("--fingerprint", 1, "--fingerprint SHA256:…（首次连接确认用）", "--server-inspect root@1.2.3.4 --fingerprint SHA256:abc…"),
     // 内部提权子进程：由本程序自己起，用户不需要手工输入。放在这里是为了让参数校验认识它。
     ("--install-seal", 1, "--install-seal <安装目录>（内部安装权限阶段）", "由安装器以管理员权限调用"),
+    ("--uninstall-preflight", 1, "--uninstall-preflight <安装目录> [--keep-guard]（内部卸载安全阶段）", "只由已安装的 SpiderVPN 卸载器调用"),
+    ("--uninstall-owns-shortcut", 2, "--uninstall-owns-shortcut <快捷方式> <安装目录>（内部归属检查）", "只由已安装的 SpiderVPN 卸载器调用"),
     ("--guard-apply", 2, "--guard-apply <request.json> <response.json>（内部提权子进程）", "不由用户手工执行"),
 ];
 
@@ -3535,6 +3571,7 @@ const FLAG_ARGS: &[&str] = &[
     "--diagnose",
     "--disconnect",
     "--headless",
+    "--keep-guard",
     "--help",
     "--history",
     "--lines",
