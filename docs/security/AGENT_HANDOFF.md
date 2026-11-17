@@ -179,3 +179,13 @@
 - **要谨记的 P0 停止线**：当前服务端仍通过 `src/pairhost.rs` 的 systemd UNIT 使用 `/usr/bin/python3 -I .../tc-pair.py serve`，重放漏洞生产路径未替换；Rust 尚无正式 JSON 持久迁移、WG 真实增删与事务回滚、签名/JWE 密文互操作、TLS 限并发/超时、非 root 账户和客户端管理端撤销接线。这些缺失时 SEC-01/02/08 不能关；不得将 19 tests 当作零风险证明。
 - **后续详细方案**：[SEC01_LINUX_RUST_MIGRATION.md](./SEC01_LINUX_RUST_MIGRATION.md) S01–S06，结合 [REMEDIATION_BACKLOG D.13–D.14](./REMEDIATION_BACKLOG.md)。优先补专用 Rust disk ledger 的原子/fsync 落盘与老 JSON 格式可信重验，然后 Linux WG 真实事务、TLS 的 Rust 认证握手。对恶意重新发放全新 InviteId+DeviceId+Key 的攻击者无法凭旧墓碑识别真人，需严格审批控制，不要宣称百分百阻断。
 - 另有 SEC-03/09/10 Windows A/B/C UAC/WFP 现场验收未完成；WFP PR #3 实验默认关闭。Issue #5 不关，PR #3/#6 继续 Draft、main 不合并。
+
+## 18. SEC-01 Linux Rust 持久化账本 + 故障注入事务（2026-11-17）
+
+- **活动 HEAD** `07dc06f83d3f14361f822f4a519203eddc96c987`；活动分支 `fix/sec10-guard-elevation-identity-p0-20261117` / Draft PR #6。主分支 main=857ea7593941ce79f6507db5b1ced076c3a077ba 未变；切勿合并。
+- **最新代码** `server-rs/src/ledger_disk.rs` 是 Linux Rust owner-only 文件系统持久账本（schema/generation/严格 serde/invariant/信任存储路径，临时文件 0600 单硬链接+O_NOFOLLOW+sync_all+rename+parent fsync）。仅已有完整经过验证的账本可 open_existing，缺文件 fail closed；初始化仅 cfg(test)，防止真实服务无旧状态时自动重置为空。
+- **安全关键故障**：目录 fsync 在原子 rename 后失败，磁盘可能已替换 Pending，但内存仍是 Open。最新 LedgerStore 有 `Poisoned`：在提交 I/O 不确定后禁止 view/generation/update，要求关闭重开、重验磁盘和可信 live WG；cfg(test) 注入 rename 后失败并验证旧 Open 不能写回。不能把 disk sync 失败当成可以继续操作。
+- **WG 事务编排测试** `server-rs/src/transaction.rs` 通过 Rust trait PeerControl 注入假的 WG：先持久化 Pending/Revoking、再 add/remove、再 fresh snapshot 和 commit Consumed/Revoked；失败仍保留 Pending/Revoking，带旧令牌 retry_read_only 不能再次调用 add。它**并没有真实 wg/ssh TLS 适配器**，不能冒充 SEC-01 生产代码已替换。
+- **编译与测试** 最新 [Linux Rust #44036991021](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036991021) 是同 SHA Completed/Success，**32 tests passed / 0 failed / 0 ignored**（在前 19 基础上新增 7 条 ledger + 5 条 fake WG + 1 条 post-rename 硬故障测试）。`--locked`、`-D warnings` 均通过；独立 Cargo 包与 Windows 桌面主依赖隔离。最新同 SHA [MSVC #44036991126](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036991126)、[GNU #44036991031](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44036991031) 写入时未终态，接手先查两项真实状态。
+- **外部进度同步** 详见 [SEC01_LINUX_RUST_MIGRATION.md](./SEC01_LINUX_RUST_MIGRATION.md) 第三阶段、[REMEDIATION_BACKLOG.md D.16](./REMEDIATION_BACKLOG.md)，以及 Issue #5。本轮无任何 Python 生产行为改动。
+- **不能关闭的项目**：SEC-01 P0 真实设备撤销重放线上路径仍是 Python `tc-pair.py`，Windows `deploy.rs::revoke_script` 未接 Rust Ledger，真实 WG/Linux TLS 权限控制/签名/JWE/旧数据可信迁移/反回滚未做。SEC-02 P0 亦未修；Windows SEC-03/09/10 A/B/C UAC/WFP 实机未验收，PR #3/#6 Draft、main 未合并。下一次继续优先做真实可信 WG 只读快照协议与 shell 注入安全的 Linux Rust adapter、签名互操作，禁止直接运行在用户生产机。
