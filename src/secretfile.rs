@@ -31,6 +31,24 @@ use std::path::{Path, PathBuf};
 /// 运行时创建的文件所有者是 `BUILTIN\Administrators`，`OW` 与 `BA` 两条都覆盖到。
 const OWNER_ONLY_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)";
 
+/// 创建后、写入任何提权请求前，保护一次性 Guard IPC 目录。
+/// 默认 TEMP 下可能继承过宽的 ACE：禁止继承，只允许所有者、管理员与 SYSTEM。
+pub fn protect_ipc_directory(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(std::io::Error::other("提权 IPC 目录必须是实体目录"));
+    }
+    #[cfg(windows)]
+    { restrict(path) }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(any(windows, unix)))]
+    { Err(std::io::Error::other("当前系统不支持受保护的 IPC 目录")) }
+}
+
 /// 原子写一个含秘密的文本文件：临时文件 → 收紧 → 写入 → 落盘 → 改名。
 ///
 /// 失败时删掉临时文件，**不留半成品**。返回值由调用方决定文案（CLI 与界面各有各的措辞）。
@@ -262,6 +280,18 @@ mod tests {
         assert!(tighten(&path).is_ok());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn privileged_ipc_directory_has_no_inherited_acl() {
+        let dir = temp_dir("guard-ipc");
+        protect_ipc_directory(&dir).unwrap();
+        let acl = acl_of(&dir);
+        assert!(!acl.contains("(I)"), "IPC 目录不允许继承其他账户写权限：{acl}");
+        assert!(!acl.contains("Authenticated Users"), "{acl}");
+        assert!(!acl.contains("BUILTIN\\Users"), "{acl}");
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[cfg(windows)]
