@@ -21,8 +21,15 @@ ring = "=0.17.14"
 linux-netns-acceptance = []
 # Explicit opt-in; default release has no mutating admin CLI command.
 linux-admin-finalize = []
+# Explicit opt-in read-only shutdown observer, not an importer or cutover.
+linux-cutover-preflight = []
 
 [[test]]
 name = "wg_namespace_e2e"
 path = "tests/wg_namespace_e2e.rs"
 required-features = ["linux-netns-acceptance"]
+
+[[bin]]
+name = "spidervpn-pair-cutover"
+path = "src/bin/spidervpn-pair-cutover.rs"
+required-features = ["linux-cutover-preflight"]

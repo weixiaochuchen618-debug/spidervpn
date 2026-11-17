@@ -49,6 +49,22 @@ jobs:
           test "$code" -eq 2
           printf '%s\n' "$result" | grep -F 'root privileges required'
 
+      - name: SEC-01 opt-in old Python cutover read-only preflight denial regression
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path server-rs/Cargo.toml --features linux-cutover-preflight --bin spidervpn-pair-cutover
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-cutover-preflight --lib legacy_cutover::tests -- --test-threads=1
+          test "$(id -u)" -ne 0
+          set +e
+          output=$(cargo run --quiet --locked --manifest-path server-rs/Cargo.toml --features linux-cutover-preflight --bin spidervpn-pair-cutover 2>&1)
+          code=$?
+          set -e
+          test "$code" -eq 2
+          printf '%s\n' "$output" | grep -F 'NO migration or listener authorization'
+
       - name: SEC-01 root-only recovery inspection CLI denies unprivileged invocation
         shell: bash
         env:
