@@ -18,6 +18,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
+#[cfg(target_os = "linux")]
+pub mod lock;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claims {
     pub invite_id: String,
@@ -221,7 +224,7 @@ impl Ledger {
         }
         let peers = observed(live_peers)?;
         let invitation = self.invitations.get(&req.invite_id).ok_or(Refusal::UnknownInvitation)?;
-        match invitation.state {
+        match &invitation.state {
             InviteState::Open => {}
             InviteState::Cancelled => return Err(Refusal::Cancelled),
             InviteState::Expired => return Err(Refusal::Expired),
@@ -241,16 +244,20 @@ impl Ledger {
 
         let mut reserved_ips = BTreeSet::new();
         let mut reserved_keys = BTreeSet::new();
+        let mut reserved_devices = BTreeSet::new();
         for inv in self.invitations.values() {
             match &inv.state {
                 InviteState::Pending(g) | InviteState::Consumed(g) | InviteState::Revoking(g) => {
                     reserved_ips.insert(u32::from(g.address));
                     reserved_keys.insert(g.claims.public_key.as_str());
+                    reserved_devices.insert(g.claims.device_id.as_str());
                 }
                 _ => {}
             }
         }
-        if reserved_keys.contains(req.public_key.as_str()) {
+        if reserved_keys.contains(req.public_key.as_str())
+            || reserved_devices.contains(req.device_id.as_str())
+        {
             return Err(Refusal::Conflict);
         }
         for peer in peers {
@@ -261,8 +268,10 @@ impl Ledger {
             .map(Ipv4Addr::from)
             .ok_or(Refusal::AddressExhausted)?;
         let grant = Grant { claims: req.clone(), address };
-        self.invitations.get_mut(&req.invite_id).expect("checked present").state =
-            InviteState::Pending(grant.clone());
+        let Some(record) = self.invitations.get_mut(&req.invite_id) else {
+            return Err(Refusal::UnknownInvitation);
+        };
+        record.state = InviteState::Pending(grant.clone());
         Ok(grant)
     }
 
@@ -427,14 +436,13 @@ mod tests {
     #[test]
     fn original_jwk_and_request_id_do_not_allow_key_or_device_swap() {
         let (ledger, grant) = consumed();
-        for mut swapped in [
+        for swapped in [
             { let mut c = claim(INV); c.public_key = format!("{}=", "B".repeat(43)); c },
             { let mut c = claim(INV); c.device_id = INV2.into(); c },
             { let mut c = claim(INV); c.request_digest = "c".repeat(64); c },
         ] {
             assert_eq!(ledger.retry(&swapped, Some(&[peer(&grant)])),
                 Err(Refusal::ConsumedByAnotherRequest));
-            swapped.invite_id = INV2.into();
         }
     }
 
