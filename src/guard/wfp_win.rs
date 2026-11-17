@@ -1141,6 +1141,9 @@ mod imp {
         endpoint: std::net::SocketAddr,
         owner_pid: u32,
         watched_process: WatchedEngineProcess,
+        // 在独立提权 helper 中同时监控发起连接的主程序；
+        // 如果主程序已退出，不能继续仅凭 sing-box 存活保留 WFP 许可。
+        controller_process: WatchedEngineProcess,
         permitted_filters: Vec<u64>,
     }
 
@@ -1186,6 +1189,7 @@ mod imp {
             ids: &[super::super::identity::ProgramIdentity],
             endpoint: std::net::SocketAddr,
             owner_pid: u32,
+            controller_pid: u32,
             executable: &Path,
             lease_nonce: &[u8],
         ) -> Result<Self, String> {
@@ -1203,8 +1207,10 @@ mod imp {
             );
             let _guard_lock = NamedMutex::acquire(&lock_name)?;
             let watched_process = WatchedEngineProcess::open(owner_pid)?;
+            let controller_process = WatchedEngineProcess::open(controller_pid)?;
             super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
             watched_process.require_alive()?;
+            controller_process.require_alive()?;
             let engine = WfpEngine::open_dynamic().map_err(|e| e.to_string())?;
             let provider = provider_get(&engine, PROVIDER_GUID).map_err(|e| e.to_string())?;
             let sublayer = sublayer_get(&engine, SUBLAYER_GUID).map_err(|e| e.to_string())?;
@@ -1254,19 +1260,23 @@ mod imp {
             // 动态 engine，BFE 会移除已经装上的所有 permits。
             super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
             watched_process.require_alive()?;
+            controller_process.require_alive()?;
             Ok(Self {
-                engine, endpoint, owner_pid, watched_process, permitted_filters: permits,
+                engine, endpoint, owner_pid, watched_process, controller_process,
+                permitted_filters: permits,
             })
         }
 
         /// 每次接到存活检查都必须**消耗**旧 lease。失败时旧会话立即 Drop，
         /// 防止监控调用方忘记主动撤销。不能代替实时进程退出通知机制。
         pub fn revalidate(self, executable: &Path) -> Result<Self, String> {
+            self.controller_process.require_alive()?;
             self.watched_process.require_alive()?;
             super::super::proxy_identity::verify_proxy_owner(
                 self.endpoint, self.owner_pid, executable,
             )?;
             self.watched_process.require_alive()?;
+            self.controller_process.require_alive()?;
             Ok(self)
         }
 
@@ -1275,17 +1285,27 @@ mod imp {
         /// 临时许可进程本身崩溃时，由 WFP 动态会话的 RPC rundown 兜底。
         pub fn supervise_until_exit(mut self, executable: &Path) -> Result<(), String> {
             use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
             loop {
-                match self.watched_process.wait(200) {
+                // 不要单靠 PID 查询：已打开的 Windows HANDLE 精确绑定进程对象，
+                // 也不受系统复用 PID 影响。两个对象任何一个退出都撤销会话。
+                let handles = [self.watched_process.0, self.controller_process.0];
+                let result = unsafe {
+                    WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, 200)
+                };
+                match result {
                     WAIT_OBJECT_0 => {
-                        // 引擎已经退出：先撤销许可，再返回。
+                        return self.close().map_err(|e| e.to_string());
+                    }
+                    n if n == WAIT_OBJECT_0 + 1 => {
+                        // 控制程序退出：即使引擎仍活着，也不保留交易许可。
                         return self.close().map_err(|e| e.to_string());
                     }
                     WAIT_TIMEOUT => {
-                        // 任一核验失败都使 self 被消费并 Drop，绝不保留许可。
+                        // 端口被接管、控制程序无法确认等任一异常都消费并 Drop 租约。
                         self = self.revalidate(executable)?;
                     }
-                    _ => return Err("引擎进程等待状态异常，动态许可已经撤销".into()),
+                    _ => return Err("受监督进程等待状态异常，动态许可已撤销".into()),
                 }
             }
         }
@@ -1339,6 +1359,18 @@ mod imp {
         }
 
         #[test]
+        fn lease_rejects_missing_controller_pid_before_creating_dynamic_rules() {
+            let exe = std::env::current_exe().unwrap();
+            let id = super::super::super::identity::resolve_entry(
+                "Trader", exe.to_str(), &SystemIdentityEnv::new(),
+            ).expect("test exe identity");
+            assert!(DynamicProxyLease::acquire(
+                &[id], "127.0.0.1:17890".parse().unwrap(),
+                std::process::id(), 0, &exe, &[1u8; 16],
+            ).is_err(), "缺少主程序 PID 不能开启长期动态放行");
+        }
+
+        #[test]
         fn supervised_process_handle_rejects_invalid_pid_and_accepts_current() {
             assert!(WatchedEngineProcess::open(0).is_err());
             let process = WatchedEngineProcess::open(std::process::id()).unwrap();
@@ -1350,7 +1382,7 @@ mod imp {
             let exe = std::env::current_exe().unwrap();
             assert!(DynamicProxyLease::acquire(
                 &[], "127.0.0.1:17890".parse().unwrap(),
-                std::process::id(), &exe, &[1u8; 16],
+                std::process::id(), std::process::id(), &exe, &[1u8; 16],
             ).is_err());
         }
 
@@ -1363,7 +1395,7 @@ mod imp {
             };
             assert!(DynamicProxyLease::acquire(
                 &[one], "127.0.0.1:17890".parse().unwrap(),
-                std::process::id(), &exe, &[2u8; 8],
+                std::process::id(), std::process::id(), &exe, &[2u8; 8],
             ).is_err());
         }
     }
