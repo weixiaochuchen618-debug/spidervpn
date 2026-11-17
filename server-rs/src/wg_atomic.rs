@@ -30,6 +30,11 @@ const O_NOFOLLOW: i32 = 0o400000; // Linux x86_64
 const MAX_CONF: usize = 1024 * 1024;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 unsafe extern "C" { fn geteuid() -> u32; }
 
 #[derive(Debug)]
@@ -130,6 +135,10 @@ fn replace_verified(
             return Err(AtomicError::UntrustedOriginal);
         }
         fs::rename(&temporary, path).map_err(|_| AtomicError::Io)?;
+        #[cfg(test)]
+        if FAIL_AFTER_RENAME.with(|flag| flag.get()) {
+            return Err(AtomicError::CommitUncertain);
+        }
         File::open(root).and_then(|dir| dir.sync_all())
             .map_err(|_| AtomicError::CommitUncertain)?;
         Ok(())
@@ -259,6 +268,25 @@ mod tests {
         let _=g;
         drop(store);fs::remove_dir_all(p).unwrap();
     }
+    #[test]
+    fn after_rename_sync_failure_leaves_new_config_and_pending_grant() {
+        let (p,store,g)=setup("uncertain");
+        let target=p.join("wg0.conf");
+        fs::write(&target,conf()).unwrap();
+        fs::set_permissions(&target,fs::Permissions::from_mode(0o600)).unwrap();
+        let (original,meta)=read_current(&target).unwrap();
+        let plan=plan_change(&original,&g,Change::Add).unwrap();
+        FAIL_AFTER_RENAME.with(|flag|flag.set(true));
+        let error=replace_verified(&p,&target,&original,&meta,&plan);
+        FAIL_AFTER_RENAME.with(|flag|flag.set(false));
+        assert!(matches!(error,Err(AtomicError::CommitUncertain)));
+        assert!(String::from_utf8_lossy(&fs::read(&target).unwrap())
+            .contains(&g.claims.public_key), "rename may have happened");
+        assert!(matches!(store.view().unwrap().state(INV),
+            Some(InviteState::Pending(_))), "never mark consumed on uncertain fsync");
+        drop(store);fs::remove_dir_all(p).unwrap();
+    }
+
     #[test]
     fn wrong_ledger_phase_or_grant_cannot_write() {
         let (p,mut store,g)=setup("phase");
