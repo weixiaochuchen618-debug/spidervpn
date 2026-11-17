@@ -679,7 +679,7 @@ pub struct EngineSettings {
 impl EngineSettings {
     /// 拼出这次连接要跑的引擎命令行。`config_path` 是**这条线路**的引擎配置。
     ///
-    /// 测试钩子 `SPIDERVPN_ENGINE_ARGS`（空格分隔）可以把参数整体换成假引擎认识的样子：
+    /// **只在 Rust 测试/调试构建启用**的钩子 `SPIDERVPN_ENGINE_ARGS`（空格分隔）
     /// 验收要用「会稳定活着的假引擎」验证连接成功路径，而派生参数（`run -c …`）只有真引擎看得懂。
     /// 生产不设它，形状就是派生出来的那一份。
     pub fn to_engine(&self, config_path: &Path) -> crate::engine::EngineConfig {
@@ -688,12 +688,18 @@ impl EngineSettings {
             "-c".to_string(),
             config_path.to_string_lossy().to_string(),
         ];
+        // 这个变量原本只为用假的 ping 引擎测试进程生命周期。
+        // 正式发布版若继续接受环境变量，提权运行时就可能被外部注入
+        // 任意引擎子命令；release 一律使用派生的 run -c 配置路径。
+        #[cfg(any(test, debug_assertions))]
         let args = match std::env::var("SPIDERVPN_ENGINE_ARGS") {
             Ok(v) if !v.trim().is_empty() => {
                 v.split_whitespace().map(str::to_string).collect::<Vec<_>>()
             }
             _ => derived,
         };
+        #[cfg(not(any(test, debug_assertions)))]
+        let args = derived;
         crate::engine::EngineConfig { binary: self.binary.clone(), args }
     }
 }
