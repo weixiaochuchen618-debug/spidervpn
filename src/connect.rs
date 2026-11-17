@@ -230,6 +230,55 @@ pub fn connect_with_origin(
     out
 }
 
+/// 隔离实机验证入口：默认关闭，不改变原有连接 / UAC / UI 交互。
+///
+/// 只允许在明确设置 SPIDERVPN_WFP_LEASE_EXPERIMENT=1 且现有持久
+/// v1 Guard 已经保护交易名单时，测试长期动态代理租约。
+/// 生产启用前仍必须完成 Wintun/TUN 故障注入、真实进程生命周期和证据集成。
+#[cfg(windows)]
+fn try_start_experimental_proxy_lease(
+    cfg: &AppConfig,
+    engine: &EngineConfig,
+    endpoint: &str,
+    engine_pid: i64,
+    blocked: bool,
+    tun: bool,
+) -> Result<usize, String> {
+    if tun {
+        return Err("TUN 的下一跳/重新授权防泄漏尚未验收，不允许试验许可".into());
+    }
+    if !blocked {
+        return Err("持久交易程序 BLOCK 未成功核验，不允许动态放行".into());
+    }
+    let resolved = crate::guard::trade_identities(cfg);
+    if resolved.programs.is_empty() || !resolved.all_participated() {
+        return Err("交易程序名单不完整，不允许授予部分程序的临时许可".into());
+    }
+    let target = endpoint.parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("代理入口必须是精确的本地 IP:port：{e}"))?;
+    let pid: u32 = engine_pid.try_into()
+        .map_err(|_| "引擎 PID 超出 Windows 进程标识范围".to_string())?;
+    let request = crate::guard::lease_helper::LeaseRequest {
+        schema: 1,
+        // 启动器在 ShellExecuteExW 之前会替换为 ring SystemRandom 的 128-bit nonce。
+        nonce: String::new(),
+        endpoint: target,
+        engine_pid: pid,
+        controller_pid: std::process::id(),
+        engine_executable: std::path::PathBuf::from(&engine.binary),
+        programs: resolved.programs,
+    };
+    let child = crate::guard::lease_helper::launch_elevated(&request)?;
+    if !child.running() {
+        return Err("动态 WFP 辅助进程在握手后意外退出".into());
+    }
+    // handle 只用于握手与活性验证；关闭父进程的 handle 不会结束 helper。
+    // helper 自己监控控制程序和引擎的真实 HANDLE，在任一退出时撤销许可。
+    let count = request.programs.len();
+    drop(child);
+    Ok(count)
+}
+
 fn connect_inner(
     cfg: &AppConfig,
     engine: &EngineConfig,
@@ -377,6 +426,23 @@ fn connect_inner(
         return Err(format!("写运行时记录失败：{e}；{kill_note}；{note}"));
     }
     did.push("写入运行时记录".to_string());
+
+    // 试验开关默认关闭：不会改变现有 UI 或连接顺序，也不会无故增加 UAC。
+    // 此位置要求引擎已真正活着、运行时记录已原子提交，并且 0.7 步
+    // WFP 持久阻断结果明确。失败绝不删除已有 BLOCK 或误报已放行。
+    #[cfg(windows)]
+    if std::env::var("SPIDERVPN_WFP_LEASE_EXPERIMENT").as_deref() == Ok("1") {
+        match try_start_experimental_proxy_lease(
+            cfg, engine, &endpoint, pid, trading_blocked, tun,
+        ) {
+            Ok(count) => did.push(format!(
+                "WFP 临时代理租约已在隔离试验模式启动（{count} 个交易程序）"
+            )),
+            Err(err) => did.push(format!(
+                "WFP 临时代理试验未启用（{err}）；持久直连阻断不受影响"
+            )),
+        }
+    }
 
     Ok(Outcome::Done(did))
 }
