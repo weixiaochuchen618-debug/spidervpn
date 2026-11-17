@@ -160,3 +160,17 @@ jobs:
           test "$(sudo stat -c '%u:%a' "$conf")" = "0:600"
           test -x "$SPIDERVPN_SEC01_TEST_BIN"
           sudo ip netns exec "$ns" /usr/bin/env SPIDERVPN_SEC01_NS_INTERFACE="$iface" SPIDERVPN_SEC01_NS_CLIENT_PUBLIC_KEY="$client_pub" "$SPIDERVPN_SEC01_TEST_BIN" --nocapture
+      - name: Execute real root-owned legacy retirement filesystem tests in isolated runner
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$PWD/server-rs/target/netns"
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-legacy-retire --lib legacy_retire::tests --no-run --message-format=json > "$RUNNER_TEMP/sec01-retire-build.json"
+          binary="$(jq -r 'select(.reason=="compiler-artifact" and .profile.test==true and (.target.kind | index("lib"))) | .executable // empty' "$RUNNER_TEMP/sec01-retire-build.json" | tail -n1)"
+          test -n "$binary"
+          test -x "$binary"
+          # Only test-generated /tmp owner-only directories; never the
+          # actual /var/lib/tradechannel pairing service or systemd unit.
+          sudo "$binary" legacy_retire::tests --test-threads=1 --nocapture
