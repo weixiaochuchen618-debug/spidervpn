@@ -46,12 +46,30 @@ fn drop_proxy_key(key: &str) {
     let _ = hkcu.delete_subkey_all(key);
 }
 
+/// The elevated test runner must exercise the real bundled-engine identity
+/// boundary, not bypass it by launching a configured system executable.
+fn test_install(root: &Path) -> (PathBuf, PathBuf) {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create isolated bin");
+    let frontend = bin.join("spidervpn.exe");
+    let engine = bin.join("sing-box.exe");
+    if !frontend.is_file() {
+        std::fs::copy(env!("CARGO_BIN_EXE_spidervpn"), &frontend)
+            .expect("copy Rust client to isolated bin");
+    }
+    if !engine.is_file() {
+        std::fs::copy(PING, &engine).expect("copy harmless test engine");
+    }
+    (frontend, engine)
+}
+
 fn run(root: &Path, key: &str, args: &[&str]) -> (Option<i32>, String) {
     static RUNS: AtomicUsize = AtomicUsize::new(0);
     let n = RUNS.fetch_add(1, Ordering::Relaxed);
     let out_path = root.join(format!("cli-{n}.out"));
     let err_path = root.join(format!("cli-{n}.err"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_spidervpn"))
+    let (frontend, _) = test_install(root);
+    let mut child = Command::new(&frontend)
         .args(args)
         .env("SPIDERVPN_ROOT", root)
         .env("SPIDERVPN_PROXY_KEY", key)
@@ -140,6 +158,8 @@ fn write_transport_profile(root: &Path, tag: &str) -> PathBuf {
 
 fn import(root: &Path, key: &str, profile: &Path, name: &str) -> u16 {
     let port = free_port();
+    let (_, engine) = test_install(root);
+    let engine_path = engine.to_str().expect("bundled engine test path must be UTF-8");
     let (code, out) = run(
         root,
         key,
@@ -147,7 +167,7 @@ fn import(root: &Path, key: &str, profile: &Path, name: &str) -> u16 {
             "--import",
             &profile.to_string_lossy(),
             "--engine",
-            PING,
+            engine_path,
             "--port",
             &port.to_string(),
             "--line-name",
