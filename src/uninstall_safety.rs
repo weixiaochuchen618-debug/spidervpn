@@ -66,8 +66,9 @@ fn no_reparse(path: &Path) -> Result<(), String> {
 /// installation's WFP rules. This is a runtime gate, not a mockable check.
 fn actual_installation(root: &Path) -> Result<(), String> {
     safe_local_root(root)?;
-    let expected = root.join("bin").join("spidervpn.exe");
-    for p in [root, root.join("bin").as_path(), expected.as_path()] {
+    let bin = root.join("bin");
+    let expected = bin.join("spidervpn.exe");
+    for p in [root, bin.as_path(), expected.as_path()] {
         no_reparse(p)?;
     }
     let actual = std::env::current_exe()
