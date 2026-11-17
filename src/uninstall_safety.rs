@@ -53,10 +53,13 @@ fn no_reparse(path: &Path) -> Result<(), String> {
     use crate::guard::identity::IdentityEnv;
     let env = crate::guard::wfp_win::SystemIdentityEnv::new();
     for p in crate::guard::identity::reparse_chain(path) {
-        if let Ok(_) = std::fs::symlink_metadata(&p) {
-            if env.is_reparse_point(&p) {
+        match std::fs::symlink_metadata(&p) {
+            Ok(_) if env.is_reparse_point(&p) => {
                 return Err(format!("卸载路径存在符号链接/联接点：{}", p.display()));
             }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("无法验证卸载路径 {}：{e}", p.display())),
         }
     }
     Ok(())
@@ -93,10 +96,11 @@ fn preflight_data(root: &Path) -> Result<(), String> {
     no_reparse(&data)?;
     let journal = data.join("proxy-journal.json");
     no_reparse(&journal)?;
-    if journal.exists() {
-        return Err("发现未还原的系统代理记录 proxy-journal.json；先在客户端断开并还原代理，拒绝删除程序".into());
+    match std::fs::symlink_metadata(&journal) {
+        Ok(_) => Err("发现未还原的系统代理记录 proxy-journal.json；先在客户端断开并还原代理，拒绝删除程序".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("无法证明代理恢复记录不存在（{}）：{e}；拒绝卸载", journal.display())),
     }
-    Ok(())
 }
 
 fn release_guard_with(
@@ -274,6 +278,21 @@ mod tests {
             assert_eq!(fake.calls(), 1);
             assert!(store.read_removed().is_none());
         }
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn unreadable_or_linked_journal_is_never_treated_as_absent() {
+        let p = root("journal-link");
+        let data = p.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let real = data.join("pending-restore.txt");
+        std::fs::write(&real, b"pending proxy restore").unwrap();
+        let linked = data.join("proxy-journal.json");
+        std::os::windows::fs::symlink_file(&real, &linked)
+            .or_else(|_| std::fs::hard_link(&real, &linked))
+            .unwrap();
+        assert!(preflight_data(&p).is_err(), "linked journal still blocks uninstall");
         std::fs::remove_dir_all(p).unwrap();
     }
 
