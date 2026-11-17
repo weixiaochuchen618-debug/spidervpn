@@ -95,3 +95,11 @@
 - 历史红例不是被跳过：原 MSVC [44010494382](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44010494382) 的 `mode-e2e` 被管理员严格引擎校验拦住；旧 [44011375375](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44011375375) 又定位 `runtime-engine-e2e` 两个相同夹具问题；已改用隔离 bin 中的实际客户端和拷贝为 `sing-box.exe` 的系统 ping 假引擎，另同步处理 `transport-e2e`。不取消任何连接行为断言。
 - 本轮代码提交顺序：`8262db63`（mode 测试）、`253392e8`（SEC-10 DACL 读回）、`a5eebd39`（提权端校验与宽 ACL 负对照）、`31d9e55c`（MSVC 前置专项）、`87a7cd34`（runtime 测试）、`c72ea692`（transport 测试）。
 - **实际状态仍为 P0 候选，尚未安全验收**：下轮必须检查 PR #6 最新 SHA 的 MSVC 与 GNU workflow 运行及失败日志；缺少 Windows A/B/C 跨账户 UAC-01～12、可信安装根 `bin` 安全权限及真实攻击验证。原 main、WFP PR #3 的持久 BLOCK 不受影响，严禁未验收合并。
+
+
+## 9. SEC-10 诊断修正后的可靠恢复点（2026-11-17）
+
+- **继续工作必须先 fetch** [PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6) 的 head：本次候选 `0690cba5774c715255fb7c4fe55c92a2728b30d5`。`main` 与 PR #3 没有被本次合并或变更，PR #6 仍 Draft。
+- **事实与修复**：受保护 IPC 的正常 Windows SDDL 是 `D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)`，原 API 附带三个末尾 UTF-16 NUL；新 Rust 解析器一度误拒绝正常请求。提交 `0690cba5` 只移除尾部 NUL，其他授权严格拒绝。必须保留正常成功路径 + AU 可写负路径两类测试。
+- **CI 证据**：[Windows GNU 44012868496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44012868496) 与当前 HEAD 完全一致，最终 Success；[Windows MSVC 44012868490](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44012868490) 已成功运行 build、SEC-10 提权专项、全部 `tests/*.rs` 集成目标、各变更 Rust 模块回归；截至交接时最后的便携单元 suite 仍显示 In Progress，不能写成整个 MSVC CI Success。原配置有 8 个环境依赖排除项，本轮没加 skip。
+- **正式安全结论：未完成 / 不可合并**。缺少可信安装 `C:\SpiderVPN\bin` 安全 ACL / 标准用户可写路径拒绝、A/B/C 多账户真实 UAC-01～12、升级/卸载迁移、WFP 持久 BLOCK 实机验证。下轮续接按 [Backlog D.2-D.3](./REMEDIATION_BACKLOG.md) 和 [实机 UAC 验收表](./SEC10_WINDOWS_UAC_ACCEPTANCE.md) 做，不能用单机 CI 抹去 P0。
