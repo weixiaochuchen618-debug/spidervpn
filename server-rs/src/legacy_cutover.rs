@@ -13,9 +13,10 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::net::Ipv4Addr;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -27,6 +28,12 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const MAX_SHOW: usize = 4096;
 const MAX_CMDLINE: u64 = 65536;
 const TIMEOUT: Duration = Duration::from_secs(3);
+const LEGACY_ROOT: &str = "/var/lib/tradechannel/pairing-rs";
+const LEGACY_SERVER: &str = "/var/lib/tradechannel/pairing-rs/server.json";
+const MAX_SERVER_BYTES: u64 = 65536;
+const MAX_SOCKET_BYTES: u64 = 1024 * 1024;
+const O_NOFOLLOW: i32 = 0o400000; // Linux x86_64; no symlinked old config
+
 
 unsafe extern "C" { fn geteuid() -> u32; }
 
@@ -40,6 +47,9 @@ pub enum CutoverError {
     ProcessInventoryUnavailable,
     OldReceiverRunning,
     UnstableObservation,
+    TrustedPortUnavailable,
+    SocketInventoryUnavailable,
+    OldPairingPortListening,
 }
 
 /// A report intentionally has no conversion to Grant/Claims/Approval.
@@ -49,6 +59,7 @@ pub struct ShutdownObservation {
     pub persistent_unit_mask_observed: bool,
     pub stopped_systemd_unit_observed: bool,
     pub old_script_process_not_observed: bool,
+    pub old_listener_not_observed: bool,
 }
 impl ShutdownObservation {
     pub fn authorizes_legacy_import(&self) -> bool { false }
@@ -165,6 +176,109 @@ fn old_python_command(bytes:&[u8]) -> Result<bool,CutoverError> {
         .any(|window|window==b"tc-pair.py")))
 }
 
+/// The old Python receiver binds the Port stored in server.json. Checking
+/// only the default 18443 could miss a legitimate nondefault deployment.
+/// Neither an old JSON record nor this port is migration authority: it is
+/// merely a source for a conservative *denial* check.
+fn parse_old_server_port(raw: &[u8]) -> Result<u16,CutoverError> {
+    let value:serde_json::Value=serde_json::from_slice(raw)
+        .map_err(|_|CutoverError::TrustedPortUnavailable)?;
+    if value.get("SchemaVersion").and_then(serde_json::Value::as_u64)!=Some(1) {
+        return Err(CutoverError::TrustedPortUnavailable);
+    }
+    let port=value.get("Port").and_then(serde_json::Value::as_u64)
+        .and_then(|p|u16::try_from(p).ok())
+        .filter(|p| (1024..=65535).contains(p))
+        .ok_or(CutoverError::TrustedPortUnavailable)?;
+    let host=value.get("PublicHost").and_then(serde_json::Value::as_str)
+        .ok_or(CutoverError::TrustedPortUnavailable)?;
+    let addr=host.parse::<Ipv4Addr>()
+        .map_err(|_|CutoverError::TrustedPortUnavailable)?;
+    if addr.to_string()!=host
+        || value.get("Endpoint").and_then(serde_json::Value::as_str)
+            != Some(format!("{host}:{port}").as_str()) {
+        return Err(CutoverError::TrustedPortUnavailable);
+    }
+    Ok(port)
+}
+
+/// Fail closed unless the old installation's server.json is a root-owned,
+/// non-symlink single-link 0600 file inside root-controlled directories.
+/// Reject unexpected TC_PAIR_ROOT overrides: the current known deployment
+/// installs exactly this location and cannot attest arbitrary alternatives.
+fn trusted_old_server_port()->Result<u16,CutoverError>{
+    for parent in ["/var","/var/lib","/var/lib/tradechannel",LEGACY_ROOT] {
+        check_root_owned_directory(Path::new(parent))
+            .map_err(|_|CutoverError::TrustedPortUnavailable)?;
+    }
+    let file=OpenOptions::new().read(true).custom_flags(O_NOFOLLOW)
+        .open(LEGACY_SERVER).map_err(|_|CutoverError::TrustedPortUnavailable)?;
+    let meta=file.metadata().map_err(|_|CutoverError::TrustedPortUnavailable)?;
+    if !meta.file_type().is_file() || meta.uid()!=0 || meta.nlink()!=1
+        || meta.mode() & 0o777 != 0o600 || meta.len()>MAX_SERVER_BYTES {
+        return Err(CutoverError::TrustedPortUnavailable);
+    }
+    let mut contents=Vec::new();
+    file.take(MAX_SERVER_BYTES+1).read_to_end(&mut contents)
+        .map_err(|_|CutoverError::TrustedPortUnavailable)?;
+    if contents.len() as u64>MAX_SERVER_BYTES {
+        return Err(CutoverError::TrustedPortUnavailable);
+    }
+    parse_old_server_port(&contents)
+}
+
+/// Bounded parser of Linux /proc/net/tcp and tcp6. Any listening socket
+/// on the old configured port (regardless of owning process's name) denies.
+/// Missing, malformed or truncated kernel inventory is NOT an empty set.
+fn reject_listener_table(table: &[u8], port: u16, v6:bool)
+    ->Result<(),CutoverError>
+{
+    if table.is_empty() || table.len() as u64>MAX_SOCKET_BYTES
+        || table.last()!=Some(&b'\n') {
+        return Err(CutoverError::SocketInventoryUnavailable);
+    }
+    let content=std::str::from_utf8(table)
+        .map_err(|_|CutoverError::SocketInventoryUnavailable)?;
+    let mut lines=content.lines();
+    let header=lines.next().ok_or(CutoverError::SocketInventoryUnavailable)?;
+    let header:Vec<&str>=header.split_whitespace().collect();
+    if header.len()<4 || header[0]!="sl"
+        || header[1]!="local_address" || header[2]!="rem_address" || header[3]!="st" {
+        return Err(CutoverError::SocketInventoryUnavailable);
+    }
+    for line in lines {
+        let cols:Vec<&str>=line.split_whitespace().collect();
+        if cols.len()<4 || !cols[0].ends_with(':') {
+            return Err(CutoverError::SocketInventoryUnavailable);
+        }
+        let (addr,hexport)=cols[1].rsplit_once(':')
+            .ok_or(CutoverError::SocketInventoryUnavailable)?;
+        if addr.len()!=if v6 {32} else {8} || hexport.len()!=4
+            || !addr.bytes().all(|b|b.is_ascii_hexdigit())
+            || cols[3].len()!=2 || !cols[3].bytes().all(|b|b.is_ascii_hexdigit()) {
+            return Err(CutoverError::SocketInventoryUnavailable);
+        }
+        let found=u16::from_str_radix(hexport,16)
+            .map_err(|_|CutoverError::SocketInventoryUnavailable)?;
+        if cols[3]=="0A" && found==port {
+            return Err(CutoverError::OldPairingPortListening);
+        }
+    }
+    Ok(())
+}
+fn socket_table(path:&str,port:u16,v6:bool)->Result<(),CutoverError>{
+    let input=File::open(path).map_err(|_|CutoverError::SocketInventoryUnavailable)?;
+    let mut buf=Vec::new();
+    input.take(MAX_SOCKET_BYTES+1).read_to_end(&mut buf)
+        .map_err(|_|CutoverError::SocketInventoryUnavailable)?;
+    reject_listener_table(&buf,port,v6)
+}
+fn no_old_listener(port:u16)->Result<(),CutoverError>{
+    socket_table("/proc/net/tcp",port,false)?;
+    socket_table("/proc/net/tcp6",port,true)?;
+    Ok(())
+}
+
 fn scan_proc_for_python_writer() -> Result<(),CutoverError> {
     let processes=fs::read_dir("/proc")
         .map_err(|_|CutoverError::ProcessInventoryUnavailable)?;
@@ -211,6 +325,7 @@ where M:FnMut()->Result<(),CutoverError>,
         persistent_unit_mask_observed:true,
         stopped_systemd_unit_observed:true,
         old_script_process_not_observed:true,
+        old_listener_not_observed:false, // only the real port-inspection entry can assert this
     })
 }
 
@@ -218,7 +333,17 @@ where M:FnMut()->Result<(),CutoverError>,
 /// never a cutover authorization: scripts invoked by a renamed interpreter,
 /// separate PID namespaces, or uncooperative root writers may evade it.
 pub fn observe_old_python_shutdown() -> Result<ShutdownObservation,CutoverError> {
-    assess_with(unsafe{geteuid()},persistent_mask,systemctl_show,scan_proc_for_python_writer)
+    // Root first, before reading any legacy config, service or kernel paths.
+    root_required(unsafe{geteuid()})?;
+    let port_before=trusted_old_server_port()?;
+    no_old_listener(port_before)?;
+    let mut report=assess_with(0,persistent_mask,systemctl_show,scan_proc_for_python_writer)?;
+    let port_after=trusted_old_server_port()?;
+    if port_before!=port_after {return Err(CutoverError::UnstableObservation);}
+    no_old_listener(port_after)?;
+    // Still a momentary observation, NEVER a start-listener/import permit.
+    report.old_listener_not_observed=true;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -303,5 +428,53 @@ mod tests {
             else {Ok(GOOD.replace("Job=0","Job="))}
         },pass);
         assert_eq!(state,Err(CutoverError::UnstableObservation));
+    }
+
+    #[test]
+    fn rejects_invented_or_mismatched_old_server_port(){
+        let good=br#"{"SchemaVersion":1,"PublicHost":"203.0.113.10","Port":18443,"Endpoint":"203.0.113.10:18443"}"#;
+        assert_eq!(parse_old_server_port(good),Ok(18443));
+        for invalid in [
+            br#"{"SchemaVersion":1,"PublicHost":"203.0.113.10","Port":18443,"Endpoint":"203.0.113.10:18444"}"#.as_slice(),
+            br#"{"SchemaVersion":1,"PublicHost":"203.0.113.10","Port":22,"Endpoint":"203.0.113.10:22"}"#,
+            br#"{"SchemaVersion":1,"PublicHost":"203.0.113.10","Port":"18443","Endpoint":"203.0.113.10:18443"}"#,
+            br#"{"SchemaVersion":2,"PublicHost":"203.0.113.10","Port":18443,"Endpoint":"203.0.113.10:18443"}"#,
+            br#"{}"#,
+        ] {
+            assert_eq!(parse_old_server_port(invalid),Err(CutoverError::TrustedPortUnavailable));
+        }
+    }
+    #[test]
+    fn listening_socket_on_actual_old_port_denies_even_when_process_name_changed(){
+        let header=b"  sl  local_address rem_address   st tx_queue\n";
+        let ipv4=b"  0: 00000000:480B 00000000:0000 0A 0:0\n";
+        let ipv6=b"  0: 00000000000000000000000000000000:480B 00000000000000000000000000000000:0000 0A 0:0\n";
+        for (body,v6) in [(ipv4.as_slice(),false),(ipv6.as_slice(),true)] {
+            let mut table=header.to_vec();
+            table.extend_from_slice(body);
+            assert_eq!(reject_listener_table(&table,18443,v6),
+                Err(CutoverError::OldPairingPortListening));
+            assert_eq!(reject_listener_table(&table,18555,v6),Ok(()));
+            table.pop();
+            assert_eq!(reject_listener_table(&table,18443,v6),
+                Err(CutoverError::SocketInventoryUnavailable));
+        }
+    }
+    #[test]
+    fn real_kernel_ipv4_listener_is_observed_without_executing_old_python(){
+        let socket=std::net::TcpListener::bind(("127.0.0.1",0)).unwrap();
+        let port=socket.local_addr().unwrap().port();
+        assert_eq!(socket_table("/proc/net/tcp",port,false),
+            Err(CutoverError::OldPairingPortListening));
+        drop(socket);
+        assert_eq!(socket_table("/proc/net/tcp",port,false),Ok(()));
+    }
+    #[test]
+    fn untrusted_socket_inventory_never_looks_like_absence(){
+        for data in [b"".as_slice(),b"garbage\n",b"sl local_address rem_address st\n0: BAD\n",
+            b"sl local_address rem_address st\n0: 00000000:ZZZZ 00000000:0000 0A\n"] {
+            assert_eq!(reject_listener_table(data,18443,false),
+                Err(CutoverError::SocketInventoryUnavailable));
+        }
     }
 }
