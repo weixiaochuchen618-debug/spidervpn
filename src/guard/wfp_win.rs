@@ -1208,6 +1208,13 @@ mod imp {
             let _guard_lock = NamedMutex::acquire(&lock_name)?;
             let watched_process = WatchedEngineProcess::open(owner_pid)?;
             let controller_process = WatchedEngineProcess::open(controller_pid)?;
+            // 活着的 PID 不等于可信主程序：提权侧独立确认它就是当前
+            // SpiderVPN exe，不能用一个任意长寿进程冒充控制者。
+            let controller_exe = std::env::current_exe()
+                .map_err(|e| format!("无法确认 WFP helper 自身程序路径：{e}"))?;
+            super::super::proxy_identity::verify_process_executable(
+                controller_pid, &controller_exe,
+            )?;
             super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
             watched_process.require_alive()?;
             controller_process.require_alive()?;
