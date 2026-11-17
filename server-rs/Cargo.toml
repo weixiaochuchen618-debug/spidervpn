@@ -23,6 +23,8 @@ linux-netns-acceptance = []
 linux-admin-finalize = []
 # Explicit opt-in read-only shutdown observer, not an importer or cutover.
 linux-cutover-preflight = []
+# Compile offline atomic script retirement ONLY on explicit request; no runtime entrypoint.
+linux-legacy-retire = ["linux-cutover-preflight"]
 
 [[test]]
 name = "wg_namespace_e2e"
