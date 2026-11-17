@@ -39,6 +39,9 @@ pub mod wg_conf_audit;
 #[cfg(target_os = "linux")]
 pub mod wg_peer_plan;
 
+#[cfg(target_os = "linux")]
+pub mod wg_atomic;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {
