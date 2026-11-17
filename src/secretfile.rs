@@ -140,6 +140,86 @@ pub fn protect_ipc_directory(path: &Path) -> std::io::Result<()> {
     { Err(std::io::Error::other("当前系统不支持受保护的 IPC 目录")) }
 }
 
+/// SEC-10：提权端**重新读回**一次性 IPC 的真实 Windows DACL。
+///
+/// 在低权限父进程创建后直到 UAC 子进程读取前，任何异常 ACL 修改都必须
+/// fail closed。只接受创建 helper 生成的三条显式 full-access ACE；不得有
+/// 继承项、额外普通用户或重复 ACE。此检查不代替请求摘要、reparse 和句柄校验。
+#[cfg(windows)]
+pub fn verify_private_ipc_acl(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(), std::ptr::null_mut(),
+            std::ptr::null_mut(), std::ptr::null_mut(), &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() {
+        return Err(format!("Guard IPC DACL 无法读回（{}）：状态 {status}", path.display()));
+    }
+    let mut rendered: *mut u16 = std::ptr::null_mut();
+    let mut len = 0u32;
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION,
+            &mut rendered, &mut len,
+        )
+    };
+    let acl = if ok != 0 && !rendered.is_null() {
+        unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(rendered, len as usize)) }
+    } else {
+        unsafe {
+            if !rendered.is_null() { LocalFree(rendered as HLOCAL); }
+            LocalFree(descriptor as HLOCAL);
+        }
+        return Err("Guard IPC DACL 无法转换为 SDDL".into());
+    };
+    unsafe {
+        LocalFree(rendered as HLOCAL);
+        LocalFree(descriptor as HLOCAL);
+    }
+
+    let mut remaining = acl.strip_prefix("D:P")
+        .ok_or_else(|| "Guard IPC DACL 未禁止继承".to_string())?;
+    let mut seen = 0u8;
+    while !remaining.is_empty() {
+        if !remaining.starts_with('(') {
+            return Err("Guard IPC DACL 包含额外控制标记".into());
+        }
+        let close = remaining.find(')')
+            .ok_or_else(|| "Guard IPC DACL ACE 不完整".to_string())?;
+        let fields: Vec<&str> = remaining[1..close].split(';').collect();
+        if fields.len() != 6 || fields[0] != "A" || fields[1] != ""
+            || (fields[2] != "FA" && !fields[2].eq_ignore_ascii_case("0x1f01ff"))
+            || fields[3] != "" || fields[4] != ""
+        {
+            return Err("Guard IPC DACL 包含非授权或非完整权限 ACE".into());
+        }
+        let bit = match fields[5] {
+            "SY" => 1, "BA" => 2, "OW" => 4,
+            _ => return Err("Guard IPC DACL 包含额外账户或组".into()),
+        };
+        if seen & bit != 0 {
+            return Err("Guard IPC DACL 包含重复 ACE".into());
+        }
+        seen |= bit;
+        remaining = &remaining[close + 1..];
+    }
+    if seen != 7 {
+        return Err("Guard IPC DACL 缺少 SYSTEM/Administrators/Owner Rights".into());
+    }
+    Ok(())
+}
+
 /// 原子写一个含秘密的文本文件：临时文件 → 收紧 → 写入 → 落盘 → 改名。
 ///
 /// 失败时删掉临时文件，**不留半成品**。返回值由调用方决定文案（CLI 与界面各有各的措辞）。
