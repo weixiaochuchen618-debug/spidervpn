@@ -229,6 +229,49 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
     Ok(())
 }
 
+/// 普通权限主进程先创建“受保护的空回执”，保证它仍是文件 owner。
+/// 提权后的管理员可向这份文件写入，但绝不创建一个主程序无法读取的新文件。
+fn prepare_reply_file(path: &Path) -> Result<(), String> {
+    let file = std::fs::OpenOptions::new()
+        .write(true).create_new(true).open(path)
+        .map_err(|e| format!("建立提权回执占位文件失败：{e}"))?;
+    if let Err(err) = crate::secretfile::tighten(path) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("提权回执文件 DACL 收紧失败：{err}"));
+    }
+    drop(file);
+    Ok(())
+}
+
+/// 只准填充主程序建立的空回执。不能任意创建或覆盖其他文件。
+fn write_reply_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    use std::io::Write;
+    let data = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    if data.len() > MAX_IPC_FILE_BYTES {
+        return Err("提权回执超出大小上限".into());
+    }
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("受保护的回执文件不存在：{e}"))?;
+    if !meta.file_type().is_file() || meta.len() != 0 {
+        return Err("提权回执必须是已建立且尚未写入的空普通文件".into());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).truncate(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT，不能通过换成符号链接劫持管理员写入。
+        options.custom_flags(0x0020_0000);
+    }
+    let mut file = options.open(path).map_err(|e| format!("打开回执文件失败：{e}"))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("回执句柄并非普通文件".into());
+    }
+    file.write_all(&data).and_then(|_| file.sync_all())
+        .map_err(|e| format!("写回执文件失败：{e}"))
+}
+
 fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
     let meta = std::fs::symlink_metadata(path)
         .map_err(|e| format!("读临时文件失败：{e}"))?;
@@ -333,6 +376,7 @@ pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
     let files = GuardIpcFiles::create().map_err(ElevateError::SpawnFailed)?;
     let (req_path, res_path) = (&files.req, &files.res);
     write_json_file(req_path, req).map_err(ElevateError::SpawnFailed)?;
+    prepare_reply_file(res_path).map_err(ElevateError::SpawnFailed)?;
 
     let exe = std::env::current_exe().map_err(|e| ElevateError::SpawnFailed(e.to_string()))?;
     let code = run_elevated(&exe, req_path, res_path)?;
@@ -487,7 +531,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
     let req: GuardRequest = match read_json_file(req_path) {
         Ok(r) => r,
         Err(e) => {
-            let _ = write_json_file(
+            let _ = write_reply_file(
                 res_path,
                 &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
             );
@@ -496,7 +540,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
     };
     // 白名单：动作解析是从枚举来的（反序列化已经过滤），这里再确认一次它确实是四种之一。
     if GuardAction::parse(req.action.as_str()).is_none() {
-        let _ = write_json_file(
+        let _ = write_reply_file(
             res_path,
             &GuardReply {
                 result: Err(WfpError::InvalidState),
@@ -510,7 +554,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
     if let Err(reason) = validate_elevated_programs(
         &req, &super::wfp_win::SystemIdentityEnv::new(),
     ) {
-        let _ = write_json_file(
+        let _ = write_reply_file(
             res_path,
             &GuardReply { result: Err(WfpError::InvalidState), notes: vec![reason] },
         );
@@ -519,7 +563,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
 
     // 未知 StoreKind 不能静默降级为 Registry：防止伪造请求写错证据位置。
     let Some(store_kind) = StoreKind::parse(&req.store_kind) else {
-        let _ = write_json_file(
+        let _ = write_reply_file(
             res_path,
             &GuardReply {
                 result: Err(WfpError::InvalidState),
@@ -545,7 +589,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
 
     match outcome {
         Err(err) => {
-            let _ = write_json_file(
+            let _ = write_reply_file(
                 res_path,
                 &GuardReply { result: Err(err), notes: vec![err.message()] },
             );
@@ -571,7 +615,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
             let store: Box<dyn EvidenceStore> = match evidence_store_for(&req) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = write_json_file(
+                    let _ = write_reply_file(
                         res_path,
                         &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
                     );
@@ -587,14 +631,14 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
                     "ElevatedRemove",
                 );
                 if let Err(e) = store.write_removed(&marker) {
-                    let _ = write_json_file(
+                    let _ = write_reply_file(
                         res_path,
                         &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
                     );
                     return 4;
                 }
                 if let Err(e) = store.invalidate("user-remove") {
-                    let _ = write_json_file(
+                    let _ = write_reply_file(
                         res_path,
                         &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
                     );
@@ -609,7 +653,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
                     req.record_version,
                 );
                 if let Err(e) = store.write(&rec) {
-                    let _ = write_json_file(
+                    let _ = write_reply_file(
                         res_path,
                         &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
                     );
@@ -618,7 +662,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
                 // 安装/核验成功 → 清掉「已解除」标记（Q8：下次连接重新启用）
                 let _ = store.clear_removed();
             }
-            let _ = write_json_file(res_path, &GuardReply { result: Ok(ev), notes: Vec::new() });
+            let _ = write_reply_file(res_path, &GuardReply { result: Ok(ev), notes: Vec::new() });
             0
         }
     }
@@ -775,9 +819,13 @@ mod tests {
         assert!(write_json_file(&files.req, &data).is_err(),
             "提权请求不允许覆盖或重放");
         assert_eq!(read_json_file::<serde_json::Value>(&files.req).unwrap(), data);
-        std::fs::write(&files.res, b"{}").unwrap();
-        assert!(write_json_file(&files.res, &data).is_err(),
-            "子进程不能覆盖请求者预先布置的回复文件");
+        prepare_reply_file(&files.res).unwrap();
+        assert!(prepare_reply_file(&files.res).is_err());
+        assert!(write_reply_file(&files.res, &data).is_ok(),
+            "提权子进程应该能填写受保护的主程序回执");
+        assert!(write_reply_file(&files.res, &data).is_err(),
+            "已填写的回复不允许重放或覆盖");
+        assert_eq!(read_json_file::<serde_json::Value>(&files.res).unwrap(), data);
     }
 
     #[test]
