@@ -45,13 +45,14 @@
 
 ## 3.1 最新活动修复恢复点（SEC-10，2026-11-17）
 
-- 独立 Rust 修复 [PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，从 main `857ea759` 开始；最新已推送提交 `94affb04`，Draft，不影响 main 或 WFP PR #3。
+- 独立 Rust 修复 [PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，从 main `857ea759` 开始；最新已推送提交 `3f0ef0c5`，Draft，不影响 main 或 WFP PR #3。
 - 已做：提权子进程二次核验 WFP AppId/device path、拒绝虚假 StoreKind；guard 请求使用随机独立 DACL 目录，UAC 启动参数携带请求 SHA256 内容绑定，固定文件名/路径验证，主程序预建空回执避免不同进程文件 owner 权限问题；Rust 回归测试增加被修改的请求和未知 StoreKind 在调用 WFP 后端之前即拒绝；提权辅助进程超时尝试终止。
-- 待做：**必须先检查**最新 [MSVC CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44006982192) 与 [GNU CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44006981900) 的状态及失败日志。然后完成 Windows 非管理员与管理员不同账户的实机 ACL/UAC 验收、可信安装目录和配置引擎路径等 SEC-03 工作。没有通过前不得称为 P0 已修复。
+- 待做：**必须先检查**最新 [MSVC CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44008388149) 与 [GNU CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44008388178) 的状态及失败日志。然后完成 Windows 非管理员与管理员不同账户的实机 ACL/UAC 验收、可信安装目录和配置引擎路径等 SEC-03 工作。没有通过前不得称为 P0 已修复。
 - 旧版 Windows GNU 运行 `44002952064` 的 14 项专项单测只有 1 项失败：测试没有先按真实路径创建 `req.json` / `res.json`，却期望 Windows reparse 校验放行不存在文件；已在 `a357668d` 修正测试先确认缺失文件必须拒绝、真实两文件创建后通过，**没有放松安全判断**。`7f0b65af` 增加回执失败不得返回 exit 0 的保证。最新 CI 仍待验证。
 - `7f0b65af` 的 GNU 测试 15 项 Guard + 11 项身份全部通过，但 `secretfile` 中两项默认继承 ACL 测试因为 CI Runner `%TEMP%` 本身受保护而失败；`707f6ef3` 已在隔离目录显式构造旧版宽松权限，再验证收紧与非私钥文件不误改。`5f3a4726` 新增按 Windows 打开句柄检查硬链接数，拒绝请求/回执硬链接，测试不跳过。当前最新 CI 未完成，不能合并 PR #6。**跨账户 UAC 的真实可用性和权限隔离仍未验收**。
 - 最新活动提交 `94affb04`：发布版 Rust 不再接受 `SPIDERVPN_ROOT` 控制安装根/HKLM Guard 证据，提权端拒绝格式正确但与运行环境不符的 StoreKind；GNU CI 新增无 test/debug 编译配置的 Release 根覆盖检测；Windows 测试直接读回 SDDL，验证受保护的 IPC 目录与两个文件显式 BA、SY、OW 且没有 AU/BU。最新两套 CI **等待结果**。
 - 实机跨账户测试（A 普通用户、B 独立管理员、C 第二普通用户）必须按照 [SEC10_WINDOWS_UAC_ACCEPTANCE.md](./SEC10_WINDOWS_UAC_ACCEPTANCE.md) 的 UAC-01～12 执行，当前**尚未完成**；成功的代码静态/单测不得称为跨账户 UAC 已验收。
+- **新的真实风险及修复**：旧版 Guard 请求/回执及随机目录先创建后 SetNamedSecurityInfoW，存在低权限进程在 DACL 收紧前抢占句柄的窗口；Rust 最新 `3f0ef0c5` 用原生 Win32 CreateDirectoryW/CreateFileW 在对象创建时直接附加保护 DACL，创建失败拒绝，禁止重用预占目录/文件，并增加宽权限父目录下的创建瞬间 ACL 验证。最新 CI **待完成**，仍需独立 Windows A/B/C 账户真实 UAC/ACL 验证，不得宣布漏洞全闭环。
 - 真正任务状态写在 [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) 的 “D.1 最新恢复点”。更换 Agent 直接从该条开始，不需要用户重新说明。
 
 ## 4. 新 Agent 首次执行的标准流程（无需用户再解释需求）
