@@ -24,6 +24,9 @@ pub mod lock;
 
 pub mod legacy;
 
+/// Offline legacy RS256 verification ONLY, not a runtime authorization path.
+pub mod legacy_signed;
+
 #[cfg(target_os = "linux")]
 pub mod ledger_disk;
 
