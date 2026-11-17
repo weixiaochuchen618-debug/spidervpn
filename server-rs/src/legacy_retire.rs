@@ -10,9 +10,11 @@
 //! it as a script and shell '>' cannot overwrite it.
 //!
 //! Linux renameat2(RENAME_EXCHANGE) swaps a prepared empty directory with the
-//! old file ATOMICALLY. At no point after the exchange can the legacy SSH
-//! uploader recreate the script by ordinary '>' redirection, including after
-//! power loss. The original file is preserved in a protected quarantine.
+//! old file ATOMICALLY. In the running kernel there is no intermediate
+//! missing-path window for an old SSH '>' upload. Durability requires the
+//! subsequent parent-directory fsync; a power loss before that fsync may
+//! revert the exchange. Never authorize migration without re-observing the
+//! retired path after restart. Original bytes go to protected quarantine.
 //!
 //! This is NOT a global writer fence: uncooperative root may bypass any
 //! filesystem state, invoke a copied script, or race before the swap; old
@@ -141,9 +143,10 @@ fn stage_at(parent:&Path,owner:u32)->Result<RetirementWitness,RetirementError>{
         .map_err(|_|RetirementError::UnsafeParent)?;
     empty_private_directory(&prepared,owner)?;
     sync_parent(parent)?; // stage dir must survive an interruption pre-swap
-    // CRITICAL atomic cutover: file at old pathname is exchanged with an
-    // empty 0700 directory. No missing-path window permits SSH redirection
-    // to re-create a runnable Python entrypoint.
+    // CRITICAL atomic swap: while running, there is no missing-path
+    // interval for SSH redirection. Power-loss durability is NOT guaranteed
+    // until the parent directory fsync succeeds; any uncertain state must
+    // be re-inspected after reboot before authorizing future cutover.
     rename_with(&original,&prepared,RENAME_EXCHANGE)?;
     sync_parent(parent)?;
     empty_private_directory(&original,owner)?;
