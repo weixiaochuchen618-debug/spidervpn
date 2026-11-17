@@ -103,3 +103,12 @@
 - **事实与修复**：受保护 IPC 的正常 Windows SDDL 是 `D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)`，原 API 附带三个末尾 UTF-16 NUL；新 Rust 解析器一度误拒绝正常请求。提交 `0690cba5` 只移除尾部 NUL，其他授权严格拒绝。必须保留正常成功路径 + AU 可写负路径两类测试。
 - **CI 证据**：[Windows GNU 44012868496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44012868496) 与当前 HEAD 完全一致，最终 Success；[Windows MSVC 44012868490](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44012868490) 已成功运行 build、SEC-10 提权专项、全部 `tests/*.rs` 集成目标、各变更 Rust 模块回归；截至交接时最后的便携单元 suite 仍显示 In Progress，不能写成整个 MSVC CI Success。原配置有 8 个环境依赖排除项，本轮没加 skip。
 - **正式安全结论：未完成 / 不可合并**。缺少可信安装 `C:\SpiderVPN\bin` 安全 ACL / 标准用户可写路径拒绝、A/B/C 多账户真实 UAC-01～12、升级/卸载迁移、WFP 持久 BLOCK 实机验证。下轮续接按 [Backlog D.2-D.3](./REMEDIATION_BACKLOG.md) 和 [实机 UAC 验收表](./SEC10_WINDOWS_UAC_ACCEPTANCE.md) 做，不能用单机 CI 抹去 P0。
+
+
+## 10. 最新续接：SEC-03 安装 DACL 与真实安全验收（2026-11-17）
+
+- **选定任务 P0 SEC-03（SEC-10 同一权限边界依赖）**。本次活动 Rust PR 仍为 [Draft PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，从 main 857ea759 分出；提交候选截止 a14016cd4a921b2e8639de22ab9f70add9d62a17，实时 HEAD 须再次核对。PR #3 未合并，WFP 持久 BLOCK 与原 UI/连接路径未修改。
+- **已落地候选**：src/install_trust.rs 的 Win32 SECURITY_ATTRIBUTES 原子目录创建、已有目录/EXE/DLL/启动脚本 DACL 收紧与现场读回、Owner Rights/Users RX，数据根独立 AU Modify，拒绝 reparse、路径跳转、未知 bin 文件、外部硬链接。package-files/install.ps1 只在复制前和复制后调用 Rust --install-seal，权限规则不得移回 PS；正式版只允许 C:\SpiderVPN，管理员权限安装是新的明确要求。
+- **测试和 CI 现状**：tests/install-seal-e2e.rs + install_trust::tests::；MSVC/GNU 专项均已注册。旧 MSVC [44017844701](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44017844701) 有 2/4 正常路径 ACL 单测因 Windows D:PAI 标记被误拒，提交 c4b9618b 修正只接受 D:P / D:PAI 两种受保护控制标记（其余 ACE 逐字比对）；新增硬链接拒绝提交 d4bf342a；旧 data 升级时显式保护目录为 AU Modify 且保留内容提交 a14016cd。**这些提交之后的当前 SHA CI 仍需终态核对**：[MSVC 44018620435](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620435)、[GNU 44018620441](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620441)。不能引用旧 SHA 的成功或取消。
+- **实机 DoD 缺失**：[SEC03_INSTALL_ACL_ACCEPTANCE.md](./SEC03_INSTALL_ACL_ACCEPTANCE.md) I01–I12，A 普通/B 独立管理员/C 第二普通用户的实际覆盖/改 ACL/UAC/升级/卸载与 WFP 持久阻断。完整 A/B/C 测试前 SEC-03 保持橙色“候选开发中”，SEC-10 也未完成。特别注意既有卸载脚本 SEC-09 与受保护 bin 新管理员权限要求的兼容，不能在 Guard 未核验解除时删除 EXE。安装包来源/签名、旧安装 TOCTOU、真实跨用户 ACL 尚未证明，绝不可合并 main。
+- **唯一任务状态**：继续看 [REMEDIATION_BACKLOG.md §D.4-D.5](./REMEDIATION_BACKLOG.md)。新 Agent 若见 CI 红例必须读失败 job logs 修 Rust/测试（不删断言、不增 skip），红例修复后重新匹配最新 SHA 的 MSVC/GNU。后续优先收口 SEC-03 安装、卸载和 A/B/C 实机，再推进 SEC-01 Rust 服务安全。
