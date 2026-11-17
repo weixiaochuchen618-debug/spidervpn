@@ -34,6 +34,23 @@ jobs:
           set -euo pipefail
           cargo test --locked --manifest-path server-rs/Cargo.toml -- --test-threads=1 --nocapture
 
+      - name: SEC-01 root-only recovery inspection CLI denies unprivileged invocation
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          set +e
+          output=$(cargo run --quiet --locked --manifest-path server-rs/Cargo.toml \
+            --bin spidervpn-pair-audit -- inspect \
+            /var/lib/spidervpn-pair wg0 11111111-1111-4111-8111-111111111111 2>&1)
+          exit_code=$?
+          set -e
+          test "$exit_code" -eq 2
+          printf '%s\n' "$output" | grep -F 'root privileges required'
+          test ! -e /var/lib/spidervpn-pair/.pairing-authority.lock
+
       - name: Verify production pairing runtime is not claimed to be migrated
         shell: bash
         run: |
