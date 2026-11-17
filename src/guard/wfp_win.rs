@@ -1378,6 +1378,21 @@ mod imp {
         }
 
         #[test]
+        fn process_handle_detects_actual_child_exit_without_pid_reuse_guessing() {
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            let mut child = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 1"])
+                .spawn().expect("Windows PowerShell subprocess");
+            let watched = WatchedEngineProcess::open(child.id())
+                .expect("must capture actual child process object before exit");
+            assert!(watched.require_alive().is_ok());
+            let result = child.wait().expect("child must exit");
+            assert!(result.success());
+            assert_eq!(watched.wait(0), WAIT_OBJECT_0);
+            assert!(watched.require_alive().is_err());
+        }
+
+        #[test]
         fn lease_rejects_missing_ids_without_modifying_bfe() {
             let exe = std::env::current_exe().unwrap();
             assert!(DynamicProxyLease::acquire(
