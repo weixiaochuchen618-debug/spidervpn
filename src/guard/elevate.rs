@@ -202,6 +202,36 @@ pub fn is_elevated() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// 已打开文件的硬链接安全检查（符号链接/reparse 校验不能覆盖 hard link）。
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn require_single_link(file: &std::fs::File) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(format!(
+            "无法核验提权 IPC 文件的硬链接计数：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if info.nNumberOfLinks != 1 {
+        return Err("提权 IPC 文件存在其它硬链接，拒绝读写".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn require_single_link(_file: &std::fs::File) -> Result<(), String> {
+    // 此 helper 只在 Windows 产品中实际提权；非 Windows 用于纯逻辑测试。
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 请求/回复文件的读写（大小上限 + nonce + 严格 JSON）
 // ---------------------------------------------------------------------------
 
@@ -216,6 +246,11 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .write(true).create_new(true).open(path)
         .map_err(|e| format!("建立独立临时文件失败：{e}"))?;
+    if let Err(err) = require_single_link(&file) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(err);
+    }
     if let Err(err) = crate::secretfile::tighten(path) {
         drop(file);
         let _ = std::fs::remove_file(path);
@@ -269,6 +304,7 @@ fn write_reply_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
     if !live_meta.is_file() || live_meta.len() != 0 {
         return Err("回执句柄不是预先创建的空普通文件，拒绝写入".into());
     }
+    require_single_link(&file)?;
     file.write_all(&data).and_then(|_| file.sync_all())
         .map_err(|e| format!("写回执文件失败：{e}"))
 }
@@ -293,6 +329,7 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
         return Err("临时文件句柄并非普通文件".into());
     }
+    require_single_link(&file)?;
     let mut data = Vec::new();
     file.take(MAX_IPC_FILE_BYTES as u64 + 1).read_to_end(&mut data)
         .map_err(|e| format!("读临时文件失败：{e}"))?;
@@ -362,6 +399,7 @@ fn read_attested_guard_request(path: &Path) -> Result<GuardRequest, String> {
     if !input.metadata().map_err(|e| e.to_string())?.is_file() {
         return Err("提权请求文件句柄不是普通文件".into());
     }
+    require_single_link(&input)?;
     use std::io::Read;
     let mut data = Vec::new();
     input.by_ref().take(MAX_IPC_FILE_BYTES as u64 + 1)
@@ -994,6 +1032,38 @@ mod tests {
         prepare_reply_file(&files.res).unwrap();
         assert!(write_reply_file(&files.res, &reply).is_ok());
         assert!(write_reply_file(&files.res, &reply).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_ipc_rejects_request_and_reply_hardlinks_by_handle() {
+        let request = test_ipc_request();
+        let files = GuardIpcFiles::create(&request).unwrap();
+        write_json_file(&files.req, &request).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+
+        let req_alias = files.dir.join("req-alias.json");
+        std::fs::hard_link(&files.req, &req_alias)
+            .expect("Windows hard link creation should be available on local NTFS runner");
+        assert!(read_attested_guard_request(&files.req).is_err(),
+            "不能把硬链接的请求当成唯一的可信文件");
+        std::fs::remove_file(req_alias).unwrap();
+
+        let reply_alias = files.dir.join("res-alias.json");
+        std::fs::hard_link(&files.res, &reply_alias)
+            .expect("Windows hard link creation should be available on local NTFS runner");
+        let fake = GuardReply {
+            result: Err(WfpError::InvalidState),
+            notes: vec!["test".into()],
+        };
+        assert!(write_reply_file(&files.res, &fake).is_err(),
+            "不能向可能与其它敏感文件共享 inode 的硬链接回执写入");
+        assert_eq!(std::fs::metadata(&files.res).unwrap().len(), 0);
+        std::fs::remove_file(reply_alias).unwrap();
+
+        assert_eq!(read_attested_guard_request(&files.req).unwrap(), request);
+        assert!(write_reply_file(&files.res, &fake).is_ok(),
+            "移除硬链接后正常受保护 IPC 不应受影响");
     }
 
     #[test]
