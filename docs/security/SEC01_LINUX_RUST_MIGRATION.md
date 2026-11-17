@@ -136,3 +136,11 @@
 - 基于 PR #7 的真实 Linux kernel/netns 绿色回归，单独建立 [Draft PR #8](https://github.com/weixiaochuchen618-debug/spidervpn/pull/8)。Rust 新 `admin_terminal` 模块只编译在 opt-in `linux-admin-finalize` 下。root + 控制终端 `/dev/tty` 才允许 45s 内确认，请求为 `FINALIZE InviteId Generation Stage`；不支持标准输入重定向、HTTP 或自动授权。再次严格三重 WG live/config/live readback + 重查代数和其它 peer，无偏差才调用原 `finalize_stable_prepared`。**只能补写已发生的终态，不运行 wg set、不修订 wg.conf**，且全部时间等待持有 SEC-08 独占 flock。
 - Rust 测试包含拒绝路径、不可回放的 generation/stage challenge、短输入超时和漂移的 fail-closed；CI 的 root/PTy 测试由测试代码生成专用伪终端，只证明 root 可以进行真实 TTY 交互，**不证明 root 是自然人、不能防恶意 root**。最新候选 HEAD `b8cac95971ca468948c401f4ebce2b961989f0c4`，同 SHA Linux/MSVC/GNU CI 尚需最终结果。过渡红例 `-D warnings` 无用 import 已由 `e2e86e00` 删除，未跳测。
 - 本能力不等于生产管理员审批/可恢复任意中断状态，更不等于 Python receiver 安全迁移。必须继续实机授权、可信签名迁移、真实 root/I/O 容错/断电以及 Windows revoke 同步验收，SEC-01 仍为未修复。
+
+
+## 第十二阶段：旧 RS256 授权独立离线验签（不迁移线上授权）
+
+- 基于 PR #8 安全候选，继续 [Draft PR #9](https://github.com/weixiaochuchen618-debug/spidervpn/pull/9)，`server-rs/src/legacy_signed.rs` 增加使用已锁定 ring 0.17.14 的纯 Rust 验签。它把旧 `tc-pair.py SignedAuthorization` 的签名验证与完整请求/设备/地址/server identity field binding 分离。签名来源必须是**独立可信的管理公钥**，不能自信任来自 JWS 或旧 JSON 的密钥字段；算法严格 RS256，拒绝 JWT alg 混淆、非规范编码、错签名/错服务器/旧记录字段替换。
+- 输出仅 `ProofReport`，无新 `Grant`、no import、no WG mutation。旧记录缺 RequestDigest、签名未覆盖 RecipientJwkDigest 及旧撤销状态不能从旧授权凭空推断；仍需原签名设备请求和可信实时 WG/ledger 迁移。Python 只用于生成跨实现的独立测试签名夹具，绝不作为新生产验签。
+- 当前候选 HEAD `4ca1c308688af5e9ce3785dd0da3fcac711de4bf`，对应 Linux [#44072823025](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44072823025) 与 Windows [MSVC #44072823427](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44072823427) [GNU #44072823056](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44072823056) 必须按同 SHA 完成结果登记。之前因测试 E0502 与签名夹具 12 字符丢失的两个红 CI 保留；修正后 `3ff51bf3` 的 [Linux #44072627523](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44072627523) 已两 Job Success、97 library + 5 CLI + 1 真实 WG netns 通过。
+- 真安全验收尚远：RS256 正向用例不代表能将旧 Python receiver 安全升级；需分离签名授权、设备原始请求、权限和实机撤销 readback 的各自证据链，完成 root-only 可信导入与完整在线 Rust TLS/HTTP 切换之后才可收 SEC-01。
