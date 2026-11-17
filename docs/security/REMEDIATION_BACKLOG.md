@@ -308,3 +308,10 @@ PR/commit/CI: ...
 - **CI 证据**：[Linux Rust #44042690148](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690148) 与上述 SHA 一致 **Completed/Success：71 Rust tests passed，0 failed，0 ignored**，`cargo --locked`、`RUSTFLAGS=-D warnings` 均保留。基线 48 项 + 本轮 23 项。过渡 SHA `7a6231a1` 因 Plan.bytes 只被测试使用触发 dead_code、`e41f400c` 因 Read/Write::by_ref 歧义 E0034 未通过，均在后续 SHA 修改代码修复，未添加警告豁免或跳过测试。
 - **当前 Windows 同 SHA**：[MSVC 44042690238](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690238)、[GNU 44042690146](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690146)，写入时仍在运行；不可借旧版成功宣称当前客户端双绿。
 - **阻塞/风险仍存在**：这套 Rust 更新流程未由 Python server 或 Windows 管理端调用，JWS/RS256/JWE/旧记录信任迁移与 TLS 非 root 未完成；只在 fake WG/临时文件中测试，**未在真实 Linux WG namespace 跑内核变更**。配置落盘但 `wg set` 失败会留下 Pending/Revoking + live/disk 暂时失配；下一步需要安全且显式授权的 reconciliation/migration 入口，禁止无脑重试。SEC-01/02/08 生产漏洞仍 Open，SEC-03/09/10 Windows 真机 UAC/WFP 验收仍未完成，main 未动，PR #3/#6 Draft，Issue #5 Open。详见 [SEC01_LINUX_RUST_MIGRATION 第六阶段](./SEC01_LINUX_RUST_MIGRATION.md)。
+
+## D.20 同 SHA Windows 兼容性结果（Rust 单 peer 事务）（2026-11-17）
+
+- 代码 `468af9e675bbf118464e1094306c6a055039324d` 的 [Linux #44042690148](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690148) **Completed/Success：71/71，0 ignored**。
+- 同一 SHA 的 [Windows GNU #44042690146](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690146) **Completed/Success**（Rust GNU 构建、Release SPIDERVPN_ROOT 隔离、原 SEC-09/10/11 安全专项）。
+- 同一 SHA 的 [Windows MSVC #44042690238](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44042690238)：Rust 构建、PowerShell 语法、安全专项、全部集成测试、变更模块回归均已 Success；记录时正在跑最后 `Portable Rust unit suite`，保留原先 8 项环境依赖排除，本轮无新增 skip。必须查询最终 workflow `Completed/Success` 后才可宣称完整 MSVC 绿。
+- 此证据仅表明 Linux Rust 候选单测与现有 Windows 桌面程序自动化兼容，**不是 Linux 线上 Python 接收器、真实 wg set、Windows UAC/WFP 实机安全验收**。发布约束仍不变，Issue #5 Open，PR #3/#6 Draft，不合并 main。
