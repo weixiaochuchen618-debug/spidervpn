@@ -4,7 +4,8 @@
 SpiderVPN 卸载：删程序与入口，数据默认保留。
 
 .DESCRIPTION
-顺序是「先确认没在跑 → 删入口 → 删程序 → 问数据」。
+顺序是「先确认没在跑 → Rust 提权安全预检/WFP 回读 → 删本安装入口 → 删固定程序清单 → 问数据」。
+任何预检失败都必须保留 EXE，供后续修复与解除持久阻断。
 数据目录（`C:\SpiderVPN\data`）里有线路、配置、操作记录，默认**一律保留**：
 要删必须自己输入 DELETE，避免手滑把用户的线路删掉（这个项目为此出过事故）。
 
@@ -15,7 +16,7 @@ SpiderVPN 卸载：删程序与入口，数据默认保留。
   -NoPrompt          不问；数据按「保留」处理（除非同时给 -DeleteData）
   -DeleteData        连数据一起删（危险，等价于手输 DELETE）
 
-退出码：0 完成；1 拒绝执行（程序在跑 / 代理没还原 / 交易保护没解除成功）。
+退出码：0 完成；1 拒绝执行（权限不够 / 程序在跑 / 代理没还原 / WFP 解除未核实）。
 #>
 [CmdletBinding()]
 param(
@@ -44,64 +45,27 @@ if ($running.Count -gt 0) {
     Bad "程序正在运行（pid=$pids）。请先退出：关窗即可；缩在托盘里的用托盘菜单「退出」。"
 }
 
-# 代理没还原就卸载 = 系统代理还指着已经不存在的引擎，网络会断。
-# 这件事必须挡在前面：程序下次启动本来会自愈，卸载之后就没人修了。
-$journal = Join-Path $data 'proxy-journal.json'
-if (Test-Path -LiteralPath $journal) {
-    Write-Host '  检测到上次连接没有还原系统代理（数据目录里有 proxy-journal.json）。' -ForegroundColor Yellow
-    Write-Host '  请先启动一次程序点「断开」，或手动把系统代理改回去，然后再卸载。' -ForegroundColor Yellow
-    if ($NoPrompt -and -not $DeleteData) { Bad '为安全起见，先不卸载（避免把网络留在一个坏状态）。' }
-    if ($NoPrompt) { } else {
-        $ans = Read-Host '  确实要继续卸载吗？输入 FORCE 继续'
-        if ($ans -ne 'FORCE') { Bad '已取消（系统代理仍未还原）。' }
-    }
-}
-
-# 1) 交易保护（WFP 阻止规则）：默认解除，而且必须赶在删 exe 之前。
-#
-# 为什么顺序不能反：那些规则是**持久**的（FWPM_FILTER_FLAG_PERSISTENT），exe 一删就再没有
-# 谁能删它们——名单里的交易程序会被永久挡住直连，而用户已经找不到这个程序了。
-# 解除失败时**不继续删程序**：把「还能修」的状态留给人，比删完留一堆没人管的规则强。
+# 代理未还原、UAC 不足或 WFP 清除/核验失败由 Rust fail-closed 拒绝。
+# 不再接受脚本输入 FORCE 绕过；旧版 guard exit 3 也绝不能继续删除程序。
+# 权限信任边界全部由当前安装的 Rust EXE 校验；本脚本只负责后续清理。
 $exe = Join-Path $bin 'spidervpn.exe'
+if (-not (Test-Path -LiteralPath $exe)) {
+    Bad "找不到已安装的 SpiderVPN 程序：$exe。无法独立确认持久 WFP 规则已解除，不进行任何卸载清理。"
+}
+Say '正在执行 Rust 安全卸载预检（管理员权限、系统代理还原与 WFP 现场核验）…'
 if ($KeepGuard) {
-    Say '交易保护：按 -KeepGuard 保留（阻止规则与核验记录都不动）'
-    Say '  以后要解除：装回来后用「维护 → 解除交易保护」，或先重新安装再卸载。'
-} elseif (-not (Test-Path -LiteralPath $exe)) {
-    Say '交易保护：没有找到程序文件，跳过解除（可能已经删过）'
+    & $exe --uninstall-preflight $TargetDir --keep-guard
 } else {
-    Say '正在解除交易保护（可能弹出一次管理员确认）…'
-    # 程序把控制台切到 UTF-8；不显式对齐解码，失败时打印出来的原因会是乱码。
-    $oldEnc = [Console]::OutputEncoding
-    try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch { }
-    $guardOut = & $exe --guard-remove 2>&1 | Out-String
-    $guardCode = $LASTEXITCODE
-    try { [Console]::OutputEncoding = $oldEnc } catch { }
-    if ($guardCode -eq 0) {
-        Say '交易保护已解除（阻止规则已删除）'
-        # 核验记录键：解除成功后里面只剩一个「已解除」标记，不含任何证据。
-        # 删它需要管理员（键在 HKLM，普通用户只读）——删不掉不算失败，如实说出来。
-        $guardKey = 'HKLM\SOFTWARE\SpiderVPN\Guard'
-        & reg.exe delete $guardKey /f *> $null
-        if ($LASTEXITCODE -eq 0) {
-            Say "  已清理核验记录：$guardKey"
-        } else {
-            Say "  核验记录键保留（需要管理员才能删）：$guardKey"
-            Say '  它不含证据，只有一个「已解除」标记；不影响下次安装。'
-        }
-    } elseif ($guardCode -eq 3) {
-        # 没有 config.json：判定层拒绝猜名单（这是设计，不是故障）。
-        Write-Host '  找不到配置文件，无法确定要解除哪些保护规则。' -ForegroundColor Yellow
-        Write-Host '  如果你曾经连接过，请先启动一次程序再卸载；或手动删除 WFP 规则。' -ForegroundColor Yellow
-    } else {
-        Write-Host $guardOut
-        Bad @"
-解除交易保护失败（exit=$guardCode），没有删除任何程序文件。
-  处理办法：
-    1. 关掉名单里的交易软件后重试；
-    2. 或先启动程序，在「维护」页点「解除交易保护」；
-    3. 确实要保留保护规则直接卸载：加 -KeepGuard。
-"@
-    }
+    & $exe --uninstall-preflight $TargetDir
+}
+$preflightCode = $LASTEXITCODE
+if ($preflightCode -ne 0) {
+    Bad "安全卸载预检失败（exit=$preflightCode）：未删除程序或入口。请先从客户端断开连接，确认系统代理已还原；必要时以管理员身份运行卸载器。"
+}
+if ($KeepGuard) {
+    Say '已明确选择 -KeepGuard：持久 WFP 阻断保留，卸载后交易程序可能继续被阻断！'
+} else {
+    Say 'Rust 已删除本程序 WFP 对象并核验 Provider/SubLayer 不存在。'
 }
 
 # 2) 入口（桌面 / 开始菜单 / 安装目录里的三个 .cmd）
@@ -110,9 +74,13 @@ if ($KeepGuard) {
 # 而卸载可能针对的是另一个目录。实测踩过：卸载临时目录时把默认安装的桌面图标删了。
 function PointsHere([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return $false }
-    # 入口是 GBK 写的（cmd 按 OEM 代码页解析），这里也按 936 读，别让中文路径读成乱码
-    $t = [IO.File]::ReadAllText($path, [Text.Encoding]::GetEncoding(936))
-    return ($null -ne $t) -and $t.Contains($TargetDir)
+    # Rust 校验整份安装器生成的 .cmd 模板与目标路径，拒绝模糊子串匹配。
+    # exit 0 = 属于本安装；3 = 不是；其余失败必须停止清理（不误删）。
+    & $exe --uninstall-owns-shortcut $path $TargetDir | Out-Null
+    $ownedCode = $LASTEXITCODE
+    if ($ownedCode -eq 0) { return $true }
+    if ($ownedCode -eq 3) { return $false }
+    Bad "无法确认快捷入口的归属：$path（Rust exit=$ownedCode）。停止卸载，避免误删其他安装。"
 }
 $desk = [Environment]::GetFolderPath('Desktop')
 if ($desk) {
@@ -122,15 +90,22 @@ if ($desk) {
 $sm = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\SpiderVPN'
 if (Test-Path -LiteralPath $sm) {
     $owned = @(Get-ChildItem -LiteralPath $sm -File -ErrorAction SilentlyContinue | Where-Object { PointsHere $_.FullName })
-    if ($owned.Count -gt 0) { Remove-Item -LiteralPath $sm -Recurse -Force; Say "  已删：$sm" }
+    foreach ($item in $owned) {
+        Remove-Item -LiteralPath $item.FullName -Force
+        Say "  已删：$($item.FullName)"
+    }
+    # 只在目录真正为空时删目录；保留其他安装/用户创建的快捷入口。
+    if (-not (Get-ChildItem -LiteralPath $sm -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $sm -Force
+    }
 }
 foreach ($n in @('启动SpiderVPN.cmd', '以管理员身份启动SpiderVPN.cmd', '卸载SpiderVPN.cmd', 'uninstall.ps1', '用户速查.md')) {
     $p = Join-Path $TargetDir $n
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
 }
 
-# 3) 程序文件（只删 bin 下这两个，不递归删整个目录）
-foreach ($n in @('spidervpn.exe', 'WebView2Loader.dll')) {
+# 3) 只清理本安装的固定 bin 文件清单，不递归删除未知文件或用户数据
+foreach ($n in @('spidervpn.exe', 'sing-box.exe', 'WebView2Loader.dll', 'sing-box.LICENSE.txt')) {
     $p = Join-Path $bin $n
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force; Say "  已删：$p" }
 }
