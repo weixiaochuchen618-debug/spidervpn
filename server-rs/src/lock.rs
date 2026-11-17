@@ -130,6 +130,32 @@ mod tests {
     }
 
     #[test]
+    fn child_worker_observes_parent_process_lock() {
+        // Invoked by the parent as a subprocess; an ordinary top-level test
+        // run has no environment variable and does no external operation.
+        let Ok(path) = std::env::var("SPIDERVPN_TEST_LOCK_ROOT") else { return; };
+        let err = acquire_for(Path::new(&path), Duration::ZERO)
+            .err().expect("the other process must still own the lock");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn independent_process_is_blocked_until_transaction_finishes() {
+        let dir = root("child-process");
+        let guard = acquire_for(&dir, Duration::from_millis(100)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lock::tests::child_worker_observes_parent_process_lock"])
+            .env("SPIDERVPN_TEST_LOCK_ROOT", &dir)
+            .output().unwrap();
+        assert!(output.status.success(),
+            "cross-process lock failed: {}",
+            String::from_utf8_lossy(&output.stdout));
+        drop(guard);
+        acquire_for(&dir, Duration::from_millis(100)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn root_and_lock_acl_downgrade_or_preseeded_link_fail_closed() {
         let dir = root("acl");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
