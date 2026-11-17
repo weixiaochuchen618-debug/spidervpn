@@ -2067,11 +2067,15 @@ pub mod tunnel {
 
     /// 43 位 base64 + `=`（32 字节）。与 `ClientPublicKey` 同一个形状。
     fn wireguard_key(value: &str) -> bool {
-        value.len() == 44
-            && value.ends_with('=')
-            && value[..43]
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        // SEC-11: validate the *byte shape* of an external WireGuard key.
+        // UTF-8 multibyte sequences, malformed padding and overlong values
+        // are not permitted; do not slice a &str at arbitrary byte offsets.
+        let bytes = value.as_bytes();
+        bytes.len() == 44
+            && bytes[43] == b'='
+            && bytes[..43]
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
     }
 
     /// 渲染配置。返回的字符串用 **CRLF** 分行并以单个 CRLF 结尾——与旧版
@@ -2960,6 +2964,18 @@ pub mod line {
     mod tests {
         use super::*;
         use crate::config::{AppConfig, Transport};
+
+        #[test]
+        fn sec11_wireguard_key_shape_rejects_multibyte_and_bad_padding() {
+            assert!(wireguard_key(&format!("{}=", "A".repeat(43))));
+            assert!(wireguard_key(&format!("{}=", "A".repeat(40) + "+/A")));
+            assert!(!wireguard_key(&format!("{}😀=", "A".repeat(39))));
+            assert!(!wireguard_key(&format!("{}=", "é".repeat(21) + "A")));
+            assert!(!wireguard_key(&format!("{}!", "A".repeat(43))));
+            assert!(!wireguard_key(&"A".repeat(44)));
+            assert!(!wireguard_key("你好"));
+        }
+
         use crate::engine_config;
 
         const PRIVATE: &str = "d+u6Rd53MtjGqKr+jmV/k5TfWrIFdF6OSqqINw61SKo=";
