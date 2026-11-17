@@ -43,6 +43,15 @@ pub fn verify_proxy_owner(
     Ok(ListenerOwner { endpoint, pid: expected_pid })
 }
 
+/// 独立的进程身份核验：长期 WFP helper 必须确认 controller PID
+/// 指向正在运行的 SpiderVPN 主程序，而不是仅监控任意存活 PID。
+pub fn verify_process_executable(pid: u32, expected_executable: &Path) -> Result<(), String> {
+    if pid == 0 {
+        return Err("程序 PID 为 0，拒绝进程身份确认".into());
+    }
+    platform::verify_executable(pid, expected_executable)
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -205,6 +214,18 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn controller_process_must_match_current_exe() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(verify_process_executable(std::process::id(), &exe).is_ok());
+        assert!(verify_process_executable(0, &exe).is_err());
+        assert!(verify_process_executable(
+            std::process::id(),
+            &std::env::temp_dir().join("not-spidervpn.exe"),
+        ).is_err());
+    }
 
     #[test]
     fn invalid_endpoints_fail_before_looking_at_windows_tcp_table() {
