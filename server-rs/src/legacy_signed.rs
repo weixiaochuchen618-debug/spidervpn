@@ -33,7 +33,7 @@ impl ProofReport {
 }
 
 /// Canonical, unpadded base64url. Reject nonzero final pad bits.
-fn b64u(s: &str, max: usize) -> Result<Vec<u8>, ProofError> {
+pub(crate) fn b64u(s: &str, max: usize) -> Result<Vec<u8>, ProofError> {
     if s.is_empty() || s.len() > max.saturating_mul(4)/3 + 8 {
         return Err(ProofError::TooLarge);
     }
@@ -75,7 +75,7 @@ fn rsa_key(jwk:&Value)->Result<(Vec<u8>,Vec<u8>),ProofError>{
 }
 
 /// Exact RS256 wire format produced by old Python sign_jws: alg+typ only.
-fn verify_jws(jws:&str,pinned:&Value)->Result<Value,ProofError>{
+pub(crate) fn verify_jws(jws:&str,pinned:&Value)->Result<Value,ProofError>{
     if jws.len()>MAX_JWS {return Err(ProofError::TooLarge);}
     let fields:Vec<_>=jws.split('.').collect();
     if fields.len()!=3 {return Err(ProofError::Encoding);}
