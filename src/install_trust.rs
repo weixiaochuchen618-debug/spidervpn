@@ -110,6 +110,25 @@ fn directory(path: &Path, sddl: &str) -> Result<(), String> {
     verify(path, sddl)
 }
 
+fn no_external_hardlinks(path: &Path) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("无法打开安装文件 {}：{e}", path.display()))?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(format!("无法核验安装文件硬链接数量 {}：{}",
+            path.display(), std::io::Error::last_os_error()));
+    }
+    if info.nNumberOfLinks != 1 {
+        return Err(format!("安装代码文件存在外部硬链接 {}，拒绝以管理员身份覆盖",
+            path.display()));
+    }
+    Ok(())
+}
+
 fn seal_file(path: &Path) -> Result<(), String> {
     no_reparse(path)?;
     let meta = std::fs::symlink_metadata(path)
@@ -117,6 +136,7 @@ fn seal_file(path: &Path) -> Result<(), String> {
     if !meta.file_type().is_file() {
         return Err(format!("安装文件必须是常规文件：{}", path.display()));
     }
+    no_external_hardlinks(path)?;
     protect(path, CODE_FILE_SDDL)?;
     no_reparse(path)?;
     verify(path, CODE_FILE_SDDL)
@@ -377,6 +397,22 @@ mod tests {
         std::fs::write(&extra, b"not allowed").unwrap();
         assert!(seal_layout(&path).is_err(), "unknown DLL must not be tolerated");
         assert!(extra.exists(), "do not silently delete user files");
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn preexisting_engine_hardlink_is_rejected_without_overwriting_source() {
+        let path = root("hardlink");
+        let bin = path.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let outside = path.join("outside-engine.exe");
+        std::fs::write(&outside, b"do not overwrite this external file").unwrap();
+        let alias = bin.join("sing-box.exe");
+        std::fs::hard_link(&outside, &alias).unwrap();
+        assert!(no_external_hardlinks(&alias).is_err());
+        assert!(seal_layout(&path).is_err(), "hard-linked engine must fail closed");
+        assert_eq!(std::fs::read(&outside).unwrap(),
+            b"do not overwrite this external file");
         std::fs::remove_dir_all(path).unwrap();
     }
 
