@@ -47,7 +47,7 @@
 | ID | 级别 | 当前状态 | 证据 | 首要下一动作 |
 |---|---|---|---|---|
 | **SEC-10** | **P0 / 高（本地攻击者）** | 🟠 开发中：PR #6 提权身份 + IPC 部分候选；待 CI/双账户实机 | `src/guard/elevate.rs`、`src/secretfile.rs` | 继续验证 IPC ACL/不同 UAC 账户、进程归属与真正安装权限边界；见下方恢复点 |
-| **SEC-11** | **P1 / 中** | 🔴 未修复 | `src/uiweb_form.rs:6828-6834`；`src/pairing.rs:2068-2074` | 处理 UTF-8 字节下标/shape 验证；对生产 `unwrap/expect` 做有根据的回归 |
+| **SEC-11** | **P1 / 中** | 🟠 Rust UTF-8 边界修复候选已提交；待最新 CI 与余下 panic 审查 | `src/uiweb_form.rs:6828-6834`；`src/pairing.rs:2068-2074` | 处理 UTF-8 字节下标/shape 验证；对生产 `unwrap/expect` 做有根据的回归 |
 | **AUX-01** | P2 | 未完成 | `assets/tc-pair.py:303-311,692-711` | Rust 服务支持合法双栈 `Address = IPv4, IPv6` 输入，正确提取 IPv4 |
 | **AUX-02** | P2 / 合规 | 未完成 | `vendor/sing-box.LICENSE.txt` | 核实发行版本许可条款，补完整文本、源码获取说明 |
 | **AUX-03** | P2 / 审查覆盖 | 未完成 | `src/ipc.rs`、`uiweb*.rs`、`config.rs` 等 | 增加 fuzz、输入边界、未审部分的安全核查，不宣称已全库逐行 |
@@ -222,5 +222,14 @@ PR/commit/CI: ...
 
 - **代码 HEAD**：4a063de4fbb49debd7c8f04d6072ba99be3c9326；main 与 PR #3 未动，PR #6 仍 Draft，SEC-09 仍为部分候选。
 - **Windows GNU [44026418218](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418218)**：核对 head_sha 匹配，**Completed/Success**，包括 Rust GNU 编译、发布安装根拒绝环境覆盖、Rust uninstall_safety / Guard IPC / WFP identity 专项。
-- **Windows MSVC [44026418209](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418209)**：核对 head_sha 匹配，Rust 构建、PowerShell 卸载脚本语法解析、SEC-09/10 安全专项、所有 Rust 集成目标、模块回归已经分别 **Success**；写入时便携单元 suite 仍在执行，**不可宣称整个 workflow 终态 Success**。便携 suite 保留原先 8 项环境依赖排除，本轮未新增跳过。需重新查询最终结论并补录。
+- **Windows MSVC [44026418209](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418209)**：核对 head_sha 匹配，Rust 构建、PowerShell 卸载脚本语法解析、SEC-09/10 安全专项、所有 Rust 集成目标、模块回归已经分别 **Success**；便携单元 suite 后续也已成功，整个 **MSVC workflow Completed / Success**（GitHub 2026-11-17 05:59 UTC）；便携 suite 保留原先 8 项环境依赖排除，本轮没有新增跳过。
 - **不等于实机验收**：所有 WFP 删除/异常注入测试采用 fake backend，不曾在 CI Runner 上真的删除持久 WFP。Windows A/B/C 权限与 I01–I12、U01–U14、UAC-01～12、TUN 断线与真实交易程序网络仍未验收；不合并 main。
+
+## D.10 SEC-11 UTF-8 输入边界与 SEC-09 卸载清单防漂移（2026-11-17）
+
+- **上轮闭环复核**：PR #6 旧 SHA 4a063de4 对应 [MSVC 44026418209](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418209) 与 [GNU 44026418218](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44026418218) 均最终 **Completed/Success**（MSVC 仍沿用 8 项环境依赖测试排除），不能替代真实安全验收。
+- **SEC-11 已证实的崩溃边界**：src/uiweb_form.rs::short_time 原仅检查 byte[10] 为 T、len≥16，再用 [5..10]/[11..16] 截取；当索引 5 落入 CJK/emoji 字节内部时会 panic。提交 d90df394 先用 str::get(..16) 安全判断边界，再验证 ASCII 数字与日期定界符；异常值保持原文本，不 panic；合法时间列表外观不变。包含 index 5 非字符边界且 index 10 为 T 的回归反例。
+- **SEC-11 WireGuard key 形状防回归**：提交 ac282e43 将 pairing::tunnel::wireguard_key 改为原始字节 ASCII + 44 字节 + 结尾 = 检查，拒绝非法 Unicode 与填充。注意：旧实现 len()==44、ends_with('=') 本身会保证切片位置 43 为字符边界，不能虚报该旧实现已经复现 panic；本项是健壮性加固和防回归。
+- **SEC-09 清单归一**：install_trust.rs::BIN_FILES 为唯一 Rust 包文件白名单，uninstall_safety.rs 直接复用；Rust 新测试解析 package-files/uninstall.ps1 固定删除清单，确保没有缺项/重复，并确认主程序 spidervpn.exe 位于最后，uninstall.ps1 留到其余文件成功移除后才清理。提交 b839dace、0d3bbc69、f9d7dbbc。未改 UI、连接或 WFP 持久 BLOCK 实现。
+- **最新同 SHA CI 未决**：Windows MSVC/GNU 都显式运行 SEC-11 UTF-8 和密钥形状测试，最新 Rust 代码 HEAD d4f7feb8b5aed21759704b318121e2bfd8972934；[MSVC 44030514834](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514834) 与 [GNU 44030514840](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44030514840) 写入时未获得终态；必须核对最终 head_sha/结论，不得援引旧 SHA。
+- **未完成**：SEC-11 生产 unwrap/expect 逐项可触发性审查、更多 Unicode/fuzz；SEC-09/03/10 的 A/B/C 真机权限、安装/升级/卸载、WFP 持久 BLOCK 网络验证和包来源签名均没有完整证据。SEC-09/11 仍部分候选，PR #6 Draft 不合并 main，Issue #5 保持 Open。
