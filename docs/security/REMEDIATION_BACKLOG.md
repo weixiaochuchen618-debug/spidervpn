@@ -240,3 +240,10 @@ PR/commit/CI: ...
 - 提交 ce3c00fe 将原断言原样移至 pairing::tunnel::sec11_key_tests；提交 e32c7567/c658c122 同步 MSVC/GNU 两工作流的精确过滤名，不删、不 skip 测试。此前中间候选因仅保留最新 SHA 自动取消，不能计入成功/失败。
 - **当前最新 Rust HEAD**：c658c12249568ccbfe02c13a436cdaa27ffe5776；对应 [MSVC CI 44031103332](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103332) / [GNU CI 44031103722](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103722) 写入时仍在运行。最新 SHA 双 CI 必须 Completed/Success 才能把本轮自动化验证标为完成。
 - 手工 Windows A/B/C 实机 SEC-03/09/10、WFP 真机网络、SEC-11 生产 unwrap/expect 审计和 Linux P0 SEC-01/02 仍待处理；main 不动、PR #6 保持 Draft、Issue #5 Open。
+
+## D.12 SEC-11 测试作用域重跑后自动化验收（2026-11-17）
+
+- 当前代码 PR #6 HEAD c658c12249568ccbfe02c13a436cdaa27ffe5776。此前 E0425 测试作用域失败已由 ce3c00fe + 两工作流过滤器更新修复；原 Unicode/emoji 断言没有减少。
+- [Windows GNU 44031103722](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103722) 已核对 head_sha 一致，**Completed/Success**：Rust GNU 构建、release 安装根保护、Guard/卸载/SEC11 专项全部成功。
+- [Windows MSVC 44031103332](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44031103332) 已成功完成 Rust Build、PowerShell 脚本语法、SEC09/10/11 专项、全部独立 Rust integration 目标，正在运行模块回归/便携 unit suite；截至写入时 workflow 未终态，**不得提前宣称 MSVC 全绿**。旧 MSVC 原有 8 项环境依赖排除仍保留、无新增 skip。
+- 严禁把 d4f7feb8 的红例删除/改写为成功。SEC-09/11 仅候选、实机 WFP/Windows A/B/C 与生产 unwrap/expect 审查仍未完成，PR6 Draft 不合并 main。
