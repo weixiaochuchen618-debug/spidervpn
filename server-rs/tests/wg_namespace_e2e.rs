@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use spidervpn_pairing_authority::{AddressPool, Claims, InviteState, Refusal};
 use spidervpn_pairing_authority::ledger_disk::LedgerStore;
 use spidervpn_pairing_authority::recovery_inspect::{finalize_stable_prepared, RecoveryStage};
@@ -101,11 +101,13 @@ fn root_audit_observes_real_wireguard_and_refuses_revoked_replay() {
     assert!(LiveWgReader::new(IFACE).unwrap().snapshot().unwrap().is_empty());
 
     // Test-only seeded ledger: never production Python invitations.json.
+    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)
+        .expect("valid wall-clock time").as_secs()).expect("valid i64 epoch");
     let root=test_ledger();
     let original=claims(&key);
     let mut store=open(&root);
-    store.update(|l|l.insert_open(INV,600)).unwrap();
-    let grant=store.update(|l|l.reserve(original.clone(),100,
+    store.update(|l|l.insert_open(INV,now+600)).unwrap();
+    let grant=store.update(|l|l.reserve(original.clone(),now,
         AddressPool {network:Ipv4Addr::new(10,66,0,0),prefix:24},Some(&[]))).unwrap();
     assert_eq!(grant.address,Ipv4Addr::new(10,66,0,2));
     drop(store);
@@ -117,7 +119,7 @@ fn root_audit_observes_real_wireguard_and_refuses_revoked_replay() {
     expect_report(&root,"PendingAdd","VerifyAndFinalize",&key);
     let mut store=open(&root);
     assert_eq!(read_verified_snapshot(IFACE).unwrap().len(),1);
-    assert_eq!(finalize_stable_prepared(&mut store,IFACE,INV,200).unwrap(),RecoveryStage::PendingAdd);
+    assert_eq!(finalize_stable_prepared(&mut store,IFACE,INV,now+1).unwrap(),RecoveryStage::PendingAdd);
     assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Consumed(_))));
     assert!(store.view().unwrap().retry(&original,Some(&read_verified_snapshot(IFACE).unwrap())).is_ok());
     drop(store);
@@ -134,7 +136,7 @@ fn root_audit_observes_real_wireguard_and_refuses_revoked_replay() {
     expect_report(&root,"RevokingRemove","VerifyAndFinalize",&key);
 
     let mut store=open(&root);
-    assert_eq!(finalize_stable_prepared(&mut store,IFACE,INV,300).unwrap(),RecoveryStage::RevokingRemove);
+    assert_eq!(finalize_stable_prepared(&mut store,IFACE,INV,now+2).unwrap(),RecoveryStage::RevokingRemove);
     assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Revoked(_))));
     assert_eq!(store.view().unwrap().retry(&original,Some(&[])),Err(Refusal::Revoked));
     drop(store);
