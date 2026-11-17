@@ -257,7 +257,7 @@ fn write_reply_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
         return Err("提权回执必须是已建立且尚未写入的空普通文件".into());
     }
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).truncate(true);
+    options.write(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -265,8 +265,9 @@ fn write_reply_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
         options.custom_flags(0x0020_0000);
     }
     let mut file = options.open(path).map_err(|e| format!("打开回执文件失败：{e}"))?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("回执句柄并非普通文件".into());
+    let live_meta = file.metadata().map_err(|e| e.to_string())?;
+    if !live_meta.is_file() || live_meta.len() != 0 {
+        return Err("回执句柄不是预先创建的空普通文件，拒绝写入".into());
     }
     file.write_all(&data).and_then(|_| file.sync_all())
         .map_err(|e| format!("写回执文件失败：{e}"))
@@ -280,11 +281,25 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String
     {
         return Err("临时请求必须是非空、大小受限的普通文件（不允许链接）".into());
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("读临时文件失败：{e}"))?;
-    if text.len() > MAX_IPC_FILE_BYTES {
-        return Err("临时文件在读取期间超出大小上限".into());
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
     }
-    serde_json::from_str(&text).map_err(|e| format!("临时文件不是合法 JSON：{e}"))
+    let mut file = opts.open(path).map_err(|e| format!("打开临时文件失败：{e}"))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("临时文件句柄并非普通文件".into());
+    }
+    let mut data = Vec::new();
+    file.take(MAX_IPC_FILE_BYTES as u64 + 1).read_to_end(&mut data)
+        .map_err(|e| format!("读临时文件失败：{e}"))?;
+    if data.is_empty() || data.len() > MAX_IPC_FILE_BYTES {
+        return Err("临时文件在读取时超出大小上限或为空".into());
+    }
+    serde_json::from_slice(&data).map_err(|e| format!("临时文件不是合法 JSON：{e}"))
 }
 
 /// 受保护的独立 IPC 会话。只清理本会话创建的两个文件与目录，
@@ -335,8 +350,18 @@ fn read_attested_guard_request(path: &Path) -> Result<GuardRequest, String> {
     {
         return Err("提权请求必须是大小受限的普通文件".into());
     }
-    let mut input = std::fs::File::open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let mut input = options.open(path)
         .map_err(|e| format!("读取提权请求失败：{e}"))?;
+    if !input.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("提权请求文件句柄不是普通文件".into());
+    }
     use std::io::Read;
     let mut data = Vec::new();
     input.by_ref().take(MAX_IPC_FILE_BYTES as u64 + 1)
