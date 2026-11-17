@@ -43,6 +43,11 @@ const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const O_NOFOLLOW: i32 = 0o400000;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Io(io::Error),
@@ -51,6 +56,9 @@ pub enum StoreError {
     Invalid(&'static str),
     Policy(Refusal),
     GenerationExhausted,
+    /// An I/O error may occur AFTER rename. This object can no longer
+    /// authorize reads or writes until it is closed and freshly reopened.
+    Poisoned,
 }
 impl From<io::Error> for StoreError {
     fn from(err: io::Error) -> Self { Self::Io(err) }
@@ -74,6 +82,7 @@ pub struct LedgerStore {
     _guard: AuthorityLock,
     generation: u64,
     value: Ledger,
+    poisoned: bool,
 }
 
 /// Reject both stale and internally impossible states, without attempting
@@ -211,6 +220,12 @@ fn store_atomic(root: &Path, doc: &Document) -> Result<(), StoreError> {
         assert_private(&OpenOptions::new().read(true)
             .custom_flags(O_NOFOLLOW).open(root.join(LEDGER_NAME))?)?;
         fs::rename(&temporary, root.join(LEDGER_NAME))?;
+        #[cfg(test)]
+        if FAIL_AFTER_RENAME.with(|cell| cell.get()) {
+            return Err(StoreError::Io(io::Error::other(
+                "injected post-rename pre-directory-fsync failure"
+            )));
+        }
         // An fsync on the parent is necessary for the name replacement to
         // survive power loss. Failure is NOT permission to proceed to WG.
         File::open(root)?.sync_all()?;
@@ -233,12 +248,19 @@ impl LedgerStore {
             _guard: guard,
             generation: doc.generation,
             value: doc.ledger,
+            poisoned: false,
         })
     }
 
-    pub fn view(&self) -> &Ledger { &self.value }
+    pub fn view(&self) -> Result<&Ledger, StoreError> {
+        if self.poisoned { return Err(StoreError::Poisoned); }
+        Ok(&self.value)
+    }
 
-    pub fn generation(&self) -> u64 { self.generation }
+    pub fn generation(&self) -> Result<u64, StoreError> {
+        if self.poisoned { return Err(StoreError::Poisoned); }
+        Ok(self.generation)
+    }
 
     /// Make a defensive copy, validate and *durably commit* it before
     /// exposing new in-memory state or authorizing a WireGuard operation.
@@ -248,16 +270,23 @@ impl LedgerStore {
         &mut self,
         f: impl FnOnce(&mut Ledger) -> Result<T, Refusal>,
     ) -> Result<T, StoreError> {
+        if self.poisoned { return Err(StoreError::Poisoned); }
         let mut next = self.value.clone();
         let output = f(&mut next).map_err(StoreError::Policy)?;
         validate(&next)?;
         let generation = self.generation.checked_add(1)
             .ok_or(StoreError::GenerationExhausted)?;
-        store_atomic(&self.root, &Document {
+        if let Err(error) = store_atomic(&self.root, &Document {
             schema_version: SCHEMA,
             generation,
             ledger: next.clone(),
-        })?;
+        }) {
+            // The atomic rename may have happened even if the final fsync
+            // failed. Treat the in-memory copy as stale, block ALL further
+            // decisions, and require closing/reopening after investigation.
+            self.poisoned = true;
+            return Err(error);
+        }
         self.value = next;
         self.generation = generation;
         Ok(output)
@@ -330,26 +359,26 @@ mod tests {
             let mut store = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
             store.update(|l| l.insert_open(INV, 600)).unwrap();
             grant = store.update(|l| l.reserve(claim(INV), 100, pool(), Some(&[]))).unwrap();
-            before = store.generation();
-            assert!(matches!(store.view().state(INV), Some(InviteState::Pending(_))));
+            before = store.generation().unwrap();
+            assert!(matches!(store.view().unwrap().state(INV), Some(InviteState::Pending(_))));
         }
         {
             let mut store = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
-            assert_eq!(store.generation(), before);
-            assert_eq!(store.view().retry(&claim(INV), Some(&[peer(&grant)])),
+            assert_eq!(store.generation().unwrap(), before);
+            assert_eq!(store.view().unwrap().retry(&claim(INV), Some(&[peer(&grant)])),
                 Err(Refusal::RecoveryRequired));
             store.update(|l| l.confirm_consumed(INV, Some(&[peer(&grant)]))).unwrap();
             store.update(|l| l.begin_revocation(INV)).unwrap();
         }
         {
             let mut store = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
-            assert!(matches!(store.view().state(INV), Some(InviteState::Revoking(_))));
-            assert_eq!(store.view().retry(&claim(INV), Some(&[])), Err(Refusal::Revoked));
+            assert!(matches!(store.view().unwrap().state(INV), Some(InviteState::Revoking(_))));
+            assert_eq!(store.view().unwrap().retry(&claim(INV), Some(&[])), Err(Refusal::Revoked));
             store.update(|l| l.confirm_revocation(INV, Some(&[]))).unwrap();
         }
         {
             let mut store = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
-            assert!(matches!(store.view().state(INV), Some(InviteState::Revoked(_))));
+            assert!(matches!(store.view().unwrap().state(INV), Some(InviteState::Revoked(_))));
             store.update(|l| l.insert_open(INV2, 600)).unwrap();
             let mut reused = claim(INV2);
             reused.public_key = format!("{}=", "B".repeat(43));
@@ -366,12 +395,42 @@ mod tests {
         let mut store = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
         store.update(|l| l.insert_open(INV, 600)).unwrap();
         let original = fs::read(p.join(LEDGER_NAME)).unwrap();
-        let generation = store.generation();
+        let generation = store.generation().unwrap();
         let res = store.update(|l| l.insert_open(INV, 900));
         assert!(matches!(res, Err(StoreError::Policy(Refusal::DuplicateInvitation))));
         assert_eq!(fs::read(p.join(LEDGER_NAME)).unwrap(), original);
-        assert_eq!(store.generation(), generation);
+        assert_eq!(store.generation().unwrap(), generation);
         drop(store);
+        fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn post_rename_fsync_failure_poisoned_store_cannot_reauthorize_stale_state() {
+        let p = dir("uncertain-fsync");
+        bootstrap_for_test(&p).unwrap();
+        let mut store = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
+        store.update(|l| l.insert_open(INV, 600)).unwrap();
+        FAIL_AFTER_RENAME.with(|cell| cell.set(true));
+        let failure = store.update(|l| l.reserve(claim(INV), 100, pool(), Some(&[])));
+        FAIL_AFTER_RENAME.with(|cell| cell.set(false));
+        assert!(matches!(failure, Err(StoreError::Io(_))));
+        assert!(matches!(store.view(), Err(StoreError::Poisoned)));
+        assert!(matches!(store.generation(), Err(StoreError::Poisoned)));
+        assert!(matches!(
+            store.update(|l| l.cancel_open(INV)),
+            Err(StoreError::Poisoned)
+        ));
+        // The replacement may already be visible. Stale "Open" in memory
+        // must never override the persisted "Pending" after a failed fsync.
+        let current = secure_read(&p).unwrap();
+        assert!(matches!(current.ledger.state(INV), Some(InviteState::Pending(_))));
+        drop(store);
+        let reopened = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
+        assert!(matches!(
+            reopened.view().unwrap().retry(&claim(INV), Some(&[])),
+            Err(Refusal::RecoveryRequired)
+        ));
+        drop(reopened);
         fs::remove_dir_all(p).unwrap();
     }
 
