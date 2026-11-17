@@ -2142,7 +2142,21 @@ fn main() -> ExitCode {
         let d = connect::Deps {
             store: &store,
             apply: &connect::write_proxy,
-            spawn: &|e: &engine::EngineConfig| engine::start(e, &log_dir).map(|h| h.pid),
+            spawn: &|e: &engine::EngineConfig| {
+                // 管理员 TUN 不允许让低权限 config.json 决定执行任意 exe。
+                // 从本次引擎配置判断实际 TUN/代理模式，避免信任全局 mode。
+                // 不改变正常非提权代理模式的自定义引擎路径功能。
+                if cfg_ref.is_some_and(|c|
+                    connect::effective_mode(c, e) == config::Mode::Tun
+                ) && probe::elevated() {
+                    let frontend = std::env::current_exe()
+                        .map_err(|err| format!("无法确认 SpiderVPN 主程序身份：{err}"))?;
+                    engine::validate_privileged_tun_engine(
+                        std::path::Path::new(&e.binary), &frontend,
+                    )?;
+                }
+                engine::start(e, &log_dir).map(|h| h.pid)
+            },
             kill: &|pid: i64| engine::stop(pid, 3_000),
             alive: &probe::pid_alive,
             elevated: &probe::elevated,
