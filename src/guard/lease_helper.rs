@@ -95,6 +95,53 @@ pub fn validate_request(req: &LeaseRequest) -> Result<[u8; 16], String> {
     Ok(nonce)
 }
 
+/// 限制提权 helper 的文件系统写入范围：不能允许命令行把回执路径
+/// 指向任意用户文件。要求两个文件处于同一独立临时子目录，且只能用固定文件名。
+/// 这是启动器/子进程双重验证的一半；启动器还必须负责目录 ACL 与随机性。
+fn validate_transport_paths(request: &Path, response: &Path) -> Result<(), String> {
+    use std::path::Component;
+    if !request.is_absolute() || !response.is_absolute() {
+        return Err("租约 IPC 必须采用绝对路径".into());
+    }
+    if request.file_name().and_then(|x| x.to_str()) != Some("request.json")
+        || response.file_name().and_then(|x| x.to_str()) != Some("reply.json")
+    {
+        return Err("租约 IPC 文件名不符合内部协议".into());
+    }
+    let dir = request.parent().ok_or("租约请求缺少目录")?;
+    if dir != response.parent().ok_or("租约回执缺少目录")? {
+        return Err("请求与回执必须处于同一隔离目录".into());
+    }
+    if request.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        || response.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err("租约 IPC 路径不允许相对跳转组件".into());
+    }
+    let name = dir.file_name().and_then(|v| v.to_str()).unwrap_or_default();
+    if !name.starts_with("spidervpn-lease-")
+        || name.len() < "spidervpn-lease-".len() + 16
+        || !name["spidervpn-lease-".len()..]
+            .bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("租约 IPC 目录必须使用独立的随机十六进制标识".into());
+    }
+    let actual = std::fs::canonicalize(dir)
+        .map_err(|e| format!("租约 IPC 目录不可访问：{e}"))?;
+    if actual != dir {
+        return Err("租约 IPC 目录路径存在非规范化或重解析跳转".into());
+    }
+    // Windows 目录联接/junction 也需要拒绝（不能只靠 std::is_symlink）。
+    #[cfg(windows)]
+    {
+        use super::identity::IdentityEnv;
+        let env = super::wfp_win::SystemIdentityEnv::new();
+        if super::identity::reparse_chain(dir).iter().any(|p| env.is_reparse_point(p)) {
+            return Err("租约 IPC 目录路径包含重解析点，拒绝提升写入".into());
+        }
+    }
+    Ok(())
+}
+
 fn read_request(path: &Path) -> Result<LeaseRequest, String> {
     let meta = std::fs::symlink_metadata(path)
         .map_err(|e| format!("读取租约请求元数据失败：{e}"))?;
@@ -149,6 +196,10 @@ fn reply(nonce: &str, state: LeaseState, reason: String, count: usize) -> LeaseR
 /// 失败时写 Rejected（如果回执路径允许写），返回非零；不会留下动态许可。
 /// 启动者必须使用严格路径 ACL 与独立随机目录，不能与 v1 guard 请求目录复用。
 pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
+    // 拒绝利用提权 helper 对任意路径执行回执文件写入。
+    if validate_transport_paths(req_path, reply_path).is_err() {
+        return 2;
+    }
     // 运行中辅助进程不允许普通权限降级继续：否则 Ready 是假证据。
     if !super::elevate::is_elevated() {
         let _ = write_reply(reply_path, &reply("", LeaseState::Rejected,
@@ -251,13 +302,29 @@ mod tests {
     }
 
     #[test]
+    fn transport_rejects_arbitrary_writable_locations() {
+        let good_dir = std::env::temp_dir().join("spidervpn-lease-0123456789abcdef");
+        let _ = std::fs::create_dir_all(&good_dir);
+        let request = good_dir.join("request.json");
+        let response = good_dir.join("reply.json");
+        assert!(validate_transport_paths(&request, &response).is_ok());
+        assert!(validate_transport_paths(&request, &good_dir.join("config.json")).is_err());
+        assert!(validate_transport_paths(&request, &std::env::temp_dir().join("other.json")).is_err());
+        assert!(validate_transport_paths(
+            &std::env::temp_dir().join("request.json"), &response,
+        ).is_err());
+        let _ = std::fs::remove_dir_all(good_dir);
+    }
+
+    #[test]
     fn ipc_roundtrip_and_replay_guard() {
         let root = std::env::temp_dir().join(format!(
-            "spidervpn-lease-test-{}", std::process::id(),
+            "spidervpn-lease-{:016x}", std::process::id(),
         ));
         let _ = std::fs::create_dir_all(&root);
         let rq = root.join("request.json");
         let rs = root.join("reply.json");
+        assert!(validate_transport_paths(&rq, &rs).is_ok());
         let _ = std::fs::remove_file(&rq);
         let _ = std::fs::remove_file(&rs);
         let raw = serde_json::to_vec(&sample()).unwrap();
