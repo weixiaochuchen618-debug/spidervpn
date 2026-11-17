@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::evidence::{EvidenceStore, StoreKind};
-use super::identity::ProgramIdentity;
+use super::identity::{resolve_entry, IdentityEnv, ProgramIdentity};
 use super::state::{GuardEvidence, GuardRecord};
 use super::wfp::{WfpError, ERROR_CANCELLED};
 
@@ -351,6 +351,48 @@ fn run_elevated(_exe: &Path, _req: &Path, _res: &Path) -> Result<i32, ElevateErr
 }
 
 // ---------------------------------------------------------------------------
+// 提权边界：请求中只信任“要处理的程序路径”，不信任其自称的 WFP AppId。
+// Remove 不需要 AppId，不能因为用户删除了旧 exe 就使解除功能失效。
+// ---------------------------------------------------------------------------
+
+fn validate_elevated_programs(
+    req: &GuardRequest,
+    env: &dyn IdentityEnv,
+) -> Result<(), String> {
+    if req.programs.len() > super::MAX_PROGRAMS {
+        return Err(format!("程序数量超过 {} 上限", super::MAX_PROGRAMS));
+    }
+    if matches!(req.action, GuardAction::Remove) {
+        // Remove 操作只删除我方 provider 自有对象；身份列表不作为删除条件。
+        // 保留旧行为：即使目标 exe 已卸载也仍然可以解除 WFP 持久规则。
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in &req.programs {
+        if !super::identity::looks_like_bare_name(&entry.name) {
+            return Err("提权请求中的交易程序名称不是有效文件名".into());
+        }
+        let path = entry.path.to_str()
+            .ok_or_else(|| "交易程序路径含无法检查的 Unicode 字符".to_string())?;
+        let resolved = resolve_entry(&entry.name, Some(path), env)
+            .map_err(|e| format!("交易程序「{}」身份重新核验失败：{}", entry.name, e.reason()))?;
+        if entry.path != resolved.path
+            || entry.app_id != resolved.app_id
+            || entry.device_path != resolved.device_path
+        {
+            return Err(format!(
+                "交易程序「{}」WFP AppId/设备路径与系统实际身份不符，拒绝提权请求",
+                entry.name
+            ));
+        }
+        if !seen.insert(resolved.app_id) {
+            return Err("交易程序名单存在重复的 WFP AppId，拒绝歧义规则集".into());
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 子进程侧：--guard-apply
 // ---------------------------------------------------------------------------
 
@@ -380,18 +422,29 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
         );
         return 2;
     }
-    if req.programs.len() > super::MAX_PROGRAMS {
+    // 此处已经处于高权限上下文。不能直接使用低权限父进程写进
+    // JSON 的 AppId / device_path：必须由 Windows 现场重新派生并逐项比对。
+    if let Err(reason) = validate_elevated_programs(
+        &req, &super::wfp_win::SystemIdentityEnv::new(),
+    ) {
         let _ = write_json_file(
             res_path,
-            &GuardReply {
-                result: Err(WfpError::InvalidState),
-                notes: vec![format!("程序数量超过 {} 上限", super::MAX_PROGRAMS)],
-            },
+            &GuardReply { result: Err(WfpError::InvalidState), notes: vec![reason] },
         );
         return 2;
     }
 
-    let store_kind = StoreKind::parse(&req.store_kind).unwrap_or(StoreKind::Registry);
+    // 未知 StoreKind 不能静默降级为 Registry：防止伪造请求写错证据位置。
+    let Some(store_kind) = StoreKind::parse(&req.store_kind) else {
+        let _ = write_json_file(
+            res_path,
+            &GuardReply {
+                result: Err(WfpError::InvalidState),
+                notes: vec!["不支持的 Guard 证据存储类型".into()],
+            },
+        );
+        return 2;
+    };
     let expect = super::Expect {
         boot_id: req.boot_id.clone(),
         config_digest: req.config_digest.clone(),
@@ -506,6 +559,61 @@ fn evidence_store_for(_req: &GuardRequest) -> Result<Box<dyn EvidenceStore>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeIdentityEnv;
+    impl IdentityEnv for FakeIdentityEnv {
+        fn exists(&self, path: &Path) -> bool {
+            path == Path::new(r"C:\safe\trader.exe")
+        }
+        fn is_reparse_point(&self, _path: &Path) -> bool { false }
+        fn app_id(&self, _path: &Path) -> Result<Vec<u8>, super::super::identity::IdentityError> {
+            Ok("trusted-device-path\0".encode_utf16().flat_map(u16::to_le_bytes).collect())
+        }
+    }
+
+    fn identity_request(action: GuardAction) -> GuardRequest {
+        let id = resolve_entry("trader.exe", Some(r"C:\safe\trader.exe"), &FakeIdentityEnv)
+            .expect("fake identity resolves");
+        GuardRequest {
+            action, programs: vec![id], explicit: true, config_digest: "digest".into(),
+            nonce: "once".into(), boot_id: "boot".into(),
+            store_kind: "Registry".into(), legacy_running: false, record_version: 1,
+        }
+    }
+
+    #[test]
+    fn elevated_guard_rederives_wfp_appid_and_rejects_tampered_identity() {
+        let req = identity_request(GuardAction::Install);
+        assert!(validate_elevated_programs(&req, &FakeIdentityEnv).is_ok());
+
+        let mut changed = req.clone();
+        changed.programs[0].app_id[0] ^= 1;
+        assert!(validate_elevated_programs(&changed, &FakeIdentityEnv).is_err(),
+            "篡改的 APP_ID 必须在任何 WFP 写操作之前被拒绝");
+
+        changed = req.clone();
+        changed.programs[0].device_path.push_str("-forged");
+        assert!(validate_elevated_programs(&changed, &FakeIdentityEnv).is_err());
+
+        changed = req.clone();
+        changed.programs[0].path = PathBuf::from(r"C:\wrong\trader.exe");
+        assert!(validate_elevated_programs(&changed, &FakeIdentityEnv).is_err());
+
+        changed = req.clone();
+        changed.programs.push(changed.programs[0].clone());
+        assert!(validate_elevated_programs(&changed, &FakeIdentityEnv).is_err(),
+            "不能接受重复交易程序身份");
+    }
+
+    #[test]
+    fn elevated_remove_does_not_depend_on_deleted_trader_exe() {
+        let mut req = identity_request(GuardAction::Remove);
+        req.programs[0].path = PathBuf::from(r"C:\deleted\trader.exe");
+        assert!(validate_elevated_programs(&req, &FakeIdentityEnv).is_ok(),
+            "卸载交易软件之后仍必须能删除自有持久 WFP 规则");
+        req.programs = vec![req.programs[0].clone(); super::super::MAX_PROGRAMS + 1];
+        assert!(validate_elevated_programs(&req, &FakeIdentityEnv).is_err());
+    }
 
     #[test]
     fn user_cancel_is_declined_not_failure() {
