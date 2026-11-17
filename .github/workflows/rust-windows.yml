@@ -14,6 +14,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Parse the thin PowerShell uninstaller without executing it
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $file = Join-Path $env:GITHUB_WORKSPACE 'package-files/uninstall.ps1'
+          [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.ToString() }
+            throw "SEC-09 uninstall wrapper has PowerShell syntax errors"
+          }
+
       - name: Build with Rust
         run: cargo build --locked
 
