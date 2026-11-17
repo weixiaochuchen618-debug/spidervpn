@@ -800,7 +800,7 @@ fn build_request(
 }
 
 /// 拿一次互斥：一次只允许一个交易保护动作。
-fn with_guard_mutex<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn with_guard_mutex<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     let name = format!("{}{}", GUARD_MUTEX_PREFIX, wfp::PROVIDER_KEY.replace('-', "").to_uppercase());
     let _guard = wfp_win::NamedMutex::acquire(&name)?;
     Ok(f())

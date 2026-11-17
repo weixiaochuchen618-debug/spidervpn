@@ -1,0 +1,44 @@
+name: SEC-01 Linux Rust pairing authority policy (pre-integration)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-pairing-authority-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify standalone Linux Rust authority package and pinned dependencies
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path server-rs/Cargo.toml --all-targets
+
+      - name: Run SEC-01 revocation/replay, legacy audit and SEC-08 process locks
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path server-rs/Cargo.toml -- --test-threads=1 --nocapture
+
+      - name: Verify production pairing runtime is not claimed to be migrated
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This core is a migration candidate only. Production remains
+          # Python until authenticated API, ledger migration, TLS, WG and
+          # real-host rollback are separately validated.
+          grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null

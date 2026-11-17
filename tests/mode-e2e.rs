@@ -42,12 +42,31 @@ fn drop_proxy_key(key: &str) {
     let _ = hkcu.delete_subkey_all(key);
 }
 
+/// 真实提权路径只允许启动与 SpiderVPN 同目录的 bundled sing-box.exe。
+/// E2E 使用隔离安装布局：把系统 ping 作为无网络副作用的假引擎复制进
+/// 该布局；不绕过生产校验，也不依赖 CI runner 是否已提权。
+fn test_install(root: &Path) -> (PathBuf, PathBuf) {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("建立隔离 bin");
+    let frontend = bin.join("spidervpn.exe");
+    let engine = bin.join("sing-box.exe");
+    if !frontend.is_file() {
+        std::fs::copy(env!("CARGO_BIN_EXE_spidervpn"), &frontend)
+            .expect("复制真实 Rust 客户端到隔离 bin");
+    }
+    if !engine.is_file() {
+        std::fs::copy(PING, &engine).expect("复制无害系统假引擎到隔离 bin");
+    }
+    (frontend, engine)
+}
+
 fn run(root: &Path, key: &str, args: &[&str]) -> (Option<i32>, String) {
     static RUNS: AtomicUsize = AtomicUsize::new(0);
     let n = RUNS.fetch_add(1, Ordering::Relaxed);
     let out_path = root.join(format!("cli-{n}.out"));
     let err_path = root.join(format!("cli-{n}.err"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_spidervpn"))
+    let (frontend, _) = test_install(root);
+    let mut child = Command::new(&frontend)
         .args(args)
         .env("SPIDERVPN_ROOT", root)
         .env("SPIDERVPN_PROXY_KEY", key)
@@ -84,7 +103,9 @@ fn free_port() -> u16 {
 
 fn import(root: &Path, key: &str, tun: bool) {
     let port = free_port().to_string();
-    let mut args = vec!["--import", TUN_FIXTURE, "--engine", PING, "--port", &port, "--line-name", "双模式线路"];
+    let (_, engine) = test_install(root);
+    let engine_path = engine.to_str().expect("隔离测试引擎路径必须为 UTF-8");
+    let mut args = vec!["--import", TUN_FIXTURE, "--engine", engine_path, "--port", &port, "--line-name", "双模式线路"];
     if tun {
         args.push("--tun");
     }

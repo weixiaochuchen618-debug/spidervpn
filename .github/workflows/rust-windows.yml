@@ -4,6 +4,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Only the newest SHA of a PR needs full MSVC validation; older in-flight
+# runs are superseded, not counted as green or treated as skipped tests.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -14,8 +20,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Parse the thin PowerShell uninstaller without executing it
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $file = Join-Path $env:GITHUB_WORKSPACE 'package-files/uninstall.ps1'
+          [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.ToString() }
+            throw "SEC-09 uninstall wrapper has PowerShell syntax errors"
+          }
+
       - name: Build with Rust
         run: cargo build --locked
+
+      # Run the elevation/DACL negative controls before broad integration tests.
+      # An unrelated end-to-end failure must not hide their result.
+      - name: SEC-10 protected IPC and privileged engine regressions (MSVC)
+        shell: pwsh
+        run: |
+          foreach ($filter in @('install_trust::tests::', 'uninstall_safety::tests::', 'uiweb_form::tests::sec11_short_time', 'pairing::tunnel::sec11_key_tests::sec11_wireguard_key_shape', 'guard::elevate::tests::', 'secretfile::tests::privileged_ipc_objects_have_secure_acl_at_creation', 'engine::tests::privileged_engine_cannot_be_selected_from_arbitrary_config_path')) {
+            Write-Host "Running MSVC Rust security tests: $filter"
+            & cargo test --locked --bin spidervpn $filter -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
       - name: Rust integration tests (each integration target, no duplicate binary unit tests)
         shell: pwsh

@@ -329,7 +329,7 @@ impl RegistryStore {
 
     /// 隔离环境里绝不许碰生产键（否则一次测试就会污染真实机器）。
     fn guard_isolated() {
-        if std::env::var("SPIDERVPN_ROOT").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        if crate::isolation::dev_root_override().is_some() {
             panic!(
                 "隔离环境（SPIDERVPN_ROOT 已设置）里禁止访问生产注册表键 {REG_PATH}：\
                  请改用 IsolatedFileStore"
@@ -515,11 +515,11 @@ mod registry {
 /// 之所以要「唯一选择点」而不是各处自己拼：生产/测试串场的后果是「测试假通过」或
 /// 「真实机器被测试污染」，两种都极难在事后发现。记录里的 `StoreKind` 是第二道锁。
 pub fn select(root: &Path) -> Result<Box<dyn EvidenceStore>, StoreError> {
-    let isolated_by_env =
-        std::env::var("SPIDERVPN_ROOT").map(|v| !v.trim().is_empty()).unwrap_or(false);
-    // 安全网：单测/夹具常用 `%TEMP%` 当数据根，但不能靠全局环境变量（并行测试会互相踩）。
-    // 只要根在系统临时目录下，一律走隔离文件，绝不允许一次测试摸到生产 HKLM。
-    let isolated_by_path = root.starts_with(std::env::temp_dir());
+    let isolated_by_env = crate::isolation::dev_root_override().is_some();
+    // 只有 Rust 测试/调试构建才能因为 TEMP 测试夹具选择文件证据；
+    // release 正式程序无论用户如何控制环境变量/根路径都必须使用 HKLM。
+    let isolated_by_path = cfg!(any(test, debug_assertions))
+        && root.starts_with(std::env::temp_dir());
     if isolated_by_env || isolated_by_path {
         Ok(Box::new(IsolatedFileStore::new(root)?))
     } else {

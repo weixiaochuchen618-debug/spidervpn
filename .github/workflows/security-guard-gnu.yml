@@ -1,0 +1,91 @@
+name: SEC-10 Windows GNU Rust privilege-boundary validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-gnu:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      # UCRT64 supplies a complete MinGW-w64 GCC/binutils/dlltool suite.
+      # This validates the Windows GNU ABI of build.ps1; the developer's
+      # exact local WinLibs distribution remains a separate release check.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Install Windows GNU Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+
+      - name: Verify full MinGW linker tools
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          foreach ($name in @('x86_64-w64-mingw32-gcc.exe', 'dlltool.exe', 'windres.exe')) {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+              throw "Missing GNU tool: $name"
+            }
+          }
+          & x86_64-w64-mingw32-gcc.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build through the repository GNU script
+        shell: powershell
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          .\build.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prove release build ignores inherited SPIDERVPN_ROOT
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          # Compile the SAME production isolation.rs module without test/debug
+          # cfg, then set an untrusted override and assert the fixed install root.
+          $sourcePath = ($env:GITHUB_WORKSPACE -replace '\\', '/') + '/src/isolation.rs'
+          $body = @'
+          #[path = "ISOLATION_PATH"]
+          mod isolation;
+          fn main() {
+              assert_eq!(
+                  isolation::install_dir(),
+                  std::path::PathBuf::from(r"C:\SpiderVPN"),
+                  "a release executable must not trust SPIDERVPN_ROOT"
+              );
+          }
+          '@
+          $body = $body.Replace("ISOLATION_PATH", $sourcePath)
+          $sourceFile = Join-Path $env:RUNNER_TEMP "spidervpn-root-release-probe.rs"
+          $binaryFile = Join-Path $env:RUNNER_TEMP "spidervpn-root-release-probe.exe"
+          Set-Content -Path $sourceFile -Value $body -Encoding utf8
+          & rustc +stable-x86_64-pc-windows-gnu --edition=2021 --crate-name spidervpn_root_release_probe -C debug-assertions=no -o $binaryFile $sourceFile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:SPIDERVPN_ROOT = "C:\AttackerControlled\Ignored"
+          & $binaryFile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item Env:SPIDERVPN_ROOT -ErrorAction SilentlyContinue
+
+      - name: Validate elevated Guard IPC and identity Rust tests on GNU target
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
+          foreach ($filter in @('install_trust::tests::', 'uninstall_safety::tests::', 'uiweb_form::tests::sec11_short_time', 'pairing::tunnel::sec11_key_tests::sec11_wireguard_key_shape', 'guard::elevate::tests::', 'guard::identity::tests::', 'secretfile::tests::', 'guard::wfp::tests::', 'engine::tests::privileged_engine_cannot_be_selected_from_arbitrary_config_path', 'config::tests::engine_command_line_is_derived_per_line_and_the_hook_overrides_it')) {
+            Write-Host "Running GNU Rust tests: $filter"
+            & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn $filter -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::evidence::{EvidenceStore, StoreKind};
-use super::identity::ProgramIdentity;
+use super::identity::{resolve_entry, IdentityEnv, ProgramIdentity};
 use super::state::{GuardEvidence, GuardRecord};
 use super::wfp::{WfpError, ERROR_CANCELLED};
 
@@ -202,36 +202,263 @@ pub fn is_elevated() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// 已打开文件的硬链接安全检查（符号链接/reparse 校验不能覆盖 hard link）。
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn require_single_link(file: &std::fs::File) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(format!(
+            "无法核验提权 IPC 文件的硬链接计数：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if info.nNumberOfLinks != 1 {
+        return Err("提权 IPC 文件存在其它硬链接，拒绝读写".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn require_single_link(_file: &std::fs::File) -> Result<(), String> {
+    // 此 helper 只在 Windows 产品中实际提权；非 Windows 用于纯逻辑测试。
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 请求/回复文件的读写（大小上限 + nonce + 严格 JSON）
 // ---------------------------------------------------------------------------
 
 fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    use std::io::Write;
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     if bytes.len() > MAX_IPC_FILE_BYTES {
         return Err(format!("请求/回复超过 {} 字节上限", MAX_IPC_FILE_BYTES));
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("建临时目录失败：{e}"))?;
+    // 只允许本次调用写一次：不存在“上一笔的回复”可以覆盖/复用。
+    // 先创建空文件，再收紧 DACL，最后才写 JSON；不留敏感窗口。
+    // Windows 原生创建同时携带受保护 DACL；不允许先创建开放文件再补权限。
+    let mut file = crate::secretfile::create_private_ipc_file(path)
+        .map_err(|e| format!("建立受保护临时文件失败：{e}"))?;
+    if let Err(err) = require_single_link(&file) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(err);
     }
-    std::fs::write(path, bytes).map_err(|e| format!("写临时文件失败：{e}"))
+    if let Err(err) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("写临时文件失败：{err}"));
+    }
+    Ok(())
+}
+
+/// 普通权限主进程先创建“受保护的空回执”，保证它仍是文件 owner。
+/// 提权后的管理员可向这份文件写入，但绝不创建一个主程序无法读取的新文件。
+fn prepare_reply_file(path: &Path) -> Result<(), String> {
+    // 创建这一瞬间就应用 owner/admin/SYSTEM 私有 DACL，文件不曾可由他人打开。
+    let file = crate::secretfile::create_private_ipc_file(path)
+        .map_err(|e| format!("建立受保护提权回执文件失败：{e}"))?;
+    drop(file);
+    Ok(())
+}
+
+/// 只准填充主程序建立的空回执。不能任意创建或覆盖其他文件。
+fn write_reply_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    use std::io::Write;
+    let data = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    if data.len() > MAX_IPC_FILE_BYTES {
+        return Err("提权回执超出大小上限".into());
+    }
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("受保护的回执文件不存在：{e}"))?;
+    if !meta.file_type().is_file() || meta.len() != 0 {
+        return Err("提权回执必须是已建立且尚未写入的空普通文件".into());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT，不能通过换成符号链接劫持管理员写入。
+        options.custom_flags(0x0020_0000);
+    }
+    let mut file = options.open(path).map_err(|e| format!("打开回执文件失败：{e}"))?;
+    let live_meta = file.metadata().map_err(|e| e.to_string())?;
+    if !live_meta.is_file() || live_meta.len() != 0 {
+        return Err("回执句柄不是预先创建的空普通文件，拒绝写入".into());
+    }
+    require_single_link(&file)?;
+    file.write_all(&data).and_then(|_| file.sync_all())
+        .map_err(|e| format!("写回执文件失败：{e}"))
 }
 
 fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("读临时文件失败：{e}"))?;
-    if meta.len() as usize > MAX_IPC_FILE_BYTES {
-        return Err(format!("临时文件超过 {} 字节上限", MAX_IPC_FILE_BYTES));
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("读临时文件失败：{e}"))?;
+    if !meta.file_type().is_file() || meta.len() == 0
+        || meta.len() as usize > MAX_IPC_FILE_BYTES
+    {
+        return Err("临时请求必须是非空、大小受限的普通文件（不允许链接）".into());
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("读临时文件失败：{e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("临时文件不是合法 JSON：{e}"))
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let mut file = opts.open(path).map_err(|e| format!("打开临时文件失败：{e}"))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("临时文件句柄并非普通文件".into());
+    }
+    require_single_link(&file)?;
+    let mut data = Vec::new();
+    file.take(MAX_IPC_FILE_BYTES as u64 + 1).read_to_end(&mut data)
+        .map_err(|e| format!("读临时文件失败：{e}"))?;
+    if data.is_empty() || data.len() > MAX_IPC_FILE_BYTES {
+        return Err("临时文件在读取时超出大小上限或为空".into());
+    }
+    serde_json::from_slice(&data).map_err(|e| format!("临时文件不是合法 JSON：{e}"))
 }
 
-fn temp_pair(nonce: &str) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("SpiderVPN-guard-{}", ci_safe(nonce)));
-    (dir.join("req.json"), dir.join("res.json"))
+/// 受保护的独立 IPC 会话。只清理本会话创建的两个文件与目录，
+/// 不能对可能被替换的路径递归 remove_dir_all。
+struct GuardIpcFiles {
+    dir: PathBuf,
+    req: PathBuf,
+    res: PathBuf,
+}
+impl Drop for GuardIpcFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.req);
+        let _ = std::fs::remove_file(&self.res);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+impl GuardIpcFiles {
+    fn create(req: &GuardRequest) -> Result<Self, String> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        use sha2::{Digest, Sha256};
+        let mut token = [0u8; 16];
+        SystemRandom::new().fill(&mut token)
+            .map_err(|_| "无法生成安全的 Guard IPC 会话标识".to_string())?;
+        let nonce: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        // 请求字节的 SHA256 被写入 UAC 子进程命令行中不可变的目录名。
+        // 即便同用户恶意进程可改写请求文件，也不能修改已发起进程的 argv。
+        let encoded = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+        let digest = Sha256::digest(&encoded);
+        let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("SpiderVPN-guard-{nonce}-{hash}"));
+        // create_dir 不会重用已有目录；任何碰撞或恶意预占都拒绝。
+        crate::secretfile::create_private_ipc_dir(&dir)
+            .map_err(|e| format!("创建受保护独立提权目录失败：{e}"))?;
+        Ok(Self { req: dir.join("req.json"), res: dir.join("res.json"), dir })
+    }
 }
 
-fn ci_safe(text: &str) -> String {
-    text.chars().filter(|c| c.is_ascii_alphanumeric()).take(32).collect()
+/// 提权子进程从 argv 所绑定的 SHA256 校验**本次读取的确切字节**，
+/// 同一份字节再反序列化；不得验证完文件路径后又重新从磁盘读一次。
+fn read_attested_guard_request(path: &Path) -> Result<GuardRequest, String> {
+    use sha2::{Digest, Sha256};
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("提权请求不存在：{e}"))?;
+    if !meta.file_type().is_file() || meta.len() == 0
+        || meta.len() as usize > MAX_IPC_FILE_BYTES
+    {
+        return Err("提权请求必须是大小受限的普通文件".into());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let mut input = options.open(path)
+        .map_err(|e| format!("读取提权请求失败：{e}"))?;
+    if !input.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("提权请求文件句柄不是普通文件".into());
+    }
+    require_single_link(&input)?;
+    use std::io::Read;
+    let mut data = Vec::new();
+    input.by_ref().take(MAX_IPC_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut data).map_err(|e| e.to_string())?;
+    if data.is_empty() || data.len() > MAX_IPC_FILE_BYTES {
+        return Err("提权请求读取时长度异常".into());
+    }
+    let dirname = path.parent().and_then(|p| p.file_name())
+        .and_then(|v| v.to_str()).ok_or("提权请求目录无效")?;
+    let Some((_, expected_hash)) = dirname.rsplit_once('-') else {
+        return Err("缺少提权请求摘要".into());
+    };
+    let calculated = Sha256::digest(&data);
+    let digest: String = calculated.iter().map(|b| format!("{b:02x}")).collect();
+    if digest != expected_hash {
+        return Err("提权请求内容与 UAC 启动时绑定的 SHA256 不符，拒绝执行".into());
+    }
+    serde_json::from_slice(&data)
+        .map_err(|e| format!("提权请求 JSON 无效：{e}"))
+}
+
+fn validate_guard_ipc_paths(req: &Path, res: &Path) -> Result<(), String> {
+    use std::path::Component;
+    if !req.is_absolute() || !res.is_absolute() {
+        return Err("提权请求与回复必须使用绝对路径".into());
+    }
+    if req.file_name().and_then(|v| v.to_str()) != Some("req.json")
+        || res.file_name().and_then(|v| v.to_str()) != Some("res.json")
+        || req.parent() != res.parent()
+    {
+        return Err("提权请求与回复必须位于同一独立目录，且文件名固定".into());
+    }
+    if req.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        || res.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err("提权 IPC 路径不能包含相对跳转".into());
+    }
+    let dir = req.parent().ok_or("提权请求缺少父目录")?;
+    let name = dir.file_name().and_then(|v| v.to_str()).unwrap_or("");
+    let Some(suffix) = name.strip_prefix("SpiderVPN-guard-") else {
+        return Err("未知 Guard IPC 目录命名".into());
+    };
+    let Some((nonce, hash)) = suffix.split_once('-') else {
+        return Err("Guard IPC 缺少请求内容摘要".into());
+    };
+    if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit())
+        || hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("Guard IPC 目录必须使用独立随机标识与 SHA256 摘要".into());
+    }
+    if !std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("读取提权目录失败：{e}"))?.file_type().is_dir()
+    {
+        return Err("Guard IPC 目录不能是链接或非目录对象".into());
+    }
+    #[cfg(windows)]
+    {
+        use super::identity::{reparse_chain, IdentityEnv};
+        let env = super::wfp_win::SystemIdentityEnv::new();
+        if reparse_chain(req).iter().any(|p| env.is_reparse_point(p))
+            || reparse_chain(res).iter().any(|p| env.is_reparse_point(p))
+        {
+            return Err("提权 IPC 路径包含目录联接或重解析点".into());
+        }
+        // 路径与 SHA256 均正确也不能信任已经被放宽的 DACL。
+        // 审核发生在提权子进程触碰 Guard backend 之前，失败即拒绝。
+        for path in [dir, req, res] {
+            crate::secretfile::verify_private_ipc_acl(path)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -247,13 +474,13 @@ fn ci_safe(text: &str) -> String {
 /// （2026-11-06，r25）。`tests/acceptance-guard.ps1` 的 A2/A3 曾按那条意图写预期，
 /// 因此把「非提权 verify 会弹 UAC → 点否 = Declined」误判成 `NoPermission`。
 pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
-    let (req_path, res_path) = temp_pair(&req.nonce);
-    // 上次残留（同 nonce 几乎不可能，但删掉更干净）
-    let _ = std::fs::remove_file(&res_path);
-    write_json_file(&req_path, req).map_err(ElevateError::SpawnFailed)?;
+    let files = GuardIpcFiles::create(req).map_err(ElevateError::SpawnFailed)?;
+    let (req_path, res_path) = (&files.req, &files.res);
+    write_json_file(req_path, req).map_err(ElevateError::SpawnFailed)?;
+    prepare_reply_file(res_path).map_err(ElevateError::SpawnFailed)?;
 
     let exe = std::env::current_exe().map_err(|e| ElevateError::SpawnFailed(e.to_string()))?;
-    let code = run_elevated(&exe, &req_path, &res_path)?;
+    let code = run_elevated(&exe, req_path, res_path)?;
 
     // 先看退出码：非 0 一律失败。**失败也要读回复**——子进程把真正的原因写在
     // `notes` 里（例如 `WfpError::InvalidState`），只报退出码等于把唯一线索扔掉。
@@ -264,7 +491,6 @@ pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
                 let joined = reply.notes.join("；");
                 if joined.trim().is_empty() { None } else { Some(joined) }
             });
-        let _ = std::fs::remove_dir_all(req_path.parent().unwrap_or(Path::new(".")));
         return Err(match note {
             Some(note) => ElevateError::ChildFailedNote(code, note),
             None => err,
@@ -273,18 +499,15 @@ pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
     let reply: GuardReply = match read_json_file(&res_path) {
         Ok(v) => v,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(req_path.parent().unwrap_or(Path::new(".")));
-            return Err(ElevateError::BadReply(e));
+                return Err(ElevateError::BadReply(e));
         }
     };
     // 回复里的证据必须带来源（A19：安装 API 的返回值不算证据）
     if let Ok(ev) = &reply.result {
         if ev.source == super::state::GuardSource::None {
-            let _ = std::fs::remove_dir_all(req_path.parent().unwrap_or(Path::new(".")));
-            return Err(ElevateError::BadReply("回复缺少证据来源".to_string()));
+                return Err(ElevateError::BadReply("回复缺少证据来源".to_string()));
         }
     }
-    let _ = std::fs::remove_dir_all(req_path.parent().unwrap_or(Path::new(".")));
     Ok(reply)
 }
 
@@ -292,8 +515,9 @@ pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
 fn run_elevated(exe: &Path, req: &Path, res: &Path) -> Result<i32, ElevateError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, WaitForSingleObject, INFINITE,
+        GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -331,10 +555,21 @@ fn run_elevated(exe: &Path, req: &Path, res: &Path) -> Result<i32, ElevateError>
     let handle: HANDLE = info.hProcess;
     // 等它结束（上限 120 秒）。超时 = 无法确认，不是成功。
     let wait = unsafe { WaitForSingleObject(handle, (ELEVATE_WAIT_TIMEOUT_SECS * 1000) as u32) };
-    if wait != 0 {
+    if wait != WAIT_OBJECT_0 {
+        // 之前超时仅丢失 handle，但高权限子进程可能仍继续改变 WFP。
+        // 尽力终止并等待其退出；无法终止时按“未知、未保护”对待，不认成功。
+        if wait == WAIT_TIMEOUT {
+            unsafe {
+                TerminateProcess(handle, 1);
+                WaitForSingleObject(handle, 5_000);
+            }
+        }
         unsafe { CloseHandle(handle) };
-        let _ = INFINITE; // 保留常量引用，避免误改成无限等待
-        return Err(ElevateError::Timeout);
+        return if wait == WAIT_TIMEOUT {
+            Err(ElevateError::Timeout)
+        } else {
+            Err(ElevateError::ChildFailed(-1))
+        };
     }
     let mut code: u32 = 1;
     let got = unsafe { GetExitCodeProcess(handle, &mut code) };
@@ -350,6 +585,66 @@ fn run_elevated(_exe: &Path, _req: &Path, _res: &Path) -> Result<i32, ElevateErr
     Err(ElevateError::SpawnFailed("当前平台不支持提权".to_string()))
 }
 
+/// 提权子进程不得从父进程的 JSON 自由选择证据存储：
+/// release 必须使用 Registry；仅测试/调试 build 且显式设置
+/// SPIDERVPN_ROOT 时才允许 IsolatedFile。必须在调用 WFP backend 前验证。
+fn validate_elevated_store_kind(kind: StoreKind) -> Result<(), String> {
+    let required = if crate::isolation::dev_root_override().is_some() {
+        StoreKind::IsolatedFile
+    } else {
+        StoreKind::Registry
+    };
+    if kind != required {
+        return Err(format!(
+            "提权请求存储类型 {} 与运行环境预期 {} 不一致",
+            kind.as_str(), required.as_str()
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 提权边界：请求中只信任“要处理的程序路径”，不信任其自称的 WFP AppId。
+// Remove 不需要 AppId，不能因为用户删除了旧 exe 就使解除功能失效。
+// ---------------------------------------------------------------------------
+
+fn validate_elevated_programs(
+    req: &GuardRequest,
+    env: &dyn IdentityEnv,
+) -> Result<(), String> {
+    if req.programs.len() > super::MAX_PROGRAMS {
+        return Err(format!("程序数量超过 {} 上限", super::MAX_PROGRAMS));
+    }
+    if matches!(req.action, GuardAction::Remove) {
+        // Remove 操作只删除我方 provider 自有对象；身份列表不作为删除条件。
+        // 保留旧行为：即使目标 exe 已卸载也仍然可以解除 WFP 持久规则。
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in &req.programs {
+        if !super::identity::looks_like_bare_name(&entry.name) {
+            return Err("提权请求中的交易程序名称不是有效文件名".into());
+        }
+        let path = entry.path.to_str()
+            .ok_or_else(|| "交易程序路径含无法检查的 Unicode 字符".to_string())?;
+        let resolved = resolve_entry(&entry.name, Some(path), env)
+            .map_err(|e| format!("交易程序「{}」身份重新核验失败：{}", entry.name, e.reason()))?;
+        if entry.path != resolved.path
+            || entry.app_id != resolved.app_id
+            || entry.device_path != resolved.device_path
+        {
+            return Err(format!(
+                "交易程序「{}」WFP AppId/设备路径与系统实际身份不符，拒绝提权请求",
+                entry.name
+            ));
+        }
+        if !seen.insert(resolved.app_id) {
+            return Err("交易程序名单存在重复的 WFP AppId，拒绝歧义规则集".into());
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 子进程侧：--guard-apply
 // ---------------------------------------------------------------------------
@@ -359,10 +654,15 @@ fn run_elevated(_exe: &Path, _req: &Path, _res: &Path) -> Result<i32, ElevateErr
 /// **只接受白名单动作**；任何解析/校验失败都写「失败回复」并返回非 0——
 /// 退出码是权威，回复只是给人看的补充。
 pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::GuardBackend) -> i32 {
-    let req: GuardRequest = match read_json_file(req_path) {
+    // 任何请求文件读取、错误回复写入之前验证固定路径与 reparse 链。
+    // 未验证的外部路径不能被提权进程当成“错误回复位置”写入。
+    if validate_guard_ipc_paths(req_path, res_path).is_err() {
+        return 2;
+    }
+    let req: GuardRequest = match read_attested_guard_request(req_path) {
         Ok(r) => r,
         Err(e) => {
-            let _ = write_json_file(
+            let _ = write_reply_file(
                 res_path,
                 &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
             );
@@ -371,7 +671,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
     };
     // 白名单：动作解析是从枚举来的（反序列化已经过滤），这里再确认一次它确实是四种之一。
     if GuardAction::parse(req.action.as_str()).is_none() {
-        let _ = write_json_file(
+        let _ = write_reply_file(
             res_path,
             &GuardReply {
                 result: Err(WfpError::InvalidState),
@@ -380,18 +680,39 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
         );
         return 2;
     }
-    if req.programs.len() > super::MAX_PROGRAMS {
-        let _ = write_json_file(
+    // 此处已经处于高权限上下文。不能直接使用低权限父进程写进
+    // JSON 的 AppId / device_path：必须由 Windows 现场重新派生并逐项比对。
+    if let Err(reason) = validate_elevated_programs(
+        &req, &super::wfp_win::SystemIdentityEnv::new(),
+    ) {
+        let _ = write_reply_file(
             res_path,
-            &GuardReply {
-                result: Err(WfpError::InvalidState),
-                notes: vec![format!("程序数量超过 {} 上限", super::MAX_PROGRAMS)],
-            },
+            &GuardReply { result: Err(WfpError::InvalidState), notes: vec![reason] },
         );
         return 2;
     }
 
-    let store_kind = StoreKind::parse(&req.store_kind).unwrap_or(StoreKind::Registry);
+    // 未知 StoreKind 不能静默降级为 Registry：防止伪造请求写错证据位置。
+    let Some(store_kind) = StoreKind::parse(&req.store_kind) else {
+        let _ = write_reply_file(
+            res_path,
+            &GuardReply {
+                result: Err(WfpError::InvalidState),
+                notes: vec!["不支持的 Guard 证据存储类型".into()],
+            },
+        );
+        return 2;
+    };
+    if let Err(reason) = validate_elevated_store_kind(store_kind) {
+        let _ = write_reply_file(
+            res_path,
+            &GuardReply {
+                result: Err(WfpError::InvalidState),
+                notes: vec![reason],
+            },
+        );
+        return 2;
+    }
     let expect = super::Expect {
         boot_id: req.boot_id.clone(),
         config_digest: req.config_digest.clone(),
@@ -409,7 +730,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
 
     match outcome {
         Err(err) => {
-            let _ = write_json_file(
+            let _ = write_reply_file(
                 res_path,
                 &GuardReply { result: Err(err), notes: vec![err.message()] },
             );
@@ -435,7 +756,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
             let store: Box<dyn EvidenceStore> = match evidence_store_for(&req) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = write_json_file(
+                    let _ = write_reply_file(
                         res_path,
                         &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
                     );
@@ -451,14 +772,14 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
                     "ElevatedRemove",
                 );
                 if let Err(e) = store.write_removed(&marker) {
-                    let _ = write_json_file(
+                    let _ = write_reply_file(
                         res_path,
                         &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
                     );
                     return 4;
                 }
                 if let Err(e) = store.invalidate("user-remove") {
-                    let _ = write_json_file(
+                    let _ = write_reply_file(
                         res_path,
                         &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
                     );
@@ -473,7 +794,7 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
                     req.record_version,
                 );
                 if let Err(e) = store.write(&rec) {
-                    let _ = write_json_file(
+                    let _ = write_reply_file(
                         res_path,
                         &GuardReply { result: Err(WfpError::InvalidState), notes: vec![e] },
                     );
@@ -482,8 +803,12 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
                 // 安装/核验成功 → 清掉「已解除」标记（Q8：下次连接重新启用）
                 let _ = store.clear_removed();
             }
-            let _ = write_json_file(res_path, &GuardReply { result: Ok(ev), notes: Vec::new() });
-            0
+            // 回执是调用方确认这次提升操作的唯一返回通道。
+            // 如果 WFP/证据写入成功但回执失败，绝不能退出 0 假装全程成功。
+            match write_reply_file(res_path, &GuardReply { result: Ok(ev), notes: Vec::new() }) {
+                Ok(()) => 0,
+                Err(_) => 6,
+            }
         }
     }
 }
@@ -493,19 +818,141 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
 /// 生产走 [`super::select`]；隔离环境（`SPIDERVPN_ROOT`）走文件 store——
 /// 子进程继承了父进程的环境变量，所以两边看到的是同一个 store。
 fn evidence_store_for(_req: &GuardRequest) -> Result<Box<dyn EvidenceStore>, String> {
-    let root = std::env::var("SPIDERVPN_ROOT").unwrap_or_default();
-    let root = if root.trim().is_empty() {
-        // 生产：不需要数据根（走注册表）
-        PathBuf::from(".")
-    } else {
-        PathBuf::from(root)
-    };
+    // 由编译模式和隔离测试入口决定，绝不读取未经审查的 release 环境变量。
+    let root = crate::isolation::dev_root_override()
+        .unwrap_or_else(|| PathBuf::from("."));
     super::evidence::select(&root).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeIdentityEnv;
+    impl IdentityEnv for FakeIdentityEnv {
+        fn exists(&self, path: &Path) -> bool {
+            path == Path::new(r"C:\safe\trader.exe")
+        }
+        fn is_reparse_point(&self, _path: &Path) -> bool { false }
+        fn app_id(&self, _path: &Path) -> Result<Vec<u8>, super::super::identity::IdentityError> {
+            Ok("trusted-device-path\0".encode_utf16().flat_map(u16::to_le_bytes).collect())
+        }
+    }
+
+    fn identity_request(action: GuardAction) -> GuardRequest {
+        let id = resolve_entry("trader.exe", Some(r"C:\safe\trader.exe"), &FakeIdentityEnv)
+            .expect("fake identity resolves");
+        GuardRequest {
+            action, programs: vec![id], explicit: true, config_digest: "digest".into(),
+            nonce: "once".into(), boot_id: "boot".into(),
+            store_kind: "Registry".into(), legacy_running: false, record_version: 1,
+        }
+    }
+
+    #[test]
+    fn elevated_guard_rederives_wfp_appid_and_rejects_tampered_identity() {
+        let req = identity_request(GuardAction::Install);
+        assert!(validate_elevated_programs(&req, &FakeIdentityEnv).is_ok());
+
+        let mut changed = req.clone();
+        changed.programs[0].app_id[0] ^= 1;
+        assert!(validate_elevated_programs(&changed, &FakeIdentityEnv).is_err(),
+            "篡改的 APP_ID 必须在任何 WFP 写操作之前被拒绝");
+
+        changed = req.clone();
+        changed.programs[0].device_path.push_str("-forged");
+        assert!(validate_elevated_programs(&changed, &FakeIdentityEnv).is_err());
+
+        changed = req.clone();
+        changed.programs[0].path = PathBuf::from(r"C:\wrong\trader.exe");
+        assert!(validate_elevated_programs(&changed, &FakeIdentityEnv).is_err());
+
+        changed = req.clone();
+        changed.programs.push(changed.programs[0].clone());
+        assert!(validate_elevated_programs(&changed, &FakeIdentityEnv).is_err(),
+            "不能接受重复交易程序身份");
+    }
+
+    #[test]
+    fn elevated_remove_does_not_depend_on_deleted_trader_exe() {
+        let mut req = identity_request(GuardAction::Remove);
+        req.programs[0].path = PathBuf::from(r"C:\deleted\trader.exe");
+        assert!(validate_elevated_programs(&req, &FakeIdentityEnv).is_ok(),
+            "卸载交易软件之后仍必须能删除自有持久 WFP 规则");
+        req.programs = vec![req.programs[0].clone(); super::super::MAX_PROGRAMS + 1];
+        assert!(validate_elevated_programs(&req, &FakeIdentityEnv).is_err());
+    }
+
+    struct CountingBackend(std::sync::atomic::AtomicUsize);
+    impl super::super::GuardBackend for CountingBackend {
+        fn available(&self) -> bool { true }
+        fn read(&self, _: &[ProgramIdentity], _: &super::super::Expect)
+            -> Result<GuardEvidence, WfpError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(WfpError::InvalidState)
+        }
+        fn install(&self, _: &[ProgramIdentity], _: &super::super::Expect)
+            -> Result<GuardEvidence, WfpError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(WfpError::InvalidState)
+        }
+        fn sync(&self, _: &[ProgramIdentity], _: &super::super::Expect)
+            -> Result<GuardEvidence, WfpError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(WfpError::InvalidState)
+        }
+        fn remove(&self) -> Result<GuardEvidence, WfpError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(WfpError::InvalidState)
+        }
+    }
+
+    #[test]
+    fn elevated_entry_rejects_modified_request_before_any_wfp_backend_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut req = test_ipc_request();
+        let files = GuardIpcFiles::create(&req).unwrap();
+        write_json_file(&files.req, &req).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+        req.action = GuardAction::Remove;
+        std::fs::write(&files.req, serde_json::to_vec(&req).unwrap()).unwrap();
+
+        let backend = CountingBackend(AtomicUsize::new(0));
+        assert_eq!(guard_apply_main(&files.req, &files.res, &backend), 2);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0,
+            "被替换的请求不允许调用任何 WFP 后端动作");
+    }
+
+    #[test]
+    fn valid_but_wrong_elevated_store_kind_is_rejected_before_wfp() {
+        let expected = if crate::isolation::dev_root_override().is_some() {
+            StoreKind::IsolatedFile
+        } else {
+            StoreKind::Registry
+        };
+        let mismatched = if expected == StoreKind::Registry {
+            StoreKind::IsolatedFile
+        } else {
+            StoreKind::Registry
+        };
+        assert!(validate_elevated_store_kind(expected).is_ok());
+        assert!(validate_elevated_store_kind(mismatched).is_err(),
+            "即便 StoreKind 是已知枚举，提权端也不能信任它选择任意证据存储");
+    }
+
+    #[test]
+    fn unknown_elevated_store_is_rejected_before_any_wfp_backend_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut req = test_ipc_request();
+        req.store_kind = "ForgedStore".into();
+        let files = GuardIpcFiles::create(&req).unwrap();
+        write_json_file(&files.req, &req).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+        let backend = CountingBackend(AtomicUsize::new(0));
+        assert_eq!(guard_apply_main(&files.req, &files.res, &backend), 2);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0,
+            "未知 StoreKind 必须在更改 WFP 前拒绝");
+    }
 
     #[test]
     fn user_cancel_is_declined_not_failure() {
@@ -563,6 +1010,142 @@ mod tests {
         for e in all {
             assert!(!e.message().is_empty());
         }
+    }
+
+    fn test_ipc_request() -> GuardRequest {
+        GuardRequest {
+            action: GuardAction::Verify, programs: Vec::new(), explicit: true,
+            config_digest: "hash".into(), nonce: "test-nonce".into(),
+            boot_id: "boot".into(), store_kind: "Registry".into(),
+            legacy_running: false, record_version: 1,
+        }
+    }
+
+    #[test]
+    fn guarded_ipc_rejects_arbitrary_paths_and_reused_names() {
+        let request = test_ipc_request();
+        let files = GuardIpcFiles::create(&request).unwrap();
+        // 子进程只会在 apply() 已创建请求和空回执后启动；不存在的
+        // 文件在 SystemIdentityEnv::is_reparse_point 中必须被保守拒绝。
+        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_err(),
+            "不存在的 IPC 文件必须拒绝，不能放松安全检查来满足测试");
+        write_json_file(&files.req, &request).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+        let verification = validate_guard_ipc_paths(&files.req, &files.res);
+        assert!(verification.is_ok(),
+            "真实启动顺序中已创建的受保护请求/回执应该通过路径安全校验：{verification:?}");
+        let bad = files.dir.join("other.json");
+        assert!(validate_guard_ipc_paths(&files.req, &bad).is_err());
+        assert!(validate_guard_ipc_paths(&files.req, &files.dir.join("req.json")).is_err());
+        assert!(validate_guard_ipc_paths(&files.req, &std::env::temp_dir().join("res.json")).is_err());
+        assert!(files.dir.file_name().unwrap().to_string_lossy().len() >= 113);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_entry_rejects_widened_reply_acl_before_wfp() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let request = test_ipc_request();
+        let files = GuardIpcFiles::create(&request).unwrap();
+        write_json_file(&files.req, &request).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+        let verification = validate_guard_ipc_paths(&files.req, &files.res);
+        assert!(verification.is_ok(),
+            "正常受保护目录/请求/回执必须成功通过实际 DACL 读回：{verification:?}");
+
+        // 同账户攻击者能够放宽自己创建的回执 DACL；提权端必须按对象的
+        // 实际状态拒绝，而不是仅信父进程曾调用过 protect。
+        let output = std::process::Command::new("icacls")
+            .arg(&files.res)
+            .arg("/grant")
+            .arg("*S-1-5-11:(M)")
+            .output()
+            .expect("隔离 Windows runner 必须有 icacls");
+        assert!(output.status.success(),
+            "无法构造 ACL 降级负对照：{}", String::from_utf8_lossy(&output.stderr));
+        assert!(crate::secretfile::verify_private_ipc_acl(&files.res).is_err());
+        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_err());
+        let backend = CountingBackend(AtomicUsize::new(0));
+        assert_eq!(guard_apply_main(&files.req, &files.res, &backend), 2);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0,
+            "ACL 被放宽的 IPC 不允许访问 WFP 后端");
+    }
+
+    #[test]
+    fn elevated_request_is_bound_to_original_uac_directory_digest() {
+        let req = test_ipc_request();
+        let files = GuardIpcFiles::create(&req).unwrap();
+        write_json_file(&files.req, &req).unwrap();
+        assert_eq!(read_attested_guard_request(&files.req).unwrap(), req);
+        // 恶意进程修改已写请求，UAC argv 绑定的目录摘要并不会改变。
+        let mut forged = req.clone();
+        forged.action = GuardAction::Remove;
+        std::fs::write(&files.req, serde_json::to_vec(&forged).unwrap()).unwrap();
+        assert!(read_attested_guard_request(&files.req).is_err(),
+            "请求文件在 UAC 之后被替换时不能执行 Remove");
+    }
+
+    #[test]
+    fn response_write_failure_is_never_treated_as_success() {
+        // 删除/替换回执后，已成功执行的高权限动作也不能返回“成功”。
+        let files = GuardIpcFiles::create(&test_ipc_request()).unwrap();
+        let reply = GuardReply {
+            result: Err(WfpError::InvalidState),
+            notes: vec!["test".into()],
+        };
+        assert!(write_reply_file(&files.res, &reply).is_err());
+        prepare_reply_file(&files.res).unwrap();
+        assert!(write_reply_file(&files.res, &reply).is_ok());
+        assert!(write_reply_file(&files.res, &reply).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_ipc_rejects_request_and_reply_hardlinks_by_handle() {
+        let request = test_ipc_request();
+        let files = GuardIpcFiles::create(&request).unwrap();
+        write_json_file(&files.req, &request).unwrap();
+        prepare_reply_file(&files.res).unwrap();
+
+        let req_alias = files.dir.join("req-alias.json");
+        std::fs::hard_link(&files.req, &req_alias)
+            .expect("Windows hard link creation should be available on local NTFS runner");
+        assert!(read_attested_guard_request(&files.req).is_err(),
+            "不能把硬链接的请求当成唯一的可信文件");
+        std::fs::remove_file(req_alias).unwrap();
+
+        let reply_alias = files.dir.join("res-alias.json");
+        std::fs::hard_link(&files.res, &reply_alias)
+            .expect("Windows hard link creation should be available on local NTFS runner");
+        let fake = GuardReply {
+            result: Err(WfpError::InvalidState),
+            notes: vec!["test".into()],
+        };
+        assert!(write_reply_file(&files.res, &fake).is_err(),
+            "不能向可能与其它敏感文件共享 inode 的硬链接回执写入");
+        assert_eq!(std::fs::metadata(&files.res).unwrap().len(), 0);
+        std::fs::remove_file(reply_alias).unwrap();
+
+        assert_eq!(read_attested_guard_request(&files.req).unwrap(), request);
+        assert!(write_reply_file(&files.res, &fake).is_ok(),
+            "移除硬链接后正常受保护 IPC 不应受影响");
+    }
+
+    #[test]
+    fn one_shot_ipc_cannot_overwrite_existing_request_or_response() {
+        let files = GuardIpcFiles::create(&test_ipc_request()).unwrap();
+        let data = serde_json::json!({"Safe":true});
+        write_json_file(&files.req, &data).unwrap();
+        assert!(write_json_file(&files.req, &data).is_err(),
+            "提权请求不允许覆盖或重放");
+        assert_eq!(read_json_file::<serde_json::Value>(&files.req).unwrap(), data);
+        prepare_reply_file(&files.res).unwrap();
+        assert!(prepare_reply_file(&files.res).is_err());
+        assert!(write_reply_file(&files.res, &data).is_ok(),
+            "提权子进程应该能填写受保护的主程序回执");
+        assert!(write_reply_file(&files.res, &data).is_err(),
+            "已填写的回复不允许重放或覆盖");
+        assert_eq!(read_json_file::<serde_json::Value>(&files.res).unwrap(), data);
     }
 
     #[test]

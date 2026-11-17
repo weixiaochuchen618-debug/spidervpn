@@ -40,6 +40,8 @@ mod guard;
 mod instance;
 mod ipc;
 mod isolation;
+mod install_trust;
+mod uninstall_safety;
 mod lifecycle;
 // 线路动作（测速 / 保存连接方式）的结果记录：要活过重启，启动时把被中断的动作改判。
 mod lineaction;
@@ -146,6 +148,57 @@ fn main() -> ExitCode {
         eprintln!("数据根  ：{}", isolation::data_root().display());
         eprintln!("已定版的 旧版被冻结，本程序不得与它共用任何运行时资源。");
         return ExitCode::from(exit::ENVIRONMENT);
+    }
+
+    // SEC-03：安装脚本仅负责文件复制；可信代码目录的受保护 ACL、
+    // 数据目录的单独写入权限与 Win32 ACL 读回决策只在 Rust 实现。
+    // 放在锁和正常初始化前：安装时程序本体尚未进入正式运行阶段。
+    if let Some(vals) = arg_values("--install-seal", 1) {
+        return match install_trust::seal_installed_product(
+            std::path::Path::new(&vals[0]),
+        ) {
+            Ok(()) => {
+                println!("  已核验并保护 SpiderVPN 程序目录；数据目录保持独立可写。");
+                ExitCode::SUCCESS
+            }
+            Err(reason) => {
+                eprintln!("  可信安装权限未完成：{reason}");
+                ExitCode::from(exit::ENVIRONMENT)
+            }
+        };
+    }
+
+    // SEC-09：卸载安全闸门独立于 config.json；默认先由 Rust 清理并回读
+    // 本程序自己的 WFP Provider，失败必须保留 EXE。显式 --keep-guard
+    // 仅跳过这一动作，不允许跳过未还原的系统代理 journal。
+    if let Some(vals) = arg_values("--uninstall-preflight", 1) {
+        let keep_guard = argv.iter().any(|a| a == "--keep-guard");
+        return match uninstall_safety::preflight(std::path::Path::new(&vals[0]), keep_guard) {
+            Ok(()) => {
+                println!("  安全卸载预检通过（交易保护：{}）。",
+                    if keep_guard { "按用户要求保留" } else { "Rust 已回读确认解除" });
+                ExitCode::SUCCESS
+            }
+            Err(msg) => {
+                eprintln!("  安全卸载预检拒绝：{msg}");
+                ExitCode::from(exit::ENVIRONMENT)
+            }
+        };
+    }
+
+    // 严格识别安装器真正生成的快捷入口，而不是模糊 Contains 安装根。
+    // 不属于当前安装的 .cmd 一律不删（exit 3 = 非本安装文件）。
+    if let Some(vals) = arg_values("--uninstall-owns-shortcut", 2) {
+        return match uninstall_safety::owns_launcher(
+            std::path::Path::new(&vals[0]), std::path::Path::new(&vals[1]),
+        ) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(exit::CONFIG),
+            Err(msg) => {
+                eprintln!("  无法核验快捷方式归属：{msg}");
+                ExitCode::from(exit::ENVIRONMENT)
+            }
+        };
     }
 
     // `--ping`：纯客户端探测，**不建目录、不抢单实例锁**。
@@ -2142,7 +2195,20 @@ fn main() -> ExitCode {
         let d = connect::Deps {
             store: &store,
             apply: &connect::write_proxy,
-            spawn: &|e: &engine::EngineConfig| engine::start(e, &log_dir).map(|h| h.pid),
+            spawn: &|e: &engine::EngineConfig| {
+                // 管理员进程的任意引擎模式都必须拒绝 config.json
+                // 指定外部可执行文件；不能靠把 TUN 改成 Proxy 绕过。
+                // 使用实际 HKLM 提权判定，不受测试用 FORCE_NONADMIN 钩子影响。
+                // 普通权限代理模式保持原有自定义引擎行为。
+                if probe::is_elevated() {
+                    let frontend = std::env::current_exe()
+                        .map_err(|err| format!("无法确认 SpiderVPN 主程序身份：{err}"))?;
+                    engine::validate_privileged_engine(
+                        std::path::Path::new(&e.binary), &frontend,
+                    )?;
+                }
+                engine::start(e, &log_dir).map(|h| h.pid)
+            },
             kill: &|pid: i64| engine::stop(pid, 3_000),
             alive: &probe::pid_alive,
             elevated: &probe::elevated,
@@ -3489,6 +3555,9 @@ const VALUED_ARGS: &[(&str, usize, &str, &str)] = &[
     ("--backup", 1, "--backup <文件>（导出路径；默认写到 数据根\\exports）", "--backup C:\\transport.json"),
     ("--fingerprint", 1, "--fingerprint SHA256:…（首次连接确认用）", "--server-inspect root@1.2.3.4 --fingerprint SHA256:abc…"),
     // 内部提权子进程：由本程序自己起，用户不需要手工输入。放在这里是为了让参数校验认识它。
+    ("--install-seal", 1, "--install-seal <安装目录>（内部安装权限阶段）", "由安装器以管理员权限调用"),
+    ("--uninstall-preflight", 1, "--uninstall-preflight <安装目录> [--keep-guard]（内部卸载安全阶段）", "只由已安装的 SpiderVPN 卸载器调用"),
+    ("--uninstall-owns-shortcut", 2, "--uninstall-owns-shortcut <快捷方式> <安装目录>（内部归属检查）", "只由已安装的 SpiderVPN 卸载器调用"),
     ("--guard-apply", 2, "--guard-apply <request.json> <response.json>（内部提权子进程）", "不由用户手工执行"),
 ];
 
@@ -3502,6 +3571,7 @@ const FLAG_ARGS: &[&str] = &[
     "--diagnose",
     "--disconnect",
     "--headless",
+    "--keep-guard",
     "--help",
     "--history",
     "--lines",

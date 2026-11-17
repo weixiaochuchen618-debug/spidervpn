@@ -32,12 +32,24 @@ impl Rewrite {
     pub const ENV_ROOT: &'static str = "SPIDERVPN_ROOT";
 }
 
-/// 安装目录。可用环境变量覆盖，便于在开发机上把整棵树挪走。
-pub fn install_dir() -> PathBuf {
-    match std::env::var(Rewrite::ENV_ROOT) {
-        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
-        _ => PathBuf::from(Rewrite::INSTALL_DIR),
+/// 测试/调试构建才允许用环境变量覆盖文件系统与 WFP 证据存储。
+/// 正式 release exe 绝不能让继承的 SPIDERVPN_ROOT 改写安装根和 HKLM 证据链。
+pub fn dev_root_override() -> Option<PathBuf> {
+    #[cfg(any(test, debug_assertions))]
+    {
+        std::env::var(Rewrite::ENV_ROOT).ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
     }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        None
+    }
+}
+
+/// 安装目录。开发/测试可覆盖；release 始终采用固定、可验证的产品目录。
+pub fn install_dir() -> PathBuf {
+    dev_root_override().unwrap_or_else(|| PathBuf::from(Rewrite::INSTALL_DIR))
 }
 
 /// 数据根。与旧版必须既不相等、也不能是旧版数据根的子目录

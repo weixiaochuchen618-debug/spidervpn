@@ -6826,16 +6826,50 @@ fn source_word(src: &str) -> &str {
 
 /// RFC3339 → `MM-DD HH:MM`。只用于列表显示，不做时区换算（记录本来就是本地时间字符串）。
 fn short_time(ts: &str) -> String {
-    if ts.len() >= 16 && ts.as_bytes().get(10) == Some(&b'T') {
-        format!("{} {}", &ts[5..10], &ts[11..16])
-    } else {
-        ts.to_string()
-    }
+    // SEC-11: untrusted historical/event JSON may contain arbitrary Unicode.
+    // Byte offsets are legal only after verifying that all 16 timestamp
+    // positions are ASCII and the RFC3339 date/time delimiters match.
+    // Otherwise preserve the original value instead of panicking in the UI.
+    let Some(prefix) = ts.get(..16) else { return ts.to_string(); };
+    let b = prefix.as_bytes();
+    let valid = b.iter().enumerate().all(|(i, c)| match i {
+        4 | 7 => *c == b'-',
+        10 => *c == b'T',
+        13 => *c == b':',
+        _ => c.is_ascii_digit(),
+    });
+    if !valid { return ts.to_string(); }
+    format!("{} {}", &prefix[5..10], &prefix[11..16])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sec11_short_time_handles_utf8_non_boundary_and_malformed_timestamp() {
+        assert_eq!(short_time("2026-11-17T13:45:09+08:00"), "11-17 13:45");
+        assert_eq!(short_time("2026-11-17T13:45"), "11-17 13:45");
+
+        // Byte index 5 lies inside the CJK character; an old
+        // [5..10] slice used to panic when byte 10 happened to be 'T'.
+        let malicious = format!("aaaa你bbbT{}", "x".repeat(20));
+        assert_eq!(malicious.as_bytes()[10], b'T');
+        assert_eq!(short_time(&malicious), malicious);
+
+        for malformed in [
+            "2026-😀-17T13:45:00",
+            "2026-11-17T13:😀00",
+            "abcdefghijT12:34:56",
+            "2026/11/17T13:45",
+            "2026-11-17 13:45",
+            "2026-11-17T13:4",
+            "",
+        ] {
+            assert_eq!(short_time(malformed), malformed, "must preserve bad stamp");
+        }
+    }
+
 
 
     /// 「补一条兼容连接」：默认只有一颗入口；点一下先问，确认后才发长命令。

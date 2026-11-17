@@ -31,6 +31,204 @@ use std::path::{Path, PathBuf};
 /// 运行时创建的文件所有者是 `BUILTIN\Administrators`，`OW` 与 `BA` 两条都覆盖到。
 const OWNER_ONLY_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)";
 
+/// 原子创建私有的提权 IPC 目录与文件。
+///
+/// Windows 必须把受保护 DACL 作为 CreateDirectoryW/CreateFileW 的创建参数；
+/// 旧的「先 create，再 SetNamedSecurityInfoW」存在可抢打开句柄的竞态窗口。
+/// 其它平台只用于测试，不参与生产 Windows 提权。
+#[cfg(windows)]
+fn with_private_creation_attributes<T>(
+    operation: impl FnOnce(&windows_sys::Win32::Security::SECURITY_ATTRIBUTES) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    let sddl: Vec<u16> = OWNER_ONLY_SDDL.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(), SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut(),
+        )
+    } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let result = operation(&attributes);
+    unsafe { LocalFree(descriptor as HLOCAL); }
+    result
+}
+
+/// 若已存在同名目录，必须失败；绝不进入攻击者提前准备的目录。
+pub fn create_private_ipc_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        return with_private_creation_attributes(|attributes| {
+            if unsafe { CreateDirectoryW(wide.as_ptr(), attributes) } == 0 {
+                Err(std::io::Error::last_os_error())
+            } else { Ok(()) }
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::create_dir(path)?;
+        protect_ipc_directory(path)
+    }
+}
+
+/// 原子创建受保护的空请求/回执文件，供原权限用户与高权限子进程协作。
+pub fn create_private_ipc_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_SHARE_DELETE,
+        };
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        return with_private_creation_attributes(|attributes| {
+            const GENERIC_READ_WRITE: u32 = 0x8000_0000 | 0x4000_0000;
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(), GENERIC_READ_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let file = std::fs::OpenOptions::new().read(true).write(true)
+            .create_new(true).open(path)?;
+        if let Err(e) = tighten(path) { drop(file); let _ = std::fs::remove_file(path); return Err(e); }
+        Ok(file)
+    }
+}
+
+/// 创建后、写入任何提权请求前，保护一次性 Guard IPC 目录。
+/// 默认 TEMP 下可能继承过宽的 ACE：禁止继承，只允许所有者、管理员与 SYSTEM。
+pub fn protect_ipc_directory(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(std::io::Error::other("提权 IPC 目录必须是实体目录"));
+    }
+    #[cfg(windows)]
+    { restrict(path) }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(any(windows, unix)))]
+    { Err(std::io::Error::other("当前系统不支持受保护的 IPC 目录")) }
+}
+
+/// SEC-10：提权端**重新读回**一次性 IPC 的真实 Windows DACL。
+///
+/// 在低权限父进程创建后直到 UAC 子进程读取前，任何异常 ACL 修改都必须
+/// fail closed。只接受创建 helper 生成的三条显式 full-access ACE；不得有
+/// 继承项、额外普通用户或重复 ACE。此检查不代替请求摘要、reparse 和句柄校验。
+#[cfg(windows)]
+pub fn verify_private_ipc_acl(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(), std::ptr::null_mut(),
+            std::ptr::null_mut(), std::ptr::null_mut(), &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() {
+        return Err(format!("Guard IPC DACL 无法读回（{}）：状态 {status}", path.display()));
+    }
+    let mut rendered: *mut u16 = std::ptr::null_mut();
+    let mut len = 0u32;
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION,
+            &mut rendered, &mut len,
+        )
+    };
+    let acl = if ok != 0 && !rendered.is_null() {
+        // Windows API's returned length may include multiple trailing UTF-16 NULs.
+        // Strip only terminators; embedded NULs / unexpected ACL tokens still fail.
+        unsafe {
+            String::from_utf16_lossy(std::slice::from_raw_parts(rendered, len as usize))
+                .trim_end_matches('\0')
+                .to_owned()
+        }
+    } else {
+        unsafe {
+            if !rendered.is_null() { LocalFree(rendered as HLOCAL); }
+            LocalFree(descriptor as HLOCAL);
+        }
+        return Err("Guard IPC DACL 无法转换为 SDDL".into());
+    };
+    unsafe {
+        LocalFree(rendered as HLOCAL);
+        LocalFree(descriptor as HLOCAL);
+    }
+
+    let verification = (|| -> Result<(), String> {
+    let mut remaining = acl.strip_prefix("D:P")
+        .ok_or_else(|| "Guard IPC DACL 未禁止继承".to_string())?;
+    let mut seen = 0u8;
+    while !remaining.is_empty() {
+        if !remaining.starts_with('(') {
+            return Err("Guard IPC DACL 包含额外控制标记".into());
+        }
+        let close = remaining.find(')')
+            .ok_or_else(|| "Guard IPC DACL ACE 不完整".to_string())?;
+        let fields: Vec<&str> = remaining[1..close].split(';').collect();
+        if fields.len() != 6 || fields[0] != "A" || fields[1] != ""
+            || (fields[2] != "FA" && !fields[2].eq_ignore_ascii_case("0x1f01ff"))
+            || fields[3] != "" || fields[4] != ""
+        {
+            return Err("Guard IPC DACL 包含非授权或非完整权限 ACE".into());
+        }
+        let bit = match fields[5] {
+            "SY" => 1, "BA" => 2, "OW" => 4,
+            _ => return Err("Guard IPC DACL 包含额外账户或组".into()),
+        };
+        if seen & bit != 0 {
+            return Err("Guard IPC DACL 包含重复 ACE".into());
+        }
+        seen |= bit;
+        remaining = &remaining[close + 1..];
+    }
+    if seen != 7 {
+        return Err("Guard IPC DACL 缺少 SYSTEM/Administrators/Owner Rights".into());
+    }
+    Ok(())
+    })();
+    verification.map_err(|reason| format!("{reason}; 当前 Windows DACL = {acl}"))
+}
+
 /// 原子写一个含秘密的文本文件：临时文件 → 收紧 → 写入 → 落盘 → 改名。
 ///
 /// 失败时删掉临时文件，**不留半成品**。返回值由调用方决定文案（CLI 与界面各有各的措辞）。
@@ -265,12 +463,145 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn privileged_ipc_objects_have_secure_acl_at_creation() {
+        let parent = temp_dir("ipc-atomic-parent");
+        grant_test_inheritable_users_modify(&parent);
+        let dir = parent.join("private");
+        create_private_ipc_dir(&dir).unwrap();
+        let req = dir.join("req.json");
+        let reply = dir.join("res.json");
+        let _req_handle = create_private_ipc_file(&req).unwrap();
+        let _reply_handle = create_private_ipc_file(&reply).unwrap();
+        assert!(create_private_ipc_dir(&dir).is_err());
+        assert!(create_private_ipc_file(&req).is_err());
+        for item in [&dir, &req, &reply] {
+            let acl = dacl_sddl(item);
+            assert!(acl.starts_with("D:P"), "must be protected from creation: {acl}");
+            for principal in [";;;SY)", ";;;BA)", ";;;OW)"] {
+                assert!(acl.contains(principal), "missing {principal}: {acl}");
+            }
+            assert!(!acl.contains(";;;AU)") && !acl.contains(";;;BU)"),
+                "untrusted users must never receive an inherited ACE: {acl}");
+        }
+        drop(_req_handle);
+        drop(_reply_handle);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn privileged_ipc_directory_has_no_inherited_acl() {
+        let dir = temp_dir("guard-ipc");
+        protect_ipc_directory(&dir).unwrap();
+        let acl = acl_of(&dir);
+        assert!(!acl.contains("(I)"), "IPC 目录不允许继承其他账户写权限：{acl}");
+        assert!(!acl.contains("Authenticated Users"), "{acl}");
+        assert!(!acl.contains("BUILTIN\\Users"), "{acl}");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 用 Win32 直接把受保护 DACL 读回为不依赖系统界面语言的 SDDL。
+    /// 这比只检查 icacls 的 (I) 更严格：还核对不同管理员 UAC 所需的 BA、
+    /// 原调用账户所需的 OW，以及本机 SYSTEM 的 SY。
+    #[cfg(windows)]
+    fn dacl_sddl(path: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        };
+        use windows_sys::Win32::Security::Authorization::{
+            GetNamedSecurityInfoW, ConvertSecurityDescriptorToStringSecurityDescriptorW,
+            SE_FILE_OBJECT, SDDL_REVISION_1,
+        };
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0, "GetNamedSecurityInfoW failed for {}", path.display());
+        assert!(!descriptor.is_null());
+
+        let mut rendered: *mut u16 = std::ptr::null_mut();
+        let mut len = 0u32;
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION,
+                &mut rendered, &mut len,
+            )
+        };
+        assert_ne!(ok, 0, "ConvertSecurityDescriptorToStringSecurityDescriptorW failed");
+        assert!(!rendered.is_null());
+        let value = unsafe {
+            String::from_utf16_lossy(std::slice::from_raw_parts(rendered, len as usize))
+        };
+        unsafe {
+            LocalFree(rendered as HLOCAL);
+            LocalFree(descriptor as HLOCAL);
+        }
+        value
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guard_ipc_dacl_explicitly_grants_original_owner_admins_and_system() {
+        let dir = temp_dir("guard-cross-account");
+        protect_ipc_directory(&dir).unwrap();
+        let request = dir.join("req.json");
+        let reply = dir.join("res.json");
+        std::fs::File::create(&request).unwrap();
+        std::fs::File::create(&reply).unwrap();
+        tighten(&request).unwrap();
+        tighten(&reply).unwrap();
+
+        for item in [&dir, &request, &reply] {
+            let acl = dacl_sddl(item);
+            assert!(acl.starts_with("D:P"), "{} lacks protected DACL: {acl}", item.display());
+            for principal in [";;;SY)", ";;;BA)", ";;;OW)"] {
+                assert!(acl.contains(principal),
+                    "{} missing {principal} on explicit DACL: {acl}", item.display());
+            }
+            assert!(!acl.contains(";;;AU)") && !acl.contains(";;;BU)"),
+                "{} grants permissions to ordinary users: {acl}", item.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
     fn acl_of(path: &Path) -> String {
         let output = std::process::Command::new("icacls")
             .arg(path)
             .output()
             .expect("icacls 必须可用（Windows 自带）");
         String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    /// 让测试自己的随机目录**显式拥有宽松可继承的旧版 ACL**。
+    /// GitHub Windows Runner 的 %TEMP% 可能天然禁止继承，因此不能把
+    /// "普通新建文件一定有 (I)" 当成测试前提。
+    /// 仅用于临时测试目录，正式产品逻辑不会调用。
+    #[cfg(windows)]
+    fn grant_test_inheritable_users_modify(dir: &Path) {
+        let output = std::process::Command::new("icacls")
+            .arg(dir)
+            .arg("/grant")
+            .arg("*S-1-5-11:(OI)(CI)(M)")
+            .output()
+            .expect("Windows runner 必须提供 icacls");
+        assert!(output.status.success(),
+            "无法在隔离测试目录建立旧版宽松 ACL：{}",
+            String::from_utf8_lossy(&output.stderr));
     }
 
     /// 新写的私钥文件：只有管理员/SYSTEM/所有者能碰，而且不再继承父目录的 ACE。
@@ -305,6 +636,9 @@ mod tests {
     #[test]
     fn tightening_closes_a_file_that_inherited_the_loose_acl() {
         let dir = temp_dir("tighten");
+        // 真实构造旧版 Authenticated Users:(M) 继承权限，而非假定
+        // Windows Runner 的用户 TEMP 目录本来就有松 ACL。
+        grant_test_inheritable_users_modify(&dir);
         let path = dir.join("client.conf");
         std::fs::write(&path, "PrivateKey = abc").unwrap();
         let before = acl_of(&path);
@@ -337,6 +671,9 @@ mod tests {
     #[test]
     fn the_root_scan_covers_all_three_private_key_files() {
         let root = temp_dir("root");
+        // 创建受控的旧安装目录宽 ACL：确保四个文件**确实都**
+        // 继承 Authenticated Users 的写权限，回归才有安全意义。
+        grant_test_inheritable_users_modify(&root);
         let server = root.join("servers").join("9f1c2a44-0b7d-4c1e-9a2b-3c4d5e6f7a8b");
         let lines = root.join("lines");
         std::fs::create_dir_all(&server).unwrap();
@@ -356,6 +693,8 @@ mod tests {
         for path in [&conf, &key, &line] {
             let acl = acl_of(path);
             assert!(!acl.contains("(I)"), "{} 没被收紧：\n{acl}", path.display());
+            assert!(!acl.contains("Authenticated Users"),
+                "{} 仍泄露给旧版宽松账户组：\n{acl}", path.display());
         }
         // config.json 不在私钥落点名单里：不收紧，也不该被创建/删除。
         let plain_acl = acl_of(&plain);
