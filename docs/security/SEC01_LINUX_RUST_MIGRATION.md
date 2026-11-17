@@ -122,3 +122,10 @@
 - CLI 使用原 SEC-08 进程互斥锁、保护的 LedgerStore、Linux `wg show ... allowed-ips` 和仅 root 可读的 `wg.conf` 三份读回；出错统一拒绝，合法结果只显示 InviteId、Pending/Revoking 阶段、只读恢复建议和 live/config 存在布尔值。保护锁文件可能会在受保护目录内新建，其他持久状态和 WG 不修改；不声称是真正的零写入进程。
 - 同代码 HEAD `1224512392e95f0e17d70b9160817ba323a41207` 的 [Linux Rust CI #44051677137](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44051677137)：Completed/Success，91 现有库回归+5 CLI 测试成功，非 root 真实 binary 运行收到 exit 2 / root required；没有演练 root+真实 WG 的成功路径，也没有测试真实设备撤销防重放。
 - 上线前必须另行完成真实隔离 Linux namespace 中 root 读回、权限/失败注入、显式二次审批+不可重放 ticket、可信签名/迁移以及实际 Python receiver 替换；不合并到 main、不关闭 SEC-01 P0。
+
+
+## 第十阶段：真实 Linux WG netns 内核读回专项（CI 隔离，无生产部署）
+
+- 独立 Rust root-only 诊断功能 [Draft PR #7](https://github.com/weixiaochuchen618-debug/spidervpn/pull/7) 新增 `server-rs/tests/wg_namespace_e2e.rs`，编译由 `linux-netns-acceptance` feature 和专属工作流 job 明确开启，防止常规非 root 运行尝试修改宿主网卡。此 job 在 GitHub 临时 VM 上创建 disposable netns+WG 接口，受保护 `/etc/wireguard/spiderci0.conf`，测试结束移除。Rust CLI 本身只读、需 root；写状态/内核 peer 的部分全部仅由专属测试夹具和已有经验证测试 API 执行。
+- [Linux CI #44062802733](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44062802733) 与 `5a8eb6047c1f1e3074fe66a075e9d295c0054a32` 一致，Completed/Success：lib 91 + CLI 5 + actual kernel netns 1，均 0 failed/0 ignored；此前因 Cargo 可执行文件自定义目录定位错误与真实日期期满夹具而失败的 CI 被完整保留，未跳过失败。严格 `--locked`/`-D warnings`。
+- **仍不具备生产可操作的安全修复链**：本集成测试证实只读诊断+已完成终态补写在真实内核 fixture 可运行，不能证明 root-only 显式审批身份、安全 `RecoveryIo` 生产实现、真服务器 TLS/旧消费请求迁移、Windows 管理端同步或外部 root 不合作并发安全。先完善审核与可信迁移，再安排隔离 VPS 部署/回滚。SEC-01 P0 保持未修复。
