@@ -144,3 +144,11 @@
 - 输出仅 `ProofReport`，无新 `Grant`、no import、no WG mutation。旧记录缺 RequestDigest、签名未覆盖 RecipientJwkDigest 及旧撤销状态不能从旧授权凭空推断；仍需原签名设备请求和可信实时 WG/ledger 迁移。Python 只用于生成跨实现的独立测试签名夹具，绝不作为新生产验签。
 - 当前候选 HEAD `4ca1c308688af5e9ce3785dd0da3fcac711de4bf`，对应 Linux [#44072823025](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44072823025) 与 Windows [MSVC #44072823427](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44072823427) [GNU #44072823056](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44072823056) 必须按同 SHA 完成结果登记。之前因测试 E0502 与签名夹具 12 字符丢失的两个红 CI 保留；修正后 `3ff51bf3` 的 [Linux #44072627523](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44072627523) 已两 Job Success、97 library + 5 CLI + 1 真实 WG netns 通过。
 - 真安全验收尚远：RS256 正向用例不代表能将旧 Python receiver 安全升级；需分离签名授权、设备原始请求、权限和实机撤销 readback 的各自证据链，完成 root-only 可信导入与完整在线 Rust TLS/HTTP 切换之后才可收 SEC-01。
+
+
+## 第十三阶段：原始 PairRequest JWS / RecipientJwkDigest / 七行请求摘要离线证明（尚未入库）
+
+- [Draft PR #10](https://github.com/weixiaochuchen618-debug/spidervpn/pull/10) 增加 Rust `server-rs/src/legacy_request_proof.rs`。原授权 SignedAuthorization 的管理 RS256 签名与旧设备 PairRequest 的设备 RSA RS256 签名分开验；重算 `TC-ClientRequest-v1` 七行 SHA-256，并与双方签入的 RequestDigest 及旧记录标识严格对齐。同时要求**独立认证的** RecipientJwkDigest 输入，核对原 JWS 的规范 RSA JWK SHA256 和旧 Consumed 记录中的值；不能从 JWS/旧记录自身读取“独立”验证值。
+- 旧 Python 的 `SignedAuthorization` 签名不包含 `RecipientJwkDigest`，它在旧 `invites.json` 是普通可变字段；缺少受信第三方身份证据时，这条新的离线 Rust 功能依然会 FAIL-CLOSED，不能仅看旧签名正确就从已撤销状态补建 WG peer。代码只返回受限审计报告（恒 `blocks_any_authorization_import`），不写账本、网络配置和 HTTP。
+- 测试专用独立 Python cryptography 双签名 fixture 不含私钥。当前代码 SHA `e4b8b62fbec4e30bfb10c15f107bb21e2fe1f55f`；同 SHA Linux [#44074337077](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337077) Rust 核心 102 library + 5 CLI + 原管理员终态 5 用例已成功，netns 完整 workflow 与 Windows MSVC/GNU 仍须查结论，不得把相邻 SHA 的绿当结论。
+- 尚待真实历史 revoke tombstone + Rust TLS/JWE + Python receiver 排他切换、VPS 回滚演练；继续以 SEC-01 P0 **未生产修复** 登记。
