@@ -333,3 +333,10 @@
 - 代码新增 opt-in `linux-legacy-retire` Rust `legacy_retire.rs`（默认关闭，尚无 CLI/HTTP 或生产调用）：受限 root-owned 0700 legacy 目录/0600 单链接脚本检查、旧服务永久 mask + inactive + 无进程 + 无 TCP4/TCP6 socket 预检；先构建 root-only 临时目录，用 Linux `renameat2(RENAME_EXCHANGE)` **一次原子交换**旧脚本与私有目录，旧固定脚本路径当下成为不能被 shell `>` 重新建立的目录；原字节通过 `RENAME_NOREPLACE` 转存受保护的 `.tc-pair.py.retired`，fsync。交换后出错不自动恢复，避免重新开放旧写者。证明仅说明旧固定路径暂时退役，不等于 root 不可重写或生产用户授权。
 - [Linux #44079535756](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44079535756) 与该 SHA 一致，两 Job Completed/Success：113 常规 Rust library、5 CLI、5 terminal policy、11 cutover + 新 **5 真实文件系统原子交换/失败恢复专项**通过，real Linux kernel WG netns 1 passed/0 failed/ignored，严格 --locked/-D warnings。Windows [MSVC #44079535866](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44079535866) / [GNU #44079535704](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44079535704) 下次须核对同 SHA 全终态。
 - 当前 **尚未**在 Linux root 真实 server 将脚本替换，也未隔离旧 Python HTTP 与 SSH 全写路径；不自动导入旧 Consumed、不开 Rust HTTP listener、不改 UI/连接/WFP。真正上线需可信旧身份/撤销历史、root 管理审核、完整 A/B 与回滚演练，SEC-01/02/08 + Issue #5 仍 Open，全 PR Draft、main `857ea759` 不动。细节 [Backlog D.34](./REMEDIATION_BACKLOG.md)。
+
+
+## 37. PR #13 原子退役真实 root Linux 通过，Windows 待验（2026-11-17）
+
+- 代码 HEAD 更新为 **`0fed0b6488de0656d2455a5b0bc1ce90328c7b9f`**。原子交换只是进程运行时没有路径缺失窗口；只有成功 `fsync` 后才可把对应目录更新作为持久事实，若之前断电仍可能回滚，重启必须 fresh inspect。早期文档的“交换即使瞬间断电也必然保持退役”不是经过验证的结论，已在迁移文档修正。
+- 同 SHA [Linux workflow #44080116892](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44080116892) 两 Job Completed/Success：113 library + 5 CLI + 5 root TTY + 11 cutover + 5 offline retire 通过；真实 WG netns 1 pass，**额外 Linux runner sudo/root 运行实际文件系统原子退役专项 5 pass**，0 failed/ignored；strict --locked / -D warnings。测试只操作 CI /tmp 临时目录，**并非真实 VPS 生产退役/真实电源故障**。
+- 本 SHA Windows [MSVC #44080116790](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44080116790)、[GNU #44080116766](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44080116766) 当时尚未 Completed/Success；继续跟进。PR #13 Draft，base #12，main 未改；可信旧撤销/tombstone、旧 SSH 客户端禁写、正式 Rust TLS 配对与生产重启/rollback 全部依然阻塞 SEC-01/02/08。
