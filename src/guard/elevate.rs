@@ -206,32 +206,115 @@ pub fn is_elevated() -> bool {
 // ---------------------------------------------------------------------------
 
 fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    use std::io::Write;
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     if bytes.len() > MAX_IPC_FILE_BYTES {
         return Err(format!("请求/回复超过 {} 字节上限", MAX_IPC_FILE_BYTES));
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("建临时目录失败：{e}"))?;
+    // 只允许本次调用写一次：不存在“上一笔的回复”可以覆盖/复用。
+    // 先创建空文件，再收紧 DACL，最后才写 JSON；不留敏感窗口。
+    let mut file = std::fs::OpenOptions::new()
+        .write(true).create_new(true).open(path)
+        .map_err(|e| format!("建立独立临时文件失败：{e}"))?;
+    if let Err(err) = crate::secretfile::tighten(path) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("提权临时文件 ACL 收紧失败：{err}"));
     }
-    std::fs::write(path, bytes).map_err(|e| format!("写临时文件失败：{e}"))
+    if let Err(err) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("写临时文件失败：{err}"));
+    }
+    Ok(())
 }
 
 fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("读临时文件失败：{e}"))?;
-    if meta.len() as usize > MAX_IPC_FILE_BYTES {
-        return Err(format!("临时文件超过 {} 字节上限", MAX_IPC_FILE_BYTES));
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("读临时文件失败：{e}"))?;
+    if !meta.file_type().is_file() || meta.len() == 0
+        || meta.len() as usize > MAX_IPC_FILE_BYTES
+    {
+        return Err("临时请求必须是非空、大小受限的普通文件（不允许链接）".into());
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("读临时文件失败：{e}"))?;
+    if text.len() > MAX_IPC_FILE_BYTES {
+        return Err("临时文件在读取期间超出大小上限".into());
+    }
     serde_json::from_str(&text).map_err(|e| format!("临时文件不是合法 JSON：{e}"))
 }
 
-fn temp_pair(nonce: &str) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("SpiderVPN-guard-{}", ci_safe(nonce)));
-    (dir.join("req.json"), dir.join("res.json"))
+/// 受保护的独立 IPC 会话。只清理本会话创建的两个文件与目录，
+/// 不能对可能被替换的路径递归 remove_dir_all。
+struct GuardIpcFiles {
+    dir: PathBuf,
+    req: PathBuf,
+    res: PathBuf,
+}
+impl Drop for GuardIpcFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.req);
+        let _ = std::fs::remove_file(&self.res);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+impl GuardIpcFiles {
+    fn create() -> Result<Self, String> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut token = [0u8; 16];
+        SystemRandom::new().fill(&mut token)
+            .map_err(|_| "无法生成安全的 Guard IPC 会话标识".to_string())?;
+        let suffix: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("SpiderVPN-guard-{suffix}"));
+        // create_dir 不会重用已有目录；任何碰撞或恶意预占都拒绝。
+        std::fs::create_dir(&dir).map_err(|e| format!("创建独立提权目录失败：{e}"))?;
+        let files = Self { req: dir.join("req.json"), res: dir.join("res.json"), dir };
+        crate::secretfile::protect_ipc_directory(&files.dir)
+            .map_err(|e| format!("保护提权请求目录失败：{e}"))?;
+        Ok(files)
+    }
 }
 
-fn ci_safe(text: &str) -> String {
-    text.chars().filter(|c| c.is_ascii_alphanumeric()).take(32).collect()
+fn validate_guard_ipc_paths(req: &Path, res: &Path) -> Result<(), String> {
+    use std::path::Component;
+    if !req.is_absolute() || !res.is_absolute() {
+        return Err("提权请求与回复必须使用绝对路径".into());
+    }
+    if req.file_name().and_then(|v| v.to_str()) != Some("req.json")
+        || res.file_name().and_then(|v| v.to_str()) != Some("res.json")
+        || req.parent() != res.parent()
+    {
+        return Err("提权请求与回复必须位于同一独立目录，且文件名固定".into());
+    }
+    if req.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        || res.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err("提权 IPC 路径不能包含相对跳转".into());
+    }
+    let dir = req.parent().ok_or("提权请求缺少父目录")?;
+    let name = dir.file_name().and_then(|v| v.to_str()).unwrap_or("");
+    let Some(hex) = name.strip_prefix("SpiderVPN-guard-") else {
+        return Err("未知 Guard IPC 目录命名".into());
+    };
+    if hex.len() != 32 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Guard IPC 目录必须使用独立的 128-bit 随机标识".into());
+    }
+    if !std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("读取提权目录失败：{e}"))?.file_type().is_dir()
+    {
+        return Err("Guard IPC 目录不能是链接或非目录对象".into());
+    }
+    #[cfg(windows)]
+    {
+        use super::identity::{reparse_chain, IdentityEnv};
+        let env = super::wfp_win::SystemIdentityEnv::new();
+        if reparse_chain(req).iter().any(|p| env.is_reparse_point(p))
+            || reparse_chain(res).iter().any(|p| env.is_reparse_point(p))
+        {
+            return Err("提权 IPC 路径包含目录联接或重解析点".into());
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -247,13 +330,12 @@ fn ci_safe(text: &str) -> String {
 /// （2026-11-06，r25）。`tests/acceptance-guard.ps1` 的 A2/A3 曾按那条意图写预期，
 /// 因此把「非提权 verify 会弹 UAC → 点否 = Declined」误判成 `NoPermission`。
 pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
-    let (req_path, res_path) = temp_pair(&req.nonce);
-    // 上次残留（同 nonce 几乎不可能，但删掉更干净）
-    let _ = std::fs::remove_file(&res_path);
-    write_json_file(&req_path, req).map_err(ElevateError::SpawnFailed)?;
+    let files = GuardIpcFiles::create().map_err(ElevateError::SpawnFailed)?;
+    let (req_path, res_path) = (&files.req, &files.res);
+    write_json_file(req_path, req).map_err(ElevateError::SpawnFailed)?;
 
     let exe = std::env::current_exe().map_err(|e| ElevateError::SpawnFailed(e.to_string()))?;
-    let code = run_elevated(&exe, &req_path, &res_path)?;
+    let code = run_elevated(&exe, req_path, res_path)?;
 
     // 先看退出码：非 0 一律失败。**失败也要读回复**——子进程把真正的原因写在
     // `notes` 里（例如 `WfpError::InvalidState`），只报退出码等于把唯一线索扔掉。
@@ -264,7 +346,6 @@ pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
                 let joined = reply.notes.join("；");
                 if joined.trim().is_empty() { None } else { Some(joined) }
             });
-        let _ = std::fs::remove_dir_all(req_path.parent().unwrap_or(Path::new(".")));
         return Err(match note {
             Some(note) => ElevateError::ChildFailedNote(code, note),
             None => err,
@@ -273,18 +354,15 @@ pub fn apply(req: &GuardRequest) -> Result<GuardReply, ElevateError> {
     let reply: GuardReply = match read_json_file(&res_path) {
         Ok(v) => v,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(req_path.parent().unwrap_or(Path::new(".")));
-            return Err(ElevateError::BadReply(e));
+                return Err(ElevateError::BadReply(e));
         }
     };
     // 回复里的证据必须带来源（A19：安装 API 的返回值不算证据）
     if let Ok(ev) = &reply.result {
         if ev.source == super::state::GuardSource::None {
-            let _ = std::fs::remove_dir_all(req_path.parent().unwrap_or(Path::new(".")));
-            return Err(ElevateError::BadReply("回复缺少证据来源".to_string()));
+                return Err(ElevateError::BadReply("回复缺少证据来源".to_string()));
         }
     }
-    let _ = std::fs::remove_dir_all(req_path.parent().unwrap_or(Path::new(".")));
     Ok(reply)
 }
 
@@ -401,6 +479,11 @@ fn validate_elevated_programs(
 /// **只接受白名单动作**；任何解析/校验失败都写「失败回复」并返回非 0——
 /// 退出码是权威，回复只是给人看的补充。
 pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::GuardBackend) -> i32 {
+    // 任何请求文件读取、错误回复写入之前验证固定路径与 reparse 链。
+    // 未验证的外部路径不能被提权进程当成“错误回复位置”写入。
+    if validate_guard_ipc_paths(req_path, res_path).is_err() {
+        return 2;
+    }
     let req: GuardRequest = match read_json_file(req_path) {
         Ok(r) => r,
         Err(e) => {
@@ -671,6 +754,30 @@ mod tests {
         for e in all {
             assert!(!e.message().is_empty());
         }
+    }
+
+    #[test]
+    fn guarded_ipc_rejects_arbitrary_paths_and_reused_names() {
+        let files = GuardIpcFiles::create().unwrap();
+        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_ok());
+        let bad = files.dir.join("other.json");
+        assert!(validate_guard_ipc_paths(&files.req, &bad).is_err());
+        assert!(validate_guard_ipc_paths(&files.req, &files.dir.join("req.json")).is_err());
+        assert!(validate_guard_ipc_paths(&files.req, &std::env::temp_dir().join("res.json")).is_err());
+        assert!(files.dir.file_name().unwrap().to_string_lossy().len() >= 48);
+    }
+
+    #[test]
+    fn one_shot_ipc_cannot_overwrite_existing_request_or_response() {
+        let files = GuardIpcFiles::create().unwrap();
+        let data = serde_json::json!({"Safe":true});
+        write_json_file(&files.req, &data).unwrap();
+        assert!(write_json_file(&files.req, &data).is_err(),
+            "提权请求不允许覆盖或重放");
+        assert_eq!(read_json_file::<serde_json::Value>(&files.req).unwrap(), data);
+        std::fs::write(&files.res, b"{}").unwrap();
+        assert!(write_json_file(&files.res, &data).is_err(),
+            "子进程不能覆盖请求者预先布置的回复文件");
     }
 
     #[test]
