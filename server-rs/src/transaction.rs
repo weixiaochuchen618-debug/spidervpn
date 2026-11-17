@@ -55,7 +55,7 @@ pub fn retry_read_only(
     verified: &Claims,
 ) -> Result<Grant, TransactionError> {
     let observed = peers.snapshot().map_err(TransactionError::WireGuard)?;
-    store.view().retry(verified, Some(&observed)).cloned()
+    store.view()?.retry(verified, Some(&observed)).cloned()
         .map_err(TransactionError::Readback)
 }
 
@@ -179,10 +179,10 @@ mod tests {
         assert_eq!(wg.add_calls, 1, "retry must never add a peer");
         revoke(&mut store, &mut wg, I).unwrap();
         assert_eq!(wg.remove_calls, 1);
-        assert!(matches!(store.view().state(I), Some(InviteState::Revoked(_))));
+        assert!(matches!(store.view().unwrap().state(I), Some(InviteState::Revoked(_))));
         drop(store);
         let restarted = open(&p);
-        assert!(matches!(restarted.view().state(I), Some(InviteState::Revoked(_))));
+        assert!(matches!(restarted.view().unwrap().state(I), Some(InviteState::Revoked(_))));
         assert!(matches!(retry_read_only(&restarted, &mut wg, &claim(I)),
             Err(TransactionError::Readback(Refusal::Revoked))));
         assert_eq!(wg.add_calls, 1);
@@ -201,7 +201,7 @@ mod tests {
             Err(TransactionError::WireGuard(_))));
         drop(store);
         let mut restarted = open(&p);
-        assert!(matches!(restarted.view().state(I), Some(InviteState::Pending(_))));
+        assert!(matches!(restarted.view().unwrap().state(I), Some(InviteState::Pending(_))));
         wg.fail_add = false;
         assert!(matches!(enroll(&mut restarted, &mut wg, claim(I), 101, pool()),
             Err(TransactionError::Store(StoreError::Policy(Refusal::RecoveryRequired)))));
@@ -222,12 +222,12 @@ mod tests {
             Err(TransactionError::WireGuard(_))));
         drop(store);
         let mut restarted = open(&p);
-        assert!(matches!(restarted.view().state(I), Some(InviteState::Revoking(_))));
+        assert!(matches!(restarted.view().unwrap().state(I), Some(InviteState::Revoking(_))));
         assert!(matches!(retry_read_only(&restarted, &mut wg, &claim(I)),
             Err(TransactionError::Readback(Refusal::Revoked))));
         wg.fail_remove = false;
         revoke(&mut restarted, &mut wg, I).unwrap();
-        assert!(matches!(restarted.view().state(I), Some(InviteState::Revoked(_))));
+        assert!(matches!(restarted.view().unwrap().state(I), Some(InviteState::Revoked(_))));
         assert_eq!(wg.add_calls, 1);
         drop(restarted);
         fs::remove_dir_all(p).unwrap();
@@ -243,12 +243,12 @@ mod tests {
         assert!(matches!(enroll(&mut store, &mut wg, claim(I), 100, pool()),
             Err(TransactionError::WireGuard(_))));
         assert_eq!(wg.add_calls, 0);
-        assert!(matches!(store.view().state(I), Some(InviteState::Open)));
+        assert!(matches!(store.view().unwrap().state(I), Some(InviteState::Open)));
         wg.fail_snapshot = false;
         wg.wrong_readback = true;
         assert!(matches!(enroll(&mut store, &mut wg, claim(I), 100, pool()),
             Err(TransactionError::Store(StoreError::Policy(Refusal::PeerMissing)))));
-        assert!(matches!(store.view().state(I), Some(InviteState::Pending(_))));
+        assert!(matches!(store.view().unwrap().state(I), Some(InviteState::Pending(_))));
         assert_eq!(wg.add_calls, 1);
         drop(store);
         fs::remove_dir_all(p).unwrap();
