@@ -12,7 +12,7 @@
 
 use crate::{claims_valid, Grant, InviteState, Peer};
 use crate::ledger_disk::{LedgerStore, StoreError};
-use crate::wg_conf_audit::{require_exact_match, ConfigError};
+use crate::wg_conf_audit::{read_verified_snapshot, require_exact_match, ConfigError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryStage { PendingAdd, RevokingRemove }
@@ -118,6 +118,48 @@ pub fn inspect_recovery(
         config_has_peer: config == Presence::Exact,
         kernel_has_peer: kernel == Presence::Exact,
     })
+}
+
+/// Terminal-only local reconciliation. This cannot create or remove a WG
+/// peer. Use the protected live+config triple reader; caller-provided peer
+/// lists are never trusted to finalize a persisted authority ledger.
+#[derive(Debug)]
+pub enum FinalizeError {
+    Readback(ConfigError),
+    Inspection(RecoveryError),
+    NotReadyForFinalization,
+    Store(StoreError),
+}
+fn finalize_from_verified_peers(
+    store: &mut LedgerStore, invite_id: &str, now_unix: i64, peers: &[Peer],
+) -> Result<RecoveryStage, FinalizeError> {
+    let status = inspect_recovery(store, invite_id, peers, peers, now_unix)
+        .map_err(FinalizeError::Inspection)?;
+    if status.action != RecoveryAction::VerifyAndFinalize {
+        return Err(FinalizeError::NotReadyForFinalization);
+    }
+    match status.stage {
+        RecoveryStage::PendingAdd => {
+            store.update(|ledger| ledger.confirm_consumed(invite_id, Some(peers)))
+                .map_err(FinalizeError::Store)?;
+        }
+        RecoveryStage::RevokingRemove => {
+            store.update(|ledger| ledger.confirm_revocation(invite_id, Some(peers)))
+                .map_err(FinalizeError::Store)?;
+        }
+    }
+    Ok(status.stage)
+}
+
+/// Only permitted complete-state recovery: inspect a fresh trusted live+
+/// wg.conf triple snapshot and fsync the missing final ledger transition.
+/// This NEVER calls wg set, writes wg.conf or creates a new invitation.
+/// Absent/mismatched peer states stop here until separate local approval.
+pub fn finalize_stable_prepared(
+    store: &mut LedgerStore, interface: &str, invite_id: &str, now_unix: i64,
+) -> Result<RecoveryStage, FinalizeError> {
+    let peers = read_verified_snapshot(interface).map_err(FinalizeError::Readback)?;
+    finalize_from_verified_peers(store, invite_id, now_unix, &peers)
 }
 
 #[cfg(test)]
@@ -260,6 +302,49 @@ mod tests {
             RecoveryAction::VerifyAndFinalize);
         finish(dir,store);
     }
+    #[test]
+    fn verified_pending_with_both_peers_present_can_finalize_without_wg_command(){
+        let (dir,mut store,g)=fixture("finalize-add",false);
+        let x=[peer(&g)];
+        let stage=finalize_from_verified_peers(&mut store,INV,200,&x).unwrap();
+        assert_eq!(stage,RecoveryStage::PendingAdd);
+        assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Consumed(_))));
+        drop(store);
+        let restored=LedgerStore::open_existing(&dir,Duration::ZERO).unwrap();
+        assert!(matches!(restored.view().unwrap().state(INV),Some(InviteState::Consumed(_))));
+        finish(dir,restored);
+    }
+    #[test]
+    fn verified_revoking_with_both_peers_absent_can_finalize_and_keep_tombstones(){
+        let (dir,mut store,g)=fixture("finalize-remove",true);
+        let stage=finalize_from_verified_peers(&mut store,INV,700,&[]).unwrap();
+        assert_eq!(stage,RecoveryStage::RevokingRemove);
+        assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Revoked(_))));
+        assert!(store.view().unwrap().retry(&g.claims,Some(&[])).is_err());
+        finish(dir,store);
+    }
+    #[test]
+    fn partial_or_absent_pending_never_finalizes_without_admin_correction(){
+        let (dir,mut store,g)=fixture("not-ready",false);
+        let original=std::fs::read(dir.join("authority-ledger.json")).unwrap();
+        let x=[peer(&g)];
+        assert!(matches!(finalize_from_verified_peers(&mut store,INV,200,&[]),
+            Err(FinalizeError::NotReadyForFinalization)));
+        assert!(matches!(finalize_from_verified_peers(&mut store,INV,200,&x),
+            Ok(RecoveryStage::PendingAdd)));
+        // The preceding exact two-sided state is the only allowed case.
+        assert_ne!(std::fs::read(dir.join("authority-ledger.json")).unwrap(),original);
+        finish(dir,store);
+    }
+    #[test]
+    fn existing_revoked_state_cannot_be_finalized_again_as_pending(){
+        let (dir,mut store,_)=fixture("finalize-denied",true);
+        finalize_from_verified_peers(&mut store,INV,100,&[]).unwrap();
+        assert!(matches!(finalize_from_verified_peers(&mut store,INV,100,&[]),
+            Err(FinalizeError::Inspection(RecoveryError::NotRecoverableState))));
+        finish(dir,store);
+    }
+
     #[test]
     fn inspection_never_modifies_ledger_bytes_or_generation(){
         let (dir,store,g)=fixture("read-only",false);
