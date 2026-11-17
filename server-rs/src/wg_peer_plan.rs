@@ -55,7 +55,7 @@ impl std::fmt::Debug for Plan {
 impl Plan {
     /// Full config bytes including server secrets. Only pass to the future
     /// owner-only atomic writer; never print or send to an HTTP response.
-    pub fn config_bytes(&self) -> &[u8] { &self.bytes }
+    pub(crate) fn config_bytes(&self) -> &[u8] { &self.bytes }
     pub fn changed(&self) -> bool { self.changed }
     pub fn expected_peers(&self) -> &[Peer] { &self.expected_peers }
 }
