@@ -294,6 +294,83 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
+    /// 用 Win32 直接把受保护 DACL 读回为不依赖系统界面语言的 SDDL。
+    /// 这比只检查 icacls 的 (I) 更严格：还核对不同管理员 UAC 所需的 BA、
+    /// 原调用账户所需的 OW，以及本机 SYSTEM 的 SY。
+    #[cfg(windows)]
+    fn dacl_sddl(path: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        };
+        use windows_sys::Win32::Security::Authorization::{
+            GetNamedSecurityInfoW, ConvertSecurityDescriptorToStringSecurityDescriptorW,
+            SE_FILE_OBJECT, SDDL_REVISION_1,
+        };
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0, "GetNamedSecurityInfoW failed for {}", path.display());
+        assert!(!descriptor.is_null());
+
+        let mut rendered: *mut u16 = std::ptr::null_mut();
+        let mut len = 0u32;
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION,
+                &mut rendered, &mut len,
+            )
+        };
+        assert_ne!(ok, 0, "ConvertSecurityDescriptorToStringSecurityDescriptorW failed");
+        assert!(!rendered.is_null());
+        let value = unsafe {
+            String::from_utf16_lossy(std::slice::from_raw_parts(rendered, len as usize))
+        };
+        unsafe {
+            LocalFree(rendered as HLOCAL);
+            LocalFree(descriptor as HLOCAL);
+        }
+        value
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guard_ipc_dacl_explicitly_grants_original_owner_admins_and_system() {
+        let dir = temp_dir("guard-cross-account");
+        protect_ipc_directory(&dir).unwrap();
+        let request = dir.join("req.json");
+        let reply = dir.join("res.json");
+        std::fs::File::create(&request).unwrap();
+        std::fs::File::create(&reply).unwrap();
+        tighten(&request).unwrap();
+        tighten(&reply).unwrap();
+
+        for item in [&dir, &request, &reply] {
+            let acl = dacl_sddl(item);
+            assert!(acl.starts_with("D:P"), "{} lacks protected DACL: {acl}", item.display());
+            for principal in [";;;SY)", ";;;BA)", ";;;OW)"] {
+                assert!(acl.contains(principal),
+                    "{} missing {principal} on explicit DACL: {acl}", item.display());
+            }
+            assert!(!acl.contains(";;;AU)") && !acl.contains(";;;BU)"),
+                "{} grants permissions to ordinary users: {acl}", item.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(windows)]
     fn acl_of(path: &Path) -> String {
         let output = std::process::Command::new("icacls")
