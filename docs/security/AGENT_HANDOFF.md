@@ -318,3 +318,10 @@
 - 续作 [Draft PR #12](https://github.com/weixiaochuchen618-debug/spidervpn/pull/12)（base #11），HEAD `16c4176ed302871e2cb41787954a0f667f90d202`。保留 PR #11 系统层 root mask/inactive/dead 和 `/proc/<pid>/cmdline` 双重只读预检，进一步通过旧 Python root-only `server.json` 中规范的真实 `Port` 与 `Endpoint` 映射，前后两次读取完整 `/proc/net/tcp`、`/proc/net/tcp6`，凡 LIVE LISTEN socket 命中端口（即便脚本已改名）就拒绝。任意文件、所有权、字节长度、格式或快照漂移也拒绝。
 - `legacy_cutover.rs` 默认发版无此命令，opt-in `linux-cutover-preflight` 的报告依然不授予导入/新 HTTP 监听或 WireGuard 写操作；更不可信地推断旧 revoke 历史。新增实际 Linux `TcpListener` 动态端口内核观察 + 假 IPv4/IPv6 及坏记录和旧配置端口测试。Linux [#44077594144](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077594144) 核心 Job 113 library + 5 CLI + 5 admin policy + 11 cutover policy success（0 failed/ignored，`--locked`/`-D warnings`）；该工作流 netns Job 以及 [MSVC #44077593890](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077593890)、[GNU #44077593911](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077593911) 仍需查最终结论。
 - **下一优先项**：确立真正可审计的 root/systemd 切换栅栏，停止且防重启旧 Python 任何写入口，完成独立 revoke/tombstone 证据和旧账本转换逻辑的 fail-closed 设计；仅快照没有解决真实排他。当前 PR #12 不能合并 main 或关闭 SEC-01。主分支 main `857ea759`，Issue #5 OPEN，PR #3/#6/#7/#8/#9/#10/#11/#12 Draft。
+
+
+## 35. PR #12 真实内核双路径 Linux CI 完成验收（2026-11-17）
+
+- 当前 HEAD `16c4176ed302871e2cb41787954a0f667f90d202`，同 SHA [Linux #44077594144](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077594144) 两 Job Completed/Success。113 Rust lib tests、5 CLI、5 root TTY admin、11 cutover tests，内含 **真实 Linux `TcpListener`/proc/net/tcp 内核 LISTEN 检查**；另独立 WG netns 1 passed/0 failed/0 ignored。没有任何 WFP/UI 修改或 Python 生产接入。
+- 本轮 Windows [MSVC #44077593890](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077593890) / [GNU #44077593911](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44077593911) 当时仍运行中，须用 exact SHA 查询终态。下一工作重点是 root 测试 VPS 的 systemd 真实 mask + 同时阻断**旧 Python HTTP 和 SSH CLI**两种写者、旧 systemd unit 文件恢复/回滚，不能将双次只读快照变成不可重放切换审批。
+- 历史进度索引 [Backlog D.32-D.33](./REMEDIATION_BACKLOG.md)，Issue #5 Open，SEC-01/02/08 未完成，main `857ea759` 不合并。
