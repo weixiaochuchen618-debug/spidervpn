@@ -291,7 +291,18 @@ fn run<'a>(
     // 显式标注：`impl Into<Auth>` 的入参再 `.into()` 时，`Auth: Into<Auth>` 的
     // 恒等实现会让编译器无法唯一确定目标类型（E0283）。
     let auth: ssh::Auth<'a> = auth.into();
-    ssh::exec(target, auth, expected, command, TIMEOUT).map_err(explain)
+    // An independently fenced server must not be reactivated by this old
+    // client, including during digest probe, auto-upload, create, cancel,
+    // authorize-request or service restart. The guard runs in the same SSH
+    // command BEFORE any old side effect, with no extra round trip.
+    let protected = crate::legacy_writer_fence::guard_ssh_command(command);
+    let result = ssh::exec(target, auth, expected, &protected, TIMEOUT)
+        .map_err(explain)?;
+    if crate::legacy_writer_fence::remote_says_fenced(result.code, &result.stderr) {
+        return Err(Fault::new(crate::exit::CONFLICT,
+            "该服务器已进入旧配对写入禁用状态，禁止旧客户端重新上传或启动旧接收器；请使用经过验收的管理路径。"));
+    }
+    Ok(result)
 }
 
 /// 上传脚本。先比摘要：同一版本的脚本已经在服务器上时不再传，

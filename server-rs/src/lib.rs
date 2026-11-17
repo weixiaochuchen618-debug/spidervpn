@@ -30,6 +30,12 @@ pub mod legacy_signed;
 /// Independently pinned original PairRequest evidence, still never import.
 pub mod legacy_request_proof;
 
+// Cross-crate verification of the ACTUAL Windows SSH guard Rust source on
+// Linux. Test-only, never compiled into the pairing authority binary.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../src/legacy_writer_fence.rs"]
+mod windows_legacy_ssh_guard_tests;
+
 #[cfg(target_os="linux")]
 pub mod legacy_cutover;
 

@@ -46,6 +46,14 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+      - name: SEC-01 legacy Python SSH writer retirement gate (MSVC)
+        shell: pwsh
+        run: |
+          & cargo test --locked --bin spidervpn legacy_writer_fence::tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo test --locked --bin spidervpn old_wireguard_writers_refuse_retired_pairing_host_before_side_effects -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Rust integration tests (each integration target, no duplicate binary unit tests)
         shell: pwsh
         run: |

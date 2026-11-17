@@ -688,7 +688,7 @@ pub fn peer_script(spec: &Spec, client_public: &str) -> String {
     let Spec { interface, .. } = spec;
     format!(
         r#"set -eu
-umask 077
+{fence}umask 077
 IFACE='{interface}'
 CONF="/etc/wireguard/$IFACE.conf"
 KEY="/etc/wireguard/$IFACE.key"
@@ -744,6 +744,7 @@ echo "TC_SERVER_PUBLIC=$(printf '%s' "$(cat "$KEY")" | wg pubkey)"
 echo "TC_DONE=1"
 "#,
         client_ip = CLIENT_ADDRESS,
+        fence = crate::legacy_writer_fence::SHELL_DENY_PRELUDE,
     )
 }
 
@@ -850,7 +851,7 @@ pub fn revoke_script(spec: &Spec, public_key: &str) -> String {
     let Spec { interface, .. } = spec;
     format!(
         r#"set -eu
-umask 077
+{fence}umask 077
 IFACE='{interface}'
 CONF="/etc/wireguard/$IFACE.conf"
 KEY="/etc/wireguard/$IFACE.key"
@@ -891,6 +892,7 @@ echo "TC_PEERS=$PEERS"
 echo "TC_DONE=1"
 "#,
         drop_peer_awk = DROP_PEER_AWK,
+        fence = crate::legacy_writer_fence::SHELL_DENY_PRELUDE,
     )
 }
 
@@ -988,7 +990,7 @@ pub fn revoke_peer<'a>(
 pub fn uninstall_script(spec: &Spec) -> String {
     format!(
         r#"set -eu
-IFACE='{interface}'
+{fence}IFACE='{interface}'
 CONF_DIR='{conf_dir}'
 fail() {{ echo "TC_ERROR=$1"; shift; printf '%s\n' "$*" >&2; exit 1; }}
 [ "$(id -u)" = 0 ] || fail NotRoot '需要 root 权限。'
@@ -1023,6 +1025,7 @@ echo "TC_DONE=1"
 "#,
         interface = spec.interface,
         conf_dir = TRANSPORT_CONF_DIR,
+        fence = crate::legacy_writer_fence::SHELL_DENY_PRELUDE,
     )
 }
 
@@ -2147,7 +2150,17 @@ mod tests {
             !script.contains("transport.env"),
             "transport.env 是身份，不能删：{script}"
         );
-        assert!(!script.contains("/var/lib/tradechannel"), "审计与身份目录不能碰：{script}");
+        // The SEC-01 read-only retirement prelude MUST inspect the root
+        // path; forbidding the literal path anywhere would reject that
+        // necessary denial check. Remove only the exact, separately tested
+        // immutable read-only fence; the original uninstaller must still
+        // never mutate or even reference the legacy audit/identity tree.
+        let readonly_gate = crate::legacy_writer_fence::SHELL_DENY_PRELUDE;
+        assert_eq!(script.matches(readonly_gate).count(), 1,
+            "卸载必须且只能有一个经过验证的只读禁写门禁：{script}");
+        let uninstaller = script.replacen(readonly_gate, "", 1);
+        assert!(!uninstaller.contains("/var/lib/tradechannel"),
+            "卸载正文不得碰审计与身份目录：{uninstaller}");
     }
 
     #[test]
@@ -2669,6 +2682,22 @@ TC_DONE=1\n";
         assert!(error.contains("自己的公钥"), "{error}");
         let error = parse_peer("TC_ERROR=PeerMissing\n").expect_err("失败码必须报错");
         assert!(error.contains("PeerMissing"), "{error}");
+    }
+
+    #[test]
+    fn old_wireguard_writers_refuse_retired_pairing_host_before_side_effects() {
+        let s = spec();
+        let key = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
+        for script in [
+            peer_script(&s,key),
+            revoke_script(&s,key),
+            uninstall_script(&s),
+        ] {
+            let prelude = crate::legacy_writer_fence::SHELL_DENY_PRELUDE;
+            assert!(script.starts_with(&format!("set -eu\n{prelude}")), "{script}");
+            assert!(script.find("exit 73").unwrap() < script.find("IFACE=").unwrap());
+            assert!(script.contains("TC_ERROR=LegacyWriterFenced"));
+        }
     }
 
     // ---- 撤销设备 ----

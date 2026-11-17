@@ -52,6 +52,7 @@ mod netbind;
 mod oprecord;
 mod pairing;
 mod pairhost;
+mod legacy_writer_fence;
 mod pairstore;
 mod perf;
 mod presentation;
