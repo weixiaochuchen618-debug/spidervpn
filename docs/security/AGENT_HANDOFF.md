@@ -302,3 +302,12 @@
 - 当前 Rust HEAD `e4b8b62fbec4e30bfb10c15f107bb21e2fe1f55f`。同 SHA [Linux #44074337077](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337077) 两 Job Completed/Success，102 Rust library + 5 CLI + 5 feature admin + 1 real kernel netns E2E 均通过，0 failed/ignored，严格 --locked/-D warnings。
 - 同 SHA [MSVC #44074337005](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337005)、[GNU #44074337010](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337010) 还没完成，后续必须核查终态。没有改变 UI、连接流程、WFP Persistent BLOCK、Python 生产配对 receiver、main。
 - **非常关键的不可发布点**：原 Python 持久旧记录并不等于独立可信的客户端密钥证明；即使有双签名的测试样本与成功审计，也不能将过往 Consumed 授权静默导入、补建 peer、恢复已撤销设备。无可信历史证据需拒绝/人工重新配对，SEC-01 P0 不得关闭。详见 [D.30](./REMEDIATION_BACKLOG.md)。
+
+
+## 33. SEC-01 Python→Rust 服务退场只读预检候选（2026-11-17）
+
+- 新的活动代码 [Draft PR #11](https://github.com/weixiaochuchen618-debug/spidervpn/pull/11)，base 为 PR #10 的 `fix/sec01-original-request-proof-20261117`，HEAD `cd3cd51f53ff1df55d67150d89d3601eb1cfcd47`。本轮精确定位到 `src/pairhost.rs` 安装的 `tc-pair.service` (Python root), 其旧写入口不服从 Rust SEC-08 flock。没有更改原生产服务或 UI/Guard/WFP。
+- `legacy_cutover.rs` 新增 root-only 检查 + 单独 opt-in 的 `spidervpn-pair-cutover`，必须是持久 `/etc/systemd/system/tc-pair.service -> /dev/null`、mask/inactive/dead/zero PIDs+Job、`/proc` 中不见任何 tc-pair.py（不止 serve），两次重复读 mask/服务/进程，所有缺失或不可读 fail-closed。**通过也不是授权：不导入旧 Grant、不开放新监听、不操作 WG**，不能防止脚本以别名重启或不协作 root 写者。
+- Linux [CI #44075947553](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44075947553) 两 Job Completed/Success，同 SHA：109 library + 5 CLI，新增 7 preflight unit tests + 原 5 admin TTY tests + 1 real kernel WG netns test，0 failed/ignored，Cargo --locked/-D warnings。新 CLI 的真实非 root 拒绝 exit2 已执行。**真实 root 且无 mask 场景暂未在 CI E2E 验证**，不能推断系统级服务迁移成功。
+- 同 SHA Windows [MSVC #44075947516](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44075947516)、[GNU #44075947502](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44075947502) 还需核对最终状态；不要把旧 SHA 绿色当最新绿。下一步继续设计**真正不可并行的 root/systemd 切换栅栏**、真实 Linux root 服务 stop/mask/reboot 验证和 trusted revoke/tombstone 迁移；没有这条完整链不许启用 Rust 消费接口。
+- 此 PR 仅预集成，SEC-01/02/08 与 Issue #5 继续 Open，相关 #3/#6/#7/#8/#9/#10/#11 全部 Draft，正式 main `857ea759` 不合并。详情见 [Backlog D.31](./REMEDIATION_BACKLOG.md)。

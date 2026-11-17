@@ -152,3 +152,10 @@
 - 旧 Python 的 `SignedAuthorization` 签名不包含 `RecipientJwkDigest`，它在旧 `invites.json` 是普通可变字段；缺少受信第三方身份证据时，这条新的离线 Rust 功能依然会 FAIL-CLOSED，不能仅看旧签名正确就从已撤销状态补建 WG peer。代码只返回受限审计报告（恒 `blocks_any_authorization_import`），不写账本、网络配置和 HTTP。
 - 测试专用独立 Python cryptography 双签名 fixture 不含私钥。当前代码 SHA `e4b8b62fbec4e30bfb10c15f107bb21e2fe1f55f`；同 SHA Linux [#44074337077](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44074337077) Rust 核心 102 library + 5 CLI + 原管理员终态 5 用例已成功，netns 完整 workflow 与 Windows MSVC/GNU 仍须查结论，不得把相邻 SHA 的绿当结论。
 - 尚待真实历史 revoke tombstone + Rust TLS/JWE + Python receiver 排他切换、VPS 回滚演练；继续以 SEC-01 P0 **未生产修复** 登记。
+
+
+## 第十四阶段：旧 Python root systemd 停服观察（只读、不是全局写者栅栏）
+
+- 已定位线上接收器实装为 `tc-pair.service`，`User=root`、Python `tc-pair.py serve`。旧脚本与 Rust 尚未共享一个跨进程独占锁；不能直接在原线上旧服务未退出时启用 Rust 新授权处理器。新增 [Draft PR #11](https://github.com/weixiaochuchen618-debug/spidervpn/pull/11) / `server-rs/src/legacy_cutover.rs`，仅在 Linux root 下只读观察**持久 systemd mask + inactive/dead/pid-zero + 无可见 tc-pair.py writer**，两次观察相互比对；进程权限/外部状态异常一律拒绝。
+- 独立 `spidervpn-pair-cutover` 需显式编译 feature `linux-cutover-preflight`（默认关闭），无自启与写入口。绝不执行 `systemctl stop/mask`、不修改配对账本/WireGuard/生产 Python，也不授权旧 Consumed 导入或启动新的 Rust TLS listener。任何预检成功只意味着这些条件在读回时短暂成立，**不证明没有 root 人工重启、别名进程、额外命名空间或时间竞态**。
+- 当前 HEAD `cd3cd51f53ff1df55d67150d89d3601eb1cfcd47`，同 SHA [Linux #44075947553](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44075947553) 109 Rust 核心、5 CLI、额外 7 preflight unit、5 opt-in TTY admin、1 真 WG netns 全成功，0 skipped/failed；Windows MSVC/GNU 对应运行仍待 final。真正生产替代必须先具备可审核的旧 writer 停用/栅栏、可信历史撤销、root 导入事务、TLS/JWE/HTTP、VPS kill/reboot 和回滚验收；SEC-01 未修复。
