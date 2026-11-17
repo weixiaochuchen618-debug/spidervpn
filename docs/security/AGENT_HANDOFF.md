@@ -406,3 +406,10 @@
 - **新 CI 正在执行，绝不提前宣称绿**：[Linux #44203320571](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320571)、[MSVC #44203320563](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320563)、[GNU #44203320555](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320555)。优先按准确 SHA 查询 Linux `spidervpn-pair-retire` compile + six new tests + 非 root CLI、WG real netns/root temp filesystem；失败必须修复源码再测，所有已有测试保留。Windows CI 需要确认完整 MSVC/GNU；即使三绿也不能等同 VPS 实机 root 退役。
 - 这不是完整服务器端 writer fence：真正 root/老版 SSH 可绕过、unit mask 是独立前提，撤销历史/tombstone 不可信仍不能迁入，Rust TLS 未接管。发行/合并闸门原样：SEC-01/02/08 / Issue #5 未验收、所有 PR Draft，main `857ea759` 未变。参见 [Backlog D.44](./REMEDIATION_BACKLOG.md)。
 
+
+
+## 47. PR #17 Linux CI 首 SHA 红例、E0382 修复与新三平台验证（2026-11-18）
+
+- 首 SHA `45c5f86` 的 [Linux #44203320571](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320571) core **Failure**，root netns Job Success：新增 CLI Rust unit test 连续两次 `unwrap()` 移动同一 `Result`，真实 E0382 编译错误。已修复为 `as_deref()` 保留两个原始断言，不删除/skip 任何测试；[Draft PR #17](https://github.com/weixiaochuchen618-debug/spidervpn/pull/17) 新代码 HEAD **`de8e2e222a31c0290385a0126c0f2538571c33d0`**。
+- 新 SHA [Linux #44203644974](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644974)、[MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970)、[GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) **需要重新查询终态及原始日志**。保留前轮失败记录，不把父 PR #16 绿套用到此 SHA。真实 root/systemd VPS 退役和撤销迁移仍未验收，Issue #5 Open / PR Draft，main/UI/WFP 不动；见 Backlog D.45。
+

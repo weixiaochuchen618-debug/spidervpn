@@ -533,3 +533,12 @@ PR/commit/CI: ...
 - **新增验收**：Rust CLI 六类定向单测覆盖非 root/多余参数在任何 IO 前拒绝、首轮 shutdown 失败、空 TTY/错误同意不执行、人工停留后的第二次 shutdown 失败、retire 结果不授权迁移、失败/不完整 witness、UTF-8/CRLF/超长/EOF 终端输入。Linux CI 用 `--locked`、`RUSTFLAGS=-D warnings` 编译 bin、运行全部测试，并由 CI 非 root 调用同一 binary 验证 exit 2；原 WG netns、sudo 临时目录 root filesystem 退役测试保留，不删除/跳过任何测试。
 - **本条建立时 CI 仍运行**：精确 SHA [Linux #44203320571](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320571)、[MSVC #44203320563](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320563)、[GNU #44203320555](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320555)，必须逐个检查最终状态与失败日志；不能继承 PR #16 绿。无真实 VPS root/stop/mask/reboot/power-loss/rollback 或历史 revocation 可信迁移；SEC-01/02/08 和 Issue #5 OPEN、全部安全 PR Draft，main `857ea759` / UI / WFP 持久 BLOCK 均不变。
 
+
+
+## D.45 PR #17 Rust E0382 真实 CI 红例、不跳过修正与新 HEAD（2026-11-18）
+
+- 首次代码 SHA `45c5f86fae1c55d7eb2418b589b4f32f4f530557` 的 [Linux workflow #44203320571](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203320571) **最终 Failure**，不能称为全绿。两个 Job 中真实 Linux WG kernel netns + root /tmp filesystem 退役 Job 为 Success；core Job 前置 Rust authority、legacy preflight/retire 全通过，但新增 `spidervpn-pair-retire` binary TEST 构建发生 Rust E0382：新测试 `line.unwrap()` 两次移动同一 `Result<String, ()>`。失败测试未忽略、未删除。
+- 已在同一 Draft PR #17 修正为两个借用的 `line.as_deref()` 断言，不改产品/退役决策或测试范围；当前代码 HEAD **`de8e2e222a31c0290385a0126c0f2538571c33d0`**。旧红结果必须保留历史，且其 CI 不得替代新 SHA 的验证。
+- 新准确 SHA 已触发 [Linux #44203644974](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644974)、[MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970)、[GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991)，**本条记录时仍在运行**；必须核查每条 Job / 新 CLI six tests / 既有全量回归终态。
+- 不构成 production 安全验收；不可自动在实际 VPS 上停止旧 Python、打开新 Rust TLS、导入旧 revoked/consumed 或合并 main。SEC-01/02/08、Issue #5 OPEN，PR #17 Draft。详细见 D.44。
+
