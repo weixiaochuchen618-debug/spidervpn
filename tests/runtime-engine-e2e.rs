@@ -46,12 +46,31 @@ fn drop_proxy_key(key: &str) {
 ///
 /// 输出落**文件**而不是管道：假引擎活得比连接进程久，管道写端被它继承时
 /// `wait_with_output` 会一直等到引擎退出（实测把「连接后立刻检查」拖成 30 秒后检查）。
+/// Use the same layout as the protected production executable. A real, harmless
+/// Windows PING process stands in for the bundled sing-box executable; no
+/// privilege check is disabled to make this E2E pass on an elevated runner.
+fn test_install(root: &Path) -> (PathBuf, PathBuf) {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create isolated executable directory");
+    let frontend = bin.join("spidervpn.exe");
+    let engine = bin.join("sing-box.exe");
+    if !frontend.is_file() {
+        std::fs::copy(env!("CARGO_BIN_EXE_spidervpn"), &frontend)
+            .expect("copy actual Rust app into isolated bin");
+    }
+    if !engine.is_file() {
+        std::fs::copy(PING, &engine).expect("copy harmless fake engine into bundled path");
+    }
+    (frontend, engine)
+}
+
 fn run(root: &Path, key: &str, args: &[&str], engine_args: &str) -> (Option<i32>, String) {
     static RUNS: AtomicUsize = AtomicUsize::new(0);
     let n = RUNS.fetch_add(1, Ordering::Relaxed);
     let out_path = root.join(format!("cli-{n}.out"));
     let err_path = root.join(format!("cli-{n}.err"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_spidervpn"))
+    let (frontend, _) = test_install(root);
+    let mut child = Command::new(&frontend)
         .args(args)
         .env("SPIDERVPN_ROOT", root)
         .env("SPIDERVPN_PROXY_KEY", key)
@@ -123,6 +142,8 @@ fn setup(root: &Path, key: &str) -> u16 {
     make_proxy_key(key);
     let profile = write_profile(root);
     let port = free_port();
+    let (_, engine) = test_install(root);
+    let engine_path = engine.to_str().expect("test bundled engine path must be UTF-8");
     let (code, out) = run(
         root,
         key,
@@ -130,7 +151,7 @@ fn setup(root: &Path, key: &str) -> u16 {
             "--import",
             &profile.to_string_lossy(),
             "--engine",
-            PING,
+            engine_path,
             "--port",
             &port.to_string(),
             "--line-name",
