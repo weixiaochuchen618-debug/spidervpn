@@ -1031,8 +1031,9 @@ mod tests {
             "不存在的 IPC 文件必须拒绝，不能放松安全检查来满足测试");
         write_json_file(&files.req, &request).unwrap();
         prepare_reply_file(&files.res).unwrap();
-        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_ok(),
-            "真实启动顺序中已创建的受保护请求/回执应该通过路径安全校验");
+        let verification = validate_guard_ipc_paths(&files.req, &files.res);
+        assert!(verification.is_ok(),
+            "真实启动顺序中已创建的受保护请求/回执应该通过路径安全校验：{verification:?}");
         let bad = files.dir.join("other.json");
         assert!(validate_guard_ipc_paths(&files.req, &bad).is_err());
         assert!(validate_guard_ipc_paths(&files.req, &files.dir.join("req.json")).is_err());
@@ -1048,8 +1049,9 @@ mod tests {
         let files = GuardIpcFiles::create(&request).unwrap();
         write_json_file(&files.req, &request).unwrap();
         prepare_reply_file(&files.res).unwrap();
-        assert!(validate_guard_ipc_paths(&files.req, &files.res).is_ok(),
-            "正常受保护目录/请求/回执必须成功通过实际 DACL 读回");
+        let verification = validate_guard_ipc_paths(&files.req, &files.res);
+        assert!(verification.is_ok(),
+            "正常受保护目录/请求/回执必须成功通过实际 DACL 读回：{verification:?}");
 
         // 同账户攻击者能够放宽自己创建的回执 DACL；提权端必须按对象的
         // 实际状态拒绝，而不是仅信父进程曾调用过 protect。
