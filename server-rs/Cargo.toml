@@ -23,8 +23,10 @@ linux-netns-acceptance = []
 linux-admin-finalize = []
 # Explicit opt-in read-only shutdown observer, not an importer or cutover.
 linux-cutover-preflight = []
-# Compile offline atomic script retirement ONLY on explicit request; no runtime entrypoint.
+# Compile offline atomic script retirement ONLY on explicit request.
 linux-legacy-retire = ["linux-cutover-preflight"]
+# A distinct, opt-in root-TTY CLI; no release/default command or HTTP route.
+linux-legacy-retire-cli = ["linux-legacy-retire"]
 
 [[test]]
 name = "wg_namespace_e2e"
@@ -35,3 +37,8 @@ required-features = ["linux-netns-acceptance"]
 name = "spidervpn-pair-cutover"
 path = "src/bin/spidervpn-pair-cutover.rs"
 required-features = ["linux-cutover-preflight"]
+
+[[bin]]
+name = "spidervpn-pair-retire"
+path = "src/bin/spidervpn-pair-retire.rs"
+required-features = ["linux-legacy-retire-cli"]
