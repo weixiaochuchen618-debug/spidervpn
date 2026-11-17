@@ -83,7 +83,11 @@ jobs:
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="$PWD/server-rs/target/netns"
-          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-netns-acceptance --test wg_namespace_e2e --no-run
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-netns-acceptance --test wg_namespace_e2e --no-run --message-format=json > "$RUNNER_TEMP/sec01-build.json"
+          test_bin="$(jq -r 'select(.reason=="compiler-artifact" and .target.name=="wg_namespace_e2e") | .executable // empty' "$RUNNER_TEMP/sec01-build.json" | tail -n1)"
+          test -n "$test_bin"
+          test -x "$test_bin"
+          printf 'SPIDERVPN_SEC01_TEST_BIN=%s\n' "$test_bin" >> "$GITHUB_ENV"
 
       - name: Execute root-only audit with actual kernel peers in a disposable netns
         shell: bash
@@ -111,6 +115,5 @@ jobs:
           printf '[Interface]\nPrivateKey = %s\nAddress = 10.66.0.1/24\n' "$(cat "$server_key")" | sudo tee "$conf" >/dev/null
           sudo chmod 0600 "$conf"
           test "$(sudo stat -c '%u:%a' "$conf")" = "0:600"
-          mapfile -t candidates < <(find server-rs/target/netns/debug/deps -maxdepth 1 -type f -name 'wg_namespace_e2e-*' -executable)
-          test "${#candidates[@]}" -eq 1
-          sudo ip netns exec "$ns" /usr/bin/env SPIDERVPN_SEC01_NS_INTERFACE="$iface" SPIDERVPN_SEC01_NS_CLIENT_PUBLIC_KEY="$client_pub" "$PWD/${candidates[0]}" --nocapture
+          test -x "$SPIDERVPN_SEC01_TEST_BIN"
+          sudo ip netns exec "$ns" /usr/bin/env SPIDERVPN_SEC01_NS_INTERFACE="$iface" SPIDERVPN_SEC01_NS_CLIENT_PUBLIC_KEY="$client_pub" "$SPIDERVPN_SEC01_TEST_BIN" --nocapture
