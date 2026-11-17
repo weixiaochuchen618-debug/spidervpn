@@ -290,11 +290,27 @@ fn actual_sddl(path: &Path) -> Result<String, String> {
     Ok(actual)
 }
 
+/// Windows adds AI to an already-protected DACL during an ACL rewrite.
+/// Only this control-bit representation is allowed to differ; ACEs may not.
+fn same_protected_acl(got: &str, expected: &str) -> bool {
+    if got == expected {
+        return true;
+    }
+    match (got.strip_prefix("D:PAI"), expected.strip_prefix("D:P")) {
+        (Some(actual_aces), Some(expected_aces)) => actual_aces == expected_aces,
+        _ => false,
+    }
+}
+
 /// Intentionally require an exact, protected allowlist: no inherited or
 /// additional write ACE, no inherited owner full control, and no NULL DACL.
 fn verify(path: &Path, expected: &str) -> Result<(), String> {
     let got = actual_sddl(path)?;
-    if got != expected {
+    // SetNamedSecurityInfoW can mark a protected DACL "AI" (auto-inherit
+    // machinery has processed it). D:PAI is still protected; "AI" does
+    // not add an ACE. Compare every ACE byte-for-byte, never accept a
+    // standalone D:AI, inherited ACE, extra SID or broader mask.
+    if !same_protected_acl(&got, expected) {
         return Err(format!(
             "安装权限不符合受保护 ACL；对象 {}，期望 {expected}，实际 {got}",
             path.display()
@@ -362,6 +378,24 @@ mod tests {
         assert!(seal_layout(&path).is_err(), "unknown DLL must not be tolerated");
         assert!(extra.exists(), "do not silently delete user files");
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn windows_auto_inheritance_control_bit_never_broadens_code_dacl() {
+        let without_prefix = CODE_DIR_SDDL.strip_prefix("D:P").unwrap();
+        let ai = format!("D:PAI{without_prefix}");
+        assert!(same_protected_acl(CODE_DIR_SDDL, CODE_DIR_SDDL));
+        assert!(same_protected_acl(&ai, CODE_DIR_SDDL));
+        for invalid in [
+            format!("D:AI{without_prefix}"),
+            format!("D:PAI{without_prefix}(A;;FA;;;AU)"),
+            format!("D:PAI{without_prefix}(A;;FA;;;WD)"),
+            format!("D:PAI{without_prefix}(A;;FA;;;OW)"),
+            format!("D:P(A;;FA;;;AU)"),
+        ] {
+            assert!(!same_protected_acl(&invalid, CODE_DIR_SDDL),
+                "must reject unprotected/added privilege: {invalid}");
+        }
     }
 
     #[test]
