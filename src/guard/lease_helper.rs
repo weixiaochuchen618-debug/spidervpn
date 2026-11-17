@@ -49,6 +49,34 @@ pub enum LeaseState {
     Closed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseAck {
+    schema: u32,
+    nonce: String,
+    accepted: bool,
+}
+
+/// Ready 只是启动协商，不能孤立地当作父进程已接管成功。
+/// 辅助进程只接受同一个随机目录的 ack.json，绝不接受另一会话旧 nonce。
+fn read_ack(path: &Path, nonce: &str) -> Result<bool, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("检查租约确认文件失败：{e}")),
+    };
+    if !meta.file_type().is_file() || meta.len() == 0 || meta.len() > 4096 {
+        return Err("租约确认文件不是有效普通小文件".into());
+    }
+    let body = std::fs::read(path).map_err(|e| format!("读取租约确认文件失败：{e}"))?;
+    let ack: LeaseAck = serde_json::from_slice(&body)
+        .map_err(|e| format!("租约确认文件不是合法协议：{e}"))?;
+    if ack.schema != LEASE_SCHEMA || ack.nonce != nonce || !ack.accepted {
+        return Err("启动方确认的会话版本、nonce 或决定不匹配".into());
+    }
+    Ok(true)
+}
+
 fn decode_nonce(text: &str) -> Result<[u8; 16], String> {
     if text.len() != 32 || !text.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err("租约 nonce 必须是 32 位十六进制串".into());
@@ -242,6 +270,27 @@ pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
         {
             return 4;
         }
+        // 双向握手：如果 parent 退出、读取回执失败或拒绝确认，15 秒内
+        // 自动撤销；等待期间每 100ms 重新核验引擎、主进程与监听身份。
+        // 不允许“只有 Ready 文件就长期放行”的失败状态。
+        let ack_path = reply_path.with_file_name("ack.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut lease = lease;
+        loop {
+            match read_ack(&ack_path, &req.nonce) {
+                Ok(true) => break,
+                Err(_) => return 6, // lease 被 Drop，动态会话随之关闭
+                Ok(false) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return 6;
+            }
+            lease = match lease.revalidate(&req.engine_executable) {
+                Ok(value) => value,
+                Err(_) => return 6,
+            };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         // helper 自己退出/崩溃时，BFE 动态 session 自动撤销临时 PERMIT。
         return if lease.supervise_until_exit(&req.engine_executable).is_ok() { 0 } else { 5 };
     }
@@ -299,6 +348,30 @@ mod tests {
         ] {
             assert!(validate_request(&bad).is_err(), "bad input accepted: {bad:?}");
         }
+    }
+
+    #[test]
+    fn ack_is_bound_to_exact_nonce_and_never_accepts_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-lease-{:016x}", std::process::id() as u64 + 1,
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let path = root.join("ack.json");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read_ack(&path, &sample().nonce).unwrap(), false);
+        let base = LeaseAck {
+            schema: LEASE_SCHEMA, nonce: sample().nonce.clone(), accepted: true,
+        };
+        std::fs::write(&path, serde_json::to_vec(&base).unwrap()).unwrap();
+        assert!(read_ack(&path, &base.nonce).unwrap());
+        assert!(read_ack(&path, "ffffffffffffffffffffffffffffffff").is_err());
+        std::fs::write(&path, serde_json::to_vec(&LeaseAck {
+            accepted: false, ..base.clone()
+        }).unwrap()).unwrap();
+        assert!(read_ack(&path, &base.nonce).is_err());
+        std::fs::write(&path, b"{bad-json").unwrap();
+        assert!(read_ack(&path, &base.nonce).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
