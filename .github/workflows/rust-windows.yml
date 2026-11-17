@@ -40,7 +40,7 @@ jobs:
       - name: SEC-10 protected IPC and privileged engine regressions (MSVC)
         shell: pwsh
         run: |
-          foreach ($filter in @('install_trust::tests::', 'uninstall_safety::tests::', 'uiweb_form::tests::sec11_short_time', 'pairing::tunnel::tests::sec11_wireguard_key_shape', 'guard::elevate::tests::', 'secretfile::tests::privileged_ipc_objects_have_secure_acl_at_creation', 'engine::tests::privileged_engine_cannot_be_selected_from_arbitrary_config_path')) {
+          foreach ($filter in @('install_trust::tests::', 'uninstall_safety::tests::', 'uiweb_form::tests::sec11_short_time', 'pairing::tunnel::sec11_key_tests::sec11_wireguard_key_shape', 'guard::elevate::tests::', 'secretfile::tests::privileged_ipc_objects_have_secure_acl_at_creation', 'engine::tests::privileged_engine_cannot_be_selected_from_arbitrary_config_path')) {
             Write-Host "Running MSVC Rust security tests: $filter"
             & cargo test --locked --bin spidervpn $filter -- --test-threads=1
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
