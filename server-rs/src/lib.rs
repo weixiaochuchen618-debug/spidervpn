@@ -45,6 +45,9 @@ pub mod wg_atomic;
 #[cfg(target_os = "linux")]
 pub mod wg_live_set;
 
+#[cfg(target_os = "linux")]
+pub mod recovery_inspect;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {
