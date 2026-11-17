@@ -274,6 +274,9 @@ fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
 pub struct LeaseChild {
     handle: windows_sys::Win32::Foundation::HANDLE,
     pub directory: PathBuf,
+    // 未得到可靠 Ready/ACK 确认的 helper，父进程退出此作用域时必须
+    // 立即终止，不能让一个半启动的动态许可继续放行最多 15 秒。
+    confirmed: bool,
 }
 #[cfg(windows)]
 impl LeaseChild {
@@ -287,11 +290,17 @@ impl LeaseChild {
 impl Drop for LeaseChild {
     fn drop(&mut self) {
         if !self.handle.is_null() {
+            if !self.confirmed {
+                // 未完成双向握手：主动终止未信任 helper，让 BFE 动态会话
+                // 立即 rundown；如果 OS 拒绝 TerminateProcess，helper 自己
+                // 仍必须在 15 秒无 ACK 时撤销许可，形成双重保护。
+                unsafe { windows_sys::Win32::System::Threading::TerminateProcess(self.handle, 1); }
+            }
             unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle); }
             self.handle = std::ptr::null_mut();
         }
-        // 仅在 helper 已结束时清理，避免删除它尚未读取的 ack.json。
-        // 应由未来生产连接管理器保留 LeaseChild 至断开，以便回收临时目录。
+        // 已确认的 helper 正常运行期间不能因父端局部 handle Drop 而被杀，
+        // 它自己通过真实进程句柄监控引擎和主程序生命期。
     }
 }
 
@@ -358,7 +367,7 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     if info.hProcess.is_null() {
         return Err("启动 WFP helper 后未获取进程句柄".into());
     }
-    let child = LeaseChild { handle: info.hProcess, directory };
+    let mut child = LeaseChild { handle: info.hProcess, directory, confirmed: false };
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if unsafe { WaitForSingleObject(child.handle, 0) } != WAIT_TIMEOUT {
@@ -371,6 +380,7 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
                 if !child.running() {
                     return Err("租约确认后 helper 已退出，拒绝报告连接已受保护".into());
                 }
+                child.confirmed = true;
                 return Ok(child);
             }
             Err(e) => {
