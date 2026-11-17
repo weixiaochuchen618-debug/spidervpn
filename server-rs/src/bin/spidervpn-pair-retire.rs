@@ -264,8 +264,8 @@ mod tests {
             let mut file = File::open(&path).unwrap();
             let line = read_line(&mut file, Duration::from_secs(1));
             assert_eq!(line.is_ok(), accepted, "input {name}");
-            if name == "exact" { assert_eq!(line.unwrap(), APPROVAL); }
-            if name == "wrong" { assert_ne!(line.unwrap(), APPROVAL); }
+            if name == "exact" { assert_eq!(line.as_deref(), Ok(APPROVAL)); }
+            if name == "wrong" { assert_ne!(line.as_deref(), Ok(APPROVAL)); }
         }
         std::fs::remove_dir_all(root).unwrap();
     }
