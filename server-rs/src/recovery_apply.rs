@@ -51,6 +51,14 @@ pub struct AdministratorApproval {
     action: RecoveryAction,
 }
 
+impl RecoveryReview {
+    /// Only public, non-secret fields are exposed for future local admin UI.
+    pub fn invite_id(&self) -> &str { &self.invite_id }
+    pub fn generation(&self) -> u64 { self.generation }
+    pub fn inspection(&self) -> RecoveryInspection { self.inspection }
+}
+
+
 #[cfg(test)]
 fn approve_for_test(review: &RecoveryReview) -> AdministratorApproval {
     AdministratorApproval {
@@ -99,7 +107,7 @@ pub fn prepare_review(
 /// implicit rollback, blind retry or silent re-add after partial failure.
 pub fn apply_approved(
     store: &mut LedgerStore, review: &RecoveryReview,
-    approval: &AdministratorApproval, now: i64,
+    approval: AdministratorApproval, now: i64,
     io: &mut impl RecoveryIo,
 ) -> Result<RecoveryStage,RecoveryApplyError> {
     if approval.generation!=review.generation
@@ -251,7 +259,7 @@ mod tests {
                 if d{vec![target(&g)]}else{vec![]});
             let review=prepare_review(&store,INV,200,&mut ops).unwrap();
             let approval=approve_for_test(&review);
-            assert_eq!(apply_approved(&mut store,&review,&approval,200,&mut ops).unwrap(),
+            assert_eq!(apply_approved(&mut store,&review,approval,200,&mut ops).unwrap(),
                 RecoveryStage::PendingAdd);
             assert_eq!((ops.disk_calls,ops.kernel_calls),(expect_disk,expect_kernel));
             assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Consumed(_))));
@@ -270,7 +278,7 @@ mod tests {
                 if d{vec![target(&g)]}else{vec![]});
             let review=prepare_review(&store,INV,800,&mut ops).unwrap();
             let approval=approve_for_test(&review);
-            apply_approved(&mut store,&review,&approval,800,&mut ops).unwrap();
+            apply_approved(&mut store,&review,approval,800,&mut ops).unwrap();
             assert_eq!((ops.disk_calls,ops.kernel_calls),(expect_disk,expect_kernel));
             assert!(ops.live.is_empty()&&ops.disk.is_empty());
             assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Revoked(_))));
@@ -285,15 +293,15 @@ mod tests {
         let review=prepare_review(&store,INV,200,&mut ops).unwrap();
         let mut approval=approve_for_test(&review);
         approval.action=RecoveryAction::RepairKernelWithApproval;
-        assert!(matches!(apply_approved(&mut store,&review,&approval,200,&mut ops),
+        assert!(matches!(apply_approved(&mut store,&review,approval,200,&mut ops),
             Err(RecoveryApplyError::WrongApproval)));
         approval=approve_for_test(&review);
         ops.live.push(target(&g));
-        assert!(matches!(apply_approved(&mut store,&review,&approval,200,&mut ops),
+        assert!(matches!(apply_approved(&mut store,&review,approval,200,&mut ops),
             Err(RecoveryApplyError::StaleReview)));
         ops.live.clear();
         store.update(|l|l.insert_open("99999999-9999-4999-8999-999999999999",600)).unwrap();
-        assert!(matches!(apply_approved(&mut store,&review,&approval,200,&mut ops),
+        assert!(matches!(apply_approved(&mut store,&review,approval,200,&mut ops),
             Err(RecoveryApplyError::StaleReview)));
         assert_eq!((ops.disk_calls,ops.kernel_calls),(0,0));
         cleanup(p,store);
@@ -304,7 +312,7 @@ mod tests {
         let mut ops=Fake::new(vec![],vec![]);ops.fail_disk=true;
         let review=prepare_review(&store,INV,200,&mut ops).unwrap();
         let approval=approve_for_test(&review);
-        assert!(matches!(apply_approved(&mut store,&review,&approval,200,&mut ops),
+        assert!(matches!(apply_approved(&mut store,&review,approval,200,&mut ops),
             Err(RecoveryApplyError::Backend(_))));
         assert_eq!(ops.kernel_calls,0);
         assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Pending(_))));
@@ -317,7 +325,7 @@ mod tests {
         ops.fail_kernel=true;
         let review=prepare_review(&store,INV,800,&mut ops).unwrap();
         let approval=approve_for_test(&review);
-        assert!(matches!(apply_approved(&mut store,&review,&approval,800,&mut ops),
+        assert!(matches!(apply_approved(&mut store,&review,approval,800,&mut ops),
             Err(RecoveryApplyError::Backend(_))));
         assert_eq!((ops.disk_calls,ops.kernel_calls),(1,1));
         assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Revoking(_))));
