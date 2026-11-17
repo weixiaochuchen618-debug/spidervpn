@@ -20,7 +20,7 @@
 |---|---|---|---|---|---|
 | **SEC-01** | **P0 / 高** | 🔴 未修复（旧版曾复现） | `assets/tc-pair.py:1195,1230-1246`; `src/deploy.rs:849-891` | Rust 邀请授权/撤销状态机 + 旧记录迁移，拒绝重放 | 撤销后原/换公钥不能复入网，地址无重叠，HTTP 与 CLI 一致 |
 | **SEC-02** | **P0 / 高** | 🔴 未修复（旧版曾复现） | `assets/tc-pair.py:1453-1456`; `src/pairhost.rs:36-47` | Rust TLS daemon 并发握手 + 超时 + 低权限服务 | 一条/多条空闲连接不堵塞正常 HTTPS，服务资源可控 |
-| **SEC-03** | **P0 / 高（本地威胁前提）** | 🔴 未修复 | `package-files/install.ps1`; `src/engine.rs:163-191`; `src/isolation.rs:31-45` | Rust 安装可信边界/受保护 bin 与特权引擎路径策略 | 非管理员不可替换特权执行目标，配置篡改不能导致任意提权执行 |
+| **SEC-03** | **P0 / 高（本地威胁前提）** | 🟠 Rust ACL 候选开发中（未实机安全验收） | `package-files/install.ps1`; `src/engine.rs:163-191`; `src/isolation.rs:31-45` | Rust 安装可信边界/受保护 bin 与特权引擎路径策略 | 非管理员不可替换特权执行目标，配置篡改不能导致任意提权执行 |
 | **SEC-04** | **P1 / 中** | 🟠 部分修复 | `src/secretfile.rs:91-116`; `src/main.rs:642-705` | Rust 密钥导出与敏感文件 ACL 全覆盖，区分保密/防篡改 | 导出私钥无宽 ACL、旧文件迁移、运行正常 |
 | **SEC-05** | **P1 / 中** | 🔴 未修复 | `src/engine.rs:100-136`; `src/connect.rs:531-535,689-720` | Rust 引擎 HANDLE + 创建时间/路径/会话 ID 校验 | PID 复用不误杀陌生进程、不阻塞代理自愈 |
 | **SEC-06** | **P1 / 中** | 🔴 未修复 | `src/uiweb_form.rs:57,705`; `src/deploy.rs:1933,3326` | Rust 单一 TCP 端口白名单 | 443/8443/2443 部署、导出、导入、恢复一致通过 |
@@ -177,3 +177,13 @@ PR/commit/CI: ...
 - **安装器仅作薄入口**：package-files/install.ps1 在复制前调用可信包里的 Rust --install-seal，复制后从目标 exe 再运行一次进行权限重验；任何失败返回错误且不能打印“安装成功”。**安装现在需要提升权限**，这是本地安全信任边界变更，须有实机兼容验收，不能将普通用户无感安装描述为保持不变。正式 Release 的自定义 -TargetDir 不再被安全密封功能接受；如果确需自定义目录，应另设计安全可信路径与数据分离，而不是绕开 Rust 校验。
 - **专项回归**：install_trust::tests::（新装、旧宽 ACL 收紧、未知 DLL 拒绝、拒绝卷根/相对路径）与 tests/install-seal-e2e.rs（真实 CLI 管理员门槛、数据写入、危险目标拒绝）；Windows MSVC / GNU 工作流已加 install_trust::tests:: 专项过滤，不能跳过失败测试。候选 SHA 54f09333 的 [MSVC 44017844701](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44017844701) / [GNU 44017844745](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44017844745) 截至写入时仍在执行，**不得宣称当前候选已编译成功**。
 - **新增实机验收矩阵**：[SEC03_INSTALL_ACL_ACCEPTANCE.md](./SEC03_INSTALL_ACL_ACCEPTANCE.md) I01–I12，严格分为 A 标准用户 / B 独立管理员 / C 第二标准用户，需要记录真实写入和改 ACL 的拒绝、升级/回滚、完整用户配置可写及 WFP 持久 BLOCK 不变。SEC-03 与 SEC-10 仍 **P0 OPEN / 未完成真实安全验收**；PR #6、PR #3 都保持 Draft。安装来源验证、现有路径竞争、WFP 真机认证与 SEC-09 卸载安全待继续。
+
+
+## D.5 SEC-03 ACL 兼容性、硬链接及旧数据升级补充（2026-11-17）
+
+- **活动代码 SHA**：a14016cd4a921b2e8639de22ab9f70add9d62a17，仍在 Draft PR #6 / main 未变。前一份 D.4 是提交当时快照；以此条作为最新恢复点。
+- **真实 CI 红例与根因**：旧 SHA 54f09333 的 [MSVC 44017844701](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44017844701) 中 Rust 安装 ACL 的 4 个专项测试有 2 个失败，两个都是正常权限生成的 D:PAI（Windows AUTO_INHERITED + PROTECTED）被旧 D:P 精确对照误拒。提交 c4b9618b 仅允许 D:PAI 与 D:P 的控制位差异，所有 ACE 仍按原字节匹配；明确新增额外 AU/WD/Owner ACE 被拒测试，没有跳过/删减红例。候选中的 CI 正在重新跑。
+- **硬链接防护**：提交 d4bf342a 增加 Rust FILE_INFORMATION_BY_HANDLE 真实硬链接计数核验，已存在的 bin/sing-box.exe 或其它代码文件如有外部硬链接就拒绝安装（防覆盖到目录外/通过别名改写）；用真实 NTFS std::fs::hard_link 负向测试，保留外部目标字节不变。
+- **旧数据写入回归**：提交 a14016cd 将现有 data 目录也单独设置明确的 Authenticated Users Modify ACL，保留内部现有 config 与私钥文件内容，防止只改 root 的继承策略让旧 data 变为只读。新增旧版 config 逐字节保留且可以继续编辑测试。此处改变 data 目录本身 DACL，但不修改用户配置内容；私钥子文件独立保护由 secretfile.rs 管理，SEC-04 全覆盖仍未验收。
+- **新候选 CI**：[MSVC 44018620435](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620435) / [GNU 44018620441](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620441)，以 head_sha = a14016cd 完全一致且 workflow completed/success 为门槛，写入时尚未得到完整结果。不得使用早先被取消的 GNU run 或历史绿色 SHA 宣称成功。
+- **剩余阻塞**：A/B/C 账户 I01–I12，实际文件覆盖/变更 Owner/更换 UAC 管理员/安装包来源验证、既有文件句柄竞争、失败回滚及 SEC-09 安全卸载；因此 SEC-03 状态只是 **P0 部分候选，未达到安全 DoD**，PR #6 不合并 main。
