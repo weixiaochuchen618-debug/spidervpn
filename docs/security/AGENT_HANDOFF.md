@@ -87,3 +87,11 @@
 - 文档交付：三份持久 GitHub 文档；**尚未写入任何修复源码、尚未完成这些项目的新动态利用测试**。
 - 每次对话结束前应更新本节的“当前 SHA、已做、未做、下一动作”；禁止让用户在另一个对话里重新复述项目背景。
 
+
+
+## 8. 最新续接补充（2026-11-17，SEC-03/SEC-10）
+
+- **以 [Backlog D.2](./REMEDIATION_BACKLOG.md) 为准**：PR #6 开发头已推进到 `c72ea692`（实时请核对完整 SHA），仍 Draft。新增 Rust 特权 IPC 对象 DACL 现场读回，在目录、请求、回复任一 DACL 被放宽时执行 WFP 前拒绝。新 Windows 负对照需要确认在不同 CI ABI 下真的通过。
+- 历史红例不是被跳过：原 MSVC [44010494382](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44010494382) 的 `mode-e2e` 被管理员严格引擎校验拦住；旧 [44011375375](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44011375375) 又定位 `runtime-engine-e2e` 两个相同夹具问题；已改用隔离 bin 中的实际客户端和拷贝为 `sing-box.exe` 的系统 ping 假引擎，另同步处理 `transport-e2e`。不取消任何连接行为断言。
+- 本轮代码提交顺序：`8262db63`（mode 测试）、`253392e8`（SEC-10 DACL 读回）、`a5eebd39`（提权端校验与宽 ACL 负对照）、`31d9e55c`（MSVC 前置专项）、`87a7cd34`（runtime 测试）、`c72ea692`（transport 测试）。
+- **实际状态仍为 P0 候选，尚未安全验收**：下轮必须检查 PR #6 最新 SHA 的 MSVC 与 GNU workflow 运行及失败日志；缺少 Windows A/B/C 跨账户 UAC-01～12、可信安装根 `bin` 安全权限及真实攻击验证。原 main、WFP PR #3 的持久 BLOCK 不受影响，严禁未验收合并。
