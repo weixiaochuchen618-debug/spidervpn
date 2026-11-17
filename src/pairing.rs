@@ -2078,6 +2078,23 @@ pub mod tunnel {
                 .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
     }
 
+    // SEC-11 tests belong to tunnel, where wireguard_key is defined.
+    #[cfg(test)]
+    mod sec11_key_tests {
+        use super::wireguard_key;
+
+        #[test]
+        fn sec11_wireguard_key_shape_rejects_multibyte_and_bad_padding() {
+            assert!(wireguard_key(&format!("{}=", "A".repeat(43))));
+            assert!(wireguard_key(&format!("{}=", "A".repeat(40) + "+/A")));
+            assert!(!wireguard_key(&format!("{}😀=", "A".repeat(39))));
+            assert!(!wireguard_key(&format!("{}=", "é".repeat(21) + "A")));
+            assert!(!wireguard_key(&format!("{}!", "A".repeat(43))));
+            assert!(!wireguard_key(&"A".repeat(44)));
+            assert!(!wireguard_key("你好"));
+        }
+    }
+
     /// 渲染配置。返回的字符串用 **CRLF** 分行并以单个 CRLF 结尾——与旧版
     /// 逐字节一致；换成 LF 会让「已存在的配置是否相同」这类比较永远不成立。
     pub fn render(
@@ -2964,17 +2981,6 @@ pub mod line {
     mod tests {
         use super::*;
         use crate::config::{AppConfig, Transport};
-
-        #[test]
-        fn sec11_wireguard_key_shape_rejects_multibyte_and_bad_padding() {
-            assert!(wireguard_key(&format!("{}=", "A".repeat(43))));
-            assert!(wireguard_key(&format!("{}=", "A".repeat(40) + "+/A")));
-            assert!(!wireguard_key(&format!("{}😀=", "A".repeat(39))));
-            assert!(!wireguard_key(&format!("{}=", "é".repeat(21) + "A")));
-            assert!(!wireguard_key(&format!("{}!", "A".repeat(43))));
-            assert!(!wireguard_key(&"A".repeat(44)));
-            assert!(!wireguard_key("你好"));
-        }
 
         use crate::engine_config;
 
