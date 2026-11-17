@@ -177,11 +177,19 @@ mod tests {
         assert!(!format!("{r:?}").contains("eyJhbGci"));
     }
     #[test]
+    fn independent_dotnet_rs256_fixture_verifies_with_pinned_public_jwk(){
+        let fixture:Value=serde_json::from_str(
+            include_str!("../../tests/fixtures/pairing/dotnet-jwt-1.json")).unwrap();
+        let payload=verify_jws(fixture["compact"].as_str().unwrap(),&fixture["publicJwk"]).unwrap();
+        assert_eq!(payload["InviteId"],fixture["payload"]["InviteId"]);
+    }
+    #[test]
     fn tampered_signed_message_or_foreign_signer_is_denied(){
         let mut f=fixture();
         let original=f["legacyRecord"]["SignedAuthorization"].as_str().unwrap().to_owned();
         let mut p:Vec<String>=original.split('.').map(str::to_owned).collect();
-        p[1].replace_range(12..13,if &p[1][12..13]=="A"{"B"}else{"A"});
+        let replacement=if p[1].as_bytes()[12]==b'A'{"B"}else{"A"};
+        p[1].replace_range(12..13,replacement);
         f["legacyRecord"]["SignedAuthorization"]=json!(p.join("."));
         assert!(run(&f).is_err());
         f=fixture(); f["pinnedJwk"]["n"]=json!("AQAB");
