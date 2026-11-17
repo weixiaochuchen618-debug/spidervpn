@@ -44,3 +44,11 @@
 | S06 | 隔离 Linux VM + Windows 客户端真实端到端、安全性/兼容性验收 | 申请、撤销、重放、断电、并发、签名和 TLS 都有日志+WG/config 证据 |
 
 **发布闸门**：任何模块“单测绿色”仅代表迁移工作进度。S01–S06 缺失任一项，SEC-01/02/08 仍 Open；Draft PR #6 不合并 main、不可声称生产漏洞已被修复。
+## 第二阶段：只读旧邀请记录审计器（Rust，未迁移）
+
+- 最新候选在 Rust 开发分支 fix/sec10-guard-elevation-identity-p0-20261117 的 SHA 3d01dda610d33f38cb5f7aa7e95479ecf97b9ac4。独立 server-rs/Cargo.toml + Cargo.lock 使用原桌面仓库锁定的 serde 1.0.229 / serde_json 1.0.154 及相同依赖闭包；独立 Linux workflow 从直接 rustc 改为 cargo --locked、RUSTFLAGS=-D warnings。Windows 客户端未改依赖与运行时。
+- 新增 server-rs/src/legacy.rs::audit_legacy_json（**纯内存只读**，不读磁盘、不写邀请、不变更 WG），严格检查 SchemaVersion=1、Invites 对象、最大 4MiB / 最多 4096 邀请以及 UUID、密钥、RFC1918 /32 地址、客户端身份与请求摘要形状；不识别的状态不猜作 Open，已取消与已过期邀请保持终止状态；审计报告绝不输出 Token 或 SignedAuthorization 原文。
+- **必须正视旧格式缺陷**：assets/tc-pair.py::authorize_invite 新 Consumed 状态在记录里保存 RequestId/DeviceId/ClientPublicKey/ClientAddress/RecipientJwkDigest/SignedAuthorization，**没有保存原 RequestDigest**。Rust 不允许用猜测值伪造它；即使旧记录被人工补填 RequestDigest，Rust 仍要求实际 RS256 验签、授权绑定验证及实时 WG peer readback，才能导入为可信 Consumed。
+- [Linux Cargo CI #44034700193](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44034700193) head_sha=3d01dda6，Completed/Success，合计 **19 passed、0 failed、0 ignored**（旧 SEC01/08 13 项与只读 migration audit 6 项），脚本还明确核对生产 `pairhost.rs` 的 systemd ExecStart **仍为 Python**，不会虚报线上迁移。
+- **过渡红例**：在新增 serde_json 模块后、切换工作流至 Cargo 之前，直接 rustc 命令无法链接独立 crate 的新依赖，旧 SHA 的 Linux workflow 出现 Failed；以当前独立 Cargo `--locked` 同 SHA 成功为准，**没有删测试或 skip**。
+- 当前生产持久化、原子迁移、签名验证、Linux 真 WG 和在线 TLS daemon 均未完成，S01 仍是第一步的一部分，SEC-01/02/08 不能关闭。
