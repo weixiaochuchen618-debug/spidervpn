@@ -156,8 +156,13 @@ fn validate_transport_paths(request: &Path, response: &Path) -> Result<(), Strin
     // canonicalize 在 Windows 上可能自动加 \\?\ 前缀，不能直接与原 PathBuf
     // 比较，否则有效的普通目录也会被误判为不安全。
     // 确认目录存在，随后用 Win32 FILE_ATTRIBUTE_REPARSE_POINT 逐级排除 junction。
-    std::fs::canonicalize(dir)
+    let canonical = std::fs::canonicalize(dir)
         .map_err(|e| format!("租约 IPC 目录不可访问：{e}"))?;
+    let temp_parent = std::fs::canonicalize(std::env::temp_dir())
+        .map_err(|e| format!("系统临时目录不可访问：{e}"))?;
+    if canonical.parent() != Some(temp_parent.as_path()) {
+        return Err("租约 IPC 只能写入当前用户的系统临时目录子层".into());
+    }
     // Windows 目录联接/junction 也需要拒绝（不能只靠 std::is_symlink）。
     #[cfg(windows)]
     {
@@ -245,11 +250,22 @@ fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
     let data = serde_json::to_vec(&LeaseAck {
         schema: LEASE_SCHEMA, nonce: nonce.into(), accepted,
     }).map_err(|e| e.to_string())?;
+    // ack.json 同样必须原子发布；直接写正式文件会让 helper 的
+    // 100ms 轮询读到半截 JSON，并把有效握手误判成攻击而撤销许可。
+    let temporary = path.with_extension("json.tmp");
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
-        .open(path).map_err(|e| format!("建立唯一租约确认文件失败：{e}"))?;
+        .open(&temporary).map_err(|e| format!("建立租约确认临时文件失败：{e}"))?;
     use std::io::Write;
-    file.write_all(&data).and_then(|_| file.sync_all())
-        .map_err(|e| format!("写租约确认失败：{e}"))
+    if let Err(err) = file.write_all(&data).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("写租约确认失败：{err}"));
+    }
+    drop(file);
+    if let Err(err) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("提交租约确认失败：{err}"));
+    }
+    Ok(())
 }
 
 /// 启动器显式返回的子进程句柄。释放 handle 不会结束 Windows 进程；
@@ -583,6 +599,11 @@ mod tests {
         let actual = read_request(&rq).unwrap();
         assert_eq!(validate_request(&actual).unwrap(), decode_nonce(&actual.nonce).unwrap());
         write_reply(&rs, &reply(&actual.nonce, LeaseState::Rejected, "test".into(), 0)).unwrap();
+        let ack_path = root.join("ack.json");
+        assert!(write_ack(&ack_path, &actual.nonce, true).is_ok());
+        assert!(read_ack(&ack_path, &actual.nonce).unwrap());
+        assert!(!ack_path.with_extension("json.tmp").exists(),
+            "不能遗留半写的临时 ack 文件");
         assert_eq!(read_request(&rq).unwrap().engine_pid, 51);
         assert!(write_reply(&rs, &reply(&actual.nonce, LeaseState::Ready, String::new(), 1)).is_err(),
             "old receipt cannot be silently overwritten");
