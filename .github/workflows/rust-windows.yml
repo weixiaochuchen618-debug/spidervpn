@@ -17,6 +17,17 @@ jobs:
       - name: Build with Rust
         run: cargo build --locked
 
+      # Run the elevation/DACL negative controls before broad integration tests.
+      # An unrelated end-to-end failure must not hide their result.
+      - name: SEC-10 protected IPC and privileged engine regressions (MSVC)
+        shell: pwsh
+        run: |
+          foreach ($filter in @('guard::elevate::tests::', 'secretfile::tests::privileged_ipc_objects_have_secure_acl_at_creation', 'engine::tests::privileged_engine_cannot_be_selected_from_arbitrary_config_path')) {
+            Write-Host "Running MSVC Rust security tests: $filter"
+            & cargo test --locked --bin spidervpn $filter -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
       - name: Rust integration tests (each integration target, no duplicate binary unit tests)
         shell: pwsh
         run: |
