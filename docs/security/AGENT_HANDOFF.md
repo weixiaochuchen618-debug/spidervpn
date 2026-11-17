@@ -45,10 +45,11 @@
 
 ## 3.1 最新活动修复恢复点（SEC-10，2026-11-17）
 
-- 独立 Rust 修复 [PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，从 main `857ea759` 开始；最新已推送提交 `7f0b65af`，Draft，不影响 main 或 WFP PR #3。
+- 独立 Rust 修复 [PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，从 main `857ea759` 开始；最新已推送提交 `707f6ef3`，Draft，不影响 main 或 WFP PR #3。
 - 已做：提权子进程二次核验 WFP AppId/device path、拒绝虚假 StoreKind；guard 请求使用随机独立 DACL 目录，UAC 启动参数携带请求 SHA256 内容绑定，固定文件名/路径验证，主程序预建空回执避免不同进程文件 owner 权限问题；Rust 回归测试增加被修改的请求和未知 StoreKind 在调用 WFP 后端之前即拒绝；提权辅助进程超时尝试终止。
-- 待做：**必须先检查**最新 [MSVC CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44004013098) 与 [GNU CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44004013537) 的状态及失败日志。然后完成 Windows 非管理员与管理员不同账户的实机 ACL/UAC 验收、可信安装目录和配置引擎路径等 SEC-03 工作。没有通过前不得称为 P0 已修复。
+- 待做：**必须先检查**最新 [MSVC CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44004838338) 与 [GNU CI](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44004838372) 的状态及失败日志。然后完成 Windows 非管理员与管理员不同账户的实机 ACL/UAC 验收、可信安装目录和配置引擎路径等 SEC-03 工作。没有通过前不得称为 P0 已修复。
 - 旧版 Windows GNU 运行 `44002952064` 的 14 项专项单测只有 1 项失败：测试没有先按真实路径创建 `req.json` / `res.json`，却期望 Windows reparse 校验放行不存在文件；已在 `a357668d` 修正测试先确认缺失文件必须拒绝、真实两文件创建后通过，**没有放松安全判断**。`7f0b65af` 增加回执失败不得返回 exit 0 的保证。最新 CI 仍待验证。
+- `7f0b65af` 的 GNU 测试 15 项 Guard + 11 项身份全部通过，但 `secretfile` 中两项默认继承 ACL 测试因为 CI Runner `%TEMP%` 本身受保护而失败；`707f6ef3` 已在隔离目录显式构造旧版宽松权限，再验证收紧与非私钥文件不误改。`5f3a4726` 新增按 Windows 打开句柄检查硬链接数，拒绝请求/回执硬链接，测试不跳过。当前最新 CI 未完成，不能合并 PR #6。**跨账户 UAC 的真实可用性和权限隔离仍未验收**。
 - 真正任务状态写在 [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) 的 “D.1 最新恢复点”。更换 Agent 直接从该条开始，不需要用户重新说明。
 
 ## 4. 新 Agent 首次执行的标准流程（无需用户再解释需求）
