@@ -163,7 +163,7 @@ PR/commit/CI: ...
 
 - **最终候选 Rust SHA**：`0690cba5774c715255fb7c4fe55c92a2728b30d5`（仍在 [Draft PR #6](https://github.com/weixiaochuchen618-debug/spidervpn/pull/6)，不是 main）。
 - **正常 ACL 被误拒的真实根因**：MSVC [44012356666](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44012356666) 的受保护目录/请求/回执 DACL 现场读回为 `D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)`，但 Win32 SDDL API 返回的 UTF-16 长度还含三个末尾 `NUL`。旧严格解析器把这些尾零误认作“额外控制标记”；确诊来自专门打印原始 SDDL 的失败日志，**不能跳过这两条正常路径单测**。
-- **最终修正**：`0690cba5` 在 `src/secretfile.rs` 仅使用 `trim_end_matches('\\0')` 去掉 SDDL 返回值的末尾终止符；不删除字符串内部非法字符，不放宽受保护 `D:P` 或 ACE 的 SY/BA/OW 精确授权白名单。负向 ACL 降级测试仍必须以 `backend calls = 0` 拒绝。
+- **最终修正**：`0690cba5` 在 `src/secretfile.rs` 仅使用 `trim_end_matches('\0')` 去掉 SDDL 返回值的末尾终止符；不删除字符串内部非法字符，不放宽受保护 `D:P` 或 ACE 的 SY/BA/OW 精确授权白名单。负向 ACL 降级测试仍必须以 `backend calls = 0` 拒绝。
 - **Windows GNU 当前 SHA Success**：[44012868496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44012868496)，head_sha `0690cba5...`：通过 `build.ps1` GNU 构建、Release 根目录覆写保护、Guard elevate/identity、私钥 IPC ACL、WFP 布局、引擎身份等 Rust 专项回归。
 - **Windows MSVC 当前 SHA**：[44012868490](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44012868490)：已显示 `cargo build --locked`、SEC-10 专项、全部 Rust 集成测试目标、相关模块回归步骤 Success；`Portable Rust unit suite` 在本条记录写入时仍未给出最终结论。原工作流保留 **8 条已有的环境依赖单测排除项**，此次没有增加 `--skip`，不能把该便携单元套件称为无排除的“全量”。GNU 专项里的 `secretfile::tests::` 真实执行，不被 MSVC 便携套件的排除项代替。
 - **安全验收状态仍然不变**：SEC-03 / SEC-10 **P0 OPEN / 候选未完结**。真实多账户 UAC/独立管理员、普通账户改写安装 bin 与引擎、DLL/脚本劫持、安装/升级/卸载迁移、Windows WFP 持久阻断实机验证缺失；CI 成功并不等于这类安全验收。保持 UI、连接交互、WFP v1 持久 BLOCK 不变，PR #6 与 PR #3 均不合并。
