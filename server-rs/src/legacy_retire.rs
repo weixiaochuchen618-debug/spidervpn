@@ -21,12 +21,12 @@
 
 #![cfg(all(target_os="linux", feature="linux-legacy-retire"))]
 
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::legacy_cutover::observe_old_python_shutdown;
@@ -195,7 +195,8 @@ pub fn observe_offline_retired_entrypoint()->Result<RetirementWitness,Retirement
 #[cfg(test)]
 mod tests{
     use super::*;
-    use std::os::unix::fs::{symlink, hard_link};
+    use std::io::Write;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     const CODE: &[u8]=b"print('old pairing writer')\n";
     fn make_root(tag:&str)->PathBuf{
         let parent=std::env::temp_dir().join(
