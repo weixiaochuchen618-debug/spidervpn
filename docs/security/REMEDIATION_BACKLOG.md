@@ -193,6 +193,6 @@ PR/commit/CI: ...
 
 - **最新代码 HEAD**：a14016cd4a921b2e8639de22ab9f70add9d62a17；PR #6 仍 Draft，main 857ea759 未动。最终候选包含 D:PAI Win32 SDDL 表示修正、硬链接数量检查、已有 data 目录单独保护以及旧 config 内容保留回归。
 - **Windows GNU [44018620441](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620441)**：head_sha 与此提交一致、**Completed / Success**。包括 build.ps1 GNU 编译、Release SPIDERVPN_ROOT 不可信环境覆盖拒绝和 Rust install_trust / Guard IPC / identity / WFP 等专项过滤。
-- **Windows MSVC [44018620435](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620435)**：head_sha 相同；已确认 Rust Build、SEC-10+SEC-03 专项、全部独立 tests/*.rs 集成目标、相关模块回归步骤 **Success**；工作流最后的便携单元测试截至写入仍 In Progress（已有 8 条环境依赖排除，本轮未增加任何 skip）。必须以 GitHub 终态补录，**不能目前宣称整个 MSVC 完成**。
+- **Windows MSVC [44018620435](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44018620435)**：head_sha = a14016cd；**Completed / Success**，Rust Build、SEC-10+SEC-03 专项、全部独立 tests/*.rs 集成目标、相关模块回归、便携 Rust 单元 suite 各步骤均 Success。便携 suite 保留原有的 8 条环境依赖排除，**本轮未添加任何 skip**；不得据此宣称“无排除、跨账户真实 Windows 测试全通过”。
 - **本轮确定保留的失败证据**：54f09333 的 MSVC 44017844701 2/4 因 D:PAI 控制标记误拒，修复后在当前 SHA 的 SEC-03 专项已通过；未删除测试、未放宽额外 AU/WD/OW ACE。
 - **仍未完成**：Win11 A/B/C 三账户 I01–I12、真实安装/升级/卸载/回滚、源包签名与信任、现有文件句柄竞争、普通用户拥有旧目录的 Owner Rights 实际测试、WFP 持久 BLOCK 实机不退化。SEC-03/SEC-10 仍 P0 未完成安全验收，PR #6 与 PR #3 不合并到 main。
