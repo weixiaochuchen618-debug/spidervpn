@@ -93,6 +93,72 @@ mod tests {
         assert!(!remote_says_fenced(73, "prefixTC_ERROR=LegacyWriterFencedpost"));
     }
 
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_posix_shell_blocks_each_retired_server_marker_before_side_effects() {
+        use std::fs::{self, Permissions};
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::path::Path;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let id = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-ssh-guard-{}-{id}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, Permissions::from_mode(0o700)).unwrap();
+        let marker = root.join("marker");
+        let script = root.join("tc-pair.py");
+        let unit = root.join("tc-pair.service");
+        let output = root.join("ran");
+        // Substitute only the fixed system paths, never a user's input.
+        // This executes the EXACT Rust shell prelude against isolated test
+        // paths and checks its effects, instead of testing string matching.
+        let prelude = SHELL_DENY_PRELUDE
+            .replace(CUTOVER_MARKER, marker.to_str().unwrap())
+            .replace(OLD_SCRIPT, script.to_str().unwrap())
+            .replace(SERVICE_UNIT, unit.to_str().unwrap());
+        let command = format!("{prelude}printf ran > '{}'\n", output.display());
+        let run = || {
+            Command::new("/bin/sh").arg("-c").arg(&command)
+                .output().unwrap()
+        };
+
+        // Existing unretired deployments continue unchanged.
+        assert!(run().status.success());
+        assert_eq!(fs::read(&output).unwrap(), b"ran");
+        fs::remove_file(&output).unwrap();
+
+        // Root-created marker file, even if it has no payload.
+        fs::write(&marker, b"retired").unwrap();
+        let result = run();
+        assert_eq!(result.status.code(), Some(73));
+        assert_eq!(result.stderr, b"TC_ERROR=LegacyWriterFenced\n");
+        assert!(!output.exists());
+        fs::remove_file(&marker).unwrap();
+
+        // A dangling symlink is NOT accepted as absence.
+        symlink(root.join("missing"), &marker).unwrap();
+        assert_eq!(run().status.code(), Some(73));
+        assert!(!output.exists());
+        fs::remove_file(&marker).unwrap();
+
+        // The Linux atomic-retirement directory tombstone blocks old SSH.
+        fs::create_dir(&script).unwrap();
+        assert_eq!(run().status.code(), Some(73));
+        assert!(!output.exists());
+        fs::remove_dir(&script).unwrap();
+
+        // Permanent systemd mask is a real symlink to /dev/null.
+        symlink(Path::new("/dev/null"), &unit).unwrap();
+        assert_eq!(run().status.code(), Some(73));
+        assert!(!output.exists());
+        fs::remove_file(&unit).unwrap();
+
+        fs::remove_dir(&root).unwrap();
+    }
+
     #[test]
     fn no_server_marker_creation_or_implicit_migration_authority() {
         // Marker existence is supplied ONLY by independently managed root
