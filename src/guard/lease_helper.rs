@@ -3,7 +3,7 @@
 //! 与一次性 --guard-apply 严格分离：动态会话必须在 helper 内持续持有，
 //! 并在主程序或 sing-box 退出时立即撤销。**此阶段尚未接入生产连接按钮**。
 //!
-//! 请求与回执是有界 JSON；任何失败都只能写 Rejected，绝不伪造 Ready。
+//! Windows 通过受保护的本机命名管道交换有界 JSON，不接受旧文件路径入口。
 //! Ready 仅在 DynamicProxyLease::acquire 已核验完整持久 BLOCK 并成功写入动态
 //! PERMIT 之后写出。服务流程不做任何持久 WFP 变更或证据存储写入。
 
@@ -47,6 +47,7 @@ pub struct LeaseReply {
 pub enum LeaseState {
     Ready,
     Accepted,
+    Committed,
     Rejected,
     Closed,
 }
@@ -59,9 +60,26 @@ struct LeaseAck {
     accepted: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseFinish {
+    schema: u32,
+    nonce: String,
+    state: LeaseState,
+}
+
+fn validate_finish(body: &[u8], nonce: &str) -> Result<(), String> {
+    let finish: LeaseFinish = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    if finish.schema != LEASE_SCHEMA || finish.nonce != nonce || finish.state != LeaseState::Committed {
+        return Err("最终授权确认阶段不匹配".into());
+    }
+    Ok(())
+}
+
 /// 从同一个已打开的对象验证文件类型、链接数、长度，再有界读取。
 /// Windows 不跟随末级 reparse point，且读取期间不共享写入或删除。
 /// 这不是目录 DACL 或 IPC 对端身份认证的替代品。
+#[cfg(test)]
 fn open_ipc_file(path: &Path, limit: usize, consume: bool)
     -> Result<Option<(std::fs::File, Vec<u8>)>, String>
 {
@@ -133,6 +151,7 @@ fn open_ipc_file(path: &Path, limit: usize, consume: bool)
     Ok(Some((file, body)))
 }
 
+#[cfg(test)]
 fn read_ipc_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
     Ok(open_ipc_file(path, limit, false)?.map(|(_, body)| body))
 }
@@ -157,7 +176,7 @@ fn parse_ack(body: &[u8], nonce: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn consume_ack(path: &Path, nonce: &str) -> Result<bool, String> {
     let Some((file, body)) = open_ipc_file(path, 4096, true)? else {
         return Ok(false);
@@ -216,6 +235,7 @@ pub fn validate_request(req: &LeaseRequest) -> Result<[u8; 16], String> {
 /// 限制提权 helper 的文件系统写入范围：不能允许命令行把回执路径
 /// 指向任意用户文件。要求两个文件处于同一独立临时子目录，且只能用固定文件名。
 /// 这是启动器/子进程双重验证的一半；启动器还必须负责目录 ACL 与随机性。
+#[cfg(test)]
 fn validate_transport_paths(request: &Path, response: &Path) -> Result<(), String> {
     use std::path::Component;
     if !request.is_absolute() || !response.is_absolute() {
@@ -266,6 +286,7 @@ fn validate_transport_paths(request: &Path, response: &Path) -> Result<(), Strin
 }
 
 /// 请求必须绑定到启动器为本次会话生成的完整 128-bit 目录标识。
+#[cfg(test)]
 fn validate_session_directory(path: &Path, nonce: &str) -> Result<(), String> {
     decode_nonce(nonce)?;
     let expected = format!("spidervpn-lease-{nonce}");
@@ -277,7 +298,7 @@ fn validate_session_directory(path: &Path, nonce: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(test, not(windows)))]
+#[cfg(test)]
 fn read_request(path: &Path) -> Result<LeaseRequest, String> {
     let data = read_ipc_file(path, MAX_LEASE_IPC_BYTES)?
         .ok_or("租约请求不存在")?;
@@ -286,7 +307,7 @@ fn read_request(path: &Path) -> Result<LeaseRequest, String> {
 
 /// 验证后消费同一个打开的请求对象；不能通过再次解析路径来删除文件。
 /// 删除失败必须拒绝许可，不能留下可直接重复消费的原请求。
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn consume_request(path: &Path) -> Result<LeaseRequest, String> {
     let (file, data) = open_ipc_file(path, MAX_LEASE_IPC_BYTES, true)?
         .ok_or("租约请求不存在或已经消费")?;
@@ -298,7 +319,7 @@ fn consume_request(path: &Path) -> Result<LeaseRequest, String> {
     Ok(req)
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn delete_consumed_file(file: std::fs::File) -> Result<(), String> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -320,6 +341,7 @@ fn delete_consumed_file(file: std::fs::File) -> Result<(), String> {
 
 /// 发布时由文件系统原子拒绝已存在的目标，而不是依赖事前 exists 检查。
 /// 尚不解决父目录路径替换或同用户伪造，仍需可信目录和对端认证。
+#[cfg(test)]
 fn publish_new_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -341,6 +363,7 @@ fn publish_new_file(source: &Path, destination: &Path) -> std::io::Result<()> {
 
 /// 先写临时文件再原子改名，防止父进程把半截 Ready 当成功。
 /// 回执仅在 helper 拥有会话时表示 Ready，不代表长期守护已完成全机验收。
+#[cfg(test)]
 fn write_reply(path: &Path, reply: &LeaseReply) -> Result<(), String> {
     let data = serde_json::to_vec(reply).map_err(|e| e.to_string())?;
     if data.len() > MAX_LEASE_IPC_BYTES {
@@ -371,17 +394,26 @@ fn write_reply(path: &Path, reply: &LeaseReply) -> Result<(), String> {
 
 /// 父进程必须检查回执来自本次会话且 filter_count 与请求完全一致；
 /// "Ready" 文件本身不能证明子进程仍活着，启动器还必须检查 hProcess。
+#[cfg(test)]
 fn read_ready(path: &Path, nonce: &str, expected_count: usize, expected_helper_pid: u32) -> Result<Option<()>, String> {
     read_stage(path, nonce, expected_count, expected_helper_pid, LeaseState::Ready)
 }
 
+#[cfg(test)]
 fn read_stage(path: &Path, nonce: &str, expected_count: usize, expected_helper_pid: u32,
     expected_state: LeaseState) -> Result<Option<()>, String>
 {
     let Some(body) = read_ipc_file(path, 4096)? else {
         return Ok(None);
     };
-    let reply: LeaseReply = serde_json::from_slice(&body)
+    validate_stage(&body, nonce, expected_count, expected_helper_pid, expected_state)?;
+    Ok(Some(()))
+}
+
+fn validate_stage(body: &[u8], nonce: &str, expected_count: usize,
+    expected_helper_pid: u32, expected_state: LeaseState) -> Result<(), String>
+{
+    let reply: LeaseReply = serde_json::from_slice(body)
         .map_err(|e| format!("租约回执无效：{e}"))?;
     if reply.schema != LEASE_SCHEMA || reply.nonce != nonce {
         return Err("租约 Ready 回执版本或 nonce 不匹配".into());
@@ -395,9 +427,10 @@ fn read_stage(path: &Path, nonce: &str, expected_count: usize, expected_helper_p
     if reply.filter_count != expected_count || !reply.reason.is_empty() {
         return Err("租约 Ready 报告的过滤器数量或状态异常".into());
     }
-    Ok(Some(()))
+    Ok(())
 }
 
+#[cfg(test)]
 fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
     let data = serde_json::to_vec(&LeaseAck {
         schema: LEASE_SCHEMA, nonce: nonce.into(), accepted,
@@ -425,7 +458,6 @@ fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
 #[cfg(windows)]
 pub struct LeaseChild {
     handle: windows_sys::Win32::Foundation::HANDLE,
-    pub directory: PathBuf,
     // 未得到可靠 Ready/ACK 确认的 helper，父进程退出此作用域时必须
     // 立即终止，不能让一个半启动的动态许可继续放行最多 15 秒。
     confirmed: bool,
@@ -456,55 +488,38 @@ impl Drop for LeaseChild {
     }
 }
 
-/// 从非提权主程序启动长期 helper。**目前不在正式连接路径调用**。
-/// 这条能力仅为后续隔离实机验收准备，避免在尚未验证 TUN 时改变交互。
+/// 默认关闭的实验入口调用此启动器；不改变生产连接或持久规则。
 #[cfg(windows)]
 pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
+    use pipe_ipc::*;
     use ring::rand::{SecureRandom, SystemRandom};
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessId};
     use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS};
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
     if request.controller_pid != std::process::id() {
         return Err("只有正在运行的发起进程可以申请本次动态租约".into());
     }
-    let random = SystemRandom::new();
+    let own = unsafe { GetCurrentProcess() };
+    let controller_token = token_identity(own)?;
+    let controller_stamp = creation_stamp(own)?;
     let mut bytes = [0u8; 16];
-    random.fill(&mut bytes).map_err(|_| "生成动态许可 nonce 失败".to_string())?;
+    SystemRandom::new().fill(&mut bytes).map_err(|_| "生成动态许可 nonce 失败".to_string())?;
     let nonce = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let mut req = request.clone();
     req.nonce = nonce.clone();
     validate_request(&req)?;
-    let directory = std::env::temp_dir().join(format!("spidervpn-lease-{nonce}"));
-    std::fs::create_dir(&directory)
-        .map_err(|e| format!("创建独立租约目录失败：{e}"))?;
-    let request_path = directory.join("request.json");
-    let reply_path = directory.join("reply.json");
-    let ack_path = directory.join("ack.json");
-    validate_transport_paths(&request_path, &reply_path)?;
-    validate_session_directory(&request_path, &nonce)?;
     let data = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
-    if data.len() > MAX_LEASE_IPC_BYTES {
-        return Err("交易保护租约名单超过 IPC 大小限制".into());
-    }
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
-        .open(&request_path).map_err(|e| format!("创建独立租约请求失败：{e}"))?;
-    use std::io::Write;
-    file.write_all(&data).and_then(|_| file.sync_all())
-        .map_err(|e| format!("写入租约请求失败：{e}"))?;
-    drop(file);
+    if data.len() > MAX_LEASE_IPC_BYTES { return Err("租约请求过大".into()); }
 
-    let to_wide = |s: &std::ffi::OsStr| -> Vec<u16> {
-        s.encode_wide().chain(Some(0)).collect()
-    };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let exe_w = to_wide(exe.as_os_str());
-    let args_w = to_wide(std::ffi::OsStr::new(&format!(
-        "{LEASE_FLAG} \"{}\" \"{}\"", request_path.display(), reply_path.display(),
-    )));
+    let exe_w: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Existing main dispatch takes exactly two values. Neither is a filesystem path.
+    let args_w: Vec<u16> = format!("{LEASE_FLAG} {nonce} {}-{controller_stamp}", req.controller_pid)
+        .encode_utf16().chain(Some(0)).collect();
     let verb_w: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -514,176 +529,169 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     info.lpParameters = args_w.as_ptr();
     info.nShow = SW_HIDE;
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
-        let code = unsafe { GetLastError() };
-        return Err(format!("无法启动提权 WFP helper（Win32={code}）"));
+        return Err(format!("无法启动提权 WFP helper（Win32={}）", unsafe { GetLastError() }));
     }
-    if info.hProcess.is_null() {
-        return Err("启动 WFP helper 后未获取进程句柄".into());
-    }
-    let mut child = LeaseChild { handle: info.hProcess, directory, confirmed: false };
-    let helper_pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(child.handle) };
-    if helper_pid == 0 {
-        return Err("不能从启动的 helper 句柄确认 PID".into());
+    if info.hProcess.is_null() { return Err("启动后未获得 helper 进程句柄".into()); }
+    let mut child = LeaseChild { handle: info.hProcess, confirmed: false };
+    let helper_pid = unsafe { GetProcessId(child.handle) };
+    verify_same_image(child.handle, helper_pid)?;
+    let helper_stamp = creation_stamp(child.handle)?;
+    let helper_token = token_identity(child.handle)?;
+    if !helper_token.elevated || helper_token.session != controller_token.session {
+        return Err("helper 未提权或不在相同交互会话".into());
     }
     let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if Instant::now() >= deadline {
-            let _ = write_ack(&ack_path, &nonce, false);
-            return Err("长期 WFP helper 就绪超时，拒绝将其视为已保护".into());
-        }
-        if unsafe { WaitForSingleObject(child.handle, 0) } != WAIT_TIMEOUT {
-            return Err("长期 WFP helper 在 Ready 前已退出，未启用临时许可".into());
-        }
-        match read_ready(&reply_path, &nonce, req.programs.len(), helper_pid) {
-            Ok(Some(())) => {
-                // Ready 只是第一阶段；必须写 nonce-bound ACK 并确认进程尚存活。
-                if Instant::now() >= deadline {
-                    return Err("租约 Ready 超出启动期限".into());
-                }
-                write_ack(&ack_path, &nonce, true)?;
-                if !child.running() || Instant::now() >= deadline {
-                    return Err("租约确认后 helper 已退出，拒绝报告连接已受保护".into());
-                }
-                // Do not treat publishing ACK as proof that the helper consumed it.
-                let accepted_path = directory_receipt(&child.directory);
-                loop {
-                    if !child.running() || Instant::now() >= deadline {
-                        return Err("等待 helper 实际消费 ACK 超时或进程退出".into());
-                    }
-                    if read_stage(&accepted_path, &nonce, req.programs.len(), helper_pid,
-                        LeaseState::Accepted)?.is_some()
-                    {
-                        if !child.running() || Instant::now() >= deadline {
-                            return Err("最终租约回执已失效".into());
-                        }
-                        child.confirmed = true;
-                        return Ok(child);
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-            Err(e) => {
-                let _ = write_ack(&ack_path, &nonce, false);
-                return Err(e);
-            }
-            Ok(None) => {}
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    let pipe = Pipe::client(&nonce, deadline, || require_live(child.handle))?;
+    let check = || -> Result<(), String> {
+        require_live(child.handle)?;
+        pipe.require_peer(helper_pid, false)
+    };
+    check()?;
+    // Authenticate the actual connected process BEFORE sending any request bytes.
+    if creation_stamp(child.handle)? != helper_stamp || token_identity(child.handle)? != helper_token {
+        return Err("helper 创建时间或 token 变化".into());
     }
+    pipe.send(&data, deadline, &check)?;
+    let ready = pipe.receive(4096, deadline, &check)?;
+    validate_stage(&ready, &nonce, req.programs.len(), helper_pid, LeaseState::Ready)?;
+    let ack = serde_json::to_vec(&LeaseAck { schema: LEASE_SCHEMA, nonce: nonce.clone(), accepted: true })
+        .map_err(|e| e.to_string())?;
+    pipe.send(&ack, deadline, &check)?;
+    let accepted = pipe.receive(4096, deadline, &check)?;
+    validate_stage(&accepted, &nonce, req.programs.len(), helper_pid, LeaseState::Accepted)?;
+    // A distinct final authorization is sent only after the authenticated consumption
+    // receipt was actually read. An abandoned handshake cannot transition on ACK alone.
+    if token_identity(child.handle)? != helper_token || creation_stamp(child.handle)? != helper_stamp {
+        return Err("helper 最终身份复验失败".into());
+    }
+    let finish = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state: LeaseState::Committed })
+        .map_err(|e| e.to_string())?;
+    pipe.send(&finish, deadline, &check)?;
+    let committed = pipe.receive(4096, deadline, &check)?;
+    validate_stage(&committed, &nonce, req.programs.len(), helper_pid, LeaseState::Committed)?;
+    check()?;
+    if Instant::now() >= deadline { return Err("最终租约回执超期".into()); }
+    child.confirmed = true;
+    Ok(child)
 }
 
-fn directory_receipt(directory: &Path) -> PathBuf {
-    directory.join("accepted.json")
-}
-
+#[cfg(any(windows, test))]
 fn reply(nonce: &str, state: LeaseState, reason: String, count: usize) -> LeaseReply {
     LeaseReply { schema: LEASE_SCHEMA, nonce: nonce.to_owned(), state, reason, filter_count: count, helper_pid: std::process::id() }
 }
 
-/// 提权 helper 的进程主入口。成功时长期阻塞在 Windows 进程对象等待中。
-///
-/// 失败时写 Rejected（如果回执路径允许写），返回非零；不会留下动态许可。
-/// 启动者必须使用严格路径 ACL 与独立随机目录，不能与 v1 guard 请求目录复用。
-pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
-    // 拒绝利用提权 helper 对任意路径执行回执文件写入。
-    if validate_transport_paths(req_path, reply_path).is_err() {
-        return 2;
-    }
-    // 运行中辅助进程不允许普通权限降级继续：否则 Ready 是假证据。
-    if !super::elevate::is_elevated() {
-        let _ = write_reply(reply_path, &reply("", LeaseState::Rejected,
-            "没有管理员权限，动态交易许可未开启".into(), 0));
-        return 2;
-    }
-    #[cfg(windows)]
-    let request = consume_request(req_path);
-    #[cfg(not(windows))]
-    let request = read_request(req_path);
-    let req = match request {
-        Ok(req) => req,
-        Err(reason) => {
-            let _ = write_reply(reply_path, &reply("", LeaseState::Rejected, reason, 0));
-            return 2;
-        }
-    };
-    let nonce = match validate_request(&req) {
-        Ok(v) => v,
-        Err(reason) => {
-            let _ = write_reply(reply_path, &reply(&req.nonce, LeaseState::Rejected, reason, 0));
-            return 2;
-        }
-    };
-    // Windows 已通过原始文件句柄消费请求；仍需独立的目录与对端认证。
-    if validate_session_directory(req_path, &req.nonce).is_err() {
-        return 2;
-    }
+#[cfg(test)]
+fn directory_receipt(directory: &Path) -> PathBuf {
+    directory.join("accepted.json")
+}
 
+// Parse only the new two-value internal protocol. Old request/reply paths fail without I/O.
+fn parse_pipe_arguments(nonce: &Path, controller: &Path) -> Result<(String, u32, u64), String> {
+    let nonce = nonce.to_str().ok_or("无效的租约 nonce")?;
+    decode_nonce(nonce)?;
+    let controller = controller.to_str().ok_or("无效的租约控制进程参数")?;
+    let (pid, stamp) = controller.split_once('-').ok_or("缺少控制进程创建时间")?;
+    let pid: u32 = pid.parse().map_err(|_| "控制进程 PID 无效")?;
+    let stamp: u64 = stamp.parse().map_err(|_| "控制进程创建时间无效")?;
+    if pid == 0 || stamp == 0 || controller != format!("{pid}-{stamp}") {
+        return Err("控制进程参数不符合严格协议".into());
+    }
+    Ok((nonce.to_owned(), pid, stamp))
+}
+
+/// Elevated helper. No privileged filesystem transport, even for failure replies.
+pub fn serve(nonce_arg: &Path, controller_arg: &Path) -> i32 {
+    let Ok((nonce, pid, stamp)) = parse_pipe_arguments(nonce_arg, controller_arg) else { return 2; };
     #[cfg(windows)]
     {
-        let lease = match super::wfp_win::DynamicProxyLease::acquire(
-            &req.programs, req.endpoint, req.engine_pid, req.controller_pid,
-            &req.engine_executable, &nonce,
-        ) {
-            Ok(lease) => lease,
-            Err(reason) => {
-                let _ = write_reply(reply_path, &reply(&req.nonce, LeaseState::Rejected, reason, 0));
-                return 3;
-            }
-        };
-        let count = lease.count();
-        // 如果无法写 Ready，lease 在 return 时被 Drop，动态 WFP 权限自动撤销。
-        if write_reply(reply_path, &reply(&req.nonce, LeaseState::Ready,
-            String::new(), count)).is_err()
-        {
-            return 4;
+        if !super::elevate::is_elevated() { return 2; }
+        match serve_pipe(&nonce, pid, stamp) {
+            Ok(()) => 0,
+            Err(_) => 6,
         }
-        // 双向握手：如果 parent 退出、读取回执失败或拒绝确认，15 秒内
-        // 自动撤销；等待期间每 100ms 重新核验引擎、主进程与监听身份。
-        // 不允许“只有 Ready 文件就长期放行”的失败状态。
-        let ack_path = reply_path.with_file_name("ack.json");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut lease = lease;
-        loop {
-            if std::time::Instant::now() >= deadline {
-                return 6;
-            }
-            let accepted = match consume_ack(&ack_path, &req.nonce) {
-                Ok(value) => value,
-                Err(_) => return 6, // lease 被 Drop，动态会话随之关闭
-            };
-            lease = match lease.revalidate(&req.engine_executable) {
-                Ok(value) => value,
-                Err(_) => return 6,
-            };
-            // ACK 已存在也必须经过存活检查，且不能在截止之后接管租约。
-            if std::time::Instant::now() >= deadline {
-                return 6;
-            }
-            if accepted {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        // Only publish the second-stage receipt after accepting ACK and revalidating.
-        let accepted_path = directory_receipt(reply_path.parent().expect("validated parent"));
-        if write_reply(&accepted_path, &reply(&req.nonce, LeaseState::Accepted,
-            String::new(), count)).is_err()
-        {
-            return 6;
-        }
-        // helper 自己退出/崩溃时，BFE 动态 session 自动撤销临时 PERMIT。
-        return if lease.supervise_until_exit(&req.engine_executable).is_ok() { 0 } else { 5 };
     }
-
     #[cfg(not(windows))]
     {
-        let _ = nonce;
-        let _ = write_reply(reply_path, &reply(&req.nonce, LeaseState::Rejected,
-            "WFP 租约只支持 Windows".into(), 0));
+        let _ = (nonce, pid, stamp);
         3
     }
 }
 
+#[cfg(windows)]
+fn serve_pipe(nonce: &str, pid: u32, stamp: u64) -> Result<(), String> {
+    use pipe_ipc::*;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let controller = open_controller(pid, stamp)?;
+    let controller_token = token_identity(controller.0)?;
+    let helper_token = token_identity(unsafe { GetCurrentProcess() })?;
+    if !helper_token.elevated || helper_token.session != controller_token.session {
+        return Err("租约双方 token 不属于允许的交互会话".into());
+    }
+    let pipe = Pipe::server(nonce, &controller_token, &helper_token)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    pipe.accept(deadline, || require_live(controller.0))?;
+    let check = || -> Result<(), String> {
+        require_live(controller.0)?;
+        pipe.require_peer(pid, true)
+    };
+    check()?;
+    if token_identity(controller.0)? != controller_token || creation_stamp(controller.0)? != stamp {
+        return Err("租约控制进程 token 或创建时间不匹配".into());
+    }
+    let body = pipe.receive(MAX_LEASE_IPC_BYTES, deadline, &check)?;
+    let req: LeaseRequest = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+    let nonce_bytes = validate_request(&req)?;
+    if req.nonce != nonce || req.controller_pid != pid {
+        return Err("租约请求与操作系统对端不一致".into());
+    }
+    verify_same_image(controller.0, pid)?;
+    check()?;
+    if Instant::now() >= deadline { return Err("租约请求超期".into()); }
+    let lease = match super::wfp_win::DynamicProxyLease::acquire(
+        &req.programs, req.endpoint, req.engine_pid, pid, &req.engine_executable, &nonce_bytes,
+    ) {
+        Ok(lease) => lease,
+        Err(reason) => {
+            if let Ok(body) = serde_json::to_vec(&reply(nonce, LeaseState::Rejected, reason.clone(), 0)) {
+                let _ = pipe.send(&body, deadline, &check);
+            }
+            return Err(reason);
+        }
+    };
+    let count = lease.count();
+    let mut lease = Some(lease);
+    // Every handshake poll revalidates the live lease; a failure consumes the lease.
+    let mut check_lease = || -> Result<(), String> {
+        check()?;
+        let current = lease.take().ok_or("动态租约不可用")?;
+        lease = Some(current.revalidate(&req.engine_executable)?);
+        Ok(())
+    };
+    let ready = serde_json::to_vec(&reply(nonce, LeaseState::Ready, String::new(), count))
+        .map_err(|e| e.to_string())?;
+    pipe.send(&ready, deadline, &mut check_lease)?;
+    let ack = pipe.receive(4096, deadline, &mut check_lease)?;
+    parse_ack(&ack, nonce)?;
+    check_lease()?;
+    if token_identity(controller.0)? != controller_token || creation_stamp(controller.0)? != stamp {
+        return Err("租约控制进程最终身份复验失败".into());
+    }
+    let accepted = serde_json::to_vec(&reply(nonce, LeaseState::Accepted, String::new(), count))
+        .map_err(|e| e.to_string())?;
+    pipe.send(&accepted, deadline, &mut check_lease)?;
+    let finish = pipe.receive(4096, deadline, &mut check_lease)?;
+    validate_finish(&finish, nonce)?;
+    check_lease()?;
+    let committed = serde_json::to_vec(&reply(nonce, LeaseState::Committed, String::new(), count))
+        .map_err(|e| e.to_string())?;
+    pipe.send(&committed, deadline, &mut check_lease)?;
+    // No file path is ever opened or written by this privileged protocol.
+    // Release transport after final authorization; actual WFP rundown remains RAII.
+    let lease = lease.take().ok_or("动态租约不可用")?;
+    drop(pipe);
+    lease.supervise_until_exit(&req.engine_executable)
+}
 
 #[cfg(windows)]
 mod pipe_ipc {
@@ -955,56 +963,90 @@ mod pipe_ipc {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        fn random_nonce() -> String {
-            use ring::rand::{SecureRandom, SystemRandom};
-            let mut bytes = [0u8; 16];
-            SystemRandom::new().fill(&mut bytes).unwrap();
-            bytes.iter().map(|b| format!("{b:02x}")).collect()
-        }
 
-        #[test]
-        fn real_pipe_rejects_wrong_peer_and_duplicate_instance_and_bounds_frames() {
-            let nonce = random_nonce();
-            let token = token_identity(unsafe { GetCurrentProcess() }).unwrap();
-            let server = Pipe::server(&nonce, &token, &token).unwrap();
-            assert!(Pipe::server(&nonce, &token, &token).is_err());
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let client = Pipe::client(&nonce, deadline, || Ok(())).unwrap();
-            server.accept(deadline, || Ok(())).unwrap();
-            let pid = std::process::id();
-            server.require_peer(pid, true).unwrap();
-            client.require_peer(pid, false).unwrap();
-            assert!(server.require_peer(pid ^ 1, true).is_err());
-            assert!(client.require_peer(pid ^ 1, false).is_err());
-            client.send(b"ack", deadline, || Ok(())).unwrap();
-            assert_eq!(server.receive(3, deadline, || Ok(())).unwrap(), b"ack");
-            server.send(b"accepted", deadline, || Ok(())).unwrap();
-            assert_eq!(client.receive(8, deadline, || Ok(())).unwrap(), b"accepted");
-            client.send(b"oversize", deadline, || Ok(())).unwrap();
-            assert!(server.receive(3, deadline, || Ok(())).is_err());
-        }
-
-        #[test]
-        fn real_pipe_absent_ack_times_out_and_closed_peer_fails() {
-            let nonce = random_nonce();
-            let token = token_identity(unsafe { GetCurrentProcess() }).unwrap();
-            let server = Pipe::server(&nonce, &token, &token).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let client = Pipe::client(&nonce, deadline, || Ok(())).unwrap();
-            server.accept(deadline, || Ok(())).unwrap();
-            assert!(server.receive(4096, Instant::now() + Duration::from_millis(150), || Ok(())).is_err());
-            drop(client);
-            assert!(server.receive(4096, Instant::now() + Duration::from_millis(200), || Ok(())).is_err());
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use super::pipe_ipc::*;
+    #[cfg(windows)]
+    use std::time::{Duration, Instant};
+    #[cfg(windows)]
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(windows)]
+    fn random_nonce() -> String {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut bytes = [0u8; 16];
+        SystemRandom::new().fill(&mut bytes).unwrap();
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_pipe_rejects_wrong_peer_and_duplicate_instance_and_bounds_frames() {
+        let nonce = random_nonce();
+        let token = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        let server = Pipe::server(&nonce, &token, &token).unwrap();
+        assert!(Pipe::server(&nonce, &token, &token).is_err());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let client = Pipe::client(&nonce, deadline, || Ok(())).unwrap();
+        server.accept(deadline, || Ok(())).unwrap();
+        let pid = std::process::id();
+        server.require_peer(pid, true).unwrap();
+        client.require_peer(pid, false).unwrap();
+        assert!(server.require_peer(pid ^ 1, true).is_err());
+        assert!(client.require_peer(pid ^ 1, false).is_err());
+        client.send(b"ack", deadline, || Ok(())).unwrap();
+        assert_eq!(server.receive(3, deadline, || Ok(())).unwrap(), b"ack");
+        server.send(b"accepted", deadline, || Ok(())).unwrap();
+        assert_eq!(client.receive(8, deadline, || Ok(())).unwrap(), b"accepted");
+        client.send(b"oversize", deadline, || Ok(())).unwrap();
+        assert!(server.receive(3, deadline, || Ok(())).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_pipe_absent_ack_times_out_and_closed_peer_fails() {
+        let nonce = random_nonce();
+        let token = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        let server = Pipe::server(&nonce, &token, &token).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let client = Pipe::client(&nonce, deadline, || Ok(())).unwrap();
+        server.accept(deadline, || Ok(())).unwrap();
+        assert!(server.receive(4096, Instant::now() + Duration::from_millis(150), || Ok(())).is_err());
+        drop(client);
+        assert!(server.receive(4096, Instant::now() + Duration::from_millis(200), || Ok(())).is_err());
+    }
+
+
+    #[test]
+    fn old_file_transport_arguments_fail_without_io() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        assert!(parse_pipe_arguments(Path::new(nonce), Path::new("42-1234")).is_ok());
+        for invalid in ["42", "0-5", "42-0", "042-1", "42-1-2", "42-+1", "42-01"] {
+            assert!(parse_pipe_arguments(Path::new(nonce), Path::new(invalid)).is_err(), "{invalid}");
+        }
+        let root = std::env::temp_dir().join("spidervpn-legacy-not-opened");
+        let req = root.join("request.json");
+        let res = root.join("reply.json");
+        assert_eq!(serve(&req, &res), 2);
+    }
+
+    #[test]
+    fn finish_is_distinct_from_ack_and_bound_to_nonce() {
+        let nonce = sample().nonce;
+        let ack = serde_json::to_vec(&LeaseAck { schema: LEASE_SCHEMA, nonce: nonce.clone(), accepted: true }).unwrap();
+        assert!(validate_finish(&ack, &nonce).is_err());
+        for state in [LeaseState::Ready, LeaseState::Accepted, LeaseState::Rejected, LeaseState::Closed] {
+            let bad = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state }).unwrap();
+            assert!(validate_finish(&bad, &nonce).is_err());
+        }
+        let good = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state: LeaseState::Committed }).unwrap();
+        assert!(validate_finish(&good, &nonce).is_ok());
+        assert!(validate_finish(&good, "ffffffffffffffffffffffffffffffff").is_err());
+    }
 
     fn sample() -> LeaseRequest {
         LeaseRequest {
