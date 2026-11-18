@@ -48,6 +48,7 @@ pub enum LeaseState {
     Ready,
     Accepted,
     Committed,
+    Receipt,
     Rejected,
     Closed,
 }
@@ -69,8 +70,12 @@ struct LeaseFinish {
 }
 
 fn validate_finish(body: &[u8], nonce: &str) -> Result<(), String> {
+    validate_finish_stage(body, nonce, LeaseState::Committed)
+}
+
+fn validate_finish_stage(body: &[u8], nonce: &str, expected: LeaseState) -> Result<(), String> {
     let finish: LeaseFinish = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-    if finish.schema != LEASE_SCHEMA || finish.nonce != nonce || finish.state != LeaseState::Committed {
+    if finish.schema != LEASE_SCHEMA || finish.nonce != nonce || finish.state != expected {
         return Err("最终授权确认阶段不匹配".into());
     }
     Ok(())
@@ -570,7 +575,13 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     let committed = pipe.receive(4096, deadline, &check)?;
     validate_stage(&committed, &nonce, req.programs.len(), helper_pid, LeaseState::Committed)?;
     check()?;
-    if Instant::now() >= deadline { return Err("最终租约回执超期".into()); }
+    let receipt = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state: LeaseState::Receipt })
+        .map_err(|e| e.to_string())?;
+    pipe.send(&receipt, deadline, &check)?;
+    // The helper may close only after consuming this final receipt. In particular,
+    // it must not close a server handle immediately after writing Committed.
+    pipe.wait_server_closed(deadline, || require_live(child.handle))?;
+    if !child.running() || Instant::now() >= deadline { return Err("最终租约回执超期或进程退出".into()); }
     child.confirmed = true;
     Ok(child)
 }
@@ -640,6 +651,9 @@ fn serve_pipe(nonce: &str, pid: u32, stamp: u64) -> Result<(), String> {
         return Err("租约控制进程 token 或创建时间不匹配".into());
     }
     let body = pipe.receive(MAX_LEASE_IPC_BYTES, deadline, &check)?;
+    // The token attached to actual pipe traffic must agree with the retained
+    // controller process token. Query at Identification level, never use it for I/O.
+    pipe.require_client_token(&controller_token)?;
     let req: LeaseRequest = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
     let nonce_bytes = validate_request(&req)?;
     if req.nonce != nonce || req.controller_pid != pid {
@@ -673,6 +687,7 @@ fn serve_pipe(nonce: &str, pid: u32, stamp: u64) -> Result<(), String> {
     pipe.send(&ready, deadline, &mut check_lease)?;
     let ack = pipe.receive(4096, deadline, &mut check_lease)?;
     parse_ack(&ack, nonce)?;
+    pipe.require_client_token(&controller_token)?;
     check_lease()?;
     if token_identity(controller.0)? != controller_token || creation_stamp(controller.0)? != stamp {
         return Err("租约控制进程最终身份复验失败".into());
@@ -686,6 +701,11 @@ fn serve_pipe(nonce: &str, pid: u32, stamp: u64) -> Result<(), String> {
     let committed = serde_json::to_vec(&reply(nonce, LeaseState::Committed, String::new(), count))
         .map_err(|e| e.to_string())?;
     pipe.send(&committed, deadline, &mut check_lease)?;
+    let receipt = pipe.receive(4096, deadline, &mut check_lease)?;
+    validate_finish_stage(&receipt, nonce, LeaseState::Receipt)?;
+    pipe.require_client_token(&controller_token)?;
+    check_lease()?;
+    if Instant::now() >= deadline { return Err("最终回执消费超时".into()); }
     // No file path is ever opened or written by this privileged protocol.
     // Release transport after final authorization; actual WFP rundown remains RAII.
     let lease = lease.take().ok_or("动态租约不可用")?;
@@ -740,6 +760,7 @@ mod pipe_ipc {
         pub(super) sid: String,
         pub(super) session: u32,
         pub(super) elevated: bool,
+        authentication_id: u64,
     }
 
     // The token belongs to the actual retained process object, not a SID in JSON.
@@ -749,6 +770,10 @@ mod pipe_ipc {
             return Err(os_error("读取租约对端 token 失败"));
         }
         let token = OwnedHandle(token);
+        read_token(&token)
+    }
+
+    fn read_token(token: &OwnedHandle) -> Result<TokenIdentity, String> {
         let mut length = 0u32;
         unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut length); }
         if length < std::mem::size_of::<TOKEN_USER>() as u32 || length > 65536 {
@@ -792,7 +817,16 @@ mod pipe_ipc {
         {
             return Err(os_error("读取租约 token 提权状态失败"));
         }
-        Ok(TokenIdentity { sid, session, elevated: elevation.TokenIsElevated != 0 })
+        let mut stats: TOKEN_STATISTICS = unsafe { std::mem::zeroed() };
+        if unsafe { GetTokenInformation(token.0, TokenStatistics, (&mut stats as *mut TOKEN_STATISTICS).cast(),
+            std::mem::size_of::<TOKEN_STATISTICS>() as u32, &mut actual) } == 0
+            || actual != std::mem::size_of::<TOKEN_STATISTICS>() as u32
+        {
+            return Err(os_error("读取租约 token 登录会话失败"));
+        }
+        let authentication_id = (u64::from(stats.AuthenticationId.HighPart as u32) << 32)
+            | u64::from(stats.AuthenticationId.LowPart);
+        Ok(TokenIdentity { sid, session, elevated: elevation.TokenIsElevated != 0, authentication_id })
     }
 
     pub(super) fn open_controller(pid: u32, stamp: u64) -> Result<OwnedHandle, String> {
@@ -906,6 +940,58 @@ mod pipe_ipc {
             Ok(())
         }
 
+        pub(super) fn require_client_token(&self, expected: &TokenIdentity) -> Result<(), String> {
+            // Successful impersonation is immediately scoped. Never access files,
+            // WFP or other privileged resources under the peer token.
+            if unsafe { ImpersonateNamedPipeClient(self.0.0) } == 0 {
+                return Err(os_error("无法核验实际管道客户端 token"));
+            }
+            struct Revert;
+            impl Drop for Revert {
+                fn drop(&mut self) {
+                    if unsafe { RevertToSelf() } == 0 {
+                        // Cannot safely continue elevated work with uncertain identity.
+                        std::process::abort();
+                    }
+                }
+            }
+            let revert = Revert;
+            let mut token = std::ptr::null_mut();
+            if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } == 0 {
+                return Err(os_error("读取实际管道客户端 token 失败"));
+            }
+            let token = OwnedHandle(token);
+            let actual = read_token(&token)?;
+            drop(token);
+            drop(revert);
+            if &actual != expected {
+                return Err("实际管道客户端 SID/登录会话/token 与控制进程不匹配".into());
+            }
+            Ok(())
+        }
+
+        pub(super) fn wait_server_closed(&self, deadline: Instant,
+            mut check: impl FnMut() -> Result<(), String>) -> Result<(), String>
+        {
+            loop {
+                check()?;
+                if Instant::now() >= deadline { return Err("等待最终回执消费超时".into()); }
+                let mut available = 0u32;
+                let ok = unsafe { PeekNamedPipe(self.0.0, std::ptr::null_mut(), 0,
+                    std::ptr::null_mut(), &mut available, std::ptr::null_mut()) };
+                if ok == 0 {
+                    let err = unsafe { GetLastError() };
+                    if err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED {
+                        check()?;
+                        return Ok(());
+                    }
+                    return Err(format!("等待租约管道正常关闭失败：Win32={err}"));
+                }
+                if available != 0 { return Err("最终确认后存在额外管道数据".into()); }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         fn transfer(&self, read: bool, bytes: &mut [u8], deadline: Instant,
             check: &mut impl FnMut() -> Result<(), String>) -> Result<(), String>
         {
@@ -1000,6 +1086,8 @@ mod tests {
         assert!(client.require_peer(pid ^ 1, false).is_err());
         client.send(b"ack", deadline, || Ok(())).unwrap();
         assert_eq!(server.receive(3, deadline, || Ok(())).unwrap(), b"ack");
+        server.require_client_token(&token).unwrap();
+        assert_eq!(token_identity(unsafe { GetCurrentProcess() }).unwrap(), token);
         server.send(b"accepted", deadline, || Ok(())).unwrap();
         assert_eq!(client.receive(8, deadline, || Ok(())).unwrap(), b"accepted");
         client.send(b"oversize", deadline, || Ok(())).unwrap();
@@ -1021,6 +1109,25 @@ mod tests {
     }
 
 
+    #[cfg(windows)]
+    #[test]
+    fn final_pipe_receipt_must_be_read_before_server_close() {
+        let nonce = random_nonce();
+        let token = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        let server = Pipe::server(&nonce, &token, &token).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let client = Pipe::client(&nonce, deadline, || Ok(())).unwrap();
+        server.accept(deadline, || Ok(())).unwrap();
+        server.send(b"committed", deadline, || Ok(())).unwrap();
+        assert_eq!(client.receive(9, deadline, || Ok(())).unwrap(), b"committed");
+        assert!(client.wait_server_closed(Instant::now() + Duration::from_millis(150), || Ok(())).is_err());
+        client.send(b"receipt", deadline, || Ok(())).unwrap();
+        assert_eq!(server.receive(7, deadline, || Ok(())).unwrap(), b"receipt");
+        server.require_client_token(&token).unwrap();
+        drop(server);
+        client.wait_server_closed(deadline, || Ok(())).unwrap();
+    }
+
     #[test]
     fn old_file_transport_arguments_fail_without_io() {
         let nonce = "0123456789abcdef0123456789abcdef";
@@ -1039,7 +1146,7 @@ mod tests {
         let nonce = sample().nonce;
         let ack = serde_json::to_vec(&LeaseAck { schema: LEASE_SCHEMA, nonce: nonce.clone(), accepted: true }).unwrap();
         assert!(validate_finish(&ack, &nonce).is_err());
-        for state in [LeaseState::Ready, LeaseState::Accepted, LeaseState::Rejected, LeaseState::Closed] {
+        for state in [LeaseState::Ready, LeaseState::Accepted, LeaseState::Receipt, LeaseState::Rejected, LeaseState::Closed] {
             let bad = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state }).unwrap();
             assert!(validate_finish(&bad, &nonce).is_err());
         }
