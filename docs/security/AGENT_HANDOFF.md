@@ -511,3 +511,11 @@
 - 当前模块 `HandshakeAdmission::spawn` 成功后可返回任何 `R`，但没有全局**握手后 HTTP 请求阶段**的并发名额与独立绝对 deadline；不得假定只限制 handshake 就能防止后续无限 HTTP worker/慢请求。可独立开发下一张默认关闭的 Rust 有界 request handoff 候选，保持旧 `spawn` 不变，不接生产 TLS/HTTP，设计每一连接一请求/关闭与 session 容量。具体见 Backlog D.58。
 - 生产 SEC-02 不通过：旧 Python TLS on listening socket 尚未替换，真实证书/TLS1.2 compatibility 与 HTTP/撤销状态无法自动迁移；Issue #5 OPEN，全部安全 PR Draft，main/UI/WFP 持久 BLOCK 保持原样。
 
+
+
+## 61. PR #20 握手后单请求容量与独立期限 Rust 安全候选（2026-11-18）
+
+- 新 [Draft PR #20](https://github.com/weixiaochuchen618-debug/spidervpn/pull/20) 叠 #19，初始代码 SHA `a773fe881eb02954279d068d2c7d05dacbab5a3e`；仅改 `server-rs/src/handshake_admission.rs` 和现有 Linux CI。新增 `RequestAdmission` 共享 HTTP 配额和 `HandshakeAdmission::spawn_one_request`：握手成功、原 absolute deadline 校验后，**在释放 handshake permit 前先 reserve request permit**，失败直接关闭，成功仅处理一次请求 + 强制总 deadline、无 socket 返回。已有 `spawn` 不动，feature 仍 OFF，根本没有真正 TLS 或 HTTP parser。见 [Backlog D.59](./REMEDIATION_BACKLOG.md)。
+- 五组新真 TCP 正反向回归与原 8 条 handshake tests 都须在 Linux `--locked` / `-D warnings` 执行，真实 WG netns、root fs 不删。首 SHA [Linux #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337) netns Job 已 Success、core 正在运行；[MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354)、[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452) 仍要读终态。新 agent 先查这三条精确 SHA 工作流，红例不可 skip。
+- 即使所有测试绿，生产 `tc-pair.py` 还是 TLS wrap listening socket 旧实现，未切换 Rust server，更未完成证书/握手/HTTP/Revoked data 的安全验收；SEC-02、SEC-01、SEC-08、Issue #5 OPEN、PR #20/全部父 PR Draft，main/UI/连接/WFP persistent BLOCK 不变。
+

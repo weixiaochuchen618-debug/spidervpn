@@ -652,3 +652,13 @@ PR/commit/CI: ...
 - 本轮两次后置补丁（`1fcda2dc` 在 admission 预定绝对时限；`9cc7ab6b` 回调返回前二次检查）均由新 SHA 真编译测试；差异仅 4 个 Linux 服务端 Rust/feature/CI 文件，无 Windows UI、连接、WFP、现役 Python 或 main 改动。
 - **安全验收仍 BLOCKED**：这是默认禁用、**没有真实 TLS 协议栈、HTTP reader 或生产监听接管**的 Rust policy；完全无法证明生产 Python TLS wrap(listener) 的 P0 缺陷已消除，也无 VPS 实机/多账户/证书兼容/旧 revocation 数据等验收。SEC-02、SEC-01/08 和 Issue #5 OPEN；PR #19 Draft，不合 main。
 
+
+
+## D.59 PR #20 独立握手后 HTTP 单请求容量/期限安全边界（2026-11-18）
+
+- 在 #19 `9cc7ab6b5fcdf087eec2f80e92ef7581ebe4fe0b` 同 SHA Linux/GNU/MSVC 全绿之后，新增 stacked [Draft PR #20](https://github.com/weixiaochuchen618-debug/spidervpn/pull/20)，base #19，branch `fix/sec02-bounded-http-handoff-20261118`，首 Rust HEAD **`a773fe881eb02954279d068d2c7d05dacbab5a3e`**。仅改 `server-rs/src/handshake_admission.rs`、Linux CI yaml；原 `HandshakeAdmission::spawn` 不改、`linux-handshake-admission` 默认关闭、不接旧 Python 或任何公网端口、main/UI/连接/WFP 不动。
+- **P0 子风险**：旧 #19 限制握手并发和绝对 deadline，但还没有限制**握手成功之后**的 HTTP request/handler worker。新 Rust `RequestAdmission` 另有跨连接共享 CAS 配额（1..64）、请求阶段不可由慢字节进度延长的绝对时间（100ms..30s），`spawn_one_request` 在旧握手槽位**尚未释放前**预留 HTTP 请求 slot；请求满额时直接 fail-closed + 关闭 socket，不能启动无界 handler。成功时释放握手槽，单一工作线程处理**严格一次**请求，然后关闭连接，不暴露 socket；callback 失败/过时/崩溃均 RAII 释放两个 permit。HTTP 末尾无 I/O CPU 工作仍需在 return 前重新核对 deadline，防回调延长总时间。
+- **测试**：新增五组**真实 Linux loopback TCP**测试，覆盖成功握手→单请求→关闭、慢 HTTP 不占握手槽但占请求配额且次连接在满额时拒绝、握手验证失败不得调用 HTTP、HTTP trickle 慢流总 deadline、无 I/O late callback / panic 不得泄漏配额；原八组 SEC-02、121 旧 Rust 核心、root 临时目录原子退役、真 WG kernel/netns 均必须保留。CI 用 `--locked`、Linux `RUSTFLAGS=-D warnings`，GNU/MSVC 仍自动构建与安全回归。
+- **首次 SHA CI 待验证终态**：[Linux #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337)、[MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354)、[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452)。本条书写时 Linux netns Job Success、core 正在编译；不能借父 PR #19 的成功冒充此 SHA；一旦失败须修 Rust 而不是跳过测试。
+- **真实安全验收上限**：这还只是默认关闭的 Rust callback + TCP 资源策略，未实现加密 TLS 1.2 服务端、证书/指纹兼容、正式 HTTP parser、身份验证/撤销历史、global root writer 排他或 VPS 实机部署；用户服务仍使用有慢握手 DoS 缺陷的 Python 端。CPU 无限阻塞也无法由纯 socket wrapper 中断。故 SEC-02/SEC-01/08、Issue #5 **OPEN**，PR #20 Draft、不合并 main。
+
