@@ -64,7 +64,7 @@ mod platform {
     const AF_INET6: u32 = 23;
     const TCP_STATE_LISTEN: u32 = 2;
 
-    fn table(endpoint: SocketAddr) -> Result<Vec<u64>, String> {
+    fn table(endpoint: SocketAddr) -> Result<(Vec<u64>, usize), String> {
         let family = if endpoint.is_ipv4() { AF_INET } else { AF_INET6 };
         let mut needed: u32 = 0;
         let rc = unsafe {
@@ -83,7 +83,7 @@ mod platform {
             }
             // Vec<u64> provides 8-byte alignment for all MIB TCP rows.
             let mut storage = vec![0u64; capacity.div_ceil(8)];
-            let mut actual = storage.len() * 8;
+            let actual = storage.len() * 8;
             let mut bytes = actual as u32;
             let rc = unsafe {
                 Ip::GetExtendedTcpTable(
@@ -92,8 +92,10 @@ mod platform {
                 )
             };
             if rc == 0 {
-                if bytes as usize > actual { return Err("TCP 表发生长度越界".into()); }
-                return Ok(storage);
+                if (bytes as usize) < 4 || bytes as usize > actual {
+                    return Err("TCP 表发生长度越界".into());
+                }
+                return Ok((storage, bytes as usize));
             }
             if rc != ERROR_INSUFFICIENT_BUFFER {
                 return Err(format!("Windows TCP 监听表读取失败（Win32={rc}）"));
@@ -101,6 +103,21 @@ mod platform {
             needed = bytes;
         }
         Err("TCP 监听表持续变化，无法确认引擎进程归属".into())
+    }
+
+    // 只允许读取 API 实际返回的字节，不把对齐填充或预分配容量视为有效表项。
+    fn checked_rows(count: usize, offset: usize, row_size: usize, bytes: usize) -> bool {
+        row_size != 0 && offset <= bytes && count <= (bytes - offset) / row_size
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn tcp_table_rows_must_fit_returned_bytes() {
+        assert!(checked_rows(1, 4, 24, 28));
+        assert!(!checked_rows(1, 4, 24, 27));
+        assert!(!checked_rows(0, 4, 24, 3));
+        assert!(!checked_rows(usize::MAX, 4, 24, 28));
+        assert!(!checked_rows(1, 4, 0, 28));
     }
 
     fn network_port(port: u32) -> u16 {
@@ -113,17 +130,16 @@ mod platform {
     }
 
     pub fn listening_owners(endpoint: SocketAddr) -> Result<Vec<u32>, String> {
-        let storage = table(endpoint)?;
+        let (storage, capacity) = table(endpoint)?;
         let base = storage.as_ptr().cast::<u8>();
         let count = unsafe { *(base.cast::<u32>()) } as usize;
-        let capacity = storage.len() * 8;
         let mut pids = Vec::new();
 
         match endpoint.ip() {
             IpAddr::V4(target) => {
                 let offset = std::mem::offset_of!(Ip::MIB_TCPTABLE_OWNER_PID, table);
                 let row_size = std::mem::size_of::<Ip::MIB_TCPROW_OWNER_PID>();
-                if offset > capacity || count > (capacity - offset) / row_size {
+                if !checked_rows(count, offset, row_size, capacity) {
                     return Err("IPv4 TCP 监听表条目数越界".into());
                 }
                 for i in 0..count {
@@ -141,7 +157,7 @@ mod platform {
             IpAddr::V6(target) => {
                 let offset = std::mem::offset_of!(Ip::MIB_TCP6TABLE_OWNER_PID, table);
                 let row_size = std::mem::size_of::<Ip::MIB_TCP6ROW_OWNER_PID>();
-                if offset > capacity || count > (capacity - offset) / row_size {
+                if !checked_rows(count, offset, row_size, capacity) {
                     return Err("IPv6 TCP 监听表条目数越界".into());
                 }
                 for i in 0..count {
