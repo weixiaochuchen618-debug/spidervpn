@@ -667,3 +667,11 @@
 
 - 最新 [Draft PR #27](https://github.com/weixiaochuchen618-debug/spidervpn/pull/27) HEAD `19765b4c72ac0e2c1902c8646f3a57febe434b44`。[Linux #44255321383](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321383) 2/2 Jobs Completed/Success；实际日志：新 1 个来源规范化 + 5 个真实 TLS 长期接收器测试通过，HTTP 相关 14/14，root TLS identity 9/9、实际 WG netns 1/1、root FS 7/7、既有 Rust 121/121 等通过。严格编译 `--locked`/`-D warnings`。详见 [Backlog D.80](./REMEDIATION_BACKLOG.md)。
 - 下一轮先核对精确 SHA 的 [GNU #44255321600](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321600) 与 [MSVC #44255321332](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321332) 完整终态及原始日志；失败先修不跳过。然后推进可执行服务的可信启动和信号退出、授权/状态迁移阻塞。不能将实验 localhost denial 当生产功能，main/UI/连接/WFP persistent BLOCK 不动，PR #27 Draft；Issue #5 与生产 SEC-01/02/08 仍 OPEN，旧 Python accept 风险仍存在。
+
+
+## 80. 最新：PR #28 独立 Rust 隔离进程可信启动/永久降权与信号生命周期（2026-11-18）
+
+- [Backlog D.81–D.82](./REMEDIATION_BACKLOG.md)。PR #27 HEAD `19765b4c72ac0e2c1902c8646f3a57febe434b44` Linux #44255321383 与 GNU #44255321600 Completed/Success，MSVC #44255321332 最终 portable suite 在执行。先核对完整终态并记录。
+- 新 [Draft PR #28](https://github.com/weixiaochuchen618-debug/spidervpn/pull/28) HEAD `16bd83adf2f26eac783c68a413e9304313943219`，branch `fix/sec02-denial-service-process-lifecycle-20261118`。default-OFF `linux-denial-process-lab` 独立 Rust bin/test，复用锁定 libc，不动生产路径。仅普通 root 启动、精确 pin、固定隔离 /run 根目录、现有 no-follow loader；关闭非 stdio 继承 FD 后永久降 UID/GID 65534，空 groups、零 CapInh/Prm/Eff/Amb、NoNewPrivs/non-dumpable，随后只绑定本机随机端口。真实 SIGTERM/SIGINT 关闭 listener 并 drain。数字 UID、Linux 5.9+ 与16/4/3s是隔离实验选择，不是正式部署政策。
+- 实际子进程测试验证普通用户拒绝、root 启动拒绝错误 pin/不安全 key/任意地址、真实 /proc 身份与 capability readback、真实 TLS1.2 否决 JSON、TERM/INT 停机及已有 idle worker 清理。等待 [Linux #44256587840](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44256587840)、[GNU #44256587905](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44256587905)、[MSVC #44256588132](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44256588132) 全 workflow 原始证据。新测试不 skip。若失败优先修复。
+- 下一步：真实授权协议和可信历史状态的接入设计与实现，正式低权限身份/实际 VPS 切换。旧生产 Python TLS accept DoS 仍存在，SEC-01/02/08、SEC-07 未闭环，Issue #5 OPEN，所有 PR Draft。main 与 Windows UI/连接/WFP persistent BLOCK 未变，不合并、不在用户 VPS 运行 CI fixture。
