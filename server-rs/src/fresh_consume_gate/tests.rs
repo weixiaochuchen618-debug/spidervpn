@@ -102,10 +102,13 @@ struct Fixture {
 }
 impl Fixture {
     fn new()->Self {
+        Self::with_times(NOW,EXP,RETRY,"2026-11-18T07:00:00.123456Z")
+    }
+    fn with_times(issued:&str,expires:&str,retry:&str,created:&str)->Self {
         let dir=Directory::new();
         bootstrap_for_test(&dir.0).unwrap();
         let mut store=LedgerStore::open_existing(&dir.0,Duration::from_secs(1)).unwrap();
-        store.update(|l|l.insert_open(INV,utc_seconds(EXP).unwrap())).unwrap();
+        store.update(|l|l.insert_open(INV,utc_seconds(expires).unwrap())).unwrap();
         let management=TestKey::generate(&dir.0,"management.pem");
         let recipient=TestKey::generate(&dir.0,"recipient.pem");
         let binding=json!({"RemoteOwnerId":"55555555-5555-4555-8555-555555555555",
@@ -116,21 +119,21 @@ impl Fixture {
         let invite=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairInvite","InviteId":INV,
             "RemoteOwnerId":binding["RemoteOwnerId"],"NodeId":binding["NodeId"],
             "ServerPublicKey":binding["ServerPublicKey"],"ServerBinding":binding,
-            "ManagementSigningPublicKey":management.jwk,"IssuedAtUtc":NOW,"ExpiresAtUtc":EXP,
+            "ManagementSigningPublicKey":management.jwk,"IssuedAtUtc":issued,"ExpiresAtUtc":expires,
             "PublicEndpoint":format!("{HOST}:{PORT}"),"DeviceName":"交易电脑",
             "Capabilities":{"PairingVersion":1,"ManagementApiVersion":2,"Transport":"udp"}});
         let descriptor=json!({"SchemaVersion":1,"Kind":"TradeChannel.OnlineInvite",
             "InviteId":INV,"Invite":management.sign(&invite),"PublicHost":HOST,"Port":PORT,
             "TlsSha256":pin,"ManagementFingerprint":fingerprint,
-            "ManagementSigningPublicKey":management.jwk,"ExpiresAtUtc":EXP,"RetryUntilUtc":RETRY});
+            "ManagementSigningPublicKey":management.jwk,"ExpiresAtUtc":expires,"RetryUntilUtc":retry});
         let signed_descriptor=management.sign(&descriptor);
         let inner=json!({"SchemaVersion":1,"Kind":"TradeChannel.ClientRequest",
-            "RequestId":REQ,"DeviceId":DEV,"CreatedAtUtc":"2026-11-18T07:00:00.123456Z",
+            "RequestId":REQ,"DeviceId":DEV,"CreatedAtUtc":created,
             "ClientPublicKey":wg(1),"AddressFamilies":["IPv4"]});
         let body=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairRequest","InviteId":INV,
             "ServerBinding":binding,"ClientRequest":inner,"DeviceName":"交易电脑",
             "RecipientJwk":recipient.jwk,"RequestDigest":client_digest(&inner).unwrap(),
-            "RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":NOW});
+            "RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":issued});
         Self{store,management,recipient,binding,token,pin,fingerprint,body,invite,descriptor,
             signed_descriptor,_dir:dir}
     }
@@ -533,4 +536,84 @@ fn open_gates_recheck_expiry_and_generation_and_refuse_cancelled_replay() {
     assert_eq!(read_open_descriptor(&f.store,&scope,&get).err(),Some(GateError::InviteCancelled));
     assert_eq!(prepare_fresh_consume(&f.store,&scope,&post).err(),Some(GateError::InviteCancelled));
     assert_eq!(f.store.generation().unwrap(),cancelled_generation);
+}
+
+// GNU date is used only by this Linux test to independently construct the
+// signed UTC strings from the real wall clock, not by gate implementation.
+fn test_utc_at(seconds:i64)->String {
+    let output=Command::new("date").args(["-u","-d",&format!("@{seconds}"),
+        "+%Y-%m-%dT%H:%M:%SZ"]).output().unwrap();
+    assert!(output.status.success());
+    let timestamp=String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    assert_eq!(utc_seconds(&timestamp),Some(seconds));
+    timestamp
+}
+
+fn public_metadata_bytes(f:&Fixture)->(Vec<u8>,String) {
+    let tag=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,f.token.as_bytes()),METADATA_BEARER_DOMAIN);
+    let tag_hex:String=tag.as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    let raw=serde_json::to_vec(&json!({"SchemaVersion":1,"Kind":"SpiderVPN.InviteMetadata",
+        "InviteId":INV,"BearerHmacSha256":tag_hex,"SignedDescriptor":f.signed_descriptor,
+        "ManagementSigningPublicKey":f.management.jwk,"ManagementFingerprint":f.fingerprint,
+        "ServerBinding":f.binding,"PublicHost":HOST,"Port":PORT,"TlsSha256":f.pin,
+        "WgInterface":"wg0"})).unwrap();
+    let pin=digest::digest(&digest::SHA256,&raw).as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    (raw,pin)
+}
+
+#[test]
+fn public_system_clock_gates_accept_authenticated_current_scope_and_refuse_expiry() {
+    let now=system_utc_seconds().unwrap();
+    let issued=test_utc_at(now-60);
+    let exp=test_utc_at(now+3600);
+    let retry=test_utc_at(now+3720);
+    let mut f=Fixture::with_times(&issued,&exp,&retry,&issued);
+    let generation=f.store.generation().unwrap();
+    let (raw,pin)=public_metadata_bytes(&f);
+    let metadata=verify_pinned_invite_metadata(&raw,&pin,&f.token).unwrap();
+    let scope=metadata.scope().unwrap();
+    let get=f.get();
+    let post=f.post();
+    {
+        let d=read_open_descriptor(&f.store,&scope,&get).unwrap();
+        assert_eq!(d.legacy_data(),json!({"Status":"InvitationReady","SignedDescriptor":f.signed_descriptor}));
+        let p=prepare_fresh_consume(&f.store,&scope,&post).unwrap();
+        assert_eq!(p.claims().request_id,REQ);
+        assert_eq!(p.claims().public_key,wg(1));
+        assert_eq!(p.recipient_jwk(),&f.recipient.jwk);
+        assert!(LedgerStore::open_existing(&f._dir.0,Duration::from_millis(25)).is_err());
+    }
+    assert_eq!(f.store.generation().unwrap(),generation);
+    assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Open));
+
+    // A different current ledger with the same invitation ID but a
+    // different durable expiration must not accept the original scope.
+    let other=Fixture::with_times(&issued,&test_utc_at(now+7200),
+        &test_utc_at(now+7320),&issued);
+    assert_eq!(read_open_descriptor(&other.store,&scope,&get).err(),Some(GateError::InvalidState));
+    assert_eq!(prepare_fresh_consume(&other.store,&scope,&post).err(),Some(GateError::InvalidState));
+
+    // Valid signatures and metadata do not revive a genuinely expired
+    // invitation. No fake public timestamp is provided.
+    let expired_issued=test_utc_at(now-3600);
+    let expired=Fixture::with_times(&expired_issued,&test_utc_at(now-240),
+        &test_utc_at(now-120),&expired_issued);
+    let (raw,pin)=public_metadata_bytes(&expired);
+    let authenticated=verify_pinned_invite_metadata(&raw,&pin,&expired.token).unwrap();
+    let expired_scope=authenticated.scope().unwrap();
+    let expired_generation=expired.store.generation().unwrap();
+    assert_eq!(read_open_descriptor(&expired.store,&expired_scope,&expired.get()).err(),
+        Some(GateError::InviteExpired));
+    assert_eq!(prepare_fresh_consume(&expired.store,&expired_scope,&expired.post()).err(),
+        Some(GateError::InviteExpired));
+    assert_eq!(expired.store.generation().unwrap(),expired_generation);
+    assert_eq!(expired.store.view().unwrap().state(INV),Some(&InviteState::Open));
+
+    // Use the same already authenticated scope after a durable cancellation.
+    f.store.update(|l|l.cancel_open(INV)).unwrap();
+    let cancelled=f.store.generation().unwrap();
+    assert!(cancelled>generation);
+    assert_eq!(read_open_descriptor(&f.store,&scope,&get).err(),Some(GateError::InviteCancelled));
+    assert_eq!(prepare_fresh_consume(&f.store,&scope,&post).err(),Some(GateError::InviteCancelled));
+    assert_eq!(f.store.generation().unwrap(),cancelled);
 }
