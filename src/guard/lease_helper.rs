@@ -1439,7 +1439,9 @@ mod tests {
             assert_flow(&b, false);
             bfe = Some((baseline, audit, block, a, b));
         }
+        let mut completed_modes = 0usize;
         for mode in ["before-receipt", "late-receipt", "after-receipt", "silent-active", "wrong-challenge", "valid-then-close", "wrong-token", "wrong-sid", "replay"] {
+            if native_bfe { println!("JOINT_BFE_BEGIN mode={mode}"); }
             let nonce = random_nonce();
             let mut command = Command::new(std::env::current_exe().unwrap());
             let test_name = if native_bfe {
@@ -1492,6 +1494,7 @@ mod tests {
                 unsafe { CloseHandle(limited); }
                 assert_eq!(ok, 0);
                 assert_eq!(error, ERROR_ACCESS_DENIED);
+                println!("JOINT_BFE_LIVE mode={mode} permit_present=true block_present=true tcp_exact_allowed=true tcp_other_denied=true terminate_access_denied=true");
             }
             let mut keep_open = Some(pipe);
             if mode == "before-receipt" {
@@ -1552,6 +1555,7 @@ mod tests {
                 assert_flow(a, false);
                 assert_flow(b, false);
                 assert!(child.0.try_wait().unwrap().is_none());
+                println!("JOINT_BFE_REVOKED mode={mode} permit_absent=true block_present=true tcp_exact_denied=true tcp_other_denied=true owner_alive=true");
                 std::fs::write(dir.join("exit"), b"verified").unwrap();
             }
             // Parent stays alive, no call to kill, and child must exit normally.
@@ -1574,12 +1578,16 @@ mod tests {
             if let Some(dir) = fixture_dir {
                 std::fs::remove_dir_all(dir).unwrap();
             }
+            completed_modes += 1;
+            if native_bfe { println!("JOINT_BFE_PASS mode={mode}"); }
         }
+        assert_eq!(completed_modes, 9, "all nine distinct fault modes must run");
         if let Some((baseline, audit, block, a, b)) = bfe {
             baseline.close_checked().unwrap();
             assert!(filter_get_by_id(&audit, block).unwrap().is_none());
             assert_flow(&a, true);
             assert_flow(&b, true);
+            println!("JOINT_BFE_COMPLETE modes={completed_modes} baseline_removed=true tcp_restored=true");
         }
     }
 
