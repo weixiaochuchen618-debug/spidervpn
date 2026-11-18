@@ -136,6 +136,28 @@ jobs:
           ! grep -F 'linux-persistent-listener-lab' src/pairhost.rs
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
 
+      - name: SEC-02 opt-in Rust denial process build and unprivileged denial
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-denial-process-lab --bin spidervpn-pair-denial-lab
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-denial-process-lab --bin spidervpn-pair-denial-lab
+          test "$(id -u)" -ne 0
+          set +e
+          output=$(server-rs/target/debug/spidervpn-pair-denial-lab serve-denial-lab "$(printf '%064d' 0)" 2>&1)
+          code=$?
+          set -e
+          test "$code" -eq 2
+          printf '%s\n' "$output" | grep -F 'root startup required'
+          ! printf '%s\n' "$output" | grep -F 'READY_DENIAL_ONLY'
+          grep -F 'required-features = ["linux-denial-process-lab"]' server-rs/Cargo.toml
+          ! grep -F 'spidervpn-pair-denial-lab' src/pairhost.rs
+          grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
+
       - name: SEC-02 read-only root-owned TLS PEM pin and no-symlink lab
         shell: bash
         env:
@@ -337,6 +359,23 @@ jobs:
           # This VM is disposable. Tests create owner-only folders in /tmp,
           # do not read/overwrite /var/lib/tradechannel or original TLS keys.
           sudo "$binary" tls_identity::tests --test-threads=1 --nocapture
+
+      - name: SEC-02 actual disposable process privilege drop, TLS and TERM/INT exit
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$PWD/server-rs/target/netns"
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-denial-process-lab --test denial_process_e2e \
+            --no-run --message-format=json > "$RUNNER_TEMP/sec02-process-build.json"
+          binary="$(jq -r 'select(.reason=="compiler-artifact" and .target.name=="denial_process_e2e") | .executable // empty' "$RUNNER_TEMP/sec02-process-build.json" | tail -n1)"
+          test -n "$binary"
+          test -x "$binary"
+          test ! -e /run/spidervpn-pair-denial-lab
+          sudo "$binary" --test-threads=1 --nocapture
+          test ! -e /run/spidervpn-pair-denial-lab
 
       - name: Execute real root-owned legacy retirement filesystem tests in isolated runner
         shell: bash
