@@ -46,6 +46,8 @@ linux-http-deny-response-lab = ["linux-tls-identity-lab"]
 # Opt-in localhost-only finite TCP accept loop for the denial-only Rustls lab.
 # Never a deployed pairing listener, public port, or authorization handler.
 linux-bounded-accept-lab = ["linux-http-deny-response-lab"]
+# Opt-in stoppable, long-lived loopback listener; no deployment entry point.
+linux-persistent-listener-lab = ["linux-bounded-accept-lab"]
 
 [[test]]
 name = "wg_namespace_e2e"
