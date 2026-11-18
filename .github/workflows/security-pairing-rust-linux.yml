@@ -117,6 +117,25 @@ jobs:
           ! grep -F 'linux-bounded-accept-lab' src/pairhost.rs
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
 
+      - name: SEC-02 long-lived loopback listener source/global caps and stop/drain
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-persistent-listener-lab --lib
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-persistent-listener-lab --lib persistent_listener_lab::tests -- \
+            --test-threads=1 --nocapture
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-persistent-listener-lab --lib http_fail_closed::tests -- \
+            --test-threads=1 --nocapture
+          grep -F 'linux-persistent-listener-lab = ["linux-bounded-accept-lab"]' server-rs/Cargo.toml
+          grep -F 'listener.local_addr()?.ip().is_loopback()' server-rs/src/persistent_listener_lab.rs
+          ! grep -F 'linux-persistent-listener-lab' src/pairhost.rs
+          grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
+
       - name: SEC-02 read-only root-owned TLS PEM pin and no-symlink lab
         shell: bash
         env:
