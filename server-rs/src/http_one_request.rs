@@ -295,7 +295,16 @@ mod tests {
             |io, ()| Ok(read_one_request(io)?.target)).unwrap();
         client.write_all(b"GET /first HTTP/1.1\r\nHost: x\r\n\r\nGET /second HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
         assert_eq!(work.join().unwrap().unwrap(), "/first");
-        assert_eq!(client.read(&mut [0u8]).unwrap(), 0);
+        // Closing a TCP socket while a pipelined second request remains
+        // unread may correctly produce either FIN/EOF or RST/ConnectionReset
+        // on Linux. Both mean NO second request was dispatched or accepted.
+        let mut one = [0u8; 1];
+        match client.read(&mut one) {
+            Ok(0) => {}
+            Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("pipelined second request was not closed: {other:?}"),
+        }
+        assert_eq!(hand.active_handshakes(), 0);
         assert_eq!(req.active_requests(), 0);
     }
     #[test]
