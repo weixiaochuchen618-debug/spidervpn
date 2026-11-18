@@ -107,6 +107,8 @@ pub fn run_loopback_denial_lab(
             }
         }
     }
+    // Close the listening FD before the existing finite worker drain.
+    drop(listener);
     // Even when accept stops early, let bounded workers release permits.
     // No detached handler may be counted as a successful completed denial.
     for worker in workers {
