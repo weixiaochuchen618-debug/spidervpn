@@ -244,4 +244,124 @@ mod tests {
         let (_, json) = parse_envelope(&output);
         assert_eq!(json["Ok"], false);
     }
+    // These end-to-end accept-loop regressions require the separate
+    // default-OFF bounded listener lab, never normal release builds.
+    #[cfg(feature = "linux-bounded-accept-lab")]
+    #[test]
+    fn loopback_accept_handles_idle_and_healthy_tls12_independently() {
+        use crate::loopback_denial_lab::{run_loopback_denial_lab, LabReport};
+        let hand = HandshakeAdmission::new(2, Duration::from_millis(850)).unwrap();
+        let req = RequestAdmission::new(2, Duration::from_secs(2)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = server_config();
+        let observed_hand = hand.clone();
+        let observed_req = req.clone();
+        let accept = std::thread::spawn(move || run_loopback_denial_lab(
+            listener, &hand, &req, config, 2, Duration::from_secs(3)));
+        let _idle = TcpStream::connect(address).unwrap();
+        let healthy = TcpStream::connect(address).unwrap();
+        healthy.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let tls = ClientConnection::new(client_config(),
+            ServerName::try_from("localhost").unwrap()).unwrap();
+        let mut client = StreamOwned::new(tls, healthy);
+        client.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer NEVER-ECHO\r\n\r\n").unwrap();
+        client.flush().unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let (head, json) = parse_envelope(&response);
+        assert!(head.starts_with("HTTP/1.1 500 "));
+        assert_eq!(json, serde_json::json!({"Code":"InvalidState","Ok":false}));
+        assert!(!String::from_utf8_lossy(&response).contains("NEVER-ECHO"));
+        assert_eq!(accept.join().unwrap().unwrap(), LabReport {
+            accepted: 2, saturated: 0, denied: 1, failed: 1,
+        });
+        assert_eq!(observed_hand.active_handshakes(), 0);
+        assert_eq!(observed_req.active_requests(), 0);
+    }
+
+    #[cfg(feature = "linux-bounded-accept-lab")]
+    #[test]
+    fn loopback_accept_capacity_exhaustion_closes_socket_and_recovers() {
+        use crate::loopback_denial_lab::{run_loopback_denial_lab, LabReport};
+        let hand = HandshakeAdmission::new(1, Duration::from_millis(320)).unwrap();
+        let req = RequestAdmission::new(1, Duration::from_secs(2)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = server_config();
+        let observed_hand = hand.clone();
+        let observed_req = req.clone();
+        let accept = std::thread::spawn(move || run_loopback_denial_lab(
+            listener, &hand, &req, config, 3, Duration::from_secs(3)));
+        let _idle = TcpStream::connect(address).unwrap();
+        let start = std::time::Instant::now();
+        while observed_hand.active_handshakes() != 1
+            && start.elapsed() < Duration::from_secs(1)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(observed_hand.active_handshakes(), 1);
+        // This second connection must not occupy an unbounded backlog worker.
+        let _overloaded = TcpStream::connect(address).unwrap();
+        std::thread::sleep(Duration::from_millis(65));
+        assert_eq!(observed_hand.active_handshakes(), 1);
+        std::thread::sleep(Duration::from_millis(370));
+        let healthy = TcpStream::connect(address).unwrap();
+        healthy.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let tls = ClientConnection::new(client_config(),
+            ServerName::try_from("localhost").unwrap()).unwrap();
+        let mut client = StreamOwned::new(tls, healthy);
+        client.write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        client.flush().unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let (_, json) = parse_envelope(&response);
+        assert_eq!(json, serde_json::json!({"Code":"InvalidState","Ok":false}));
+        assert_eq!(accept.join().unwrap().unwrap(), LabReport {
+            accepted: 3, saturated: 1, denied: 1, failed: 1,
+        });
+        assert_eq!(observed_hand.active_handshakes(), 0);
+        assert_eq!(observed_req.active_requests(), 0);
+    }
+
+    #[cfg(feature = "linux-bounded-accept-lab")]
+    #[test]
+    fn loopback_accept_rejects_wildcard_public_binding_before_accept() {
+        use crate::loopback_denial_lab::run_loopback_denial_lab;
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let hand = HandshakeAdmission::new(1, Duration::from_secs(1)).unwrap();
+        let req = RequestAdmission::new(1, Duration::from_secs(1)).unwrap();
+        assert_eq!(run_loopback_denial_lab(
+            listener, &hand, &req, server_config(), 1, Duration::from_secs(1)
+        ).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(hand.active_handshakes(), 0);
+        assert_eq!(req.active_requests(), 0);
+    }
+
+    #[cfg(feature = "linux-bounded-accept-lab")]
+    #[test]
+    fn loopback_accept_has_finite_count_and_timeout_without_clients() {
+        use crate::loopback_denial_lab::run_loopback_denial_lab;
+        let hand = HandshakeAdmission::new(1, Duration::from_secs(1)).unwrap();
+        let req = RequestAdmission::new(1, Duration::from_secs(1)).unwrap();
+        let config = server_config();
+        for (count, window) in [
+            (0, Duration::from_secs(1)),
+            (65, Duration::from_secs(1)),
+            (1, Duration::ZERO),
+            (1, Duration::from_secs(6)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            assert_eq!(run_loopback_denial_lab(listener, &hand, &req,
+                Arc::clone(&config), count, window).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert_eq!(run_loopback_denial_lab(listener, &hand, &req,
+            config, 1, Duration::from_millis(120)).unwrap_err().kind(),
+            io::ErrorKind::TimedOut);
+        assert_eq!(hand.active_handshakes(), 0);
+        assert_eq!(req.active_requests(), 0);
+    }
+
 }
