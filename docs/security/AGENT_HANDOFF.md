@@ -440,3 +440,11 @@
 - [PR #18](https://github.com/weixiaochuchen618-debug/spidervpn/pull/18) stacked on #17，分支 `fix/sec01-postboot-offline-retire-verification-20261118`，初始代码 SHA `72533502c1e361d6d1a3d029b5da99cb7499f57f`。扩展**仅 Linux opt-in Rust** `spidervpn-pair-retire` 二进制 `verify` 固定动词：root-only、无 TTY、只读，对已停机/持久 mask/无旧端口监听进行前后确认，并且严格核实旧脚本 root-only 空目录 + 隔离备份原脚本 + 无遗留 staging；任何不符 fail-closed。**绝不自动执行 retire/restore，不导入邀请、不启动 listener、不修改 WireGuard**；原 `retire` 路径不变。
 - 新 Rust binary 三组正反向测试、root 临时目录两组断电/重启情境模拟回归、Linux CI 非 root `verify`/ `retire` 真执行拒绝均已提交，**还未证明 CI 通过**。交接下一步：先按此 SHA 查看完整 Linux / Windows MSVC / Windows GNU workflow 终态和原始失败日志；一旦有红必须修代码、推新 SHA、重测，更新 docs/Issue。禁止将模拟 reboot 说成 VPS 实机 power-loss 验收。详见 [Backlog D.49](./REMEDIATION_BACKLOG.md)。main/UI/WFP 不动，SEC-01/02/08 与 Issue #5 OPEN。
 
+
+
+## 52. PR #18 Linux 同 SHA 根目录 / 退役复核回归全绿，Windows 正在执行（2026-11-18）
+
+- 新 [Draft PR #18](https://github.com/weixiaochuchen618-debug/spidervpn/pull/18) Rust HEAD `72533502c1e361d6d1a3d029b5da99cb7499f57f`，同 SHA [Linux #44205893006](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205893006) **2 Jobs Completed/Success**：121 lib/0 failed/ignored、9 CLI tests（新 3）全绿、真实非 root 两个动词 exit 2、7 real root /tmp atomic retire/readback fs tests（新 2）、真实 WireGuard kernel netns 通过，`--locked` / `RUSTFLAGS=-D warnings`。
+- 同 SHA [Windows MSVC #44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) 与 [GNU #44205892961](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892961) 此刻 **in_progress**；完整终态必须另查，不能继承 #17 绿或 Linux 绿。GitHub compare 只有 3 个 Linux 文件，旧 `retire` / Windows UI/WFP 交互不改；参见 [Backlog D.50](./REMEDIATION_BACKLOG.md)。
+- 仍无用户服务器真实 root mask/retire/reboot/power-loss/recovery 或全跨代 SSH/root 写者排他与可信 revocation tombstone、Rust TLS；Issue #5 Open、全部安全 PR Draft，main 不变。
+

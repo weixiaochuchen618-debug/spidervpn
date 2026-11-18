@@ -572,3 +572,12 @@ PR/commit/CI: ...
 - 额外三组 Rust CLI tests（正确确认调用顺序、非 root/多余参数/第一次或第二次 shutdown 失败、损坏 witness 拒绝）+ 两组真实 Linux owner-only 临时目录根文件系统回归（模拟 reboot 后复核成功、丢失隔离源/伪 symlink/重入 stage/重建可执行路径均 fail-closed）。Linux CI 现同时调用真实非 root `retire` 与 `verify` 两条路径，均需 exit2；既有 root WireGuard netns 与 legacy_retire 真实 fs 测试保留。不更改默认构建、Windows UI/连接、WFP、旧 Python 生产服务和 main。
 - **新 SHA 尚未完成 CI**：必须从 [PR #18 Actions](https://github.com/weixiaochuchen618-debug/spidervpn/actions) 精确取 Linux/MSVC/GNU runs，逐一核对 Rust 编译、3+2 定向、真实 root /tmp 文件系统、完整 MSVC/GNU 回归；不能拿父 PR #17 已绿替代。该只读核验**不是**真实服务器 reboot/power-loss 证据，更不能排除其它 root/SSH writer；SEC-01/02/08、Issue #5 均 OPEN，PR Draft，不合并 main。
 
+
+
+## D.50 PR #18 新 SHA Linux 双 Job Success、真实 root 和伪重启验证（2026-11-18）
+
+- 精确 Rust HEAD `72533502c1e361d6d1a3d029b5da99cb7499f57f` 的 [Linux #44205893006](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205893006) **Completed/Success（2/2 Jobs）**：Linux core `121 library passed / 0 failed / 0 ignored`；`spidervpn-pair-retire` 现在共 **9 binary unit tests / 0 failed/ignored**，原始日志确认三条新 `postboot_verify_...` 全部 ok；`legacy_retire` 原有 5 + 新增 2 共 **7 项 root 临时目录 FS 测试**，同时通过 Linux 特定 root netns job；真正 Linux WG kernel netns 一项通过。普通 runner 以非 root 身份真运行 `retire` + `verify` 均 exit2，`root privileges required`，未触发任何正式 VPS 路径变更。Linux 保留 `--locked`、`RUSTFLAGS=-D warnings`，未增加忽略。
+- GitHub compare `de8e2e22..72533502` **仅三个文件**：Linux opt-in Rust CLI、Linux Rust `legacy_retire` 模块单测和现有 Linux CI workflow（9/111/42 行左右变更）；完全没有 Windows UI/交互/连接/Guard/WFP 的 Rust 产品代码、现役 Python 端、release 默认编译或 main 改动。
+- 同 SHA [Windows MSVC #44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) / [Windows GNU #44205892961](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892961) 本条书写时 **仍在运行**，不能提前当作全绿。后续核对两者准确 SHA 的完整工作流及原始日志；如失败必须修复，不可 skip。
+- 重启后核验所覆盖的是**runner 内的模拟状态与只读现场检查代码**，不是实测生产 VPS 真实重启、断电恢复或非协作 root/旧 SSH 写者。仍不可导入历史 Consumed/Revoked / 绑定 Rust TLS / 合并 main；SEC-01/02/08 与 Issue #5 OPEN，PR #18 Draft。
+
