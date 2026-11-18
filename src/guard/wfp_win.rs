@@ -770,6 +770,25 @@ mod imp {
             Self::ephemeral_proxy_permit(name, app_id, endpoint, lease_nonce)
         }
 
+        // Test-only constructor for the joint native pipe/BFE fixture. Reuse
+        // the real permit and block builders, but never touch the product
+        // provider, sublayer, persistent flags, or deterministic rule IDs.
+        #[cfg(test)]
+        pub fn isolated_lifecycle_filter(app_id: &[u8], endpoint: Option<std::net::SocketAddr>,
+            nonce: &[u8]) -> Result<Box<RawFilter>, String>
+        {
+            let mut filter = match endpoint {
+                Some(addr) => Self::ephemeral_proxy_permit("isolated pipe lease test", app_id, addr, nonce)?,
+                None => Self::block("isolated pipe baseline test", app_id, Layer::V4),
+            };
+            filter.raw.filterKey = windows_sys::core::GUID::default(); // BFE assigns fresh key
+            filter.raw.flags = 0;
+            filter.raw.providerKey = std::ptr::null_mut();
+            filter.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
+            filter.raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+            Ok(filter)
+        }
+
         pub fn as_ptr(&self) -> *const W::FWPM_FILTER0 {
             &self.raw
         }
