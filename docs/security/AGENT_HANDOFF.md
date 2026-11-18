@@ -448,3 +448,10 @@
 - 同 SHA [Windows MSVC #44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) 与 [GNU #44205892961](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892961) 此刻 **in_progress**；完整终态必须另查，不能继承 #17 绿或 Linux 绿。GitHub compare 只有 3 个 Linux 文件，旧 `retire` / Windows UI/WFP 交互不改；参见 [Backlog D.50](./REMEDIATION_BACKLOG.md)。
 - 仍无用户服务器真实 root mask/retire/reboot/power-loss/recovery 或全跨代 SSH/root 写者排他与可信 revocation tombstone、Rust TLS；Issue #5 Open、全部安全 PR Draft，main 不变。
 
+
+
+## 53. PR #18 Windows GNU 完整通过、MSVC 最后一轮仍待终态（2026-11-18）
+
+- 同一代码 `72533502c1e361d6d1a3d029b5da99cb7499f57f`，Linux [#44205893006](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205893006) 双 Job Success；GNU [#44205892961](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892961) 整个 workflow Completed/Success，原始日志核验 SEC-01 旧门禁在 GNU 运行成功（有已有 Rust warnings）。MSVC [#44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) Rust Build + SEC-10 + SEC-01 + integration + changed modules 全部单独 Success，最后 Portable Rust unit suite 仍 in_progress；**必须再查最终 Job**，不可将部分成功说成全绿。
+- 只读 postboot 验证并**无可信原文件内容哈希、无跨时段或跨 root 的独占性证明**，只能作为 opt-in root 管理工具观察事实，不可作为 Rust listener/历史 revoked 迁移或旧写者排他授权。真实 VPS 仍须独立人工/运维验收；SEC-01/02/08 / Issue #5 Open、PR #18 Draft、main/WFP/UI 不动，详见 [Backlog D.51](./REMEDIATION_BACKLOG.md)。
+

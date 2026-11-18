@@ -581,3 +581,11 @@ PR/commit/CI: ...
 - 同 SHA [Windows MSVC #44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) / [Windows GNU #44205892961](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892961) 本条书写时 **仍在运行**，不能提前当作全绿。后续核对两者准确 SHA 的完整工作流及原始日志；如失败必须修复，不可 skip。
 - 重启后核验所覆盖的是**runner 内的模拟状态与只读现场检查代码**，不是实测生产 VPS 真实重启、断电恢复或非协作 root/旧 SSH 写者。仍不可导入历史 Consumed/Revoked / 绑定 Rust TLS / 合并 main；SEC-01/02/08 与 Issue #5 OPEN，PR #18 Draft。
 
+
+
+## D.51 PR #18 GNU 同 SHA 全绿，MSVC 原专项通过但全量还在进行（2026-11-18）
+
+- 精确代码 SHA `72533502c1e361d6d1a3d029b5da99cb7499f57f` 的 [Windows GNU #44205892961](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892961) **Completed/Success**，Rust GNU 构建、Release 禁止 `SPIDERVPN_ROOT` 测试、Guard/身份权限、旧 SEC-01 guard Rust 专项均成功，原始日志确认 `deploy::tests::sec01_sourced_transport_reads_refuse_retired_pairing_host ... ok` 和 `sec01_install_transport_restore_are_guarded_before_all_mutations ... ok`。GNU 有原仓既有 unused 等 warnings，不能说零 warnings。
+- 同 SHA [Windows MSVC #44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) Build、SEC-10 protected IPC、SEC-01 SSH writer gate、全量 integration targets、changed-module regression 步骤先后 **Success**；最后 Portable Rust unit suite **尚在运行，整体 MSVC 不提前记全绿**。Linux 两 Job Success 见 D.50。
+- **精确的验证上限**：`verify` 只能检查当下 root-controlled 路径类型/权限、原隔离文件存在与 systemd/进程/socket 快照；没有独立受信 SHA256 对比或历史时序证据，不能证明原始隔离**内容在重启期间从未遭别的 root 进程篡改**。亦不能证明另一个 root/SSH 写者之后绝不会启动服务。真实 VPS reboot/power-loss/rollback、跨代写者隔离及撤销历史可信性仍未验证；SEC-01/02/08 / Issue #5 OPEN，PR #18 Draft，main/UI/WFP 不动。
+
