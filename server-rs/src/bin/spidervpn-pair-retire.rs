@@ -4,6 +4,8 @@
 //! Requires an already stopped and persistently masked tc-pair.service; no
 //! caller-controlled paths, stdin approvals, or implicit rollback.
 //! Compile only with linux-legacy-retire-cli, never enabled by default.
+//! 'verify' is a root-only read-only post-reboot check. It does NOT repair or
+//! restart an old service and cannot prove non-cooperating root writers absent.
 #![cfg(target_os = "linux")]
 
 use std::ffi::{OsStr, OsString};
@@ -14,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use spidervpn_pairing_authority::legacy_cutover::observe_old_python_shutdown;
 use spidervpn_pairing_authority::legacy_retire::{
-    stage_offline_legacy_retirement, RetirementWitness,
+    observe_offline_retired_entrypoint, stage_offline_legacy_retirement, RetirementWitness,
 };
 
 const APPROVAL: &str = "RETIRE tc-pair.py WITHOUT MIGRATION";
@@ -67,12 +69,40 @@ where
     // The retirement primitive also repeats its own root/systemd/process/
     // TCP-listener checks before and after its atomic exchange and fsync.
     observe().map_err(|_| Denied::ShutdownUnverified)?;
-    let witness = retire().map_err(|_| Denied::RetirementUncertain)?;
+    require_witness(retire().map_err(|_| Denied::RetirementUncertain)?)
+}
+
+/// A witness proves only the known old script pathname and quarantine
+/// representation, NOT exclusive control of all root/SSH writers.
+fn require_witness(witness: RetirementWitness) -> Result<RetirementWitness, Denied> {
     if !witness.legacy_script_path_is_directory || !witness.original_script_preserved
         || witness.authorizes_migration() || witness.authorizes_new_listener()
     {
         return Err(Denied::RetirementUncertain);
     }
+    Ok(witness)
+}
+
+/// Explicit post-reboot *read-only* re-attestation, NOT a resume/retry of
+/// retirement. Re-observe the old Python service state on both sides of
+/// the existing root-only tombstone+quarantine inspection. No TTY approval
+/// is needed because this operation cannot mutate files, peers, or ledger.
+fn verify_with<O, V>(
+    args: &[OsString], uid: u32, mut observe: O, mut verify: V,
+) -> Result<RetirementWitness, Denied>
+where
+    O: FnMut() -> Result<(), ()>,
+    V: FnMut() -> Result<RetirementWitness, ()>,
+{
+    if uid != 0 {
+        return Err(Denied::RootRequired);
+    }
+    if args.len() != 1 || args[0].as_os_str() != OsStr::new("verify") {
+        return Err(Denied::InvalidArguments);
+    }
+    observe().map_err(|_| Denied::ShutdownUnverified)?;
+    let witness = require_witness(verify().map_err(|_| Denied::RetirementUncertain)?)?;
+    observe().map_err(|_| Denied::ShutdownUnverified)?;
     Ok(witness)
 }
 
@@ -130,14 +160,31 @@ fn approve_from_tty() -> Result<bool, ()> {
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let result = run_with(
-        &args,
-        unsafe { geteuid() },
-        || observe_old_python_shutdown().map(|_| ()).map_err(|_| ()),
-        approve_from_tty,
-        || stage_offline_legacy_retirement().map_err(|_| ()),
-    );
+    let uid = unsafe { geteuid() };
+    let is_verify = args.first()
+        .is_some_and(|arg| arg.as_os_str() == OsStr::new("verify"));
+    let result = if is_verify {
+        verify_with(
+            &args, uid,
+            || observe_old_python_shutdown().map(|_| ()).map_err(|_| ()),
+            || observe_offline_retired_entrypoint().map_err(|_| ()),
+        )
+    } else {
+        run_with(
+            &args, uid,
+            || observe_old_python_shutdown().map(|_| ()).map_err(|_| ()),
+            approve_from_tty,
+            || stage_offline_legacy_retirement().map_err(|_| ()),
+        )
+    };
     match result {
+        Ok(_) if is_verify => println!(
+            "Read-only post-reboot verification: old Python service remains \
+             stopped/masked; known tc-pair.py path is an empty private \
+             directory and original bytes remain quarantined. \
+             NO authorization to migrate grants, start a listener, or \
+             modify WireGuard. Other root/SSH writers are NOT excluded."
+        ),
         Ok(_) => println!(
             "Offline legacy Python script-path retirement observed. \
              NO authorization to migrate grants, start a listener, or modify \
@@ -147,7 +194,7 @@ fn main() {
             let message = match reason {
                 Denied::RootRequired => "root privileges required",
                 Denied::InvalidArguments =>
-                    "exact command 'retire' required; no paths or flags accepted",
+                    "exact command 'retire' or 'verify' required; no paths or flags accepted",
                 Denied::ShutdownUnverified => "old Python shutdown cannot be proven",
                 Denied::ApprovalDenied => "controlling TTY approval denied or timed out",
                 Denied::RetirementUncertain =>
@@ -243,6 +290,61 @@ mod tests {
         ] {
             assert_eq!(run_with(&argv, 0, || Ok(()), || Ok(true), || Ok(fake)),
                 Err(Denied::RetirementUncertain));
+        }
+    }
+    #[test]
+    fn postboot_verify_is_read_only_and_rechecks_service_state() {
+        let argv = args(&["verify"]);
+        let seq = std::cell::RefCell::new(Vec::new());
+        let report = verify_with(
+            &argv, 0,
+            || { seq.borrow_mut().push("shutdown"); Ok(()) },
+            || { seq.borrow_mut().push("known-tombstone"); Ok(witness()) },
+        );
+        assert_eq!(report, Ok(witness()));
+        assert_eq!(*seq.borrow(), vec!["shutdown", "known-tombstone", "shutdown"]);
+        assert!(!report.unwrap().authorizes_migration());
+    }
+    #[test]
+    fn postboot_verify_denies_nonroot_bad_arguments_and_uncertain_shutdown() {
+        for (uid, input, expected) in [
+            (1001, args(&["verify"]), Denied::RootRequired),
+            (0, args(&["verify", "--yes"]), Denied::InvalidArguments),
+            (0, args(&["verify", "/tmp/other"]), Denied::InvalidArguments),
+            (0, args(&["retire"]), Denied::InvalidArguments),
+            (0, args(&[]), Denied::InvalidArguments),
+        ] {
+            assert_eq!(verify_with(&input, uid,
+                || panic!("invalid verification must not read old service"),
+                || panic!("invalid verification must not touch disk")),
+                Err(expected));
+        }
+        let count = Cell::new(0);
+        assert_eq!(verify_with(&args(&["verify"]), 0,
+            || { count.set(count.get() + 1);
+                if count.get() == 1 { Ok(()) } else { Err(()) } },
+            || Ok(witness())),
+            Err(Denied::ShutdownUnverified));
+        assert_eq!(count.get(), 2);
+        assert_eq!(verify_with(&args(&["verify"]), 0, || Err(()),
+            || panic!("missing service evidence must deny before disk")),
+            Err(Denied::ShutdownUnverified));
+        assert_eq!(verify_with(&args(&["verify"]), 0, || Ok(()),
+            || Err(())), Err(Denied::RetirementUncertain));
+    }
+    #[test]
+    fn postboot_verify_rejects_false_or_incomplete_tombstone_witness() {
+        for invalid in [
+            RetirementWitness { legacy_script_path_is_directory: false,
+                original_script_preserved: true },
+            RetirementWitness { legacy_script_path_is_directory: true,
+                original_script_preserved: false },
+        ] {
+            let second = Cell::new(false);
+            assert_eq!(verify_with(&args(&["verify"]), 0,
+                || { second.set(true); Ok(()) }, || Ok(invalid)),
+                Err(Denied::RetirementUncertain));
+            assert!(second.get());
         }
     }
     #[test]

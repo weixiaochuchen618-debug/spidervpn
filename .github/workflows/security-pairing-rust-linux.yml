@@ -77,7 +77,7 @@ jobs:
           ! grep -F 'linux-legacy-retire' src/pairhost.rs
 
 
-      - name: SEC-01 root-only opt-in offline retirement CLI denies unprivileged or unattended execution
+      - name: SEC-01 opt-in root-only retire and read-only post-reboot verify CLI regressions
         shell: bash
         env:
           RUSTFLAGS: "-D warnings"
@@ -94,6 +94,15 @@ jobs:
           set -e
           test "$code" -eq 2
           printf '%s\n' "$output" | grep -F 'root privileges required'
+          # Verification, unlike retirement, is read-only; non-root must still
+          # be refused before inspecting any real service or filesystem state.
+          set +e
+          verify_output=$(cargo run --quiet --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-legacy-retire-cli --bin spidervpn-pair-retire -- verify 2>&1)
+          verify_code=$?
+          set -e
+          test "$verify_code" -eq 2
+          printf '%s\n' "$verify_output" | grep -F 'root privileges required'
           test ! -e /var/lib/tradechannel/pairing-rs/.tc-pair.py.retired
           # This optional binary is never compiled without explicitly enabling
           # the feature, and no Windows SSH or production server path invokes it.
