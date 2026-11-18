@@ -735,21 +735,29 @@ fn serve_pipe(nonce: &str, pid: u32, stamp: u64) -> Result<(), String> {
     let committed = serde_json::to_vec(&reply(nonce, LeaseState::Committed, String::new(), count))
         .map_err(|e| e.to_string())?;
     pipe.send(&committed, deadline, &mut check_lease)?;
-    let receipt = pipe.receive(4096, deadline, &mut check_lease)?;
-    validate_finish_stage(&receipt, nonce, LeaseState::Receipt)?;
-    pipe.require_client_token(&controller_token)?;
-    check_lease()?;
-    if Instant::now() >= deadline { return Err("最终回执消费超时".into()); }
-    let active = serde_json::to_vec(&reply(nonce, LeaseState::Active, String::new(), count))
-        .map_err(|e| e.to_string())?;
-    pipe.send(&active, deadline, &mut check_lease)?;
-    // Never continue dynamic permits without the same authenticated channel.
-    let result = supervise_authenticated_channel(&pipe, nonce, &controller_token, &mut check_lease);
+    let result = finish_and_supervise(&pipe, nonce, count, &controller_token, deadline, &mut check_lease);
     let close = match lease.take() {
         Some(lease) => lease.close().map_err(|e| e.to_string()),
         None => Ok(()),
     };
     result.and(close)
+}
+
+// Shared by the real helper and the different-process regression; no mock transport.
+#[cfg(windows)]
+fn finish_and_supervise(pipe: &pipe_ipc::Pipe, nonce: &str, count: usize,
+    identity: &pipe_ipc::TokenIdentity, deadline: std::time::Instant,
+    mut check: impl FnMut() -> Result<(), String>) -> Result<(), String>
+{
+    let receipt = pipe.receive(4096, deadline, &mut check)?;
+    validate_finish_stage(&receipt, nonce, LeaseState::Receipt)?;
+    pipe.require_client_token(identity)?;
+    check()?;
+    if std::time::Instant::now() >= deadline { return Err("最终回执消费超时".into()); }
+    let active = serde_json::to_vec(&reply(nonce, LeaseState::Active, String::new(), count))
+        .map_err(|e| e.to_string())?;
+    pipe.send(&active, deadline, &mut check)?;
+    supervise_authenticated_channel(pipe, nonce, identity, &mut check)
 }
 
 #[cfg(windows)]
@@ -1280,6 +1288,117 @@ mod tests {
         let good = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state: LeaseState::Committed }).unwrap();
         assert!(validate_finish(&good, &nonce).is_ok());
         assert!(validate_finish(&good, "ffffffffffffffffffffffffffffffff").is_err());
+    }
+
+    // Invokes itself as a separate test executable process, with a narrowly scoped
+    // worker branch. The outer test never calls TerminateProcess on a passing path.
+    #[cfg(windows)]
+    #[test]
+    fn real_process_channel_faults_revoke_without_kill() {
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Child, Command};
+        use windows_sys::Win32::System::Threading::GetProcessId;
+
+        const WORKER: &str = "SPIDERVPN_LEASE_CHANNEL_TEST_WORKER";
+        if let Ok(nonce) = std::env::var(WORKER) {
+            let controller_pid: u32 = std::env::var("SPIDERVPN_LEASE_TEST_PID").unwrap().parse().unwrap();
+            let stamp: u64 = std::env::var("SPIDERVPN_LEASE_TEST_STAMP").unwrap().parse().unwrap();
+            assert!(open_controller(controller_pid, stamp ^ 1).is_err());
+            let controller = open_controller(controller_pid, stamp).unwrap();
+            let identity = token_identity(controller.0).unwrap();
+            let own = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+            let pipe = Pipe::server(&nonce, &identity, &own).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            pipe.accept(deadline, || require_live(controller.0)).unwrap();
+            assert!(pipe.require_peer(std::process::id(), true).is_err());
+            let check = || {
+                require_live(controller.0)?;
+                pipe.require_peer(controller_pid, true)?;
+                pipe.require_connected()
+            };
+            let committed = serde_json::to_vec(&reply(&nonce, LeaseState::Committed, String::new(), 1)).unwrap();
+            pipe.send(&committed, deadline, &check).unwrap();
+            // This is the exact final-receipt/lifecycle function used by serve_pipe.
+            // No BFE writes in this portable test; canary covers native teardown.
+            let result = finish_and_supervise(&pipe, &nonce, 1, &identity,
+                Instant::now() + Duration::from_secs(3), &check);
+            assert!(result.is_err(), "an abandoned or forged channel must not return success");
+            require_live(controller.0).expect("controller stayed alive; no owner exit shortcut");
+            return;
+        }
+
+        struct Cleanup(Child);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                // Only panic/failure cleanup; success path already reaps a normal exit.
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        let pid = std::process::id();
+        let stamp = creation_stamp(unsafe { GetCurrentProcess() }).unwrap();
+        for mode in ["before-receipt", "late-receipt", "after-receipt", "silent-active", "wrong-challenge", "valid-then-close"] {
+            let nonce = random_nonce();
+            let mut child = Cleanup(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "guard::lease_helper::tests::real_process_channel_faults_revoke_without_kill", "--nocapture"])
+                .env(WORKER, &nonce)
+                .env("SPIDERVPN_LEASE_TEST_PID", pid.to_string())
+                .env("SPIDERVPN_LEASE_TEST_STAMP", stamp.to_string())
+                .spawn().unwrap());
+            let helper_pid = child.0.id();
+            assert_ne!(helper_pid, pid);
+            let handle = child.0.as_raw_handle();
+            assert_eq!(unsafe { GetProcessId(handle) }, helper_pid);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let pipe = Pipe::client(&nonce, deadline, || require_live(handle)).unwrap();
+            pipe.require_peer(helper_pid, false).unwrap();
+            assert!(pipe.require_peer(pid, false).is_err());
+            let committed = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
+            validate_stage(&committed, &nonce, 1, helper_pid, LeaseState::Committed).unwrap();
+            let mut keep_open = Some(pipe);
+            if mode == "before-receipt" {
+                drop(keep_open.take());
+            } else if mode == "late-receipt" {
+                // Keep the live pipe without sending Receipt past the deadline.
+            } else {
+                let pipe = keep_open.as_ref().unwrap();
+                let receipt = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA,
+                    nonce: nonce.clone(), state: LeaseState::Receipt }).unwrap();
+                pipe.send(&receipt, deadline, || require_live(handle)).unwrap();
+                let active = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
+                validate_stage(&active, &nonce, 1, helper_pid, LeaseState::Active).unwrap();
+                if mode == "after-receipt" {
+                    drop(keep_open.take());
+                } else if mode != "silent-active" {
+                    let challenge = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
+                    let mut heartbeat = decode_heartbeat(&challenge, &nonce, 1).unwrap();
+                    if mode == "wrong-challenge" {
+                        heartbeat.challenge = "0".repeat(32);
+                    }
+                    pipe.send(&serde_json::to_vec(&heartbeat).unwrap(), deadline,
+                        || require_live(handle)).unwrap();
+                    if mode == "valid-then-close" {
+                        let next = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
+                        decode_heartbeat(&next, &nonce, 2).unwrap();
+                        drop(keep_open.take());
+                    }
+                }
+            }
+            // In silent modes keep the handle open until helper times itself out.
+            // Parent stays alive, no call to kill, and child must exit normally.
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "worker failed for {mode}: {status}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "helper orphaned after {mode}");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            drop(keep_open);
+        }
     }
 
     #[test]
