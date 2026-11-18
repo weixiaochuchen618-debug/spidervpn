@@ -844,3 +844,10 @@ PR/commit/CI: ...
 - 专项 Rust tests：①源地址规范化；②同一来源完成 TLS 后停留 HTTP 阶段，多连接立即 EOF/RST，新真实 127.0.0.2 源经独立正常验签 OpenSSL TLS1.2 客户端完成固定拒绝，释放后原来源恢复；③全局额度饱和/断开恢复；④80 次连续 TLS 连接（突破旧 64 次生命周期上限），峰值有界；⑤停止时监听 FD 先释放，旧 worker 仍可在时限内 drain；⑥无效容量、wildcard 和预先 stop。未改变任何授权逻辑或生产 Windows UI/连接交互/WFP persistent BLOCK。
 - 新 SHA CI 已触发：[Linux #44255321383](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321383)、[GNU #44255321600](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321600)，初次查询 queued，MSVC 后续按精确 SHA 查询（不可拿父 SHA 充当）；新增非 test library build、`--locked`/`-D warnings`，全部原 TLS/HTTP/Rust/root/netns tests 保留，不删失败/不跳过。
 - 仍只限本地 fail-closed HTTP JSON denial；线上 Python handshake accept DoS 仍未修复。缺可信现网证书和邀请/撤销历史迁移、所有旧 writers 排他、成功授权路由、实际服务最小权限、VPS 真机切换/reboot/rollback、Windows UAC/WFP real-host DoD。PR #27 Draft，不合 main，Issue #5 OPEN。
+
+
+## D.80 PR #27 Linux 同 SHA 完整通过（2026-11-18）
+
+- [Draft #27](https://github.com/weixiaochuchen618-debug/spidervpn/pull/27) HEAD `19765b4c72ac0e2c1902c8646f3a57febe434b44` 对应 [Linux #44255321383](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321383) **Completed/Success，2/2 Jobs**（core 134635523525 和 real-root 134635523950）。实际 core 日志：新 mapped IPv4 来源规范化 1/1；新 5 项 persistent_tests 全 ok，含旧 9 项 HTTP denial/有限接收器合集 **14 passed / 0 failed / 0 ignored**。真实跨 kernel source TLS1.2、全阶段来源限制、全局限制与 EOF/RST、80 次连续连接、停止先释放端口、新旧监听器回收通过。非 test Rust library build、`--locked`/`-D warnings` 均绿。既有基本库 121/121、握手/请求 13/13、framing 9/9、TLS wire 7/7、旧证书专项 1/1、root TLS identity 9/9、实际 WG netns 1/1、root FS 7/7 继续成功。
+- 准确同 SHA 的 [GNU #44255321600](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321600)、[MSVC #44255321332](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321332) 当前 in_progress，待核对完整 workflow 与日志，不冒称通过。新测试没有 skip/ignore。
+- 候选只支持 loopback 默认关闭的受限拒绝路径；没有公网、systemd、信号处理/强制取消、真实鉴权、可信生产历史状态和部署切换。SEC-01/02/08 与 Issue #5 OPEN；旧 Python 风险仍未消除、SEC-07 生命周期未闭环，PR #27 Draft，main 和 WFP #3 保持原状。未获得真实验收，不合并。
