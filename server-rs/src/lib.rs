@@ -45,6 +45,10 @@ pub mod tls_identity;
 #[cfg(all(target_os = "linux", feature = "linux-http-deny-response-lab"))]
 pub mod http_fail_closed;
 
+/// SEC-02 default-OFF real localhost accept, bounded worker/denial-only lab.
+#[cfg(all(target_os = "linux", feature = "linux-bounded-accept-lab"))]
+pub mod loopback_denial_lab;
+
 pub mod legacy;
 
 /// Offline legacy RS256 verification ONLY, not a runtime authorization path.

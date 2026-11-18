@@ -92,6 +92,27 @@ jobs:
           ! grep -F 'linux-http-deny-response-lab' src/pairhost.rs
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
 
+      - name: SEC-02 real bounded localhost accept + TLS1.2 denial-only adversarial loopback
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          # Compile opt-in production-shaped library WITHOUT cfg(test).
+          # The default binary, old Python systemd unit and public port stay untouched.
+          cargo build --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-bounded-accept-lab --lib
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-bounded-accept-lab --lib http_fail_closed::tests -- \
+            --test-threads=1 --nocapture
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-bounded-accept-lab --lib tls_wire::tests -- \
+            --test-threads=1 --nocapture
+          grep -F 'linux-bounded-accept-lab = ["linux-http-deny-response-lab"]' server-rs/Cargo.toml
+          grep -F 'listener.local_addr()?.ip().is_loopback()' server-rs/src/loopback_denial_lab.rs
+          ! grep -F 'linux-bounded-accept-lab' src/pairhost.rs
+          grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
+
       - name: SEC-02 read-only root-owned TLS PEM pin and no-symlink lab
         shell: bash
         env:
