@@ -27,6 +27,10 @@ pub mod lock;
 #[cfg(all(target_os = "linux", feature = "linux-handshake-admission"))]
 pub mod handshake_admission;
 
+/// SEC-02 strict, default-off HTTP/1.1 request framing. No server/TLS/auth.
+#[cfg(all(target_os = "linux", feature = "linux-handshake-admission"))]
+pub mod http_one_request;
+
 pub mod legacy;
 
 /// Offline legacy RS256 verification ONLY, not a runtime authorization path.
