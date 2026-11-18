@@ -584,3 +584,12 @@
 - [MSVC #44227864692](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864692)、[GNU #44227864808](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864808) 同新 SHA 在执行，必须继续查全量编译、SEC-01/SEC-10、安全与集成测试**终态/日志**，禁止称三平台完成或借 #21 成绩。
 - 安全等级不变：此功能是 default-off 真实 TLS protocol **实验测试**，不包含 production root-owned PEM loading、证书旧指纹兼容验证、实际 HTTP response、可信 Token/撤销历史、全 root 写者禁用或 VPS systemd/重启/rollback 演练。旧 Python 接收线程仍可被慢 TLS 卡住，SEC-02 **生产未修**；Issue #5/SEC-01/02/08 Open，PR #22 Draft，main/Windows UI/连接/WFP persistent BLOCK 不动。
 
+
+
+## 70. PR #22 最新 TLS1.2 加密/解密 Rust lab 全三平台 CI Success；继续严守生产验收（2026-11-18）
+
+- 当前 [Draft PR #22](https://github.com/weixiaochuchen618-debug/spidervpn/pull/22) Rust HEAD **`63f84bce9c75865727d2d8b409d08b4198d4d181`**；[Linux #44227864860](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864860) **2/2 Jobs Success**（121 lib、13 handshake/HTTP admission、9 HTTP1.1 parser 真实 TCP、**7 真实 rustls TLS1.2 encrypted/decrypted wire tests** 全 pass/0 fail/ignored，真 WG kernel netns/root tmp fs 成功，`--locked` `-D warnings`）；[GNU #44227864808](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864808) **Completed/Success**（原既有 warnings）；[MSVC #44227864692](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864692) **Completed/Success**，全部 Build/Guard/SSH/Integrations/changed-module/full portable suite 真执行，原始总结 `1429 passed; 0 failed; 1 ignored; 8 filtered`（全部原有）。三条相同代码 SHA。详见 [Backlog D.66–68](./REMEDIATION_BACKLOG.md)。
+- 首 SHA `d205763f` [Linux #44227662295](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227662295) 真实 core Failed：strict deny-warning 的 unused import，原旧用例正常，新 TLS tests 没执行；`63f84bce` 删掉 unused import 后完整重跑，未 skip。该历史应保留。
+- **下一高优先级生产前步骤**：原 Python `assets/tc-pair.py` 默认 `CERT=ROOT/tls.crt` 和 `TLSKEY=ROOT/tls.key`，`ROOT` 默认 `/var/lib/tradechannel/pairing-rs` 但受旧 `TC_PAIR_ROOT` 环境影响；新 Rust 端必须固定 trusted root path/文件所有权、禁止 symlink 与低权限可写父目录，采用**原证书且保持已有客户端 pin**；随后真实 TLS1.2 单请求 HTTP JSON/Content-Length/Connection close 响应 + 可信 bearer/Revoked 授权 integration（未可信迁移只返回 fail-closed 错误），最后 Linux VPS 系统服务切换和可回滚重启/故障注入真实验证。不能使用刚测试过的**临时 CA/leaf**替换生产证书。
+- PR #22 只是默认关闭的 rustls TLS1.2 真实加密测试模块；仍无可用公网 listener、PEM loader/旧指纹确认、实际 HTTP response、root writer 阻断/撤销历史迁移与 VPS 实机验收；SEC-02/01/08、Issue #5 OPEN，不并 main。原 Windows UI/正常连接及 WFP persistent BLOCK 未变。
+
