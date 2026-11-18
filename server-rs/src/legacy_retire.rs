@@ -278,6 +278,48 @@ mod tests{
         clean(&root);
     }
     #[test]
+    fn postboot_readonly_witness_verifies_complete_retirement_without_writes(){
+        let root=make_root("reboot-good");
+        put_script(&root);
+        stage_at(&root,root_uid()).unwrap();
+        let expected=fs::read(backup(&root)).unwrap();
+        // Reopen paths as a fresh observer would after a reboot.
+        assert_eq!(witness_at(&root,root_uid()),Ok(RetirementWitness{
+            legacy_script_path_is_directory:true,
+            original_script_preserved:true,
+        }));
+        assert_eq!(fs::read(backup(&root)).unwrap(),expected);
+        assert!(OpenOptions::new().write(true).truncate(true).create(true)
+            .open(script(&root)).is_err());
+        clean(&root);
+    }
+    #[test]
+    fn postboot_witness_denies_recreated_script_or_missing_quarantine(){
+        let root=make_root("reboot-tamper");
+        put_script(&root);
+        stage_at(&root,root_uid()).unwrap();
+        // Unknown or missing backup must not become a "successful" witness.
+        fs::rename(backup(&root),root.join("lost-original")).unwrap();
+        assert_eq!(witness_at(&root,root_uid()),
+            Err(RetirementError::IncompleteRetirement));
+        symlink("lost-original",backup(&root)).unwrap();
+        assert_eq!(witness_at(&root,root_uid()),
+            Err(RetirementError::IncompleteRetirement));
+        fs::remove_file(backup(&root)).unwrap();
+        fs::rename(root.join("lost-original"),backup(&root)).unwrap();
+        // A resumed/staged interrupted swap is uncertain even when the
+        // original quarantine is still intact.
+        fs::write(staged(&root),b"unexpected").unwrap();
+        assert_eq!(witness_at(&root,root_uid()),
+            Err(RetirementError::IncompleteRetirement));
+        fs::remove_file(staged(&root)).unwrap();
+        fs::remove_dir(script(&root)).unwrap();
+        fs::write(script(&root),b"old Python writer restored").unwrap();
+        assert_eq!(witness_at(&root,root_uid()),
+            Err(RetirementError::IncompleteRetirement));
+        clean(&root);
+    }
+    #[test]
     fn weak_permissions_and_modified_tombstone_are_denied(){
         let root=make_root("permissions");
         put_script(&root);
