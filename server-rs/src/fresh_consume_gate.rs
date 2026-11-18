@@ -13,27 +13,26 @@ use crate::ledger_disk::LedgerStore;
 use crate::legacy_request_proof::{client_digest, recipient_digest};
 use crate::legacy_signed::{b64u, verify_jws};
 use crate::{hex_sha256, lower_uuid, wg_key, Claims, InviteState, Ledger, Peer};
-use ring::hmac;
+use ring::{digest, hmac};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::fmt;
 
 /// Deliberately not deserializable from network JSON and no Debug (token).
-/// Its construction is a TRUST BOUNDARY, not evidence of migration.
-/// Signed descriptor and independently trusted token/metadata must be loaded
-/// by a future authenticated authority. The existing legacy audit reports
-/// cannot construct this safely without additional offline evidence.
+/// Fields are private: outside this module a scope comes only from an
+/// independently pinned metadata record. This proves metadata/token binding,
+/// NOT trusted revocation history or successful legacy migration.
 pub struct TrustedOpenInvite<'a> {
-    pub invite_id: &'a str,
-    pub token: &'a str,
-    pub signed_descriptor: &'a str,
-    pub management_jwk: &'a Value,
-    pub management_fingerprint: &'a str,
-    pub server_binding: &'a Value,
-    pub public_host: &'a str,
-    pub port: u16,
-    pub tls_der_pin: &'a str,
+    invite_id: &'a str,
+    token: &'a str,
+    signed_descriptor: &'a str,
+    management_jwk: &'a Value,
+    management_fingerprint: &'a str,
+    server_binding: &'a Value,
+    public_host: &'a str,
+    port: u16,
+    tls_der_pin: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +156,78 @@ fn verify_unique_jws(s: &str, key: &Value) -> Option<Value> {
 fn token_shape(token: &str) -> bool {
     token.len() == 43 && b64u(token, 32).is_ok_and(|v| v.len() == 32)
 }
+const METADATA_BEARER_DOMAIN: &[u8] = b"SpiderVPN pinned invitation metadata bearer v1";
+
+/// Verified, read-only metadata record. No Debug/Deserialize or public fields;
+/// the candidate bearer is borrowed, never stored in the metadata record.
+/// This is a pre-integration verifier, not a production file loader.
+pub struct AuthenticatedInviteMetadata<'a> {
+    record: Value,
+    bearer: &'a str,
+}
+impl AuthenticatedInviteMetadata<'_> {
+    pub fn scope(&self) -> Result<TrustedOpenInvite<'_>,GateError> {
+        let v=&self.record;
+        let invalid=GateError::InvalidState;
+        Ok(TrustedOpenInvite {
+            invite_id:text(v,"InviteId").ok_or(invalid)?,
+            token:self.bearer,
+            signed_descriptor:text(v,"SignedDescriptor").ok_or(invalid)?,
+            management_jwk:v.get("ManagementSigningPublicKey").ok_or(invalid)?,
+            management_fingerprint:text(v,"ManagementFingerprint").ok_or(invalid)?,
+            server_binding:v.get("ServerBinding").ok_or(invalid)?,
+            public_host:text(v,"PublicHost").ok_or(invalid)?,
+            port:v.get("Port").and_then(Value::as_u64)
+                .and_then(|n|u16::try_from(n).ok()).filter(|n|*n!=0).ok_or(invalid)?,
+            tls_der_pin:text(v,"TlsSha256").ok_or(invalid)?,
+        })
+    }
+}
+
+fn decode_sha256_hex(s: &str) -> Option<Vec<u8>> {
+    if !hex_sha256(s) { return None; }
+    (0..s.len()).step_by(2).map(|i|u8::from_str_radix(&s[i..i+2],16).ok()).collect()
+}
+
+/// Verify the exact record bytes against an independently provisioned current
+/// SHA256 pin (NOT a hash read beside the same untrusted record), then verify
+/// the canonical high-entropy bearer against its pinned HMAC tag. The pin
+/// is a trust input; do not derive it from HTTP, legacy invites.json, or this
+/// record. No signer, pin registry, migration or trusted persistence here.
+/// All GET/fresh/retry calls still check the signed descriptor and current
+/// locked ledger. Authentic metadata alone cannot establish revocation history.
+pub fn verify_pinned_invite_metadata<'a>(raw: &[u8], pinned_sha256: &str,
+    bearer: &'a str) -> Result<AuthenticatedInviteMetadata<'a>,GateError>
+{
+    let invalid=GateError::InvalidState;
+    if raw.is_empty() || raw.len()>MAX_BODY_BYTES { return Err(invalid); }
+    let pin=decode_sha256_hex(pinned_sha256).ok_or(invalid)?;
+    // The record digest is a public integrity pin, not the secret bearer.
+    if digest::digest(&digest::SHA256,raw).as_ref()!=pin.as_slice() {
+        return Err(invalid);
+    }
+    let record=unique_json(raw).ok_or(invalid)?;
+    if !version_kind(&record,"SpiderVPN.InviteMetadata")
+        || record.as_object().is_none_or(|o|o.len()!=11) {
+        return Err(invalid);
+    }
+    let tag=decode_sha256_hex(text(&record,"BearerHmacSha256").ok_or(invalid)?)
+        .ok_or(invalid)?;
+    if !token_shape(bearer)
+        || hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256,bearer.as_bytes()),
+            METADATA_BEARER_DOMAIN,&tag).is_err() {
+        return Err(GateError::Forbidden);
+    }
+    let metadata=AuthenticatedInviteMetadata { record,bearer };
+    let scope=metadata.scope()?;
+    if !lower_uuid(scope.invite_id) || !hex_sha256(scope.tls_der_pin)
+        || !valid_binding(scope.server_binding)
+        || management_fingerprint(scope.management_jwk).as_deref()!=Some(scope.management_fingerprint) {
+        return Err(invalid);
+    }
+    Ok(metadata)
+}
+
 fn token_matches(expected: &str, given: &str) -> bool {
     if !token_shape(expected) || !token_shape(given) { return false; }
     // ring's constant-time MAC verification, with the same fixed domain

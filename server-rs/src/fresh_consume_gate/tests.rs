@@ -371,3 +371,37 @@ fn noncanonical_historical_revoking_key_cannot_evade_fresh_gate() {
     assert_eq!(f.error(&f.post()),Some(GateError::InvalidState));
     assert_eq!(f.store.generation().unwrap(),gen);
 }
+
+#[test]
+fn independent_metadata_pin_binds_bearer_descriptor_and_scope() {
+    let f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let tag=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,f.token.as_bytes()),METADATA_BEARER_DOMAIN);
+    let tag_hex:String=tag.as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    let record=json!({"SchemaVersion":1,"Kind":"SpiderVPN.InviteMetadata",
+        "InviteId":INV,"BearerHmacSha256":tag_hex,"SignedDescriptor":f.signed_descriptor,
+        "ManagementSigningPublicKey":f.management.jwk,"ManagementFingerprint":f.fingerprint,
+        "ServerBinding":f.binding,"PublicHost":HOST,"Port":PORT,"TlsSha256":f.pin});
+    let pin_for=|raw:&[u8]| -> String {
+        digest::digest(&digest::SHA256,raw).as_ref().iter().map(|b|format!("{b:02x}")).collect()
+    };
+    let raw=serde_json::to_vec(&record).unwrap();
+    let pin=pin_for(&raw);
+    let authenticated=verify_pinned_invite_metadata(&raw,&pin,&f.token).unwrap();
+    let scope=authenticated.scope().unwrap();
+    assert!(read_open_descriptor(&f.store,&scope,&f.get(),now).is_ok());
+    assert!(prepare_fresh_consume(&f.store,&scope,&f.post(),now).is_ok());
+    let other=encode(&[78;32]);
+    assert_eq!(verify_pinned_invite_metadata(&raw,&pin,&other).err(),Some(GateError::Forbidden));
+    assert_eq!(verify_pinned_invite_metadata(&raw,&"f".repeat(64),&f.token).err(),Some(GateError::InvalidState));
+    for field in ["BearerHmacSha256","SignedDescriptor","InviteId","PublicHost","TlsSha256","ServerBinding"] {
+        let mut altered=record.clone();
+        altered[field]=json!("attacker controlled");
+        assert_eq!(verify_pinned_invite_metadata(&serde_json::to_vec(&altered).unwrap(),&pin,&f.token).err(),Some(GateError::InvalidState));
+    }
+    // Even if independently pinned, ambiguous JSON must never become a scope.
+    let body=String::from_utf8(raw.clone()).unwrap();
+    let duplicate=format!("{{\"InviteId\":\"other\",{}",&body[1..]);
+    assert_eq!(verify_pinned_invite_metadata(duplicate.as_bytes(),&pin_for(duplicate.as_bytes()),&f.token).err(),Some(GateError::InvalidState));
+    assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Open));
+}
