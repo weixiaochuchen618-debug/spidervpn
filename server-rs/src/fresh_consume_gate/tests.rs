@@ -151,7 +151,7 @@ impl Fixture {
     }
     fn post(&self)->ParsedRequest {self.request(&self.recipient.sign(&self.body))}
     fn error(&self,req:&ParsedRequest)->Option<GateError> {
-        prepare_fresh_consume(&self.store,&self.scope(),req,utc_seconds(NOW).unwrap()).err()
+        fixture_fresh(&self.store,&self.scope(),req,utc_seconds(NOW).unwrap()).err()
     }
 }
 
@@ -159,9 +159,9 @@ impl Fixture {
 fn signed_get_and_fresh_post_match_legacy_protocol_without_writing_ledger() {
     let f=Fixture::new();
     let generation=f.store.generation().unwrap();
-    let descriptor=read_open_descriptor(&f.store,&f.scope(),&f.get(),utc_seconds(NOW).unwrap()).unwrap();
+    let descriptor=fixture_get(&f.store,&f.scope(),&f.get(),utc_seconds(NOW).unwrap()).unwrap();
     assert_eq!(descriptor.legacy_data(),json!({"Status":"InvitationReady","SignedDescriptor":f.signed_descriptor}));
-    let prepared=prepare_fresh_consume(&f.store,&f.scope(),&f.post(),utc_seconds(NOW).unwrap()).unwrap();
+    let prepared=fixture_fresh(&f.store,&f.scope(),&f.post(),utc_seconds(NOW).unwrap()).unwrap();
     assert_eq!(prepared.claims().request_id,REQ);
     assert_eq!(prepared.claims().device_id,DEV);
     assert_eq!(prepared.claims().public_key,wg(1));
@@ -185,12 +185,12 @@ fn wrong_token_host_route_expiry_and_unknown_invitation_fail_closed() {
     req=f.post();
     req.target.push_str("?extra=1");
     assert_eq!(f.error(&req),Some(GateError::NotFound));
-    assert_eq!(prepare_fresh_consume(&f.store,&f.scope(),&f.post(),utc_seconds(EXP).unwrap()).err(),Some(GateError::InviteExpired));
+    assert_eq!(fixture_fresh(&f.store,&f.scope(),&f.post(),utc_seconds(EXP).unwrap()).err(),Some(GateError::InviteExpired));
     let mut other=f.scope();
     other.invite_id=OTHER_INV;
     req=f.post();
     req.target=format!("/v1/invitations/{OTHER_INV}/consume");
-    assert_eq!(prepare_fresh_consume(&f.store,&other,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InviteNotFound));
+    assert_eq!(fixture_fresh(&f.store,&other,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InviteNotFound));
 }
 
 #[test]
@@ -202,17 +202,17 @@ fn actual_signed_descriptor_and_nested_invite_must_bind_to_independent_scope() {
     foreign["TlsSha256"]=json!("b".repeat(64));
     let signed=f.management.sign(&foreign);
     scope.signed_descriptor=&signed;
-    assert_eq!(prepare_fresh_consume(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_fresh(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InvalidState));
     let mut inner=f.invite.clone();
     inner["ServerBinding"]["NodeId"]=json!(OTHER_INV);
     foreign=f.descriptor.clone();
     foreign["Invite"]=json!(f.management.sign(&inner));
     let signed=f.management.sign(&foreign);
     scope.signed_descriptor=&signed;
-    assert_eq!(prepare_fresh_consume(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_fresh(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InvalidState));
     scope=f.scope();
     scope.management_jwk=&f.recipient.jwk;
-    assert_eq!(prepare_fresh_consume(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_fresh(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InvalidState));
 }
 
 #[test]
@@ -251,7 +251,7 @@ fn duplicate_json_keys_rejected_even_with_valid_signature() {
 #[test]
 fn consumed_pending_revocation_and_other_invite_tombstones_cannot_reenroll() {
     let mut f=Fixture::new();
-    let claims=prepare_fresh_consume(&f.store,&f.scope(),&f.post(),utc_seconds(NOW).unwrap())
+    let claims=fixture_fresh(&f.store,&f.scope(),&f.post(),utc_seconds(NOW).unwrap())
         .unwrap().claims().clone();
     let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
     let grant=f.store.update(|l|l.reserve(claims.clone(),utc_seconds(NOW).unwrap(),pool,Some(&[]))).unwrap();
@@ -281,7 +281,7 @@ fn consumed_pending_revocation_and_other_invite_tombstones_cannot_reenroll() {
     body["RequestDigest"]=json!(client_digest(&body["ClientRequest"]).unwrap());
     let mut req=f.request(&f.recipient.sign(&body));
     req.target=format!("/v1/invitations/{OTHER_INV}/consume");
-    assert_eq!(prepare_fresh_consume(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::Revoked));
+    assert_eq!(fixture_fresh(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::Revoked));
     assert_eq!(f.store.view().unwrap().state(OTHER_INV),Some(&InviteState::Open));
 }
 
@@ -314,7 +314,7 @@ fn authenticated_consumed_retry_is_bounded_exact_and_read_only() {
     let now=utc_seconds(NOW).unwrap();
     let exp=utc_seconds(EXP).unwrap();
     let req=f.post();
-    let claims=prepare_fresh_consume(&f.store,&f.scope(),&req,now).unwrap().claims().clone();
+    let claims=fixture_fresh(&f.store,&f.scope(),&req,now).unwrap().claims().clone();
     assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(&[])).err(),Some(GateError::InvalidState));
     let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
     let grant=f.store.update(|l|l.reserve(claims.clone(),now,pool,Some(&[]))).unwrap();
@@ -353,7 +353,7 @@ fn authenticated_consumed_retry_is_bounded_exact_and_read_only() {
 fn noncanonical_historical_revoking_key_cannot_evade_fresh_gate() {
     let mut f=Fixture::new();
     let now=utc_seconds(NOW).unwrap();
-    let mut claims=prepare_fresh_consume(&f.store,&f.scope(),&f.post(),now).unwrap().claims().clone();
+    let mut claims=fixture_fresh(&f.store,&f.scope(),&f.post(),now).unwrap().claims().clone();
     // Change only unused base64 pad bits: old wg_key shape accepts it.
     let mut alias=wg(1);
     assert_eq!(&alias[42..43],"E");
@@ -389,8 +389,8 @@ fn independent_metadata_pin_binds_bearer_descriptor_and_scope() {
     let pin=pin_for(&raw);
     let authenticated=verify_pinned_invite_metadata(&raw,&pin,&f.token).unwrap();
     let scope=authenticated.scope().unwrap();
-    assert!(read_open_descriptor(&f.store,&scope,&f.get(),now).is_ok());
-    assert!(prepare_fresh_consume(&f.store,&scope,&f.post(),now).is_ok());
+    assert!(fixture_get(&f.store,&scope,&f.get(),now).is_ok());
+    assert!(fixture_fresh(&f.store,&scope,&f.post(),now).is_ok());
     assert_eq!(check_retry_interface(&scope,"wg0"),Ok(()));
     for wrong in ["wg1","wg00","WG0","all",""] {
         assert_eq!(check_retry_interface(&scope,wrong),Err(GateError::InvalidState));
@@ -440,7 +440,7 @@ fn retry_observes_under_current_lock_and_rechecks_clock_after_readback() {
     let now=utc_seconds(NOW).unwrap();
     let exp=utc_seconds(EXP).unwrap();
     let req=f.post();
-    let claims=prepare_fresh_consume(&f.store,&f.scope(),&req,now).unwrap().claims().clone();
+    let claims=fixture_fresh(&f.store,&f.scope(),&req,now).unwrap().claims().clone();
     let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
     let grant=f.store.update(|l|l.reserve(claims.clone(),now,pool,Some(&[]))).unwrap();
     let peer=Peer{public_key:claims.public_key.clone(),address:grant.address};
@@ -475,4 +475,62 @@ fn retry_observes_under_current_lock_and_rechecks_clock_after_readback() {
     assert_eq!(prepare_consumed_retry(&f.store,&scope,&req,"wg1").err(),Some(GateError::InvalidState));
     assert_eq!(f.store.generation().unwrap(),generation);
     assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Consumed(grant)));
+}
+
+fn fixture_get<'a>(store: &'a LedgerStore,scope: &TrustedOpenInvite<'a>,
+    request: &ParsedRequest,now: i64) -> Result<OpenDescriptor<'a>,GateError>
+{
+    read_open_with_clock(store,scope,request,||Ok(now))
+}
+
+fn fixture_fresh<'a>(store: &'a LedgerStore,scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest,now: i64) -> Result<VerifiedFreshConsume<'a>,GateError>
+{
+    prepare_fresh_with_clock(store,scope,request,||Ok(now))
+}
+
+#[test]
+fn open_gates_recheck_expiry_and_generation_and_refuse_cancelled_replay() {
+    let mut f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let exp=utc_seconds(EXP).unwrap();
+    let get=f.get();
+    let post=f.post();
+    let generation=f.store.generation().unwrap();
+    {
+        let scope=f.scope();
+        let mut times=[exp-1,exp].into_iter();
+        assert_eq!(read_open_with_clock(&f.store,&scope,&get,
+            ||Ok(times.next().unwrap())).err(),Some(GateError::InviteExpired));
+        let mut times=[exp-1,exp].into_iter();
+        assert_eq!(prepare_fresh_with_clock(&f.store,&scope,&post,
+            ||Ok(times.next().unwrap())).err(),Some(GateError::InviteExpired));
+        let mut times=[now,now-1].into_iter();
+        assert_eq!(read_open_with_clock(&f.store,&scope,&get,
+            ||Ok(times.next().unwrap())).err(),Some(GateError::InvalidState));
+        let mut times=[now,now-1].into_iter();
+        assert_eq!(prepare_fresh_with_clock(&f.store,&scope,&post,
+            ||Ok(times.next().unwrap())).err(),Some(GateError::InvalidState));
+        assert!(fixture_get(&f.store,&scope,&get,now).is_ok());
+        assert!(fixture_fresh(&f.store,&scope,&post,now).is_ok());
+    }
+    assert_eq!(f.store.generation().unwrap(),generation);
+    f.store.update(|l|l.insert_open(OTHER_INV,exp)).unwrap();
+    let advanced=f.store.generation().unwrap();
+    assert!(advanced>generation);
+    // An old captured generation cannot validate even while the invite
+    // remains Open. This is an actual persisted generation change.
+    assert_eq!(check_open_completion(&f.store,INV,generation,now,now),
+        Err(GateError::InvalidState));
+    assert_eq!(check_open_completion(&f.store,INV,advanced,now,now),Ok(()));
+    f.store.update(|l|l.cancel_open(INV)).unwrap();
+    let cancelled_generation=f.store.generation().unwrap();
+    assert!(cancelled_generation>advanced);
+    let scope=f.scope();
+    assert_eq!(fixture_get(&f.store,&scope,&get,now).err(),Some(GateError::InviteCancelled));
+    assert_eq!(fixture_fresh(&f.store,&scope,&post,now).err(),Some(GateError::InviteCancelled));
+    // The real public system-clock paths must refuse as well.
+    assert_eq!(read_open_descriptor(&f.store,&scope,&get).err(),Some(GateError::InviteCancelled));
+    assert_eq!(prepare_fresh_consume(&f.store,&scope,&post).err(),Some(GateError::InviteCancelled));
+    assert_eq!(f.store.generation().unwrap(),cancelled_generation);
 }

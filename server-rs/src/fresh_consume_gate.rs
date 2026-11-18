@@ -44,9 +44,10 @@ pub enum GateError {
 }
 
 /// Read-only protocol payload (not a proof of network authorization).
-#[derive(PartialEq, Eq)]
+/// Borrow the same locked authority while using the validated descriptor.
 pub struct OpenDescriptor<'a> {
     pub signed_descriptor: &'a str,
+    _store: &'a LedgerStore,
 }
 impl OpenDescriptor<'_> {
     pub fn legacy_data(&self) -> Value {
@@ -382,25 +383,60 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
     Ok(ledger)
 }
 
+/// Check the actual locked generation and the end-of-validation clock.
+/// No caller-supplied timestamp is accepted at a public gate entry point.
+fn check_open_completion(store: &LedgerStore, invite_id: &str, generation: u64,
+    before: i64, after: i64) -> Result<(),GateError>
+{
+    if after<before || store.generation().map_err(|_|GateError::InvalidState)?!=generation {
+        return Err(GateError::InvalidState);
+    }
+    let ledger=store.view().map_err(|_|GateError::InvalidState)?;
+    let inv=ledger.invitations.get(invite_id).ok_or(GateError::InviteNotFound)?;
+    if !matches!(inv.state,InviteState::Open) { return Err(GateError::InvalidState); }
+    if after>=inv.expires_unix { return Err(GateError::InviteExpired); }
+    Ok(())
+}
+
 /// Authenticated read-only GET for an independently trusted OPEN invitation.
 /// Consumed/retry and migration remain deliberately unavailable here.
-pub fn read_open_descriptor<'a>(store: &LedgerStore, scope: &TrustedOpenInvite<'a>,
-    request: &ParsedRequest, now: i64) -> Result<OpenDescriptor<'a>,GateError>
+pub fn read_open_descriptor<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'a>,
+    request: &ParsedRequest) -> Result<OpenDescriptor<'a>,GateError>
 {
+    read_open_with_clock(store,scope,request,system_utc_seconds)
+}
+
+fn read_open_with_clock<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'a>,
+    request: &ParsedRequest, mut clock: impl FnMut() -> Result<i64,GateError>)
+    -> Result<OpenDescriptor<'a>,GateError>
+{
+    let now=clock()?;
+    let generation=store.generation().map_err(|_|GateError::InvalidState)?;
     common(store,scope,request,now,Operation::Get)?;
     if !request.body.is_empty() { return Err(GateError::InvalidRequest); }
-    Ok(OpenDescriptor { signed_descriptor:scope.signed_descriptor })
+    check_open_completion(store,scope.invite_id,generation,now,clock()?)?;
+    Ok(OpenDescriptor { signed_descriptor:scope.signed_descriptor,_store:store })
 }
 
 /// Exact POST consume envelope, bearer + independently signed invitation +
 /// possession of recipient private key + request digest/binding + durable
 /// OPEN/nonrevoked state. No persistence/write/peer mutation here.
 pub fn prepare_fresh_consume<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
-    request: &ParsedRequest, now: i64) -> Result<VerifiedFreshConsume<'a>,GateError>
+    request: &ParsedRequest) -> Result<VerifiedFreshConsume<'a>,GateError>
 {
+    prepare_fresh_with_clock(store,scope,request,system_utc_seconds)
+}
+
+fn prepare_fresh_with_clock<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, mut clock: impl FnMut() -> Result<i64,GateError>)
+    -> Result<VerifiedFreshConsume<'a>,GateError>
+{
+    let now=clock()?;
+    let generation=store.generation().map_err(|_|GateError::InvalidState)?;
     let ledger=common(store,scope,request,now,Operation::Fresh)?;
     let (claims, recipient_jwk)=verify_consume_claims(scope,request,now)?;
     check_history(ledger,&claims)?;
+    check_open_completion(store,scope.invite_id,generation,now,clock()?)?;
     // No address allocation is attempted without real peer inventory.
     // A future transaction must recheck policy under this same lock before
     // persisting Pending; a verified self-signature is not an approval.
