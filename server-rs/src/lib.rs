@@ -49,6 +49,10 @@ pub mod http_fail_closed;
 #[cfg(all(target_os = "linux", feature = "linux-bounded-accept-lab"))]
 pub mod loopback_denial_lab;
 
+/// SEC-02 opt-in long-lived loopback accept, source and total worker caps.
+#[cfg(all(target_os = "linux", feature = "linux-persistent-listener-lab"))]
+pub mod persistent_listener_lab;
+
 pub mod legacy;
 
 /// Offline legacy RS256 verification ONLY, not a runtime authorization path.
