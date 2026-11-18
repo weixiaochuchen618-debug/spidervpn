@@ -624,3 +624,13 @@ PR/commit/CI: ...
 - **严格限定差异**：GitHub compare parent #18 `72533502` 到 #19 新 HEAD 仅 4 个文件：`server-rs/Cargo.toml`（feature **默认关闭**）、`server-rs/src/lib.rs`（条件编译入口）、`server-rs/src/handshake_admission.rs`（新 Rust 非 TLS 策略）、原 Linux CI workflow。没有改变 `assets/tc-pair.py`、`src/pairhost.rs`、Windows UI/连接/WFP；main 未变。
 - 精确同 SHA [Windows MSVC #44211428496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428496) / [GNU #44211428529](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428529) **本条书写时仍在执行**，不能提前声称全绿；如红需查 logs 并修复重跑。SEC-02 仍未接入真正 TLS/HTTP 端口和旧 Python 迁移，**状态不变：P0 OPEN / production vulnerable**；SEC-01/08 和 Issue #5 亦 OPEN、PR #19 Draft、生产安全验收未完成。
 
+
+
+## D.56 PR #19 第二轮对抗修正：CPU-only 回调不能在超时后返回成功；新 Linux 八条测试（2026-11-18）
+
+- 在 HEAD `1fcda2dcbc1941b4f2b644641ed3e18450ed1e34` 成功 Linux 7 tests 之后，独立复查发现：`DeadlineIo` 在每次 read/write 都检查绝对截止时间，但 TLS 验签等 **最后一次 I/O 之后的纯 CPU 工作** 若耗时超限，其回调原可不再读取 socket 而返回 `Ok`。此漏洞不应以“IO 有 deadline”等同“整个握手成功必须未超时”。
+- **第三个 Rust commit HEAD `9cc7ab6b5fcdf087eec2f80e92ef7581ebe4fe0b`**：在握手回调完成后**再次检查之前在 admission 时固定的截止时间**，超时一律 `TimedOut` 而不是返回成功，RAII Permit 不变。新增第八条 Rust `callback_cannot_report_success_after_deadline_without_more_io`：真实 TCP connection，callback 不做 IO、故意 sleep 超时，确认不得 `Ok`。之前 7 条都保留、没有 skip/ignore。
+- 对此最新 SHA [Linux #44212209581](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209581) **core Job Completed/Success**，原始日志确认 **121 Rust lib / 0 failed / 0 ignored、SEC-02 8/8 真实 TCP tests / 0 failed / 0 ignored**，并且已有管理/旧脚本回归成功；独立 kernel/netns Job 本条写入时还在运行，不能提前称整个 Linux workflow 完整全绿。
+- 本 SHA [MSVC #44212209567](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209567) / [GNU #44212209522](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209522) 同样 **进行中**，完整成功必须查同 SHA 每个 Job 和原始日志；原前两个 SHA 绿只能当历史，不可替代。无生产 TLS 接收器；对于无限 CPU 自旋/绕过 wrapper 的外部函数仍无法预先强制中断，未来服务还需隔离处理。
+- SEC-02 **生产 P0 仍 OPEN**，SEC-01/08 / Issue #5 OPEN；PR #19 Draft/unmerged，Windows UI/连接/WFP persistent BLOCK、现役 Python 和 main `857ea759` 均不动。
+

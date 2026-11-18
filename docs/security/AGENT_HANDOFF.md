@@ -487,3 +487,11 @@
 - 当前 [Draft PR #19](https://github.com/weixiaochuchen618-debug/spidervpn/pull/19) Rust HEAD `1fcda2dcbc1941b4f2b644641ed3e18450ed1e34`；新 [Linux #44211428730](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428730) **两 Job 全部 Completed/Success**，库 121 / 0 failed/ignored，握手 policy 新增**七项真实 loopback TCP** tests / 0 failed/ignored，root 临时目录与真实 WG kernel/netns 也保持 Success。测试强制 worker 延迟启动后，连接即使已发送有效字节，IO 也不得越过 admission 时建立的 deadline。
 - 精确同 SHA [Windows MSVC #44211428496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428496) 与 [GNU #44211428529](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428529) 仍需核对**整条 CI 终态**。父 PR #18 全绿不等于 #19 已验收。原 Python 仍处于 TLS listener wrap 的单连接阻塞风险；Rust feature 默认 OFF，未上线 TLS 并发或 HTTP handler，不能关闭 SEC-02 / Issue #5 或合并 main。见 [Backlog D.55](./REMEDIATION_BACKLOG.md)。
 
+
+
+## 58. PR #19 第三个 Rust SHA：补齐握手无 I/O 回调末尾 deadline 校验（2026-11-18）
+
+- 新审查漏洞：原 `DeadlineIo` 只保证 I/O 操作在时限内；如果最后一次 TLS read 后验签 CPU 计算拖延，callback 可晚于 budget 却 `Ok`。现提交 `9cc7ab6b5fcdf087eec2f80e92ef7581ebe4fe0b` 在 return 前验证 admission 计算的**绝对 deadline**，过期转为 `TimedOut`，新增第八条（真 TCP 上不 I/O 但超时返回成功必须被拦截）Rust 回归，旧七条没删除。
+- 最新 [Linux #44212209581](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209581) core Job **Completed/Success**：121 lib / 0 failed/ignored；SEC-02 **8/8 loopback Rust tests / 0 failed/ignored**；kernel/netns root job 还需查最终终态。准确同 SHA [MSVC #44212209567](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209567) / [GNU #44212209522](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209522) 仍在运行。必须依每一条最终 Job 和失败日志作证，不把旧 `1fcda2dc` 7 tests 绿写成新 HEAD 全绿；[Backlog D.56](./REMEDIATION_BACKLOG.md)。
+- 产品安全范围不变：Rust 限时/有界线程只是**默认关闭的独立策略核心**，没有真实 TLS 证书、握手和 HTTP 的服务端生产路径，更无持续活跃连接、公网慢握手对抗验收；SEC-02 不可关闭，Issue #5/SEC-01/08/Win UAC/WFP 等仍在阻塞。PR #19 Draft、不并 main。
+
