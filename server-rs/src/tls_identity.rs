@@ -310,9 +310,10 @@ mod tests {
             "the legacy pin hashes certificate DER, NEVER PEM text");
         let identity = check(&root, &pin).unwrap();
         assert_eq!(identity.leaf_der_sha256, pin);
-        assert_eq!(identity.server_config.versions.len(), 1);
-        assert_eq!(identity.server_config.versions[0].version,
-            rustls::ProtocolVersion::TLSv1_2);
+        // rustls::ServerConfig keeps its enabled protocol versions private.
+        // Validate config constructibility here; the separate real encrypted
+        // client/server test proves TLS1.2 compatibility on the actual wire.
+        rustls::ServerConnection::new(identity.server_config).unwrap();
     }
 
     #[test]
