@@ -597,3 +597,13 @@ PR/commit/CI: ...
 - Linux Rust `--locked`、`RUSTFLAGS=-D warnings` 保持不变：121 lib/0 failed/ignored、opt-in retire CLI 9 binary tests（含新增 3 verify）、真实 Linux root 隔离临时路径原子退役与 postboot 二项（总计 7）和内核 netns 完整通过，普通用户真执行 `retire`、`verify` 都拒绝退出 2。未为 CI 跳过一条新增失败测试。PR #18 相比父 PR #17 仅 3 个 Linux 文件：Rust opt-in CLI、Linux Rust retire module、原有 Linux CI workflow；默认关闭，无生产 Python / Windows UI/连接/WFP 变动。
 - **风险/验收状态没有因全绿改变**：本次 `verify` 是时间点 root 级别的**只读**旧入口目录和隔离文件**类型、owner、权限与存在**验证，配合 systemd/process/socket 快照，**不是隔离文件内容的独立哈希真实性、跨 root/跨时间全写者排他的证据**，更不是实际 VPS reboot/power loss、可信历史 revoke tombstone、Rust TLS / API 服务接管或 Windows UAC/WFP 真机安全验收。SEC-01/02/08 和 Issue #5 仍 OPEN，PR #18 及祖先 PR 都 Draft、未合并 main。main `857ea7593941ce79f6507db5b1ced076c3a077ba` 未变。
 
+
+
+## D.53 SEC-02 Rust 有界并行握手 + 不可延长绝对时限基础（2026-11-18）
+
+- 新 [Draft PR #19](https://github.com/weixiaochuchen618-debug/spidervpn/pull/19) 叠加在 #18 `72533502c1e361d6d1a3d029b5da99cb7499f57f`，分支 `fix/sec02-bounded-tls-handshake-admission-20261118`，初始 Rust HEAD **`6ec1f401ddbc5bc19b82fa62a36c61ee20890b28`**。选项 `linux-handshake-admission` **默认关闭**，不接 production receiver，也不暴露新的公网端口。
+- **真实风险链**：当前生产 Python `assets/tc-pair.py` 的 `command_serve` 在 `ThreadingHTTPServer` 的**监听套接字**上先 `ssl.SSLContext.wrap_socket(...,server_side=True)`，再 `serve_forever`；未完成 TLS handshake 可能在主 accept 线程阻塞，后续合法连接排队。将来 Rust 服务端必须在 accept 后对**单条**连接独立握手并限时，不能将 TLS 放回监听 socket。
+- **本轮 Rust 交付**：仅新增 feature-gated `server-rs/src/handshake_admission.rs`，`HandshakeAdmission` 使用 `AtomicUsize` CAS 抢占槽位再启动线程、最多 64 并行，不足时立即 `WouldBlock` 拒绝；`DeadlineIo` 对底层 TcpStream 的**整个**握手使用 monotonic `Instant` 绝对 deadline（100ms–30s），按剩余时间逐次设定 read/write 超时，连续小字节流无法刷新窗口；RAII 在成功/错误/panic 后释放槽位。该基础组件没有 TLS 协议栈/HTTP parser 或监听绑定，不能视为已修复生产 SEC-02；受恶意占满全部槽位时仍可拒绝正常用户，CPU 忙循环/绕过 DeadlineIo 的外部库调用不在约束范围，未来必须以真实 TLS + HTTP 集成复核。
+- **专项测试**：六组 Rust 真实 loopback TCP（非模拟）回归覆盖边界配置拒绝、单空闲/另一健康连接独立握手、满槽立即拒绝及回收、慢滴答数据不可延长总 deadline、超时后不可写入、错误与 panic 后槽位释放；Linux CI 保持 `--locked`、`RUSTFLAGS=-D warnings` 新增独立专项，而原有状态机、Root 隔离文件系统、真实 WG kernel/netns 均保留。无 Windows UI、连接/WFP、旧 Python 生产启动、main 变更。
+- **本条代码尚未通过同 SHA CI**：正在运行 [Linux #44211032490](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032490)、[MSVC #44211032535](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032535)、[GNU #44211032519](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032519)；必须查终态及新 Rust 单测/回归日志，失败即修正重跑，不可跳过。SEC-02 **P0 OPEN / 生产未修**；SEC-01/08、Issue #5 OPEN，PR Draft，不合并 main。
+

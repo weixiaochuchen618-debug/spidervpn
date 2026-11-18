@@ -463,3 +463,12 @@
 - 新增只读 opt-in root CLI `verify` 只能复核快照：systemd mask/停机、进程、旧端口、旧脚本 0700 空目录 + quarantine 0600 文件是否**存在和元数据可靠**，没有可信字节内容对比/签名历史或阻止旧 root/SSH 写者后续重启的能力。模拟 reboot/fs 篡改回归通过 **不等于** VPS 真实 power-loss/reboot/rollback 验收；仍禁止启用 Rust API/迁入旧 Consumed/Revoked 记录。完整细节和未完成清单见 [Backlog D.49–D.52](./REMEDIATION_BACKLOG.md)。
 - [Draft PR #18](https://github.com/weixiaochuchen618-debug/spidervpn/pull/18) base #17，不合并 main，不改现有 UI、连接交互、WFP persistent BLOCK。SEC-01/02/08 / Issue #5 继续 OPEN。下一步 P0 应优先推进**服务器可信全旧写者排他策略、撤销历史可信 tombstone、root systemd 真实停服/重启回滚演练、Rust TLS 并发接管**，而不是在 CI 绿时宣称生产修复。
 
+
+
+## 55. PR #19：转向 SEC-02 真 TLS 阻塞风险的 Rust 有界握手政策（2026-11-18）
+
+- 已审查旧 Python `assets/tc-pair.py::command_serve`：`ThreadingHTTPServer` 监听 socket **先执行 TLS wrap_socket 再 serve_forever**，所以未完成握手可阻塞 accept loop；不能把 Python ThreadingHTTPServer 字样误判为 handshake 并发已经安全。
+- 新独立 [Draft PR #19](https://github.com/weixiaochuchen618-debug/spidervpn/pull/19) stacked on #18，初始 Rust HEAD `6ec1f401ddbc5bc19b82fa62a36c61ee20890b28`，默认禁用 `linux-handshake-admission` feature。仅 Rust Linux policy：AtomicUsize 有界抢占 handshake worker，`DeadlineIo` 总时限下的读写接口（包括慢滴答），RAII 释放失败/崩溃槽位；测试是真实 loopback socket，**尚未实现 TLS/HTTPS 或服务端真实 cutover**。本轮未改旧 Python、Windows UI/连接/WFP 或 main。具体见 [Backlog D.53](./REMEDIATION_BACKLOG.md)。
+- 新 CI [Linux #44211032490](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032490)、[MSVC #44211032535](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032535)、[GNU #44211032519](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032519) **最初仍 in_progress**。按最新实际代码 SHA 查询；若 Linux Rust E0382/E0277、线程/套接字超时测试红，必须真实定位修 Rust 再重跑，不能忽略/skip；后查 MSVC/GNU 整条工作流而非一个 Build 步骤。
+- 重要不夸大：此模块只生成将来 Rust TLS 接收器必须接线的安全基础；普通合法客户端在 Worker 饱和时仍可能被拒绝，外部 TLS 库绕开 DeadlineIo 或 CPU 占满需实际评估。**SEC-02/SEC-01/SEC-08 P0 未生产验收、Issue #5 Open、所有安全 PR Draft**；真实 VPS root、systemd/reboot/rollback、可信撤销历史、真正 Rust TLS/HTTPS 并发慢握手回归仍待做。PR #18 已完成全平台绿但不代表 SEC-02 可合并。
+
