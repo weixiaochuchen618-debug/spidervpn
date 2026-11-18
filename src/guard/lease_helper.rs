@@ -684,6 +684,324 @@ pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
     }
 }
 
+
+#[cfg(windows)]
+mod pipe_ipc {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::Security::*;
+    use windows_sys::Win32::Security::Authorization::*;
+    use windows_sys::Win32::Storage::FileSystem::*;
+    use windows_sys::Win32::System::Pipes::*;
+    use windows_sys::Win32::System::Threading::*;
+
+    pub(super) struct OwnedHandle(pub(super) HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe { CloseHandle(self.0); }
+            }
+        }
+    }
+
+    fn os_error(context: &str) -> String {
+        format!("{context}: {}", std::io::Error::last_os_error())
+    }
+
+    pub(super) fn require_live(handle: HANDLE) -> Result<(), String> {
+        if unsafe { WaitForSingleObject(handle, 0) } != WAIT_TIMEOUT {
+            return Err("租约对端进程已退出或不可核验".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn creation_stamp(handle: HANDLE) -> Result<u64, String> {
+        let (mut created, mut exited, mut kernel, mut user) = unsafe {
+            (std::mem::zeroed::<FILETIME>(), std::mem::zeroed::<FILETIME>(),
+             std::mem::zeroed::<FILETIME>(), std::mem::zeroed::<FILETIME>())
+        };
+        if unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+            return Err(os_error("读取租约对端进程创建时间失败"));
+        }
+        Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct TokenIdentity {
+        pub(super) sid: String,
+        pub(super) session: u32,
+        pub(super) elevated: bool,
+    }
+
+    // The token belongs to the actual retained process object, not a SID in JSON.
+    pub(super) fn token_identity(process: HANDLE) -> Result<TokenIdentity, String> {
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+            return Err(os_error("读取租约对端 token 失败"));
+        }
+        let token = OwnedHandle(token);
+        let mut length = 0u32;
+        unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut length); }
+        if length < std::mem::size_of::<TOKEN_USER>() as u32 || length > 65536 {
+            return Err("租约 token SID 长度异常".into());
+        }
+        // TOKEN_USER contains a pointer and requires native alignment.
+        let mut data = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+        let mut actual = length;
+        if unsafe { GetTokenInformation(token.0, TokenUser, data.as_mut_ptr().cast(), length, &mut actual) } == 0
+            || actual < std::mem::size_of::<TOKEN_USER>() as u32 || actual > length
+        {
+            return Err(os_error("读取租约 token 用户失败"));
+        }
+        let user = unsafe { &*data.as_ptr().cast::<TOKEN_USER>() };
+        let mut sid_text = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0 || sid_text.is_null() {
+            return Err(os_error("转换租约 token SID 失败"));
+        }
+        // Windows owns the nul terminated string, LocalFree after the bounded copy.
+        let mut n = 0usize;
+        while n < 256 && unsafe { *sid_text.add(n) } != 0 { n += 1; }
+        let sid = if n < 256 {
+            String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, n) }).ok()
+        } else { None };
+        unsafe { LocalFree(sid_text.cast()); }
+        let sid = sid.ok_or("租约 token SID 字符串异常")?;
+        if !sid.starts_with("S-1-") || !sid.bytes().all(|v| v == b'S' || v == b'-' || v.is_ascii_digit()) {
+            return Err("租约 token SID 格式异常".into());
+        }
+        let mut session = 0u32;
+        let mut elevation: TOKEN_ELEVATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetTokenInformation(token.0, TokenSessionId, (&mut session as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32, &mut actual) } == 0
+            || actual != std::mem::size_of::<u32>() as u32
+        {
+            return Err(os_error("读取租约 token 会话失败"));
+        }
+        if unsafe { GetTokenInformation(token.0, TokenElevation, (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut actual) } == 0
+            || actual != std::mem::size_of::<TOKEN_ELEVATION>() as u32
+        {
+            return Err(os_error("读取租约 token 提权状态失败"));
+        }
+        Ok(TokenIdentity { sid, session, elevated: elevation.TokenIsElevated != 0 })
+    }
+
+    pub(super) fn open_controller(pid: u32, stamp: u64) -> Result<OwnedHandle, String> {
+        if pid == 0 || pid == std::process::id() || stamp == 0 {
+            return Err("租约控制进程身份不合法".into());
+        }
+        let h = OwnedHandle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) });
+        if h.0.is_null() { return Err(os_error("打开租约控制进程失败")); }
+        require_live(h.0)?;
+        if creation_stamp(h.0)? != stamp {
+            return Err("租约控制进程创建时间不匹配".into());
+        }
+        verify_same_image(h.0, pid)?;
+        Ok(h)
+    }
+
+    pub(super) fn verify_same_image(handle: HANDLE, pid: u32) -> Result<(), String> {
+        require_live(handle)?;
+        if pid == 0 || unsafe { GetProcessId(handle) } != pid {
+            return Err("租约进程句柄与 PID 不匹配".into());
+        }
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        super::super::proxy_identity::verify_process_executable(pid, &exe)?;
+        require_live(handle)
+    }
+
+    fn name(nonce: &str) -> Result<Vec<u16>, String> {
+        decode_nonce(nonce)?;
+        Ok(format!(r"\\.\pipe\SpiderVPN.Lease.{nonce}").encode_utf16().chain(Some(0)).collect())
+    }
+
+    pub(super) struct Pipe(OwnedHandle);
+
+    impl Pipe {
+        // Only exact process-token user SIDs. No Everyone/Users/Administrators group ACE.
+        // The controller needs data and attribute access, not FILE_CREATE_PIPE_INSTANCE.
+        // Medium mandatory integrity permits the intended ordinary UI to connect.
+        pub(super) fn server(nonce: &str, controller: &TokenIdentity, helper: &TokenIdentity) -> Result<Self, String> {
+            let name = name(nonce)?;
+            let sddl: Vec<u16> = format!("D:P(A;;GA;;;{})(A;;0x00120183;;;{})S:(ML;;NW;;;ME)",
+                helper.sid, controller.sid).encode_utf16().chain(Some(0)).collect();
+            let mut sd = std::ptr::null_mut();
+            if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1,
+                &mut sd, std::ptr::null_mut()) } == 0 || sd.is_null()
+            {
+                return Err(os_error("建立租约管道安全描述符失败"));
+            }
+            let attr = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+            let h = unsafe { CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1, 65536, 65536, 0, &attr) };
+            unsafe { LocalFree(sd.cast()); }
+            if h == INVALID_HANDLE_VALUE || h.is_null() {
+                return Err(os_error("建立唯一租约命名管道失败"));
+            }
+            Ok(Self(OwnedHandle(h)))
+        }
+
+        pub(super) fn client(nonce: &str, deadline: Instant, mut check: impl FnMut() -> Result<(), String>) -> Result<Self, String> {
+            let name = name(nonce)?;
+            loop {
+                check()?;
+                if Instant::now() >= deadline { return Err("连接租约管道超时".into()); }
+                let h = unsafe { CreateFileW(name.as_ptr(), 0x00120183, 0, std::ptr::null(),
+                    OPEN_EXISTING, SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, std::ptr::null_mut()) };
+                if h != INVALID_HANDLE_VALUE && !h.is_null() {
+                    let pipe = Self(OwnedHandle(h));
+                    let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+                    if unsafe { SetNamedPipeHandleState(pipe.0.0, &mode, std::ptr::null(), std::ptr::null()) } == 0 {
+                        return Err(os_error("设置租约管道非阻塞模式失败"));
+                    }
+                    return Ok(pipe);
+                }
+                let err = unsafe { GetLastError() };
+                if err != ERROR_FILE_NOT_FOUND && err != ERROR_PIPE_BUSY {
+                    return Err(format!("打开本地租约管道失败：Win32={err}"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        pub(super) fn accept(&self, deadline: Instant, mut check: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+            loop {
+                check()?;
+                if Instant::now() >= deadline { return Err("等待租约控制端超时".into()); }
+                if unsafe { ConnectNamedPipe(self.0.0, std::ptr::null_mut()) } != 0 {
+                    return Ok(());
+                }
+                let err = unsafe { GetLastError() };
+                if err == ERROR_PIPE_CONNECTED { return Ok(()); }
+                if err != ERROR_PIPE_LISTENING {
+                    return Err(format!("租约管道连接失败：Win32={err}"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        pub(super) fn require_peer(&self, expected: u32, server_end: bool) -> Result<(), String> {
+            let mut actual = 0u32;
+            let ok = unsafe {
+                if server_end { GetNamedPipeClientProcessId(self.0.0, &mut actual) }
+                else { GetNamedPipeServerProcessId(self.0.0, &mut actual) }
+            };
+            if ok == 0 || expected == 0 || actual != expected {
+                return Err("操作系统返回的租约管道对端 PID 不匹配".into());
+            }
+            Ok(())
+        }
+
+        fn transfer(&self, read: bool, bytes: &mut [u8], deadline: Instant,
+            check: &mut impl FnMut() -> Result<(), String>) -> Result<(), String>
+        {
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                check()?;
+                if Instant::now() >= deadline { return Err("租约管道 I/O 超时".into()); }
+                let chunk = &mut bytes[offset..];
+                let mut count = 0u32;
+                let ok = unsafe {
+                    if read { ReadFile(self.0.0, chunk.as_mut_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
+                    else { WriteFile(self.0.0, chunk.as_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
+                };
+                if ok == 0 {
+                    let err = unsafe { GetLastError() };
+                    if err != ERROR_NO_DATA {
+                        return Err(format!("租约管道 I/O 失败：Win32={err}"));
+                    }
+                    // A closing pipe also returns NO_DATA; bounded timeout is fail closed.
+                    if count != 0 { return Err("租约管道部分失败".into()); }
+                }
+                if count as usize > chunk.len() { return Err("租约管道长度越界".into()); }
+                offset += count as usize;
+                if count == 0 { std::thread::sleep(Duration::from_millis(50)); }
+            }
+            check()?;
+            if Instant::now() >= deadline { return Err("租约管道消息已超期".into()); }
+            Ok(())
+        }
+
+        pub(super) fn send(&self, bytes: &[u8], deadline: Instant,
+            mut check: impl FnMut() -> Result<(), String>) -> Result<(), String>
+        {
+            if bytes.is_empty() || bytes.len() > MAX_LEASE_IPC_BYTES {
+                return Err("租约管道发送长度异常".into());
+            }
+            let mut frame = Vec::with_capacity(bytes.len() + 4);
+            frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            frame.extend_from_slice(bytes);
+            self.transfer(false, &mut frame, deadline, &mut check)
+        }
+
+        pub(super) fn receive(&self, limit: usize, deadline: Instant,
+            mut check: impl FnMut() -> Result<(), String>) -> Result<Vec<u8>, String>
+        {
+            let mut header = [0u8; 4];
+            self.transfer(true, &mut header, deadline, &mut check)?;
+            let size = u32::from_le_bytes(header) as usize;
+            if size == 0 || size > limit || size > MAX_LEASE_IPC_BYTES {
+                return Err("租约管道消息长度异常".into());
+            }
+            let mut body = vec![0u8; size];
+            self.transfer(true, &mut body, deadline, &mut check)?;
+            Ok(body)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn random_nonce() -> String {
+            use ring::rand::{SecureRandom, SystemRandom};
+            let mut bytes = [0u8; 16];
+            SystemRandom::new().fill(&mut bytes).unwrap();
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        #[test]
+        fn real_pipe_rejects_wrong_peer_and_duplicate_instance_and_bounds_frames() {
+            let nonce = random_nonce();
+            let token = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+            let server = Pipe::server(&nonce, &token, &token).unwrap();
+            assert!(Pipe::server(&nonce, &token, &token).is_err());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let client = Pipe::client(&nonce, deadline, || Ok(())).unwrap();
+            server.accept(deadline, || Ok(())).unwrap();
+            let pid = std::process::id();
+            server.require_peer(pid, true).unwrap();
+            client.require_peer(pid, false).unwrap();
+            assert!(server.require_peer(pid ^ 1, true).is_err());
+            assert!(client.require_peer(pid ^ 1, false).is_err());
+            client.send(b"ack", deadline, || Ok(())).unwrap();
+            assert_eq!(server.receive(3, deadline, || Ok(())).unwrap(), b"ack");
+            server.send(b"accepted", deadline, || Ok(())).unwrap();
+            assert_eq!(client.receive(8, deadline, || Ok(())).unwrap(), b"accepted");
+            client.send(b"oversize", deadline, || Ok(())).unwrap();
+            assert!(server.receive(3, deadline, || Ok(())).is_err());
+        }
+
+        #[test]
+        fn real_pipe_absent_ack_times_out_and_closed_peer_fails() {
+            let nonce = random_nonce();
+            let token = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+            let server = Pipe::server(&nonce, &token, &token).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let client = Pipe::client(&nonce, deadline, || Ok(())).unwrap();
+            server.accept(deadline, || Ok(())).unwrap();
+            assert!(server.receive(4096, Instant::now() + Duration::from_millis(150), || Ok(())).is_err());
+            drop(client);
+            assert!(server.receive(4096, Instant::now() + Duration::from_millis(200), || Ok(())).is_err());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
