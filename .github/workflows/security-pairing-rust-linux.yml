@@ -34,7 +34,7 @@ jobs:
           set -euo pipefail
           cargo test --locked --manifest-path server-rs/Cargo.toml -- --test-threads=1 --nocapture
 
-      - name: SEC-02 bounded Rust TLS handshake admission lab (feature off by default)
+      - name: SEC-02 bounded handshake and post-handshake one-request HTTP resource policy lab (feature off)
         shell: bash
         env:
           RUSTFLAGS: "-D warnings"
@@ -47,6 +47,8 @@ jobs:
           # production remains the original Python receiver.
           grep -F 'linux-handshake-admission = []' server-rs/Cargo.toml
           ! grep -F 'linux-handshake-admission' src/pairhost.rs
+          grep -F 'pub fn spawn_one_request' server-rs/src/handshake_admission.rs
+          grep -F 'pub struct RequestAdmission' server-rs/src/handshake_admission.rs
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
 
       - name: Compile and test opt-in Rust root-only terminal finalization policy
