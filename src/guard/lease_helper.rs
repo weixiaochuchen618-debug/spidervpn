@@ -40,6 +40,7 @@ pub struct LeaseReply {
     pub state: LeaseState,
     pub reason: String,
     pub filter_count: usize,
+    pub helper_pid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -347,7 +348,7 @@ fn write_reply(path: &Path, reply: &LeaseReply) -> Result<(), String> {
 
 /// 父进程必须检查回执来自本次会话且 filter_count 与请求完全一致；
 /// "Ready" 文件本身不能证明子进程仍活着，启动器还必须检查 hProcess。
-fn read_ready(path: &Path, nonce: &str, expected_count: usize) -> Result<Option<()>, String> {
+fn read_ready(path: &Path, nonce: &str, expected_count: usize, expected_helper_pid: u32) -> Result<Option<()>, String> {
     let Some(body) = read_ipc_file(path, 4096)? else {
         return Ok(None);
     };
@@ -358,6 +359,9 @@ fn read_ready(path: &Path, nonce: &str, expected_count: usize) -> Result<Option<
     }
     if reply.state != LeaseState::Ready {
         return Err(format!("租约 helper 拒绝启动：{}", reply.reason));
+    }
+    if expected_helper_pid == 0 || reply.helper_pid != expected_helper_pid {
+        return Err("租约 Ready 回执与启动的 helper 进程 PID 不匹配".into());
     }
     if reply.filter_count != expected_count || !reply.reason.is_empty() {
         return Err("租约 Ready 报告的过滤器数量或状态异常".into());
@@ -488,6 +492,10 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
         return Err("启动 WFP helper 后未获取进程句柄".into());
     }
     let mut child = LeaseChild { handle: info.hProcess, directory, confirmed: false };
+    let helper_pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(child.handle) };
+    if helper_pid == 0 {
+        return Err("不能从启动的 helper 句柄确认 PID".into());
+    }
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if Instant::now() >= deadline {
@@ -497,7 +505,7 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
         if unsafe { WaitForSingleObject(child.handle, 0) } != WAIT_TIMEOUT {
             return Err("长期 WFP helper 在 Ready 前已退出，未启用临时许可".into());
         }
-        match read_ready(&reply_path, &nonce, req.programs.len()) {
+        match read_ready(&reply_path, &nonce, req.programs.len(), helper_pid) {
             Ok(Some(())) => {
                 // Ready 只是第一阶段；必须写 nonce-bound ACK 并确认进程尚存活。
                 if Instant::now() >= deadline {
@@ -521,7 +529,7 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
 }
 
 fn reply(nonce: &str, state: LeaseState, reason: String, count: usize) -> LeaseReply {
-    LeaseReply { schema: LEASE_SCHEMA, nonce: nonce.to_owned(), state, reason, filter_count: count }
+    LeaseReply { schema: LEASE_SCHEMA, nonce: nonce.to_owned(), state, reason, filter_count: count, helper_pid: std::process::id() }
 }
 
 /// 提权 helper 的进程主入口。成功时长期阻塞在 Windows 进程对象等待中。
@@ -715,13 +723,13 @@ mod tests {
         write_reply(&response, &reply(&req.nonce, LeaseState::Ready, String::new(), 1)).unwrap();
         write_ack(&ack, &req.nonce, true).unwrap();
         assert!(read_request(&request).is_ok());
-        assert!(read_ready(&response, &req.nonce, 1).unwrap().is_some());
+        assert!(read_ready(&response, &req.nonce, 1, std::process::id()).unwrap().is_some());
         assert!(read_ack(&ack, &req.nonce).unwrap());
         for path in [&request, &response, &ack] {
             std::fs::hard_link(path, path.with_extension("linked")).unwrap();
         }
         assert!(read_request(&request).is_err());
-        assert!(read_ready(&response, &req.nonce, 1).is_err());
+        assert!(read_ready(&response, &req.nonce, 1, std::process::id()).is_err());
         assert!(read_ack(&ack, &req.nonce).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -796,16 +804,18 @@ mod tests {
         let path = root.join("reply.json");
         let _ = std::fs::remove_file(&path);
         let nonce = sample().nonce;
-        assert!(read_ready(&path, &nonce, 1).unwrap().is_none());
+        assert!(read_ready(&path, &nonce, 1, std::process::id()).unwrap().is_none());
         let good = reply(&nonce, LeaseState::Ready, String::new(), 1);
         std::fs::write(&path, serde_json::to_vec(&good).unwrap()).unwrap();
-        assert!(read_ready(&path, &nonce, 1).unwrap().is_some());
-        assert!(read_ready(&path, &nonce, 2).is_err());
-        assert!(read_ready(&path, "ffffffffffffffffffffffffffffffff", 1).is_err());
+        assert!(read_ready(&path, &nonce, 1, std::process::id()).unwrap().is_some());
+        assert!(read_ready(&path, &nonce, 2, std::process::id()).is_err());
+        assert!(read_ready(&path, &nonce, 1, 0).is_err());
+        assert!(read_ready(&path, &nonce, 1, std::process::id() ^ 1).is_err());
+        assert!(read_ready(&path, "ffffffffffffffffffffffffffffffff", 1, std::process::id()).is_err());
         std::fs::write(&path, serde_json::to_vec(&reply(
             &nonce, LeaseState::Rejected, "not protected".into(), 0
         )).unwrap()).unwrap();
-        assert!(read_ready(&path, &nonce, 1).is_err());
+        assert!(read_ready(&path, &nonce, 1, std::process::id()).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
