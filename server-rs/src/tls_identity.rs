@@ -237,6 +237,7 @@ mod tests {
         cert: Vec<u8>,
         key: Vec<u8>,
         der: Vec<u8>,
+        ca_der: Vec<u8>,
     }
 
     fn fixture() -> &'static Fixture {
@@ -246,23 +247,40 @@ mod tests {
                 "spidervpn-sec02-pem-fixture-{}", std::process::id()));
             fs::create_dir(&p).unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-            let status = Command::new("openssl")
-                .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                    "-days", "1", "-sha256", "-subj", "/CN=localhost",
-                    "-keyout", "tls.key", "-out", "tls.crt"])
-                .current_dir(&p).stdout(Stdio::null()).stderr(Stdio::null())
-                .status().expect("missing Linux OpenSSL fixture generator");
-            assert!(status.success(), "test PEM fixture generator failed");
-            let status = Command::new("openssl")
-                .args(["x509", "-in", "tls.crt", "-outform", "DER",
-                    "-out", "tls.der"])
-                .current_dir(&p).stdout(Stdio::null()).stderr(Stdio::null())
-                .status().unwrap();
-            assert!(status.success(), "test leaf DER export failed");
+            // A distinct CA:TRUE test trust anchor signs a CA:FALSE
+            // localhost leaf. rustls must reject a CA as the end-entity;
+            // never weaken certificate verification to make the fixture pass.
+            fn run(p: &Path, args: &[&str]) {
+                let status = Command::new("openssl")
+                    .args(args).current_dir(p)
+                    .stdout(Stdio::null()).stderr(Stdio::null())
+                    .status().expect("missing Linux OpenSSL fixture generator");
+                assert!(status.success(), "SEC-02 test certificate generation failed");
+            }
+            run(&p, &["req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-days", "1", "-subj", "/CN=SpiderVPN-SEC02-Test-CA",
+                "-addext", "basicConstraints=critical,CA:TRUE",
+                "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                "-keyout", "ca.key", "-out", "ca.pem"]);
+            run(&p, &["req", "-new", "-newkey", "rsa:2048", "-nodes",
+                "-subj", "/CN=localhost", "-keyout", "tls.key",
+                "-out", "tls.csr"]);
+            fs::write(p.join("extensions.txt"),
+                "subjectAltName=DNS:localhost\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
+                .unwrap();
+            run(&p, &["x509", "-req", "-in", "tls.csr", "-CA",
+                "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+                "-days", "1", "-sha256", "-extfile", "extensions.txt",
+                "-out", "tls.crt"]);
+            run(&p, &["x509", "-in", "tls.crt", "-outform", "DER",
+                "-out", "tls.der"]);
+            run(&p, &["x509", "-in", "ca.pem", "-outform", "DER",
+                "-out", "ca.der"]);
             let out = Fixture {
                 cert: fs::read(p.join(CERT_NAME)).unwrap(),
                 key: fs::read(p.join(KEY_NAME)).unwrap(),
                 der: fs::read(p.join("tls.der")).unwrap(),
+                ca_der: fs::read(p.join("ca.der")).unwrap(),
             };
             fs::remove_dir_all(p).unwrap();
             out
@@ -330,7 +348,7 @@ mod tests {
         let work = spawn_tls12_decrypted_one_request(
             &hand, &requests, server, identity.server_config).unwrap();
         let mut roots = RootCertStore::empty();
-        roots.add(CertificateDer::from(fixture().der.clone())).unwrap();
+        roots.add(CertificateDer::from(fixture().ca_der.clone())).unwrap();
         let client_cfg = Arc::new(
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_protocol_versions(&[&rustls::version::TLS12]).unwrap()
