@@ -534,3 +534,11 @@
 - 下一项真正 SEC-02 Rust 接收器必须对齐旧 `assets/tc-pair.py`：TLS1.2（当前 minimum==maximum）、HTTP1.1、旧 JSON response `Content-Length`、`Connection: close`、POST body 1..131072 字节且禁止 Transfer-Encoding。增加真实 TLS 握手、空闲/慢流隔离、请求 header/body size/timeouts、重复 `Content-Length`、无/错误 bearer token、HTTP pipelining/长连接、证书/指纹兼容验收，不能把 `spawn_one_request` 当前“一次 callback”说成真正单条 HTTP wire request。
 - 新候选仅默认禁用的 server-rs policy，原生产 Python DoS 尚未修复。SEC-01/02/08 / Issue #5 Open，所有 PR Draft，main/UI/连接/WFP 不动。
 
+
+
+## 64. PR #20 最新提交三平台最终通过、生产 SEC-02 仍不可关闭（2026-11-18）
+
+- [Draft PR #20](https://github.com/weixiaochuchen618-debug/spidervpn/pull/20)，代码 `a773fe881eb02954279d068d2c7d05dacbab5a3e` 精确对应 [Linux #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337)（2/2 Jobs Success）、[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452)（Success）、[MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354)（Success）。Linux 121 lib + 13 handshake/request-loopback tests/0 failed/ignored，真 WG netns + root FS，`--locked`、`-D warnings`。MSVC 全量 unit 原日志 **1429 passed / 0 failed / 1 previously ignored / 8 existing environment-filtered**，GNU 原有编译 warnings 未称消除；不掩盖失败也未加 skip。
+- 此 PR **只有两个 Linux Rust/CI 文件改变**、默认 feature OFF；没有现役 Python、HTTP parser、真正 TLS、Windows UI/connection/WFP 或 main 改动。类型上只执行**一次 handler callback** 并防无限线程和慢连接超时，不证明严格一个 HTTP wire request；未来必须加真实 TLS1.2/证书与指纹验证，符合旧协议的 HTTP1.1 单请求（header/body/错误分支/POST 131072 大小/anti-pipelining）和有效 token/撤销 ledger，真实 VPS 端口监听并发 + rollback 演练。详见 [Backlog D.59–62](./REMEDIATION_BACKLOG.md)。
+- SEC-01/02/08 和 Issue #5 Open，PR #20 与父级 Draft 不合并。main/UI/正常连接/WFP 持久 BLOCK 不变。安全整改下一轮可以由这些 evidence 接着做真实 TLS/HTTP 接收候选，但不得自动迁移旧 Consumed/Revoked 数据或宣称已上线。
+

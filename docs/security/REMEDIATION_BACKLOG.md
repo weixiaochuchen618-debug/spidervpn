@@ -679,3 +679,11 @@ PR/commit/CI: ...
 - 经源文件逐项复核：目前现役 `assets/tc-pair.py` 只使用 TLS1.2（`SSLContext.minimum_version/maximum_version` 均设 TLSv1_2）；HTTP/1.1 旧 JSON 响应带 `Content-Type: application/json`、`Content-Length` 与 `Connection: close`，请求 POST body 允许 1..**131072 字节**，必须具备数字 `Content-Length`，拒绝任何 `Transfer-Encoding`。未来真正的 Rust TLS/HTTP 迁移必须以协议金样本验证这些兼容边界，并增加 header 整体/单字段大小限制、短读/slowloris/重复长度/请求重放/超时/keepalive/HTTP pipelining 反例；本 PR #20 没有实现/声称已实现真实 TLS/HTTP parser/授权。
 - 因旧 Python 接收端没改、生产 SEC-02 仍存在，当前 PR #20 **Draft**、Issue #5 和 SEC-01/02/08 OPEN，不合 main，不更改 UI/连接/WFP 持久 BLOCK。
 
+
+
+## D.62 PR #20 同一新 SHA Linux / GNU / MSVC 三平台全部 Success，生产 SEC-02 仍未验收（2026-11-18）
+
+- Rust HEAD **`a773fe881eb02954279d068d2c7d05dacbab5a3e`** 的 [Linux #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337) **两 Job Completed/Success**，121 Rust library/0 failed/ignored，13 条 SEC-02 真实 TCP handshake+posthandler 配额/绝对 deadline tests /0 failed/ignored、真 kernel WG netns 与 root temp FS 回归通过，Linux `--locked`、`RUSTFLAGS=-D warnings`。同 SHA [Windows GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452) **Completed/Success**（原仓已有 warnings）；[Windows MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354) **Completed/Success**：真实 Build、SEC-10、SEC-01、全部 integration、changed modules、Portable full suite 各步骤成功。MSVC 原始最后总结 **1429 passed / 0 failed / 1 ignored（原有）/ 8 filtered（原有环境依赖）**。无新增 skip/ignore，未混用旧 SHA 结果。
+- 此 PR 精确 compare 父 #19 只有两文件：`server-rs/src/handshake_admission.rs` + `.github/workflows/security-pairing-rust-linux.yml`；默认关闭的 Rust `RequestAdmission` + `spawn_one_request` 完成**一次 handler callback** 资源限额和结束关闭，**不保证 HTTP wire 只收到/解析一条 request**。HTTP1.1 parser/headers/POST size/pipelining/认证未实现，也没有 TLS1.2 crypto、客户端真实证书指纹兼容、服务器 TLS 监听上线、旧 Python 退役/撤销数据迁移。因此成功的只是隔离候选代码与现有 Windows回归，**不是生产 P0 SEC-02 缺陷的修复认证**。
+- 安全账本：**SEC-01 / SEC-02 / SEC-08 / Issue #5 仍 OPEN**，全部安全 PR（含 [Draft #20](https://github.com/weixiaochuchen618-debug/spidervpn/pull/20)）维持 Draft/unmerged；main `857ea7593941ce79f6507db5b1ced076c3a077ba`、原 UI、正常连接/代理、WFP persistent BLOCK 无改动。实际 VPS systemd/reboot/rollback 与 Windows UAC/WFP 多账户安全验收缺失，不得以 CI Success 自行放行。
+
