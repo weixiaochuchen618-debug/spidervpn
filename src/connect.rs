@@ -250,17 +250,22 @@ fn try_start_experimental_proxy_lease(
     if !blocked {
         return Err("持久交易程序 BLOCK 未成功核验，不允许动态放行".into());
     }
+    // Register at the earliest authorized experimental entry, before identity
+    // resolution or UAC. Concurrent disconnect cancels this exact reservation.
+    let pid: u32 = engine_pid.try_into()
+        .map_err(|_| "引擎 PID 超出 Windows 进程标识范围".to_string())?;
+    let registration = crate::guard::lease_helper::register_experimental_lease(
+        pid, std::path::Path::new(&engine.binary),
+    )?;
     let resolved = crate::guard::trade_identities(cfg);
     if resolved.programs.is_empty() || !resolved.all_participated() {
         return Err("交易程序名单不完整，不允许授予部分程序的临时许可".into());
     }
     let target = endpoint.parse::<std::net::SocketAddr>()
         .map_err(|e| format!("代理入口必须是精确的本地 IP:port：{e}"))?;
-    let pid: u32 = engine_pid.try_into()
-        .map_err(|_| "引擎 PID 超出 Windows 进程标识范围".to_string())?;
     let request = crate::guard::lease_helper::LeaseRequest {
         schema: 1,
-        // 启动器在 ShellExecuteExW 之前会替换为 ring SystemRandom 的 128-bit nonce。
+        // The registered lease owns its unique random 128-bit nonce.
         nonce: String::new(),
         endpoint: target,
         engine_pid: pid,
@@ -268,12 +273,12 @@ fn try_start_experimental_proxy_lease(
         engine_executable: std::path::PathBuf::from(&engine.binary),
         programs: resolved.programs,
     };
-    let child = crate::guard::lease_helper::launch_elevated(&request)?;
+    let child = crate::guard::lease_helper::launch_elevated(&request, registration)?;
     if !child.running() {
         return Err("动态 WFP 辅助进程在握手后意外退出".into());
     }
-    // handle 只用于握手与活性验证；关闭父进程的 handle 不会结束 helper。
-    // helper 自己监控控制程序和引擎的真实 HANDLE，在任一退出时撤销许可。
+    // The unique pipe-owning worker retains this registration after startup;
+    // disconnect_inner cancels it independently of engine termination.
     let count = request.programs.len();
     drop(child);
     Ok(count)
@@ -526,6 +531,12 @@ pub fn disconnect_with_origin(
 
 fn disconnect_inner(cfg: Option<&AppConfig>, deps: &Deps) -> Result<Outcome, String> {
     let mut did = Vec::new();
+
+    // Experiment only: cancel the current locally owned lease even if runtime
+    // is absent/corrupt or the following engine stop returns Err. No lease is
+    // a no-op; never infer another process's ownership from runtime.json.
+    #[cfg(windows)]
+    crate::guard::lease_helper::cancel_current_experimental_lease();
 
     // 1) 先停引擎：否则还原代理之后，引擎仍在跑，流量会绕过代理直连。
     //    这里必须按 EnginePid 停——守护就是我们自己，照着 SupervisorPid 去 kill 等于自杀。
