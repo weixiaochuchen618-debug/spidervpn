@@ -9,7 +9,10 @@
 use spidervpn_pairing_authority::handshake_admission::{HandshakeAdmission, RequestAdmission};
 use spidervpn_pairing_authority::persistent_listener_lab::run_persistent_denial_lab;
 use spidervpn_pairing_authority::tls_identity::read_disposable_process_identity;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::net::{Ipv4Addr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -118,7 +121,118 @@ fn permanently_drop_lab_privileges() -> io::Result<()> {
     Ok(())
 }
 
-fn run() -> Result<(), &'static str> {
+// The disposable lab supervisor must deliberately supply anonymous capture
+// pipes for BOTH outputs. File type alone does not authenticate the reader:
+// never treat this policy as a production log endpoint trust decision.
+// No application diagnostic may be emitted until all stdio checks pass.
+#[derive(PartialEq, Eq)]
+struct FdState {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+    kind: libc::mode_t,
+    rdev: libc::dev_t,
+    flags: libc::c_int,
+}
+
+fn refused_stdio() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "unsafe lab stdio")
+}
+
+fn inspect_fd(fd: RawFd) -> io::Result<FdState> {
+    // SAFETY: fstat initializes the provided stat on success; F_GETFL
+    // only reads the current open-file-description flags.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || flags & libc::O_PATH != 0 {
+            return Err(refused_stdio());
+        }
+        Ok(FdState { device: st.st_dev, inode: st.st_ino,
+            kind: st.st_mode & libc::S_IFMT, rdev: st.st_rdev, flags })
+    }
+}
+
+fn anonymous_pipe(fd: RawFd, state: &FdState, direction: libc::c_int) -> io::Result<()> {
+    if state.kind != libc::S_IFIFO
+        || state.flags & libc::O_ACCMODE != direction
+        || state.flags & (libc::O_NONBLOCK | libc::O_ASYNC | libc::O_DIRECT) != 0
+    {
+        return Err(refused_stdio());
+    }
+    // A filesystem FIFO also has S_IFIFO. Require the Linux anonymous pipe
+    // identity for the same inode, not a filesystem pathname or socket.
+    let target = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+    if target != std::path::PathBuf::from(format!("pipe:[{}]", state.inode)) {
+        return Err(refused_stdio());
+    }
+    Ok(())
+}
+
+fn readonly_null(state: &FdState) -> bool {
+    state.kind == libc::S_IFCHR
+        && libc::major(state.rdev) == 1 && libc::minor(state.rdev) == 3
+        && state.flags & libc::O_ACCMODE == libc::O_RDONLY
+}
+
+struct LabStdio {
+    input: FdState,
+    output: FdState,
+    error: FdState,
+}
+
+impl LabStdio {
+    fn isolate() -> io::Result<Self> {
+        let input = inspect_fd(libc::STDIN_FILENO)?;
+        let output = inspect_fd(libc::STDOUT_FILENO)?;
+        let error = inspect_fd(libc::STDERR_FILENO)?;
+        anonymous_pipe(libc::STDOUT_FILENO, &output, libc::O_WRONLY)?;
+        anonymous_pipe(libc::STDERR_FILENO, &error, libc::O_WRONLY)?;
+        if !readonly_null(&input) {
+            anonymous_pipe(libc::STDIN_FILENO, &input, libc::O_RDONLY)?;
+        }
+
+        // Do not retain even an allowed inherited input capability. Open a
+        // fixed non-following, non-controlling, nonblocking device and
+        // prove its device identity and direction before installing it.
+        let null = OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open("/dev/null")?;
+        let fd = null.as_raw_fd();
+        let input = inspect_fd(fd)?;
+        if fd <= libc::STDERR_FILENO || !readonly_null(&input) {
+            return Err(refused_stdio());
+        }
+        // SAFETY: single-threaded startup, valid owned source and existing
+        // stdio number; dup2 atomically replaces the inherited input.
+        if unsafe { libc::dup2(fd, libc::STDIN_FILENO) } != libc::STDIN_FILENO {
+            return Err(io::Error::last_os_error());
+        }
+        drop(null);
+        let stdio = Self { input, output, error };
+        stdio.verify()?;
+        Ok(stdio)
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        // No worker or other local descriptor owner exists when called
+        // across the credential transition. Compare actual fd identities
+        // AND access flags, without needing privileged proc symlink access
+        // after setting dumpable=0. A shared pipe's reader is still not an
+        // authenticated peer.
+        if inspect_fd(libc::STDIN_FILENO)? != self.input
+            || inspect_fd(libc::STDOUT_FILENO)? != self.output
+            || inspect_fd(libc::STDERR_FILENO)? != self.error
+        {
+            return Err(refused_stdio());
+        }
+        Ok(())
+    }
+}
+
+fn run(stdio: &LabStdio) -> Result<(), &'static str> {
     // Require ordinary root invocation, not a setuid launcher.
     if unsafe { libc::getuid() != 0 || libc::geteuid() != 0 } {
         return Err("root startup required for isolated lab identity");
@@ -136,6 +250,7 @@ fn run() -> Result<(), &'static str> {
     let identity = read_disposable_process_identity(pin)
         .map_err(|_| "isolated TLS identity or pin refused")?;
     permanently_drop_lab_privileges().map_err(|_| "privilege drop refused")?;
+    stdio.verify().map_err(|_| "stdio readback after privilege drop refused")?;
     if STOP.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -167,8 +282,17 @@ fn run() -> Result<(), &'static str> {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("spidervpn-pair-denial-lab: {error}");
+    let stdio = match LabStdio::isolate() {
+        Ok(stdio) => stdio,
+        // In particular, never eprintln to an inherited writable file or
+        // socket on a startup error. Even the other output is not assumed
+        // trusted when the whole preflight failed.
+        Err(_) => std::process::exit(2),
+    };
+    if let Err(error) = run(&stdio) {
+        if stdio.verify().is_ok() {
+            eprintln!("spidervpn-pair-denial-lab: {error}");
+        }
         std::process::exit(2);
     }
 }
