@@ -1776,6 +1776,29 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn a2_actual_process_app_id(handle: windows_sys::Win32::Foundation::HANDLE) -> Vec<u8> {
+        use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+        use super::super::identity::device_path_from_app_id;
+        use super::super::wfp_win::app_id_from_path;
+        let image = |flags| {
+            let mut buf = vec![0u16; 32768];
+            let mut len = buf.len() as u32;
+            assert_ne!(unsafe { QueryFullProcessImageNameW(handle, flags, buf.as_mut_ptr(), &mut len) }, 0,
+                "actual probe process image unavailable");
+            assert!(len > 0 && (len as usize) <= buf.len());
+            String::from_utf16(&buf[..len as usize]).unwrap()
+        };
+        let win32 = image(0);
+        let native = image(1); // PROCESS_NAME_NATIVE
+        let app = app_id_from_path(Path::new(&win32)).unwrap();
+        let wfp = device_path_from_app_id(&app);
+        println!("A2_IMAGE win32={win32:?} native={native:?} wfp_app_id={wfp:?}");
+        assert!(native.eq_ignore_ascii_case(&wfp),
+            "actual native image and independently resolved WFP APP_ID differ");
+        app
+    }
+
+    #[cfg(windows)]
     fn run_channel_fault_cases(native_bfe: bool) {
         use super::super::wfp_win::{WfpEngine, RawFilter, app_id_from_path, filter_add, filter_get_by_id};
         use std::net::{TcpListener, TcpStream, SocketAddr};
@@ -1811,7 +1834,14 @@ mod tests {
             assert!(native_bfe);
             let addr: SocketAddr = target.parse().unwrap();
             let allowed = std::env::var("SPIDERVPN_A2_TCP_ALLOWED").as_deref() == Ok("1");
-            assert_eq!(TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok(), allowed);
+            let actual = a2_actual_process_app_id(unsafe { GetCurrentProcess() });
+            let expected = std::env::var("SPIDERVPN_A2_EXPECTED_APP").unwrap();
+            assert_eq!(super::super::identity::device_path_from_app_id(&actual), expected,
+                "spawned probe must have the exact APP_ID installed in BFE");
+            let result = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+            println!("A2_TCP app={expected:?} endpoint={addr} expected_allowed={allowed} actual_allowed={} error={:?}",
+                result.is_ok(), result.as_ref().err());
+            assert_eq!(result.is_ok(), allowed);
             return;
         }
 
@@ -2199,14 +2229,20 @@ mod tests {
         fn flow(exe: Option<&Path>, listener: &TcpListener, allowed: bool) {
             let addr = listener.local_addr().unwrap();
             if let Some(exe) = exe {
+                let app = super::super::wfp_win::app_id_from_path(exe).unwrap();
+                let expected = super::super::identity::device_path_from_app_id(&app);
                 let status = Command::new(exe)
                     .args(["--ignored", "--exact", "guard::lease_helper::tests::real_process_channel_faults_with_bfe", "--nocapture"])
                     .env("SPIDERVPN_A2_TCP_TARGET", addr.to_string())
                     .env("SPIDERVPN_A2_TCP_ALLOWED", if allowed { "1" } else { "0" })
+                    .env("SPIDERVPN_A2_EXPECTED_APP", expected)
                     .status().unwrap();
                 assert!(status.success(), "distinct APP_ID TCP probe failed: {addr}");
             } else {
-                assert_eq!(TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok(), allowed);
+                let result = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+                println!("A2_TCP app=parent endpoint={addr} expected_allowed={allowed} actual_allowed={} error={:?}",
+                    result.is_ok(), result.as_ref().err());
+                assert_eq!(result.is_ok(), allowed);
             }
             if allowed {
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -2224,13 +2260,31 @@ mod tests {
         }
 
         let exe = std::env::current_exe().unwrap();
-        let dir = std::env::temp_dir().join(format!("spidervpn-a2-{}", random_nonce()));
+        // Keep both images in the runner's build directory, avoiding an
+        // unrelated temp-volume or profile alias. The previous temp-based
+        // copied-image negative actually connected; do not infer why.
+        let dir = exe.parent().unwrap().join(format!("spidervpn-a2-{}", random_nonce()));
         std::fs::create_dir(&dir).unwrap();
+        struct RemoveDir(std::path::PathBuf);
+        impl Drop for RemoveDir {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = RemoveDir(dir.clone());
         let copy = dir.join("trader-copy.exe");
         std::fs::copy(&exe, &copy).unwrap();
-        let main_app = app_id_from_path(&exe).unwrap();
-        let copy_app = app_id_from_path(&copy).unwrap();
+        let main_app = a2_actual_process_app_id(unsafe { GetCurrentProcess() });
+        assert_eq!(main_app, app_id_from_path(&exe).unwrap());
+        // Pin and inspect a real, live copy process before constructing any
+        // filter. Use its OS-reported image identity, not a speculative path.
+        let mut identity_probe = Command::new(&copy)
+            .args(["--ignored", "--exact", "guard::lease_helper::tests::real_process_channel_faults_with_bfe", "--nocapture"])
+            .env("SPIDERVPN_LEASE_CANCEL_ENGINE_FIXTURE", "1")
+            .stdin(Stdio::piped()).spawn().unwrap();
+        let copy_app = a2_actual_process_app_id(identity_probe.as_raw_handle());
+        assert_eq!(copy_app, app_id_from_path(&copy).unwrap());
         assert_ne!(main_app, copy_app);
+        drop(identity_probe.stdin.take());
+        assert!(identity_probe.wait().unwrap().success());
         let old_endpoint = TcpListener::bind("127.0.0.1:0").unwrap();
         let new_endpoint = TcpListener::bind("127.0.0.1:0").unwrap();
         old_endpoint.set_nonblocking(true).unwrap();
@@ -2245,6 +2299,28 @@ mod tests {
         let block_ids: Vec<_> = [&main_app, &copy_app].into_iter().map(|app| {
             filter_add(&baseline, &RawFilter::isolated_lifecycle_filter(app, None, &[1; 16]).unwrap()).unwrap()
         }).collect();
+        // Independently inspect both exact live BFE BLOCK conditions before
+        // any negative flow. A successful Add alone is not sufficient.
+        use super::super::wfp::{ACTION_BLOCK, CONDITION_ALE_APP_ID, MATCH_EQUAL,
+            FWP_TYPE_BYTE_BLOB, FILTER_FLAG_DISABLED, FILTER_FLAG_PERSISTENT, FILTER_WEIGHT_BLOCK, Layer, Guid};
+        for (id, app) in block_ids.iter().zip([&main_app, &copy_app]) {
+            let raw = filter_get_by_id(&audit, *id).unwrap().expect("baseline missing in BFE");
+            println!("A2_BASELINE id={id} key={:?} layer={:?} flags={} weight={:?} conditions={:?}",
+                raw.filter_key, raw.layer, raw.flags, raw.weight, raw.conditions);
+            assert_eq!(raw.action_type, ACTION_BLOCK);
+            assert_eq!(raw.layer, Layer::V4.guid());
+            assert_eq!(raw.provider_key, Guid::nil());
+            assert_eq!(raw.flags & (FILTER_FLAG_DISABLED | FILTER_FLAG_PERSISTENT), 0);
+            assert_eq!(raw.weight, Some(FILTER_WEIGHT_BLOCK));
+            assert_eq!(raw.num_conditions, 1);
+            assert_eq!(raw.conditions.len(), 1);
+            let c = &raw.conditions[0];
+            assert_eq!(c.field_key, CONDITION_ALE_APP_ID);
+            assert_eq!(c.match_type, MATCH_EQUAL);
+            assert_eq!(c.value_type, FWP_TYPE_BYTE_BLOB);
+            assert_eq!(c.blob.as_deref(), Some(app.as_slice()));
+        }
+        assert_ne!(block_ids[0], block_ids[1]);
         for app in [None, Some(copy.as_path())] {
             flow(app, &old_endpoint, false);
             flow(app, &new_endpoint, false);
