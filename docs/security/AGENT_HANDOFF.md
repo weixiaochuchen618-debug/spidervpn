@@ -646,3 +646,10 @@
 - Linux 重新执行旧 Python OpenSSL RSA2048 / SHA256 / 825 天 CN-only 自签生成命令；实测 CA:TRUE、无 SAN、DER pin、protected loader 与真实 Rustls TLS1.2 listener 的 JSON denial；另在 Windows 复用真实客户端 get/data/PinnedCert 测试同类 RSA 自签证书、错误 pin 与证书有效期边界。**端点互补证据，不是真实用户 Windows→VPS 端到端证据。**
 - 新 SHA [Linux #44253155134](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44253155134)、[GNU #44253155155](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44253155155)、[MSVC #44253155258](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44253155258) 尚待核对终态；若失败检查原始日志和不通过的测试，修复后复跑，不得跳过。
 - 详见 [Backlog D.75–D.76](./REMEDIATION_BACKLOG.md)。main 仍 `857ea7593941ce79f6507db5b1ced076c3a077ba`；SEC-01/02/08、Issue #5 OPEN，SEC-07 生命周期未闭环；PR #26 Draft/unmerged，不进入真实部署。生产 Python 阻塞风险未修复；实际 VPS 证书兼容、授权/撤销历史、旧写入者退场、切换回滚、真机 UAC/WFP 持久零泄漏仍是安全验收门槛。
+
+
+## 77. PR #26 Linux 生产旧证书形状回归完全通过；Windows 待终态（2026-11-18）
+
+- [Backlog D.77](./REMEDIATION_BACKLOG.md) 为当前证据。最新 Draft [PR #26](https://github.com/weixiaochuchen618-debug/spidervpn/pull/26) HEAD `1f5ee14500fe4f424555078ef0748a93a0c28024`，对应 [Linux #44253155134](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44253155134) **2/2 Jobs Completed/Success**。普通 core 原日志新 `sec02_legacy_openssl_rsa_identity_serves_real_tls12_denial ... ok` 1/1，root 身份回归含新测试 9/9；真实 WG netns 1/1、既有 Rust 测试继续通过，无新增失败/忽略，严格 `--locked`/`-D warnings`。
+- 真 RSA 2048 CA:TRUE、无 SAN 旧 OpenSSL 生成形状与独立 DER pin、受保护 Rust loader、真实 TLS1.2/deny-only 互通，在隔离 temp root 测试验证；Windows 现有客户端 pinned verifier 三项 Rust tests 待 [GNU #44253155155](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44253155155) / [MSVC #44253155258](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44253155258) 完整结果，不提前标三平台绿。区别互补测试与用户 VPS 实机端到端。
+- 下一轮先检查这两个准确 SHA CI 终态及原始专项/完整日志，失败必须修复不跳过；再推进 SEC-02 长期服务生命周期、跨源资源限制与可信授权等依赖；生产 SEC-01/02/08、SEC-07、Issue #5 未关闭，所有安全 PR Draft，main、原 UI/连接交互、WFP persistent BLOCK 不动。线上 Python 慢握手 accept DoS 仍在。
