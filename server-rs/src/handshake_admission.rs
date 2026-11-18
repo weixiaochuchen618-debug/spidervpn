@@ -113,7 +113,12 @@ impl HandshakeAdmission {
                 // Dropped on normal exit, error, or unwind; no leaked slot.
                 let _permit = permit;
                 let mut timed = DeadlineIo::new(stream, absolute_deadline);
-                handshake(&mut timed)
+                let result = handshake(&mut timed);
+                // TLS verification may finish with CPU-only work after the
+                // final socket read. A late callback must not return success
+                // merely because it performed no more network IO.
+                timed.remaining()?;
+                result
             })
     }
 }
@@ -296,6 +301,20 @@ mod tests {
         assert_eq!(reason.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(2));
         writer.join().unwrap();
+        assert_eq!(gate.active_handshakes(), 0);
+    }
+
+    #[test]
+    fn callback_cannot_report_success_after_deadline_without_more_io() {
+        let gate = HandshakeAdmission::new(1, Duration::from_millis(100)).unwrap();
+        let (socket, _client) = pair();
+        let completed = gate.spawn(socket, |_io| {
+            // Simulates cryptographic verification after the last TLS read.
+            thread::sleep(Duration::from_millis(140));
+            Ok::<(), io::Error>(())
+        }).unwrap();
+        assert_eq!(completed.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut);
         assert_eq!(gate.active_handshakes(), 0);
     }
 
