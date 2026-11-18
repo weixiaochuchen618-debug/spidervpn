@@ -91,7 +91,7 @@ mod tests {
     use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
     use rustls::{ClientConfig, RootCertStore, StreamOwned};
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::path::Path;
     use std::process::{Command, Stdio};
