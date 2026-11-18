@@ -617,3 +617,99 @@ fn public_system_clock_gates_accept_authenticated_current_scope_and_refuse_expir
     assert_eq!(prepare_fresh_consume(&f.store,&scope,&post).err(),Some(GateError::InviteCancelled));
     assert_eq!(f.store.generation().unwrap(),cancelled);
 }
+
+fn l1_digest(bytes: &[u8]) -> [u8;32] {
+    digest::digest(&digest::SHA256, bytes).as_ref().try_into().unwrap()
+}
+
+#[test]
+fn l1_metadata_exact_ledger_binding_is_not_current_history() {
+    use crate::ledger_disk::ReadOnlyLedgerEvidence;
+    let f = Fixture::new();
+    // An independently generated same-ID/same-expiry metadata record.
+    let other = Fixture::new();
+    let (raw, pin) = public_metadata_bytes(&f);
+    let (foreign_raw, foreign_pin) = public_metadata_bytes(&other);
+    assert_ne!(pin, foreign_pin);
+    let req = f.post();
+    let foreign_req = other.post();
+    // Both records are individually valid. Only the selected fixture pin
+    // can match the record in this comparison; no trusted registry exists.
+    assert!(verify_pinned_invite_metadata(&foreign_raw, &foreign_pin, &other.token).is_ok());
+    let now = utc_seconds(NOW).unwrap();
+    let root = f._dir.0.clone();
+    let path = root.join("authority-ledger.json");
+    let generation = f.store.generation().unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let sha = l1_digest(&bytes);
+    let token = f.token.clone();
+    drop(f.store);
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    let result = compare_local_evidence(&e, (generation, &sha), &raw, &pin, &token, &req, now).unwrap();
+    assert_eq!(result.require_current_history(), Err(GateError::InvalidState));
+    assert!(compare_local_evidence(&e, (generation, &sha), &foreign_raw, &pin,
+        &other.token, &foreign_req, now).is_err());
+    assert!(compare_local_evidence(&e, (generation + 1, &sha), &raw, &pin, &token, &req, now).is_err());
+    assert!(LedgerStore::open_existing(&root, Duration::ZERO).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    drop(e);
+    // A legitimate byte-only change at the same generation is not the
+    // original evidence. Neither observation proves a current history.
+    let mut changed = bytes.clone();
+    changed.push(b' ');
+    fs::write(&path, &changed).unwrap();
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    assert!(compare_local_evidence(&e, (generation, &sha), &raw, &pin, &token, &req, now).is_err());
+    assert_eq!(compare_local_evidence(&e, (generation, &l1_digest(&changed)), &raw, &pin,
+        &token, &req, now).unwrap().require_current_history(), Err(GateError::InvalidState));
+}
+
+#[test]
+fn l1_revoking_revoked_and_rolled_back_metadata_never_elevate() {
+    use crate::ledger_disk::ReadOnlyLedgerEvidence;
+    let mut f = Fixture::new();
+    let (raw, pin) = public_metadata_bytes(&f);
+    let now = utc_seconds(NOW).unwrap();
+    let req = f.post();
+    let claims = fixture_fresh(&f.store, &f.scope(), &req, now).unwrap().claims().clone();
+    let root = f._dir.0.clone();
+    let path = root.join("authority-ledger.json");
+    let old = fs::read(&path).unwrap();
+    let old_generation = f.store.generation().unwrap();
+    let old_sha = l1_digest(&old);
+    let pool = AddressPool { network: Ipv4Addr::new(10,44,0,0), prefix: 24 };
+    let grant = f.store.update(|l| l.reserve(claims.clone(), now, pool, Some(&[]))).unwrap();
+    f.store.update(|l| l.confirm_consumed(INV, Some(&[Peer {
+        public_key: claims.public_key.clone(), address: grant.address,
+    }]))).unwrap();
+    f.store.update(|l| l.begin_revocation(INV)).unwrap();
+    let revoking_generation = f.store.generation().unwrap();
+    let token = f.token.clone();
+    drop(f.store);
+    let revoking = fs::read(&path).unwrap();
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    assert_eq!(compare_local_evidence(&e, (revoking_generation, &l1_digest(&revoking)),
+        &raw, &pin, &token, &req, now).err(), Some(GateError::Revoked));
+    assert!(compare_local_evidence(&e, (old_generation, &old_sha),
+        &raw, &pin, &token, &req, now).is_err());
+    drop(e);
+    let mut writer = LedgerStore::open_existing(&root, Duration::ZERO).unwrap();
+    writer.update(|l| l.confirm_revocation(INV, Some(&[]))).unwrap();
+    let revoked_generation = writer.generation().unwrap();
+    drop(writer);
+    let revoked = fs::read(&path).unwrap();
+    let revoked_sha = l1_digest(&revoked);
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    assert_eq!(compare_local_evidence(&e, (revoked_generation, &revoked_sha),
+        &raw, &pin, &token, &req, now).err(), Some(GateError::Revoked));
+    drop(e);
+    // Simulate a full local rollback after the lock is released. Old bytes
+    // plus old metadata really can match L1 again, but never acquire L2.
+    fs::write(&path, &old).unwrap();
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    assert!(compare_local_evidence(&e, (revoked_generation, &revoked_sha),
+        &raw, &pin, &token, &req, now).is_err());
+    assert_eq!(compare_local_evidence(&e, (old_generation, &old_sha),
+        &raw, &pin, &token, &req, now).unwrap().require_current_history(), Err(GateError::InvalidState));
+    assert_eq!(fs::read(&path).unwrap(), old);
+}

@@ -595,5 +595,58 @@ fn prepare_retry_with_observation<'a>(store: &'a LedgerStore, scope: &TrustedOpe
     Ok(VerifiedConsumedRetry { claims,_store:store })
 }
 
+// L1 is deliberately test-only. A matched local observation cannot be
+// converted into any existing preauthorization type or a Grant. The inputs
+// represent a fixture comparison tuple, NOT a signed/current external root.
+#[cfg(test)]
+struct LocalEvidenceMatch<'a> {
+    _locked: &'a crate::ledger_disk::ReadOnlyLedgerEvidence,
+}
+
+#[cfg(test)]
+impl LocalEvidenceMatch<'_> {
+    fn require_current_history(&self) -> Result<(), GateError> {
+        // There is no independently current history provider in L1.
+        Err(GateError::InvalidState)
+    }
+}
+
+#[cfg(test)]
+fn compare_local_evidence<'a>(
+    evidence: &'a crate::ledger_disk::ReadOnlyLedgerEvidence,
+    expected: (u64, &[u8; 32]),
+    raw_metadata: &[u8],
+    metadata_pin: &str,
+    bearer: &str,
+    req: &ParsedRequest,
+    now: i64,
+) -> Result<LocalEvidenceMatch<'a>, GateError> {
+    let ledger = evidence.compare(expected.0, expected.1)
+        .map_err(|_| GateError::InvalidState)?;
+    let metadata = verify_pinned_invite_metadata(raw_metadata, metadata_pin, bearer)?;
+    let scope = metadata.scope()?;
+    let inv = ledger.invitations.get(scope.invite_id).ok_or(GateError::InviteNotFound)?;
+    if req.method != Method::Post
+        || req.target != format!("/v1/invitations/{}/consume", scope.invite_id) {
+        return Err(GateError::NotFound);
+    }
+    if req.host != format!("{}:{}", scope.public_host, scope.port) {
+        return Err(GateError::InviteMismatch);
+    }
+    let presented = req.authorization.as_deref().and_then(|a| a.strip_prefix("Bearer "))
+        .ok_or(GateError::Forbidden)?;
+    if !token_matches(scope.token, presented) { return Err(GateError::Forbidden); }
+    if matches!(inv.state, InviteState::Revoking(_) | InviteState::Revoked(_)) {
+        return Err(GateError::Revoked);
+    }
+    if !matches!(inv.state, InviteState::Open) || now < 0 || now >= inv.expires_unix {
+        return Err(GateError::InvalidState);
+    }
+    check_descriptor(&scope, inv.expires_unix, now)?;
+    let (claims, _) = verify_consume_claims(&scope, req, now)?;
+    check_history(ledger, &claims)?;
+    Ok(LocalEvidenceMatch { _locked: evidence })
+}
+
 #[cfg(test)]
 mod tests;
