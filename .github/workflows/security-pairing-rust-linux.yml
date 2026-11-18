@@ -43,6 +43,10 @@ jobs:
           cargo test --locked --manifest-path server-rs/Cargo.toml \
             --features linux-handshake-admission --lib handshake_admission::tests \
             -- --test-threads=1 --nocapture
+          # Strict HTTP/1.1 framing must pass real loopback TCP negative tests.
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-handshake-admission --lib http_one_request::tests -- --test-threads=1 --nocapture
+          grep -F 'pub fn read_one_request' server-rs/src/http_one_request.rs
+          ! grep -F 'http_one_request' src/pairhost.rs
           # This is a policy with ephemeral loopback test listeners only;
           # production remains the original Python receiver.
           grep -F 'linux-handshake-admission = []' server-rs/Cargo.toml
