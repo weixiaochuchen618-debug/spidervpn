@@ -488,10 +488,33 @@ fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
 struct LocalLeaseSlot(std::sync::Mutex<LocalLeaseState>);
 
 #[cfg(windows)]
-#[derive(Default)]
 struct LocalLeaseState {
     current: Option<std::sync::Arc<LocalLeaseControl>>,
     disconnects: usize,
+    // None is permanent failure-closed (overflow or poisoned state).
+    epoch: Option<u64>,
+}
+
+#[cfg(windows)]
+impl Default for LocalLeaseState {
+    fn default() -> Self {
+        Self { current: None, disconnects: 0, epoch: Some(0) }
+    }
+}
+
+// Non-cloneable, process-local ticket taken before the connection transaction.
+// A disconnect invalidates even tickets that have not yet registered a lease.
+#[cfg(windows)]
+pub(crate) struct LocalLeaseIntent<'a> {
+    slot: &'a LocalLeaseSlot,
+    epoch: u64,
+}
+
+#[cfg(windows)]
+struct RetainedHelper {
+    process: std::os::windows::io::OwnedHandle,
+    keys: Vec<super::wfp::Guid>,
+    acquire_complete: bool,
 }
 
 #[cfg(windows)]
@@ -505,7 +528,7 @@ struct LocalLeaseControl {
     // Once any request may have reached a helper, keep that process identity
     // until it has actually exited. Pipe closure initiates revocation, but
     // alone is not proof that an old WFP session has already closed.
-    helper: std::sync::Mutex<Option<std::os::windows::io::OwnedHandle>>,
+    helper: std::sync::Mutex<Option<RetainedHelper>>,
     owner_finished: std::sync::atomic::AtomicBool,
     cancelled: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -517,7 +540,7 @@ struct LocalLeaseControl {
 
 #[cfg(windows)]
 static LOCAL_LEASE: LocalLeaseSlot = LocalLeaseSlot(std::sync::Mutex::new(
-    LocalLeaseState { current: None, disconnects: 0 }
+    LocalLeaseState { current: None, disconnects: 0, epoch: Some(0) }
 ));
 
 #[cfg(windows)]
@@ -546,25 +569,56 @@ impl LocalLeaseControl {
         self.require_active()
     }
 
-    fn bind_helper(&self, handle: windows_sys::Win32::Foundation::HANDLE) -> Result<(), String> {
+    fn bind_helper(&self, handle: windows_sys::Win32::Foundation::HANDLE,
+        keys: Vec<super::wfp::Guid>) -> Result<(), String>
+    {
+        use std::collections::HashSet;
+        if keys.is_empty() || keys.len() > MAX_PROGRAMS
+            || keys.iter().any(|k| *k == super::wfp::Guid::nil())
+            || keys.iter().copied().collect::<HashSet<_>>().len() != keys.len()
+        {
+            return Err("实验租约动态许可键集合无效".into());
+        }
         let duplicate = pipe_ipc::duplicate_process_handle(handle)?;
         let mut helper = self.helper.lock().map_err(|_| "实验租约 helper 身份登记异常")?;
         if helper.is_some() { return Err("实验租约 helper 已登记".into()); }
-        *helper = Some(duplicate);
+        *helper = Some(RetainedHelper { process: duplicate, keys, acquire_complete: false });
         Ok(())
     }
 
-    fn finished_and_helper_exited(&self) -> bool {
+    fn record_acquire_complete(&self) -> Result<(), String> {
+        // Ready is authenticated on the same helper channel and only emitted
+        // after all writes are completed. Before Ready, pending RPC writes
+        // cannot be excluded, so even absence is not enough to reauthorize.
+        let mut helper = self.helper.lock().map_err(|_| "实验租约 helper 身份登记异常")?;
+        let helper = helper.as_mut().ok_or("未登记的 helper 回执")?;
+        helper.acquire_complete = true;
+        Ok(())
+    }
+
+    fn no_request_sent(&self) -> bool {
+        self.owner_finished.load(std::sync::atomic::Ordering::Acquire)
+            && self.helper.lock().is_ok_and(|h| h.is_none())
+    }
+
+    fn revocation_proven(&self) -> Result<bool, String> {
         use std::os::windows::io::AsRawHandle;
         use std::sync::atomic::Ordering;
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        if !self.owner_finished.load(Ordering::Acquire) { return false; }
-        let Ok(helper) = self.helper.lock() else { return false; };
-        match helper.as_ref() {
-            None => true, // no request could have reached an unregistered helper
-            Some(h) => unsafe { WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_OBJECT_0 },
-        }
+        if !self.owner_finished.load(Ordering::Acquire) { return Ok(false); }
+        let keys = {
+            let helper = self.helper.lock().map_err(|_| "旧 helper 状态不可确认")?;
+            let Some(h) = helper.as_ref() else { return Ok(true); };
+            if unsafe { WaitForSingleObject(h.process.as_raw_handle(), 0) } != WAIT_OBJECT_0
+                || !h.acquire_complete
+            {
+                return Ok(false);
+            }
+            h.keys.clone()
+        };
+        // No current-slot mutex or I/O gate is held during BFE queries.
+        super::wfp_win::old_dynamic_permits_absent(&keys)
     }
 
     fn authorized<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -591,25 +645,50 @@ impl Drop for LocalLeaseRegistration<'_> {
     fn drop(&mut self) {
         self.control.cancel();
         self.control.owner_finished.store(true, std::sync::atomic::Ordering::Release);
-        let mut slot = self.slot.0.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.current.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.control))
-            && self.control.finished_and_helper_exited()
-        {
-            slot.current = None;
+        // No BFE work on Drop/normal disconnect. Retain any possibly sent
+        // request until a separate, explicit readback proves revocation.
+        if let Ok(mut slot) = self.slot.0.lock() {
+            if slot.current.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.control))
+                && self.control.no_request_sent()
+            {
+                slot.current = None;
+            }
         }
     }
 }
 
 #[cfg(windows)]
 impl LocalLeaseSlot {
-    fn register(&self, engine_pid: u32, executable: &Path) -> Result<LocalLeaseRegistration<'_>, String> {
+    fn intent(&self) -> Result<LocalLeaseIntent<'_>, String> {
+        let slot = self.0.lock().map_err(|_| "实验租约登记状态异常")?;
+        if slot.disconnects != 0 { return Err("本进程正在断开，不启动实验租约".into()); }
+        let epoch = slot.epoch.ok_or("实验租约代际不可确认")?;
+        Ok(LocalLeaseIntent { slot: self, epoch })
+    }
+
+    fn check_intent(&self, state: &LocalLeaseState, intent: &LocalLeaseIntent<'_>) -> Result<(), String> {
+        if !std::ptr::eq(self, intent.slot) || state.epoch != Some(intent.epoch)
+            || state.disconnects != 0
+        {
+            return Err("旧连接实验租约意图已失效".into());
+        }
+        Ok(())
+    }
+
+    fn register_intent(&self, intent: LocalLeaseIntent<'_>, engine_pid: u32,
+        executable: &Path) -> Result<LocalLeaseRegistration<'_>, String> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
         use ring::rand::{SecureRandom, SystemRandom};
+        {
+            let slot = self.0.lock().map_err(|_| "实验租约登记状态异常")?;
+            self.check_intent(&slot, &intent)?;
+        }
+        self.reap_verified()?;
         let mut slot = self.0.lock().map_err(|_| "实验租约登记状态异常")?;
-        if slot.disconnects != 0 { return Err("本进程正在断开，不启动实验租约".into()); }
-        Self::reap_finished(&mut slot);
-        if slot.current.is_some() { return Err("本进程已有尚未退出的实验租约".into()); }
+        // Disconnect may have completed while independent readback ran.
+        self.check_intent(&slot, &intent)?;
+        if slot.current.is_some() { return Err("本进程已有尚未撤销的实验租约".into()); }
         if engine_pid == 0 || engine_pid == std::process::id() {
             return Err("实验租约引擎 PID 无效".into());
         }
@@ -637,21 +716,48 @@ impl LocalLeaseSlot {
         Ok(LocalLeaseRegistration { slot: self, control })
     }
 
-    fn reap_finished(slot: &mut LocalLeaseState) {
-        if slot.current.as_ref().is_some_and(|c| c.finished_and_helper_exited()) {
+    // Snapshot, read BFE outside the slot lock, and remove only the exact
+    // retired object. Stale readback can never clear a new registration.
+    fn reap_verified(&self) -> Result<(), String> {
+        let old = self.0.lock().map_err(|_| "实验租约登记状态异常")?.current.clone();
+        let Some(old) = old else { return Ok(()); };
+        if !old.revocation_proven()? {
+            return Err("旧动态许可撤销尚未证实，拒绝新实验租约".into());
+        }
+        let mut slot = self.0.lock().map_err(|_| "实验租约登记状态异常")?;
+        if slot.current.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, &old)) {
             slot.current = None;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn register(&self, engine_pid: u32, executable: &Path) -> Result<LocalLeaseRegistration<'_>, String> {
+        self.register_intent(self.intent()?, engine_pid, executable)
     }
 
     fn begin_disconnect(&self) -> LocalDisconnectGuard<'_> {
-        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        Self::reap_finished(&mut slot);
-        // Prevent a new startup throughout the existing disconnect operation,
-        // even if there was no active registration at this instant.
-        slot.disconnects = slot.disconnects.checked_add(1).expect("disconnect nesting overflow");
+        let mut slot = match self.0.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                let mut slot = poisoned.into_inner();
+                slot.epoch = None;
+                slot
+            }
+        };
+        // Even no-slot disconnect permanently invalidates previously captured
+        // intents. Do not change the normal disconnect result on overflow.
+        slot.epoch = slot.epoch.and_then(|epoch| epoch.checked_add(1));
+        let counted = if let Some(count) = slot.disconnects.checked_add(1) {
+            slot.disconnects = count;
+            true
+        } else {
+            slot.epoch = None;
+            false
+        };
         if let Some(control) = slot.current.as_ref() { control.cancel(); }
-        // Do not free the slot here. Only its pipe-owning registration drops it.
-        LocalDisconnectGuard(self)
+        // No BFE access here; existing normal disconnect has no new I/O.
+        LocalDisconnectGuard { slot: self, counted }
     }
 
     #[cfg(test)]
@@ -661,21 +767,38 @@ impl LocalLeaseSlot {
 }
 
 #[cfg(windows)]
-pub(crate) struct LocalDisconnectGuard<'a>(&'a LocalLeaseSlot);
+pub(crate) struct LocalDisconnectGuard<'a> {
+    slot: &'a LocalLeaseSlot,
+    counted: bool,
+}
 
 #[cfg(windows)]
 impl Drop for LocalDisconnectGuard<'_> {
     fn drop(&mut self) {
-        let mut state = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
-        state.disconnects -= 1;
+        if self.counted {
+            let mut state = self.slot.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.disconnects -= 1;
+        }
     }
 }
 
 #[cfg(windows)]
-pub(crate) fn register_experimental_lease(engine_pid: u32, executable: &Path)
+pub(crate) fn capture_experimental_intent() -> Result<LocalLeaseIntent<'static>, String> {
+    LOCAL_LEASE.intent()
+}
+
+#[cfg(windows)]
+pub(crate) fn register_experimental_lease(intent: LocalLeaseIntent<'static>,
+    engine_pid: u32, executable: &Path) -> Result<LocalLeaseRegistration<'static>, String>
+{
+    LOCAL_LEASE.register_intent(intent, engine_pid, executable)
+}
+
+#[cfg(all(windows, test))]
+fn register_fixture_lease(engine_pid: u32, executable: &Path)
     -> Result<LocalLeaseRegistration<'static>, String>
 {
-    LOCAL_LEASE.register(engine_pid, executable)
+    register_experimental_lease(capture_experimental_intent()?, engine_pid, executable)
 }
 
 #[cfg(windows)]
@@ -755,7 +878,13 @@ pub(crate) fn launch_elevated(request: &LeaseRequest, registration: LocalLeaseRe
     let nonce = control.nonce.clone();
     let mut req = request.clone();
     req.nonce = nonce.clone();
-    validate_request(&req)?;
+    let nonce_bytes = validate_request(&req)?;
+    // Overapproximate all possible writes, including partial acquisition.
+    // Helper independently validates each supplied APP_ID and uses the
+    // identical key derivation; it cannot add a different key for this request.
+    let permit_keys = req.programs.iter().map(|id| {
+        super::wfp_win::dynamic_permit_key(&id.app_id, req.endpoint, &nonce_bytes)
+    }).collect::<Result<Vec<_>, _>>()?;
     let data = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     if data.len() > MAX_LEASE_IPC_BYTES { return Err("租约请求过大".into()); }
 
@@ -804,10 +933,11 @@ pub(crate) fn launch_elevated(request: &LeaseRequest, registration: LocalLeaseRe
     }
     // The old slot cannot be replaced after pipe closure until the actual
     // helper exits. Bind before the first request write, even on later error.
-    control.bind_helper(child.handle)?;
+    control.bind_helper(child.handle, permit_keys)?;
     pipe.send_guarded(&data, deadline, &check, &control)?;
     let ready = pipe.receive(4096, deadline, &check)?;
     validate_stage(&ready, &nonce, req.programs.len(), helper_pid, LeaseState::Ready)?;
+    control.record_acquire_complete()?;
     let ack = serde_json::to_vec(&LeaseAck { schema: LEASE_SCHEMA, nonce: nonce.clone(), accepted: true })
         .map_err(|e| e.to_string())?;
     pipe.send_guarded(&ack, deadline, &check, &control)?;
@@ -1786,7 +1916,7 @@ mod tests {
             }
             let mut registration = if is_cancel {
                 let engine = engine.as_ref().unwrap();
-                let reg = register_experimental_lease(engine.0.id(), &std::env::current_exe().unwrap()).unwrap();
+                let reg = register_fixture_lease(engine.0.id(), &std::env::current_exe().unwrap()).unwrap();
                 if let Some(stale) = retired.take() {
                     assert_ne!(stale.nonce, reg.control.nonce);
                     stale.cancel();
@@ -1822,13 +1952,20 @@ mod tests {
             assert_ne!(helper_pid, pid);
             let handle = child.0.as_raw_handle();
             assert_eq!(unsafe { GetProcessId(handle) }, helper_pid);
-            if let Some(control) = control.as_ref() { control.bind_helper(handle).unwrap(); }
+            if let Some(control) = control.as_ref() {
+                let (_, _, _, listener, _) = bfe.as_ref().unwrap();
+                let app = app_id_from_path(&std::env::current_exe().unwrap()).unwrap();
+                let key = super::super::wfp_win::dynamic_permit_key(&app,
+                    listener.local_addr().unwrap(), &decode_nonce(&nonce).unwrap()).unwrap();
+                control.bind_helper(handle, vec![key]).unwrap();
+            }
             let deadline = Instant::now() + Duration::from_secs(10);
             let pipe = Pipe::client(&nonce, deadline, || require_live(handle)).unwrap();
             pipe.require_peer(helper_pid, false).unwrap();
             assert!(pipe.require_peer(pid, false).is_err());
             let committed = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
             validate_stage(&committed, &nonce, 1, helper_pid, LeaseState::Committed).unwrap();
+            if let Some(control) = control.as_ref() { control.record_acquire_complete().unwrap(); }
             let mut permit_id = None;
             if let Some((_, audit, block, a, b)) = &bfe {
                 let dir = fixture_dir.as_ref().unwrap();
@@ -1863,7 +2000,7 @@ mod tests {
                     nonce: nonce.clone(), state: LeaseState::Receipt }).unwrap();
                 assert!(pipe.send_guarded(&receipt, deadline, || Ok(()), control).is_err(),
                     "canceled startup wrote a late Receipt");
-                assert!(register_experimental_lease(control.engine_pid, &std::env::current_exe().unwrap()).is_err());
+                assert!(register_fixture_lease(control.engine_pid, &std::env::current_exe().unwrap()).is_err());
                 drop(keep_open.take());
                 drop(registration.take());
             } else if mode == "before-receipt" {
@@ -1962,7 +2099,7 @@ mod tests {
                         "engine must remain live through readback");
                     wait_for(deadline, || control.owner_finished.load(std::sync::atomic::Ordering::Acquire),
                         "canceled channel owner did not finish");
-                    assert!(register_experimental_lease(control.engine_pid, &std::env::current_exe().unwrap()).is_err(),
+                    assert!(register_fixture_lease(control.engine_pid, &std::env::current_exe().unwrap()).is_err(),
                         "old helper still alive; cannot replace its registration");
                     cancel_current_experimental_lease(); // still cannot replace old helper
                 }
@@ -1989,8 +2126,11 @@ mod tests {
                 std::fs::remove_dir_all(dir).unwrap();
             }
             if is_cancel {
-                // Only observed actual helper exit allows the old slot to be reaped.
+                // Actual exit remains necessary, but cannot clear the slot
+                // until the known key has also been read back as absent.
                 cancel_current_experimental_lease();
+                assert!(LOCAL_LEASE.0.lock().unwrap().current.is_some());
+                LOCAL_LEASE.reap_verified().unwrap();
                 assert!(LOCAL_LEASE.0.lock().unwrap().current.is_none());
                 retired = control;
                 cancelled_modes += 1;
@@ -2047,7 +2187,7 @@ mod tests {
             calls.set(calls.get() + 1);
             assert_eq!(pid, i64::from(control.engine_pid));
             assert!(control.require_active().is_err(), "cancel must precede the existing kill");
-            assert!(register_experimental_lease(control.engine_pid, &std::env::current_exe().unwrap()).is_err(),
+            assert!(register_fixture_lease(control.engine_pid, &std::env::current_exe().unwrap()).is_err(),
                 "new registration forbidden while disconnect executes");
             if mode == "cancel-active-kill-error" {
                 let ok = unsafe { TerminateProcess(control.engine.as_raw_handle(), 1) };
@@ -2115,12 +2255,15 @@ mod tests {
         let slot = LocalLeaseSlot::default();
         // Cancellation with no current lease remains a safe registration barrier
         // until every overlapping disconnect returns.
+        let stale_intent = slot.intent().unwrap();
         let d1 = slot.begin_disconnect();
         let d2 = slot.begin_disconnect();
         assert!(slot.register(engine_pid, &exe).is_err());
         drop(d1);
         assert!(slot.register(engine_pid, &exe).is_err());
         drop(d2);
+        assert!(slot.register_intent(stale_intent, engine_pid, &exe).is_err(),
+            "a connection begun before an already completed disconnect cannot resurrect a lease");
         let reg = slot.register(engine_pid, &exe).unwrap();
         let stale = reg.control.clone();
         assert!(slot.register(engine_pid, &exe).is_err());
@@ -2163,6 +2306,17 @@ mod tests {
         assert!(slot.register(engine_pid, &exe).is_err());
         drop(disconnect);
         assert!(slot.register(engine_pid, &exe).is_ok());
+        let old = slot.intent().unwrap();
+        slot.cancel_current();
+        slot.cancel_current();
+        assert!(slot.register_intent(old, engine_pid, &exe).is_err());
+        let other_slot = LocalLeaseSlot::default();
+        assert!(slot.register_intent(other_slot.intent().unwrap(), engine_pid, &exe).is_err());
+        slot.0.lock().unwrap().epoch = Some(u64::MAX);
+        let final_intent = slot.intent().unwrap();
+        slot.cancel_current();
+        assert!(slot.intent().is_err());
+        assert!(slot.register_intent(final_intent, engine_pid, &exe).is_err());
         assert!(engine.0.try_wait().unwrap().is_none());
         drop(engine.0.stdin.take());
         assert!(engine.0.wait().unwrap().success());
