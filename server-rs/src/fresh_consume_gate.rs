@@ -204,6 +204,26 @@ fn valid_binding(b: &Value) -> bool {
         && text(b,"ServerPublicKey").is_some_and(canonical_wg_key)
 }
 
+fn management_fingerprint(jwk: &Value) -> Option<String> {
+    let hex=recipient_digest(jwk).ok()?;
+    let raw:Vec<u8>=(0..hex.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i+2],16)).collect::<Result<_,_>>().ok()?;
+    let alphabet=b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let (mut acc,mut bits)=(0u32,0);
+    let mut out=String::from("SHA256:");
+    for byte in raw {
+        acc=(acc<<8)|u32::from(byte);
+        bits+=8;
+        while bits>=6 {
+            bits-=6;
+            out.push(char::from(alphabet[((acc>>bits)&63) as usize]));
+        }
+        acc&=(1<<bits)-1;
+    }
+    if bits>0 {out.push(char::from(alphabet[((acc<<(6-bits))&63) as usize]));}
+    Some(out)
+}
+
 fn check_descriptor(scope: &TrustedOpenInvite<'_>, expires: i64, now: i64)
     -> Result<(), GateError>
 {
@@ -232,6 +252,7 @@ fn check_descriptor(scope: &TrustedOpenInvite<'_>, expires: i64, now: i64)
             text(&invite,f)!=text(scope.server_binding,f))
         || text(&invite,"ExpiresAtUtc").and_then(utc_seconds)!=Some(exp)
         || issued>=exp || issued>now.checked_add(300).ok_or(invalid)?
+        || text(&invite,"PublicEndpoint")!=Some(format!("{}:{}",scope.public_host,scope.port).as_str())
         || !invite.get("Capabilities").is_some_and(Value::is_object)
     { return Err(invalid); }
     // The existing descriptor signature binds host/port/pin separately from
@@ -246,8 +267,8 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
         || !hex_sha256(scope.tls_der_pin) || !valid_binding(scope.server_binding)
         || scope.public_host.is_empty() || scope.public_host.len()>253
         || !scope.public_host.bytes().all(|b| b.is_ascii_graphic())
-        || scope.port==0 || now<0 || recipient_digest(scope.management_jwk).is_err()
-        || scope.management_fingerprint.is_empty()
+        || scope.port==0 || now<0
+        || management_fingerprint(scope.management_jwk).as_deref()!=Some(scope.management_fingerprint)
     { return Err(GateError::InvalidState); }
     let route = format!("/v1/invitations/{}{}",scope.invite_id,
         if consume {"/consume"} else {""});
@@ -332,6 +353,11 @@ pub fn prepare_fresh_consume<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvi
         public_key:key.to_owned(),request_digest:computed,recipient_jwk_digest,
     };
     if !crate::claims_valid(&claims) { return Err(invalid); }
+    // Legacy policy accepted noncanonical key strings. Do not let an alias
+    // of a historical key evade a tombstone comparison in the fresh gate.
+    if ledger.revoked_keys.iter().any(|k| !canonical_wg_key(k)) {
+        return Err(GateError::InvalidState);
+    }
     if ledger.denied_identity(&claims) { return Err(GateError::Revoked); }
     // No address allocation is attempted without real peer inventory.
     // A future transaction must recheck policy under this same lock before
