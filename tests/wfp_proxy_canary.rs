@@ -621,6 +621,140 @@ mod windows_canary {
         let _ = std::fs::remove_file(ready);
     }
 
+    // Isolated BFE fixture: an actual inherited anonymous pipe carries the test
+    // cancellation simply as EOF. This is NOT a replacement for the product's
+    // authenticated named pipe or the distinct-process protocol regression.
+    // It measures real filter teardown while BOTH processes are still alive,
+    // even when a real restricted process handle cannot terminate the owner.
+    #[test]
+    #[ignore = "隔离 Windows BFE 与真实管道撤销专项；CI 显式运行"]
+    fn pipe_abandonment_revokes_permit_even_when_terminate_is_denied() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess,
+        };
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+
+        fn wait_for(mut condition: impl FnMut() -> bool, why: &str) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !condition() {
+                assert!(Instant::now() < deadline, "{why}");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        fn filter_present(engine: &DynamicEngine, id: u64) -> bool {
+            let mut raw: *mut W::FWPM_FILTER0 = null_mut();
+            let rc = unsafe { W::FwpmFilterGetById0(engine.0, id, &mut raw) };
+            if rc == 0 {
+                assert!(!raw.is_null());
+                let mut ptr = raw.cast::<core::ffi::c_void>();
+                unsafe { W::FwpmFreeMemory0(&mut ptr); }
+                true
+            } else {
+                assert_eq!(rc, windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND as u32,
+                    "filter readback failed for an unexpected reason");
+                false
+            }
+        }
+
+        const CHILD: &str = "SPIDERVPN_WFP_PIPE_CANCEL_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = std::path::PathBuf::from(dir);
+            let port: u16 = std::env::var("SPIDERVPN_WFP_LEASE_PORT").unwrap().parse().unwrap();
+            let session = DynamicEngine::open();
+            let app = AppId::this_test_exe();
+            let permit_id = install_proxy_permit_in_layer(&session, &app, port, W::FWPM_SUBLAYER_UNIVERSAL);
+            std::fs::write(dir.join("ready"), permit_id.to_string()).unwrap();
+            let input = std::io::stdin();
+            let mut input = input.lock();
+            let mut byte = [0u8; 1];
+            match input.read(&mut byte).unwrap() {
+                0 => {}, // abandoned before final Receipt
+                1 => {
+                    assert_eq!(byte, [b'R']);
+                    std::fs::write(dir.join("receipt"), b"consumed").unwrap();
+                    assert_eq!(input.read(&mut byte).unwrap(), 0,
+                        "test channel must close, not deliver unrelated data");
+                }
+                _ => unreachable!(),
+            }
+            drop(session);
+            std::fs::write(dir.join("revoked"), b"closed").unwrap();
+            // Stay alive after real session close so the outer test can't confuse
+            // this assertion with RPC rundown triggered by terminating the owner.
+            wait_for(|| dir.join("exit").exists(), "parent did not confirm BFE readback");
+            return;
+        }
+
+        let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = allowed.local_addr().unwrap();
+        let denied = other.local_addr().unwrap();
+        let _drain_a = ListenerDrain::start(&allowed);
+        let _drain_b = ListenerDrain::start(&other);
+        assert!(connect(addr).is_ok() && connect(denied).is_ok());
+        let baseline = DynamicEngine::open();
+        let audit = DynamicEngine::open_regular();
+        let app = AppId::this_test_exe();
+        let block_id = install_legacy_block(&baseline, &app);
+        assert!(filter_present(&audit, block_id));
+        assert!(connect(addr).is_err() && connect(denied).is_err());
+
+        for after_receipt in [false, true] {
+            let dir = std::env::temp_dir().join(format!("spidervpn-wfp-cancel-{}-{}-{}",
+                std::process::id(), addr.port(), after_receipt));
+            std::fs::create_dir(&dir).unwrap();
+            let mut child = KillChild(Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact",
+                    "windows_canary::pipe_abandonment_revokes_permit_even_when_terminate_is_denied",
+                    "--nocapture"])
+                .env(CHILD, &dir)
+                .env("SPIDERVPN_WFP_LEASE_PORT", addr.port().to_string())
+                .stdin(Stdio::piped()).spawn().unwrap());
+            let mut writer = child.0.stdin.take().unwrap();
+            let mut id = None;
+            wait_for(|| {
+                assert!(child.0.try_wait().unwrap().is_none(), "helper exited before installing permit");
+                id = std::fs::read_to_string(dir.join("ready")).ok().and_then(|s| s.parse::<u64>().ok());
+                id.is_some()
+            }, "missing dynamic permit ID");
+            let permit_id = id.unwrap();
+            assert!(filter_present(&audit, permit_id));
+            assert!(connect(addr).is_ok() && connect(denied).is_err());
+            if after_receipt {
+                writer.write_all(b"R").unwrap();
+                writer.flush().unwrap();
+                wait_for(|| dir.join("receipt").exists(), "child did not consume receipt");
+                assert!(filter_present(&audit, permit_id));
+                assert!(connect(addr).is_ok());
+            }
+            let restricted = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, child.0.id()) };
+            assert!(!restricted.is_null());
+            let killed = unsafe { TerminateProcess(restricted, 1) };
+            let error = unsafe { GetLastError() };
+            unsafe { CloseHandle(restricted); }
+            assert_eq!(killed, 0, "restricted handle unexpectedly had kill rights");
+            assert_eq!(error, ERROR_ACCESS_DENIED);
+            assert!(child.0.try_wait().unwrap().is_none());
+            // Parent remains alive and never kills the helper on the passing path.
+            drop(writer);
+            wait_for(|| dir.join("revoked").exists(), "channel closure did not revoke the session");
+            wait_for(|| !filter_present(&audit, permit_id), "BFE still contains the revoked permit");
+            assert!(child.0.try_wait().unwrap().is_none(), "owner exited before readback");
+            assert!(filter_present(&audit, block_id), "baseline BLOCK unexpectedly removed");
+            assert!(connect(addr).is_err() && connect(denied).is_err());
+            std::fs::write(dir.join("exit"), b"done").unwrap();
+            wait_for(|| child.0.try_wait().unwrap().is_some(), "worker did not finish");
+            assert!(child.0.wait().unwrap().success());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        drop(baseline);
+        assert!(connect(addr).is_ok() && connect(denied).is_ok());
+    }
+
     #[test]
     #[ignore = "使用真实 Windows loopback 接口 LUID 验证正向 WFP TUN 许可的匹配语义；不创建 TUN"]
     fn positive_next_hop_permit_matches_only_the_actual_loopback_luid() {
