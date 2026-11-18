@@ -589,3 +589,11 @@ PR/commit/CI: ...
 - 同 SHA [Windows MSVC #44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) Build、SEC-10 protected IPC、SEC-01 SSH writer gate、全量 integration targets、changed-module regression 步骤先后 **Success**；最后 Portable Rust unit suite **尚在运行，整体 MSVC 不提前记全绿**。Linux 两 Job Success 见 D.50。
 - **精确的验证上限**：`verify` 只能检查当下 root-controlled 路径类型/权限、原隔离文件存在与 systemd/进程/socket 快照；没有独立受信 SHA256 对比或历史时序证据，不能证明原始隔离**内容在重启期间从未遭别的 root 进程篡改**。亦不能证明另一个 root/SSH 写者之后绝不会启动服务。真实 VPS reboot/power-loss/rollback、跨代写者隔离及撤销历史可信性仍未验证；SEC-01/02/08 / Issue #5 OPEN，PR #18 Draft，main/UI/WFP 不动。
 
+
+
+## D.52 PR #18 同代码 SHA Linux / Windows GNU / Windows MSVC 全流程 Success（2026-11-18）
+
+- **新 Rust HEAD 不变**：`72533502c1e361d6d1a3d029b5da99cb7499f57f`，叠加 [Draft PR #18](https://github.com/weixiaochuchen618-debug/spidervpn/pull/18) base PR #17。精确同 SHA [Linux #44205893006](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205893006)、[GNU #44205892961](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892961)、[MSVC #44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) **全部 Completed/Success**。完整 MSVC Job 原始日志最终 `test result: ok. 1429 passed; 0 failed; 1 ignored; 0 measured; 8 filtered out`；1 ignored、8 filtered 为仓库原环境依赖/fixture 策略，并非本轮为通过新增的跳过。MSVC Build Rust、SEC-10、SEC-01、all integrations、changed modules 与最终 portable 全部步骤真实 Success；GNU 旧门禁与提权 identity 实测成功，但有原仓既有 compiler warnings，不能称 GNU 0 warnings。
+- Linux Rust `--locked`、`RUSTFLAGS=-D warnings` 保持不变：121 lib/0 failed/ignored、opt-in retire CLI 9 binary tests（含新增 3 verify）、真实 Linux root 隔离临时路径原子退役与 postboot 二项（总计 7）和内核 netns 完整通过，普通用户真执行 `retire`、`verify` 都拒绝退出 2。未为 CI 跳过一条新增失败测试。PR #18 相比父 PR #17 仅 3 个 Linux 文件：Rust opt-in CLI、Linux Rust retire module、原有 Linux CI workflow；默认关闭，无生产 Python / Windows UI/连接/WFP 变动。
+- **风险/验收状态没有因全绿改变**：本次 `verify` 是时间点 root 级别的**只读**旧入口目录和隔离文件**类型、owner、权限与存在**验证，配合 systemd/process/socket 快照，**不是隔离文件内容的独立哈希真实性、跨 root/跨时间全写者排他的证据**，更不是实际 VPS reboot/power loss、可信历史 revoke tombstone、Rust TLS / API 服务接管或 Windows UAC/WFP 真机安全验收。SEC-01/02/08 和 Issue #5 仍 OPEN，PR #18 及祖先 PR 都 Draft、未合并 main。main `857ea7593941ce79f6507db5b1ced076c3a077ba` 未变。
+

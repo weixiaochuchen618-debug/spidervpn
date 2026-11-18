@@ -455,3 +455,11 @@
 - 同一代码 `72533502c1e361d6d1a3d029b5da99cb7499f57f`，Linux [#44205893006](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205893006) 双 Job Success；GNU [#44205892961](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892961) 整个 workflow Completed/Success，原始日志核验 SEC-01 旧门禁在 GNU 运行成功（有已有 Rust warnings）。MSVC [#44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) Rust Build + SEC-10 + SEC-01 + integration + changed modules 全部单独 Success，最后 Portable Rust unit suite 仍 in_progress；**必须再查最终 Job**，不可将部分成功说成全绿。
 - 只读 postboot 验证并**无可信原文件内容哈希、无跨时段或跨 root 的独占性证明**，只能作为 opt-in root 管理工具观察事实，不可作为 Rust listener/历史 revoked 迁移或旧写者排他授权。真实 VPS 仍须独立人工/运维验收；SEC-01/02/08 / Issue #5 Open、PR #18 Draft、main/WFP/UI 不动，详见 [Backlog D.51](./REMEDIATION_BACKLOG.md)。
 
+
+
+## 54. PR #18 Linux + GNU + MSVC 同一新 HEAD 终态 Success，未通过生产 DoD（2026-11-18）
+
+- 代码提交 `72533502c1e361d6d1a3d029b5da99cb7499f57f` 的 [Linux #44205893006](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205893006)（2/2 Jobs）、[Windows GNU #44205892961](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892961)、[Windows MSVC #44205892936](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44205892936) **均 Completed/Success**，MSVC 原始日志末尾 `1429 passed / 0 failed / 1 ignored（原有）/ 8 filtered out（原有环境依赖）`，所有步骤 Success。Linux 121 lib/0 fail/ignore、9 Rust CLI + 7 root 临时目录 FS + real WG kernel netns、非 root 真实 `retire` 与 `verify` exit2 全通过，`--locked` / `-D warnings` 保留。未掩盖旧 #17 原 E0382 失败，该失败早已在后续 PR #17 修复并复测。
+- 新增只读 opt-in root CLI `verify` 只能复核快照：systemd mask/停机、进程、旧端口、旧脚本 0700 空目录 + quarantine 0600 文件是否**存在和元数据可靠**，没有可信字节内容对比/签名历史或阻止旧 root/SSH 写者后续重启的能力。模拟 reboot/fs 篡改回归通过 **不等于** VPS 真实 power-loss/reboot/rollback 验收；仍禁止启用 Rust API/迁入旧 Consumed/Revoked 记录。完整细节和未完成清单见 [Backlog D.49–D.52](./REMEDIATION_BACKLOG.md)。
+- [Draft PR #18](https://github.com/weixiaochuchen618-debug/spidervpn/pull/18) base #17，不合并 main，不改现有 UI、连接交互、WFP persistent BLOCK。SEC-01/02/08 / Issue #5 继续 OPEN。下一步 P0 应优先推进**服务器可信全旧写者排他策略、撤销历史可信 tombstone、root systemd 真实停服/重启回滚演练、Rust TLS 并发接管**，而不是在 CI 绿时宣称生产修复。
+
