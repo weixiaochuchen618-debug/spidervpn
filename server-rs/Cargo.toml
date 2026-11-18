@@ -52,6 +52,8 @@ linux-bounded-accept-lab = ["linux-http-deny-response-lab"]
 linux-persistent-listener-lab = ["linux-bounded-accept-lab"]
 # Explicit disposable process lab, NOT installed or deployed.
 linux-denial-process-lab = ["linux-persistent-listener-lab", "dep:libc"]
+# Default-off request authentication against an independently trusted invite.
+linux-fresh-consume-gate = ["linux-handshake-admission"]
 
 [[test]]
 name = "wg_namespace_e2e"
