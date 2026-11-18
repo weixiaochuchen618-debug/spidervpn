@@ -1607,6 +1607,97 @@ mod tests {
         assert_eq!(after.server, before.server);
     }
 
+    // Exercise the real shared experimental start/stop entries without UAC
+    // or BFE writes. connect_inner passes its captured intent to this exact
+    // entry; this fixture does not claim to run the full connection transaction.
+    #[cfg(windows)]
+    #[test]
+    fn a2_old_experimental_intent_is_rejected_after_disconnect_returns() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        const ROLE: &str = "SPIDERVPN_A2_CONNECT_INTENT_FIXTURE";
+        const TEST: &str = "connect::tests::a2_old_experimental_intent_is_rejected_after_disconnect_returns";
+        let exe = std::env::current_exe().unwrap();
+        match std::env::var(ROLE).as_deref() {
+            Ok("engine") => {
+                let mut byte = [0u8; 1];
+                assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
+                return;
+            }
+            Ok("controller") => {}
+            _ => {
+                // Do not share the test process's global experimental slot
+                // with unrelated connection tests running in parallel.
+                let status = Command::new(&exe).args(["--exact", TEST, "--nocapture"])
+                    .env(ROLE, "controller").status().unwrap();
+                assert!(status.success());
+                return;
+            }
+        }
+        struct EngineCleanup(std::process::Child);
+        impl Drop for EngineCleanup {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let mut child = EngineCleanup(Command::new(&exe)
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ROLE, "engine").stdin(Stdio::piped()).spawn().unwrap());
+        let pid = i64::from(child.0.id());
+        let engine = EngineConfig { binary: exe.to_str().unwrap().into(), args: vec![] };
+        let cfg = cfg();
+        let endpoint = "127.0.0.1:12345";
+        assert!(crate::guard::trade_identities(&cfg).programs.is_empty());
+        for mode in ["normal", "kill-error", "missing-runtime", "corrupt-runtime"] {
+            let f = fixture(&format!("a2-intent-{mode}"));
+            let _ = std::fs::remove_file(&f.runtime);
+            let _ = std::fs::remove_file(&f.journal);
+            if mode == "corrupt-runtime" {
+                std::fs::write(&f.runtime, b"not-json").unwrap();
+            } else if mode != "missing-runtime" {
+                write_runtime(&f.runtime, pid, 1_700_000_000.0, "Running", true).unwrap();
+            }
+            let old = crate::guard::lease_helper::capture_experimental_intent().unwrap();
+            let calls = std::cell::Cell::new(0);
+            let spawn = |_: &EngineConfig| panic!("disconnect must not spawn");
+            let kill = |seen: i64| {
+                assert_eq!(seen, pid);
+                calls.set(calls.get() + 1);
+                // Simulated stop failure; actual child deliberately stays live.
+                if mode == "kill-error" { Err("A2 injected stop error".into()) } else { Ok(()) }
+            };
+            let d = deps(&f, &spawn, &kill);
+            let result = disconnect(None, &d);
+            match mode {
+                "kill-error" => {
+                    assert_eq!(result.unwrap_err(), "A2 injected stop error");
+                    assert!(f.runtime.exists());
+                }
+                "missing-runtime" | "corrupt-runtime" =>
+                    assert_eq!(result.unwrap(), Outcome::AlreadyDone),
+                _ => assert!(matches!(result.unwrap(), Outcome::Done(_))),
+            }
+            assert_eq!(calls.get(), if matches!(mode, "normal" | "kill-error") { 1 } else { 0 });
+            assert!(!child.0.try_wait().unwrap().is_some());
+            let error = try_start_experimental_proxy_lease(&cfg, &engine, endpoint,
+                pid, true, false, old).unwrap_err();
+            assert_eq!(error, "旧连接实验租约意图已失效");
+            // A genuinely new intent may register. Empty list then deliberately
+            // stops before UAC, proving the original list refusal is preserved.
+            let fresh = crate::guard::lease_helper::capture_experimental_intent().unwrap();
+            let error = try_start_experimental_proxy_lease(&cfg, &engine, endpoint,
+                pid, true, false, fresh).unwrap_err();
+            assert_eq!(error, "交易程序名单不完整，不允许授予部分程序的临时许可");
+            println!("A2_INTENT_PASS mode={mode} stale_rejected=true fresh_registered=true original_result_preserved=true");
+            let _ = std::fs::remove_dir_all(f.runtime.parent().unwrap());
+        }
+        drop(child.0.stdin.take());
+        assert!(child.0.wait().unwrap().success());
+    }
+
     #[test]
     fn disconnect_without_any_record_is_noop() {
         let f = fixture("noop");
