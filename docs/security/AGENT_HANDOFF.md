@@ -559,3 +559,10 @@
 - [GNU #44224794789](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794789) 同新 SHA **整个 workflow Completed/Success**（原有 compiler warnings），Guard/身份、SEC-01 sourced transport SSH tests 实测通过。[MSVC #44224794780](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794780) 同新 SHA Build、SEC-10/01 已 Success，继续等待 integration/changed-module/full portable unit 的**完整终态**和真实日志；禁止提前记三平台 CI 成功。
 - 对接真正 TLS 的技术缺口：当前 `http_one_request::read_one_request` 接受 `&mut DeadlineIo`，真实 TLS1.2 端必须先将 rustls/验证通过的 TLS 解密层实现为**独立受时限约束的读取接口**再交给 parser；直接把 TLS raw ciphertext 交给当前 parser 是错误的。尚无生产 listener、HTTP response、可信 token/Revoked 数据。Issue #5/SEC-01/02/08 Open，PR #21 Draft，main/UI/WFP 不变。
 
+
+
+## 67. PR #21 同最终代码 SHA 三平台成功；仍不是生产 TLS/HTTP 安全收口（2026-11-18）
+
+- [Draft PR #21](https://github.com/weixiaochuchen618-debug/spidervpn/pull/21) Rust HEAD `4f770d2f90686785d99f31e41b60ca71e6d3c48f`，精确对应 [Linux #44224794790](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794790) **2/2 Success**（121 lib + 13 旧 admission + **9 新 HTTP parser localhost TCP** /0 failed/ignored、真实 WG kernel netns 和 root FS），[GNU #44224794789](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794789) **Completed/Success**（有旧 warnings），[MSVC #44224794780](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794780) **Completed/Success**：所有 Windows 构建/权限/集成/变更模块/全量 Rust 步骤成功，最后原日志 `1429 passed; 0 failed; 1 ignored; 8 filtered`（已有）。无新 skip/ignore，首 SHA 真实 Linux pipelined EOF-only 失败记录保留于 [Backlog D.63–65](./REMEDIATION_BACKLOG.md)。
+- 改动只含 3 个 Linux Rust/CI 文件，feature 默认 OFF。新 `read_one_request(&mut DeadlineIo)` 是**未认证的明文 HTTP1.1 报文解码**，不能据此断言在真正 Rust TLS1.2 加密连接上收到了/解析了正确 HTTP 数据；必须先对接 TLS 已解密流且继续有界 timeout、完成 X509/legacy fingerprint 兼容及可信 PairRequest 授权，再用真实 client/server TLS1.2 的 wire 对抗测试和 HTTP1.1 边界测试确认。原 Python 生产/旧撤销历史、所有 root 旧写者、VPS 实机 rollback 和 Win UAC/WFP 仍是阻塞项。SEC-01/02/08 + Issue #5 Open，PR #21/父 PR 都 Draft，main/WFP/UI/连接交互不动。
+
