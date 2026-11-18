@@ -1795,6 +1795,16 @@ mod tests {
             }
         }
 
+        // A copied disposable test executable exercises a distinct real APP_ID.
+        // No production trader executable, provider or system firewall is modified.
+        if let Ok(target) = std::env::var("SPIDERVPN_A2_TCP_TARGET") {
+            assert!(native_bfe);
+            let addr: SocketAddr = target.parse().unwrap();
+            let allowed = std::env::var("SPIDERVPN_A2_TCP_ALLOWED").as_deref() == Ok("1");
+            assert_eq!(TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok(), allowed);
+            return;
+        }
+
         // A third, real engine process remains live through every cancellation
         // case. Its stdin is closed only after the parent verifies all teardown.
         const ENGINE: &str = "SPIDERVPN_LEASE_CANCEL_ENGINE_FIXTURE";
@@ -2145,12 +2155,6 @@ mod tests {
             assert_eq!(cancelled_modes, cancel_modes.len());
             println!("CANCEL_BFE_COMPLETE modes={cancelled_modes} stale_rejected=true repeat_noop=true engine_alive=true");
         }
-        if let Some(engine) = engine.as_mut() {
-            drop(engine.0.stdin.take());
-            wait_for(Instant::now() + Duration::from_secs(5), || engine.0.try_wait().unwrap().is_some(),
-                "engine fixture did not exit after explicit release");
-            assert!(engine.0.wait().unwrap().success());
-        }
         if let Some((baseline, audit, block, a, b)) = bfe {
             baseline.close_checked().unwrap();
             assert!(filter_get_by_id(&audit, block).unwrap().is_none());
@@ -2158,6 +2162,188 @@ mod tests {
             assert_flow(&b, true);
             println!("JOINT_BFE_COMPLETE modes={completed_modes} baseline_removed=true tcp_restored=true");
         }
+        if let Some(engine) = engine.as_mut() {
+            generation_barrier_bfe(engine.0.id());
+            assert!(engine.0.try_wait().unwrap().is_none());
+            drop(engine.0.stdin.take());
+            wait_for(Instant::now() + Duration::from_secs(5), || engine.0.try_wait().unwrap().is_some(),
+                "engine fixture did not exit after explicit release");
+            assert!(engine.0.wait().unwrap().success());
+        }
+    }
+
+    // Independent real BFE fixture: intentionally retain dynamic filter
+    // objects in a separate live session after the registered helper exits.
+    // This models delayed/failed teardown, not an induced native close error.
+    // Use different APP_IDs and endpoints to prove that checking only the
+    // next request's keys would miss an old residual permit.
+    #[cfg(windows)]
+    fn generation_barrier_bfe(engine_pid: u32) {
+        use super::super::wfp_win::{WfpEngine, RawFilter, app_id_from_path,
+            filter_add, filter_get_by_id, filter_delete_by_id, dynamic_permit_key,
+            old_dynamic_permits_absent};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Command, Stdio};
+
+        fn flow(exe: Option<&Path>, listener: &TcpListener, allowed: bool) {
+            let addr = listener.local_addr().unwrap();
+            if let Some(exe) = exe {
+                let status = Command::new(exe)
+                    .args(["--ignored", "--exact", "guard::lease_helper::tests::real_process_channel_faults_with_bfe", "--nocapture"])
+                    .env("SPIDERVPN_A2_TCP_TARGET", addr.to_string())
+                    .env("SPIDERVPN_A2_TCP_ALLOWED", if allowed { "1" } else { "0" })
+                    .status().unwrap();
+                assert!(status.success(), "distinct APP_ID TCP probe failed: {addr}");
+            } else {
+                assert_eq!(TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok(), allowed);
+            }
+            if allowed {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match listener.accept() {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "allowed flow not accepted");
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(e) => panic!("TCP listener error: {e}"),
+                    }
+                }
+            }
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let dir = std::env::temp_dir().join(format!("spidervpn-a2-{}", random_nonce()));
+        std::fs::create_dir(&dir).unwrap();
+        let copy = dir.join("trader-copy.exe");
+        std::fs::copy(&exe, &copy).unwrap();
+        let main_app = app_id_from_path(&exe).unwrap();
+        let copy_app = app_id_from_path(&copy).unwrap();
+        assert_ne!(main_app, copy_app);
+        let old_endpoint = TcpListener::bind("127.0.0.1:0").unwrap();
+        let new_endpoint = TcpListener::bind("127.0.0.1:0").unwrap();
+        old_endpoint.set_nonblocking(true).unwrap();
+        new_endpoint.set_nonblocking(true).unwrap();
+        assert_ne!(old_endpoint.local_addr().unwrap(), new_endpoint.local_addr().unwrap());
+        for app in [None, Some(copy.as_path())] {
+            flow(app, &old_endpoint, true);
+            flow(app, &new_endpoint, true);
+        }
+        let baseline = WfpEngine::open_dynamic().unwrap();
+        let audit = WfpEngine::open().unwrap();
+        let block_ids: Vec<_> = [&main_app, &copy_app].into_iter().map(|app| {
+            filter_add(&baseline, &RawFilter::isolated_lifecycle_filter(app, None, &[1; 16]).unwrap()).unwrap()
+        }).collect();
+        for app in [None, Some(copy.as_path())] {
+            flow(app, &old_endpoint, false);
+            flow(app, &new_endpoint, false);
+        }
+        println!("A2_BFE_BEGIN distinct_endpoints=true distinct_app_ids=true old_count=2 new_count=1");
+
+        let slot = LocalLeaseSlot::default();
+        let reg = slot.register(engine_pid, &exe).unwrap();
+        let control = reg.control.clone();
+        let stale = slot.intent().unwrap();
+        let old_nonce = decode_nonce(&control.nonce).unwrap();
+        let old_addr = old_endpoint.local_addr().unwrap();
+        let new_addr = new_endpoint.local_addr().unwrap();
+        let old_keys = vec![dynamic_permit_key(&main_app, old_addr, &old_nonce).unwrap(),
+            dynamic_permit_key(&copy_app, old_addr, &old_nonce).unwrap()];
+        // Real distinct helper-like process with retained process identity.
+        // It does not own the deliberately retained fault-injection session.
+        let mut helper = Command::new(&exe)
+            .args(["--ignored", "--exact", "guard::lease_helper::tests::real_process_channel_faults_with_bfe", "--nocapture"])
+            .env("SPIDERVPN_LEASE_CANCEL_ENGINE_FIXTURE", "1")
+            .stdin(Stdio::piped()).spawn().unwrap();
+        control.bind_helper(helper.as_raw_handle(), old_keys.clone()).unwrap();
+        let old_session = WfpEngine::open_dynamic().unwrap();
+        let old_ids: Vec<_> = [&main_app, &copy_app].into_iter().map(|app| {
+            filter_add(&old_session, &RawFilter::isolated_lifecycle_filter(app, Some(old_addr), &old_nonce).unwrap()).unwrap()
+        }).collect();
+        control.record_acquire_complete().unwrap();
+        assert!(!old_dynamic_permits_absent(&old_keys).unwrap());
+        for app in [None, Some(copy.as_path())] {
+            flow(app, &old_endpoint, true);
+            flow(app, &new_endpoint, false);
+        }
+
+        // Cancellation and actual helper exit alone are insufficient.
+        slot.cancel_current();
+        drop(reg);
+        drop(helper.stdin.take());
+        assert!(helper.wait().unwrap().success());
+        assert!(slot.register_intent(stale, engine_pid, &exe).is_err());
+        assert!(slot.register(engine_pid, &exe).is_err());
+        assert!(slot.0.lock().unwrap().current.is_some());
+        assert!(!old_dynamic_permits_absent(&old_keys).unwrap());
+        println!("A2_BFE_REJECT mode=helper-exited-residual old_count=2 helper_exited=true new_registration_denied=true");
+
+        // Simulate partial teardown: one exact key gone, the second still
+        // granting the old endpoint for an app in the old request.
+        filter_delete_by_id(&old_session, old_ids[0]).unwrap();
+        assert!(filter_get_by_id(&audit, old_ids[0]).unwrap().is_none());
+        assert!(filter_get_by_id(&audit, old_ids[1]).unwrap().is_some());
+        assert!(old_dynamic_permits_absent(&old_keys[..1]).unwrap());
+        assert!(!old_dynamic_permits_absent(&old_keys).unwrap());
+        assert!(slot.register(engine_pid, &exe).is_err());
+        flow(None, &old_endpoint, false);
+        flow(Some(&copy), &old_endpoint, true);
+        flow(Some(&copy), &new_endpoint, false);
+        println!("A2_BFE_REJECT mode=partial-delayed-close residual_count=1 new_registration_denied=true close_failure_model=injected_residual");
+
+        // No actual API failure is fabricated. Now close the fault fixture
+        // successfully and require real absence for every OLD key.
+        old_session.close_checked().unwrap();
+        assert!(old_dynamic_permits_absent(&old_keys).unwrap());
+        assert!(old_ids.iter().all(|id| filter_get_by_id(&audit, *id).unwrap().is_none()));
+        assert!(block_ids.iter().all(|id| filter_get_by_id(&audit, *id).unwrap().is_some()));
+        for app in [None, Some(copy.as_path())] {
+            flow(app, &old_endpoint, false);
+            flow(app, &new_endpoint, false);
+        }
+        let new_reg = slot.register(engine_pid, &exe).unwrap();
+        assert_ne!(control.nonce, new_reg.control.nonce);
+        let new_nonce = decode_nonce(&new_reg.control.nonce).unwrap();
+        let new_key = dynamic_permit_key(&copy_app, new_addr, &new_nonce).unwrap();
+        assert!(!old_keys.contains(&new_key));
+        let new_session = WfpEngine::open_dynamic().unwrap();
+        let new_id = filter_add(&new_session,
+            &RawFilter::isolated_lifecycle_filter(&copy_app, Some(new_addr), &new_nonce).unwrap()).unwrap();
+        assert!(old_dynamic_permits_absent(&old_keys).unwrap());
+        assert!(!old_dynamic_permits_absent(&[new_key]).unwrap());
+        flow(None, &old_endpoint, false);
+        flow(None, &new_endpoint, false);
+        flow(Some(&copy), &old_endpoint, false);
+        flow(Some(&copy), &new_endpoint, true);
+        println!("A2_BFE_PASS mode=verified-new-generation old_absent=true different_list=true different_endpoint=true old_tcp_denied=true new_tcp_exact_allowed=true");
+        new_session.close_checked().unwrap();
+        assert!(filter_get_by_id(&audit, new_id).unwrap().is_none());
+        assert!(old_dynamic_permits_absent(&[new_key]).unwrap());
+        drop(new_reg);
+
+        // A lost Ready could leave an acquisition RPC in flight. Even exact
+        // not-found and actual process exit are not treated as enough here.
+        let unknown = LocalLeaseSlot::default();
+        let unknown_reg = unknown.register(engine_pid, &exe).unwrap();
+        let unknown_key = dynamic_permit_key(&main_app, old_addr,
+            &decode_nonce(&unknown_reg.control.nonce).unwrap()).unwrap();
+        unknown_reg.control.bind_helper(helper.as_raw_handle(), vec![unknown_key]).unwrap();
+        drop(unknown_reg);
+        assert!(old_dynamic_permits_absent(&[unknown_key]).unwrap());
+        assert!(unknown.register(engine_pid, &exe).is_err());
+        assert!(unknown.0.lock().unwrap().current.is_some());
+        println!("A2_BFE_REJECT mode=unknown-acquire-completion absent_now=true new_registration_denied=true");
+
+        assert!(block_ids.iter().all(|id| filter_get_by_id(&audit, *id).unwrap().is_some()));
+        baseline.close_checked().unwrap();
+        assert!(block_ids.iter().all(|id| filter_get_by_id(&audit, *id).unwrap().is_none()));
+        for app in [None, Some(copy.as_path())] {
+            flow(app, &old_endpoint, true);
+            flow(app, &new_endpoint, true);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        println!("A2_BFE_COMPLETE old_keys=2 new_keys=1 residual_rejected=true unknown_rejected=true verified_new_generation=true baseline_removed=true tcp_restored=true");
     }
 
     // The real connect.rs disconnect entry, with a disposable runtime directory.
