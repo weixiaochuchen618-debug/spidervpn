@@ -432,6 +432,69 @@ mod imp {
         }
     }
 
+    // Single source of truth: the controller records every possible dynamic
+    // key BEFORE request delivery; the helper's actual builder uses this exact
+    // function after independently validating the supplied APP_IDs.
+    pub(crate) fn dynamic_permit_key(app_id: &[u8], endpoint: std::net::SocketAddr,
+        lease_nonce: &[u8]) -> Result<Guid, String>
+    {
+        use sha2::{Digest, Sha256};
+        use super::super::egress_policy::EgressPolicy;
+        if !matches!(EgressPolicy::local_proxy(&endpoint.to_string()),
+            Ok(EgressPolicy::LocalProxy { .. })) {
+            return Err("临时 WFP 许可必须是精确本地代理端点".into());
+        }
+        if app_id.is_empty() || app_id.len() % 2 != 0 || lease_nonce.len() < 16 {
+            return Err("临时 WFP 许可的 APP_ID 或会话 nonce 无效".into());
+        }
+        let mut h = Sha256::new();
+        h.update(b"SpiderVPN/WFP-v2/dynamic-permit");
+        h.update((app_id.len() as u64).to_le_bytes());
+        h.update(app_id);
+        h.update(endpoint.to_string().as_bytes());
+        h.update(lease_nonce);
+        let digest = h.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        let key = Guid::from_bytes_le(bytes);
+        if key == Guid::nil() { return Err("动态许可键无效".into()); }
+        Ok(key)
+    }
+
+    // Only exact FWP_E_FILTER_NOT_FOUND is absence. In particular ACCESS_DENIED,
+    // a failed BFE connection, generic not-found and malformed success are not.
+    fn permit_key_absent_status(rc: u32, has_object: bool) -> Result<bool, String> {
+        use windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND;
+        match rc {
+            0 if has_object => Ok(false),
+            n if n == FWP_E_FILTER_NOT_FOUND as u32 && !has_object => Ok(true),
+            _ => Err(format!("旧动态许可读回不可确认 (Win32={rc})")),
+        }
+    }
+
+    pub(crate) fn old_dynamic_permits_absent(keys: &[Guid]) -> Result<bool, String> {
+        use std::collections::HashSet;
+        if keys.is_empty() || keys.len() > super::super::identity::MAX_PROGRAMS
+            || keys.iter().any(|key| *key == Guid::nil())
+            || keys.iter().copied().collect::<HashSet<_>>().len() != keys.len()
+        {
+            return Err("旧动态许可完整键集合无效".into());
+        }
+        // Independent, read-only BFE queries. Never change ACL, delete a rule,
+        // reuse the old session, or infer absence from helper exit.
+        let audit = WfpEngine::open().map_err(|e| e.to_string())?;
+        for key in keys {
+            let native = to_win(*key);
+            let mut out: *mut W::FWPM_FILTER0 = std::ptr::null_mut();
+            let rc = unsafe { W::FwpmFilterGetByKey0(audit.raw(), &native, &mut out) };
+            let result = unsafe { WfpBuf::from_raw(out) };
+            if !permit_key_absent_status(rc, result.as_ref().is_some())? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// 已构造好的 `FWPM_FILTER0`（一条 block 规则）。
     pub struct RawFilter {
         raw: W::FWPM_FILTER0,
@@ -605,28 +668,8 @@ mod imp {
         fn ephemeral_proxy_permit(
             name: &str, app_id: &[u8], endpoint: std::net::SocketAddr, lease_nonce: &[u8],
         ) -> Result<Box<RawFilter>, String> {
-            use sha2::{Digest, Sha256};
-            use super::super::egress_policy::EgressPolicy;
-            if !matches!(
-                EgressPolicy::local_proxy(&endpoint.to_string()),
-                Ok(EgressPolicy::LocalProxy { .. })
-            ) {
-                return Err("临时 WFP 许可必须是精确本地代理端点".into());
-            }
-            if app_id.is_empty() || app_id.len() % 2 != 0 || lease_nonce.len() < 16 {
-                return Err("临时 WFP 许可的 APP_ID 或会话 nonce 无效".into());
-            }
+            let permit_key = dynamic_permit_key(app_id, endpoint, lease_nonce)?;
             let layer = if endpoint.is_ipv4() { Layer::V4 } else { Layer::V6 };
-            let mut h = Sha256::new();
-            h.update(b"SpiderVPN/WFP-v2/dynamic-permit");
-            h.update((app_id.len() as u64).to_le_bytes());
-            h.update(app_id);
-            h.update(endpoint.to_string().as_bytes());
-            h.update(lease_nonce);
-            let digest = h.finalize();
-            let mut key_bytes = [0u8; 16];
-            key_bytes.copy_from_slice(&digest[..16]);
-            let permit_key = Guid::from_bytes_le(key_bytes);
 
             let mut permit = RawFilter::block(name, app_id, layer);
             // 不得修改已有持久 v1 BLOCK；必须高于旧 BLOCK 0x1000 的权重。
@@ -781,7 +824,11 @@ mod imp {
                 Some(addr) => Self::ephemeral_proxy_permit("isolated pipe lease test", app_id, addr, nonce)?,
                 None => Self::block("isolated pipe baseline test", app_id, Layer::V4),
             };
-            filter.raw.filterKey = windows_sys::core::GUID::default(); // BFE assigns fresh key
+            // Keep the real deterministic permit key for independent readback.
+            // Only the fixture baseline block uses a fresh BFE-assigned key.
+            if endpoint.is_none() {
+                filter.raw.filterKey = windows_sys::core::GUID::default();
+            }
             filter.raw.flags = 0;
             filter.raw.providerKey = std::ptr::null_mut();
             filter.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
@@ -1356,6 +1403,25 @@ mod imp {
     #[cfg(test)]
     mod dynamic_proxy_lease_tests {
         use super::*;
+
+        #[test]
+        fn old_permit_absence_requires_exact_native_not_found() {
+            use windows_sys::Win32::Foundation::{FWP_E_FILTER_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_NOT_FOUND};
+            assert_eq!(permit_key_absent_status(FWP_E_FILTER_NOT_FOUND as u32, false), Ok(true));
+            assert_eq!(permit_key_absent_status(0, true), Ok(false));
+            assert!(permit_key_absent_status(0, false).is_err());
+            assert!(permit_key_absent_status(FWP_E_FILTER_NOT_FOUND as u32, true).is_err());
+            assert!(permit_key_absent_status(ERROR_ACCESS_DENIED, false).is_err());
+            assert!(permit_key_absent_status(ERROR_NOT_FOUND, false).is_err());
+            assert!(old_dynamic_permits_absent(&[]).is_err());
+            assert!(old_dynamic_permits_absent(&[Guid::nil()]).is_err());
+            let addr = "127.0.0.1:12345".parse().unwrap();
+            let key = dynamic_permit_key(&[1, 0], addr, &[1; 16]).unwrap();
+            assert_ne!(key, dynamic_permit_key(&[2, 0], addr, &[1; 16]).unwrap());
+            assert_ne!(key, dynamic_permit_key(&[1, 0], "127.0.0.1:12346".parse().unwrap(), &[1; 16]).unwrap());
+            assert_ne!(key, dynamic_permit_key(&[1, 0], addr, &[2; 16]).unwrap());
+            assert!(old_dynamic_permits_absent(&[key, key]).is_err());
+        }
 
         #[test]
         fn lease_rejects_forged_appid_and_device_path_before_bfe_writes() {
