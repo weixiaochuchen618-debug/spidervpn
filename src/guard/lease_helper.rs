@@ -57,18 +57,77 @@ struct LeaseAck {
     accepted: bool,
 }
 
+/// 从同一个已打开的对象验证文件类型、链接数、长度，再有界读取。
+/// Windows 不跟随末级 reparse point，且读取期间不共享写入或删除。
+/// 这不是目录 DACL 或 IPC 对端身份认证的替代品。
+fn read_ipc_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).share_mode(FILE_SHARE_READ);
+    }
+    #[cfg(not(windows))]
+    {
+        // 非 Windows 只有协议测试，不运行 WFP；避免跟随普通符号链接。
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => return Err("租约 IPC 不是普通文件".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("检查租约 IPC 失败：{e}")),
+        }
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("打开租约 IPC 失败：{e}")),
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0
+            || info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || info.nNumberOfLinks != 1
+        {
+            return Err("租约 IPC 文件身份不可确认或存在重解析点/硬链接".into());
+        }
+    }
+    let meta = file.metadata().map_err(|e| format!("读取租约 IPC 元数据失败：{e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return Err("租约 IPC 不允许硬链接".into());
+        }
+    }
+    if !meta.is_file() || meta.len() == 0 || meta.len() > limit as u64 {
+        return Err("租约 IPC 不是有效的普通有界文件".into());
+    }
+    let mut body = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut body)
+        .map_err(|e| format!("读取租约 IPC 失败：{e}"))?;
+    if body.is_empty() || body.len() > limit || body.len() as u64 != meta.len() {
+        return Err("租约 IPC 内容长度异常或在读取期间改变".into());
+    }
+    Ok(Some(body))
+}
+
 /// Ready 只是启动协商，不能孤立地当作父进程已接管成功。
 /// 辅助进程只接受同一个随机目录的 ack.json，绝不接受另一会话旧 nonce。
 fn read_ack(path: &Path, nonce: &str) -> Result<bool, String> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(format!("检查租约确认文件失败：{e}")),
+    let Some(body) = read_ipc_file(path, 4096)? else {
+        return Ok(false);
     };
-    if !meta.file_type().is_file() || meta.len() == 0 || meta.len() > 4096 {
-        return Err("租约确认文件不是有效普通小文件".into());
-    }
-    let body = std::fs::read(path).map_err(|e| format!("读取租约确认文件失败：{e}"))?;
     let ack: LeaseAck = serde_json::from_slice(&body)
         .map_err(|e| format!("租约确认文件不是合法协议：{e}"))?;
     if ack.schema != LEASE_SCHEMA || ack.nonce != nonce || !ack.accepted {
@@ -175,18 +234,21 @@ fn validate_transport_paths(request: &Path, response: &Path) -> Result<(), Strin
     Ok(())
 }
 
-fn read_request(path: &Path) -> Result<LeaseRequest, String> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("读取租约请求元数据失败：{e}"))?;
-    if !meta.file_type().is_file() || meta.len() == 0
-        || meta.len() as usize > MAX_LEASE_IPC_BYTES
+/// 请求必须绑定到启动器为本次会话生成的完整 128-bit 目录标识。
+fn validate_session_directory(path: &Path, nonce: &str) -> Result<(), String> {
+    decode_nonce(nonce)?;
+    let expected = format!("spidervpn-lease-{nonce}");
+    if path.parent().and_then(Path::file_name).and_then(|name| name.to_str())
+        != Some(expected.as_str())
     {
-        return Err("租约请求不是普通文件，或者大小无效".into());
+        return Err("租约目录与请求 nonce 不一致".into());
     }
-    let data = std::fs::read(path).map_err(|e| format!("读取租约请求失败：{e}"))?;
-    if data.len() > MAX_LEASE_IPC_BYTES {
-        return Err("租约请求超出大小限制".into());
-    }
+    Ok(())
+}
+
+fn read_request(path: &Path) -> Result<LeaseRequest, String> {
+    let data = read_ipc_file(path, MAX_LEASE_IPC_BYTES)?
+        .ok_or("租约请求不存在")?;
     serde_json::from_slice(&data).map_err(|e| format!("租约 JSON 无效：{e}"))
 }
 
@@ -223,17 +285,11 @@ fn write_reply(path: &Path, reply: &LeaseReply) -> Result<(), String> {
 /// 父进程必须检查回执来自本次会话且 filter_count 与请求完全一致；
 /// "Ready" 文件本身不能证明子进程仍活着，启动器还必须检查 hProcess。
 fn read_ready(path: &Path, nonce: &str, expected_count: usize) -> Result<Option<()>, String> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("读取租约 Ready 状态失败：{e}")),
+    let Some(body) = read_ipc_file(path, 4096)? else {
+        return Ok(None);
     };
-    if !meta.file_type().is_file() || meta.len() == 0 || meta.len() > 4096 {
-        return Err("租约回执不是有效的普通小文件".into());
-    }
-    let reply: LeaseReply = serde_json::from_slice(
-        &std::fs::read(path).map_err(|e| e.to_string())?,
-    ).map_err(|e| format!("租约回执无效：{e}"))?;
+    let reply: LeaseReply = serde_json::from_slice(&body)
+        .map_err(|e| format!("租约回执无效：{e}"))?;
     if reply.schema != LEASE_SCHEMA || reply.nonce != nonce {
         return Err("租约 Ready 回执版本或 nonce 不匹配".into());
     }
@@ -333,6 +389,7 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     let reply_path = directory.join("reply.json");
     let ack_path = directory.join("ack.json");
     validate_transport_paths(&request_path, &reply_path)?;
+    validate_session_directory(&request_path, &nonce)?;
     let data = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     if data.len() > MAX_LEASE_IPC_BYTES {
         return Err("交易保护租约名单超过 IPC 大小限制".into());
@@ -370,14 +427,21 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     let mut child = LeaseChild { handle: info.hProcess, directory, confirmed: false };
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        if Instant::now() >= deadline {
+            let _ = write_ack(&ack_path, &nonce, false);
+            return Err("长期 WFP helper 就绪超时，拒绝将其视为已保护".into());
+        }
         if unsafe { WaitForSingleObject(child.handle, 0) } != WAIT_TIMEOUT {
             return Err("长期 WFP helper 在 Ready 前已退出，未启用临时许可".into());
         }
         match read_ready(&reply_path, &nonce, req.programs.len()) {
             Ok(Some(())) => {
                 // Ready 只是第一阶段；必须写 nonce-bound ACK 并确认进程尚存活。
+                if Instant::now() >= deadline {
+                    return Err("租约 Ready 超出启动期限".into());
+                }
                 write_ack(&ack_path, &nonce, true)?;
-                if !child.running() {
+                if !child.running() || Instant::now() >= deadline {
                     return Err("租约确认后 helper 已退出，拒绝报告连接已受保护".into());
                 }
                 child.confirmed = true;
@@ -388,10 +452,6 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
                 return Err(e);
             }
             Ok(None) => {}
-        }
-        if Instant::now() >= deadline {
-            let _ = write_ack(&ack_path, &nonce, false);
-            return Err("长期 WFP helper 就绪超时，拒绝将其视为已保护".into());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -430,8 +490,11 @@ pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
             return 2;
         }
     };
-    // 解析后立即尽力删除请求，缩短可修改请求文件的存在时间。
-    let _ = std::fs::remove_file(req_path);
+    // 不依据刚刚读取的路径再次删除文件：该路径可能已被替换。
+    // 目录完整性及清理责任属于后续可信 IPC 生命周期设计。
+    if validate_session_directory(req_path, &req.nonce).is_err() {
+        return 2;
+    }
 
     #[cfg(windows)]
     {
@@ -459,18 +522,24 @@ pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut lease = lease;
         loop {
-            match read_ack(&ack_path, &req.nonce) {
-                Ok(true) => break,
-                Err(_) => return 6, // lease 被 Drop，动态会话随之关闭
-                Ok(false) => {}
-            }
             if std::time::Instant::now() >= deadline {
                 return 6;
             }
+            let accepted = match read_ack(&ack_path, &req.nonce) {
+                Ok(value) => value,
+                Err(_) => return 6, // lease 被 Drop，动态会话随之关闭
+            };
             lease = match lease.revalidate(&req.engine_executable) {
                 Ok(value) => value,
                 Err(_) => return 6,
             };
+            // ACK 已存在也必须经过存活检查，且不能在截止之后接管租约。
+            if std::time::Instant::now() >= deadline {
+                return 6;
+            }
+            if accepted {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         // helper 自己退出/崩溃时，BFE 动态 session 自动撤销临时 PERMIT。
@@ -509,6 +578,56 @@ mod tests {
                 device_path: "a".into(),
             }],
         }
+    }
+
+    #[test]
+    fn session_directory_requires_exact_request_nonce() {
+        let nonce = sample().nonce;
+        let root = std::env::temp_dir();
+        let request = root.join(format!("spidervpn-lease-{nonce}")).join("request.json");
+        assert!(validate_session_directory(&request, &nonce).is_ok());
+        assert!(validate_session_directory(&request, "ffffffffffffffffffffffffffffffff").is_err());
+        let short = root.join("spidervpn-lease-0123456789abcdef").join("request.json");
+        assert!(validate_session_directory(&short, &nonce).is_err());
+    }
+
+    #[test]
+    fn ipc_readers_reject_hardlinks_even_with_valid_protocol() {
+        let root = std::env::temp_dir().join(format!("spidervpn-lease-hardlink-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let req = sample();
+        let request = root.join("request.json");
+        let response = root.join("reply.json");
+        let ack = root.join("ack.json");
+        std::fs::write(&request, serde_json::to_vec(&req).unwrap()).unwrap();
+        write_reply(&response, &reply(&req.nonce, LeaseState::Ready, String::new(), 1)).unwrap();
+        write_ack(&ack, &req.nonce, true).unwrap();
+        assert!(read_request(&request).is_ok());
+        assert!(read_ready(&response, &req.nonce, 1).unwrap().is_some());
+        assert!(read_ack(&ack, &req.nonce).unwrap());
+        for path in [&request, &response, &ack] {
+            std::fs::hard_link(path, path.with_extension("linked")).unwrap();
+        }
+        assert!(read_request(&request).is_err());
+        assert!(read_ready(&response, &req.nonce, 1).is_err());
+        assert!(read_ack(&ack, &req.nonce).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ipc_reads_are_bounded_and_reject_nonfiles() {
+        let root = std::env::temp_dir().join(format!("spidervpn-lease-bounds-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("reply.json");
+        assert!(read_ipc_file(&path, 4096).unwrap().is_none());
+        std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+        assert_eq!(read_ipc_file(&path, 4096).unwrap().unwrap().len(), 4096);
+        std::fs::write(&path, vec![b'x'; 4097]).unwrap();
+        assert!(read_ipc_file(&path, 4096).is_err());
+        std::fs::write(&path, []).unwrap();
+        assert!(read_ipc_file(&path, 4096).is_err());
+        assert!(read_ipc_file(&root, 4096).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
