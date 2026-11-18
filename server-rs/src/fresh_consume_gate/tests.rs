@@ -93,6 +93,7 @@ struct Fixture {
     binding:Value,
     token:String,
     pin:String,
+    fingerprint:String,
     body:Value,
     invite:Value,
     descriptor:Value,
@@ -111,6 +112,7 @@ impl Fixture {
             "NodeId":"66666666-6666-4666-8666-666666666666","ServerPublicKey":wg(2)});
         let token=encode(&[77;32]);
         let pin="a".repeat(64);
+        let fingerprint=management_fingerprint(&management.jwk).unwrap();
         let invite=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairInvite","InviteId":INV,
             "RemoteOwnerId":binding["RemoteOwnerId"],"NodeId":binding["NodeId"],
             "ServerPublicKey":binding["ServerPublicKey"],"ServerBinding":binding,
@@ -119,7 +121,7 @@ impl Fixture {
             "Capabilities":{"PairingVersion":1,"ManagementApiVersion":2,"Transport":"udp"}});
         let descriptor=json!({"SchemaVersion":1,"Kind":"TradeChannel.OnlineInvite",
             "InviteId":INV,"Invite":management.sign(&invite),"PublicHost":HOST,"Port":PORT,
-            "TlsSha256":pin,"ManagementFingerprint":"test-pinned-management",
+            "TlsSha256":pin,"ManagementFingerprint":fingerprint,
             "ManagementSigningPublicKey":management.jwk,"ExpiresAtUtc":EXP,"RetryUntilUtc":RETRY});
         let signed_descriptor=management.sign(&descriptor);
         let inner=json!({"SchemaVersion":1,"Kind":"TradeChannel.ClientRequest",
@@ -129,12 +131,12 @@ impl Fixture {
             "ServerBinding":binding,"ClientRequest":inner,"DeviceName":"交易电脑",
             "RecipientJwk":recipient.jwk,"RequestDigest":client_digest(&inner).unwrap(),
             "RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":NOW});
-        Self{store,management,recipient,binding,token,pin,body,invite,descriptor,
+        Self{store,management,recipient,binding,token,pin,fingerprint,body,invite,descriptor,
             signed_descriptor,_dir:dir}
     }
     fn scope(&self)->TrustedOpenInvite<'_> {
         TrustedOpenInvite{invite_id:INV,token:&self.token,signed_descriptor:&self.signed_descriptor,
-            management_jwk:&self.management.jwk,management_fingerprint:"test-pinned-management",
+            management_jwk:&self.management.jwk,management_fingerprint:&self.fingerprint,
             server_binding:&self.binding,public_host:HOST,port:PORT,tls_der_pin:&self.pin}
     }
     fn request(&self,compact:&str)->ParsedRequest {
