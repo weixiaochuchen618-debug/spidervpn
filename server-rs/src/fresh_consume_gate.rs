@@ -253,6 +253,9 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
         if consume {"/consume"} else {""});
     if request.target!=route || request.method!=if consume {Method::Post} else {Method::Get}
     { return Err(GateError::NotFound); }
+    if request.host != format!("{}:{}", scope.public_host, scope.port) {
+        return Err(GateError::InviteMismatch);
+    }
     let ledger=store.view().map_err(|_|GateError::InvalidState)?;
     let inv=ledger.invitations.get(scope.invite_id).ok_or(GateError::InviteNotFound)?;
     let presented=request.authorization.as_deref().and_then(|a|a.strip_prefix("Bearer "))
