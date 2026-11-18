@@ -153,9 +153,14 @@ fn run_and_signal(pin: &str, signal: libc::c_int) {
 
     // Hold a real incomplete handshake until the process exits. Observe
     // an existing worker via the kernel, not a fixed sleep.
+    let tasks = format!("/proc/{}/task", child.child.id());
+    let drained = Instant::now() + Duration::from_secs(2);
+    while fs::read_dir(&tasks).unwrap().count() != 1 {
+        assert!(Instant::now() < drained, "previous TLS worker not reaped");
+        thread::sleep(Duration::from_millis(5));
+    }
     let _idle = TcpStream::connect(address).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
-    let tasks = format!("/proc/{}/task", child.child.id());
     while fs::read_dir(&tasks).unwrap().count() < 2 {
         assert!(Instant::now() < deadline, "no admitted TLS worker");
         thread::sleep(Duration::from_millis(5));
@@ -172,7 +177,9 @@ fn run_and_signal(pin: &str, signal: libc::c_int) {
     let stopped = child.lines.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(stopped.starts_with("STOPPED_DENIAL_ONLY "));
     assert!(stopped.contains("denied=1"));
-    assert!(stopped.contains("failed=1"));
+    let failed: u64 = stopped.split_whitespace().find_map(|s| s.strip_prefix("failed="))
+        .unwrap().parse().unwrap();
+    assert!(failed >= 1, "idle worker must be drained as failure");
     assert!(child.stderr().is_empty());
     assert_eq!(TcpStream::connect(address).unwrap_err().kind(),
         std::io::ErrorKind::ConnectionRefused);
