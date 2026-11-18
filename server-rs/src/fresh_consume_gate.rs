@@ -519,9 +519,8 @@ impl VerifiedConsumedRetry<'_> {
 }
 
 /// Verify the local selector against the independently pinned invitation
-/// metadata, not merely its syntax. The actual kernel server public key
-/// and protected config identity must still be independently verified
-/// before production integration; a name is not proof of key ownership.
+/// metadata, not merely its syntax. The adapter additionally checks actual
+/// kernel and protected config public-key identity under the same lock.
 fn check_retry_interface(scope: &TrustedOpenInvite<'_>, interface: &str)
     -> Result<(),GateError>
 {
@@ -535,14 +534,16 @@ fn check_retry_interface(scope: &TrustedOpenInvite<'_>, interface: &str)
 /// selector must exactly match independently pinned WgInterface metadata.
 /// The existing adapter reads kernel inventory, protected wg.conf and kernel
 /// inventory again, rejecting disagreements. No public API accepts cached
-/// or projected rows. Kernel/config server-key identity and writer exclusion
-/// are still integration gates. No production caller or reply here.
+/// or projected rows. Kernel and config server keys must match the signed,
+/// pinned binding. Noncooperating writers/ABA remain integration gates.
+/// No production caller or reply here.
 pub fn prepare_consumed_retry<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
     request: &ParsedRequest, interface: &str) -> Result<VerifiedConsumedRetry<'a>,GateError>
 {
     check_retry_interface(scope,interface)?;
+    let expected=text(scope.server_binding,"ServerPublicKey").ok_or(GateError::InvalidState)?;
     prepare_retry_with_observation(store,scope,request,system_utc_seconds,||
-        crate::wg_conf_audit::read_verified_snapshot(interface)
+        crate::wg_conf_audit::read_verified_identity_snapshot(store,interface,expected)
             .map_err(|_|GateError::InvalidState))
 }
 

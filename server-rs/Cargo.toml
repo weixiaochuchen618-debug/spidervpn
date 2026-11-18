@@ -18,9 +18,9 @@ ring = "=0.17.14"
 # Same version and crypto backend as the Windows client, explicitly OFF by
 # default. Real Linux TLS1.2 encrypted loopback lab, NOT deployed receiver.
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
-# Zeroize in-memory PEM key buffers on every return path. Same existing
+# Zeroize in-memory PEM and protected WG key buffers. Same existing
 # vetted version/checksum as the pinned Windows client lock.
-zeroize = { version = "=1.9.1", optional = true }
+zeroize = { version = "=1.9.1" }
 # Existing pinned transitive libc; expose only for the opted-in Linux process lab.
 libc = { version = "=0.2.191", optional = true }
 
@@ -42,7 +42,7 @@ linux-handshake-admission = []
 linux-tls-wire-lab = ["linux-handshake-admission", "dep:rustls"]
 # Strict root-owned no-symlink, single-inode TLS PEM/pin reader. Default OFF;
 # no listener, state mutation, client changes, service install or cutover.
-linux-tls-identity-lab = ["linux-tls-wire-lab", "dep:zeroize"]
+linux-tls-identity-lab = ["linux-tls-wire-lab"]
 # An opt-in TLS1.2 loopback JSON error envelope only, never pairing approval.
 linux-http-deny-response-lab = ["linux-tls-identity-lab"]
 # Opt-in localhost-only finite TCP accept loop for the denial-only Rustls lab.

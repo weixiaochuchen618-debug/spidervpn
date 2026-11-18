@@ -17,7 +17,8 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use zeroize::Zeroizing;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -57,6 +58,19 @@ pub fn valid_interface(name: &str) -> bool {
         && b[0].is_ascii_alphanumeric()
         && b.iter().all(|c| c.is_ascii_alphanumeric()
             || matches!(*c, b'_' | b'=' | b'+' | b'.' | b'-'))
+}
+
+/// Canonical nonzero RFC4648 encoding of a 32-byte WireGuard key.
+pub(crate) fn canonical_key(key: &str) -> bool {
+    wg_key(key) && b"AEIMQUYcgkosw048".contains(&key.as_bytes()[42])
+        && key.as_bytes()[..43].iter().any(|b| *b != b'A')
+}
+
+fn parse_public_key(bytes: &[u8]) -> Result<String, ReadError> {
+    let key = std::str::from_utf8(bytes).map_err(|_| ReadError::InvalidUtf8)?
+        .strip_suffix('\n').ok_or(ReadError::MalformedOutput)?;
+    if !canonical_key(key) { return Err(ReadError::InvalidPublicKey); }
+    Ok(key.to_owned())
 }
 
 /// Parse full output of wg show IFACE allowed-ips. Never infer a missing
@@ -119,15 +133,35 @@ pub(crate) fn trusted_wg_binary(path: &Path) -> Result<(), ReadError> {
 fn execute_bounded(program: &Path, args: &[&str], timeout: Duration)
     -> Result<Vec<u8>, ReadError>
 {
+    execute_bounded_input(program, args, timeout, None)
+}
+
+// Only fixed, tiny key input is supported; never include secrets in argv,
+// environment, diagnostics or command output. No unbounded pipe writes.
+fn execute_bounded_input(program: &Path, args: &[&str], timeout: Duration,
+    input: Option<&[u8]>) -> Result<Vec<u8>, ReadError>
+{
+    if input.is_some_and(|bytes| bytes.len() != 45) {
+        return Err(ReadError::InvalidPublicKey);
+    }
     let mut child = Command::new(program)
         .args(args)
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| ReadError::CommandFailed)?;
+    if let Some(bytes) = input {
+        let written = child.stdin.take().ok_or(ReadError::CommandFailed)
+            .and_then(|mut stdin| stdin.write_all(bytes).map_err(|_| ReadError::CommandFailed));
+        if let Err(err) = written {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    }
     let pipe = child.stdout.take().ok_or(ReadError::CommandFailed)?;
     let reader = thread::spawn(move || {
         let mut output = Vec::new();
@@ -160,6 +194,18 @@ fn execute_bounded(program: &Path, args: &[&str], timeout: Duration)
     Ok(bytes)
 }
 
+/// Derive ONLY a public key from a protected, canonical private key.
+pub(crate) fn derive_public_key(private_key: &str) -> Result<String, ReadError> {
+    if !canonical_key(private_key) { return Err(ReadError::InvalidPublicKey); }
+    trusted_wg_binary(Path::new(WG_BINARY))?;
+    let mut input = Zeroizing::new([0u8;45]);
+    input[..44].copy_from_slice(private_key.as_bytes());
+    input[44] = b'\n';
+    let output = execute_bounded_input(Path::new(WG_BINARY), &["pubkey"],
+        COMMAND_TIMEOUT, Some(&input[..]))?;
+    parse_public_key(&output)
+}
+
 /// Read-only and intentionally NOT an implementation of PeerControl,
 /// whose add/remove methods are not yet safe to perform on real wg.conf.
 pub struct LiveWgReader {
@@ -170,6 +216,13 @@ impl LiveWgReader {
     pub fn new(interface: &str) -> Result<Self, ReadError> {
         if !valid_interface(interface) { return Err(ReadError::InvalidInterface); }
         Ok(Self { interface: interface.to_string() })
+    }
+    /// Kernel interface public key, never the private-key or dump selector.
+    pub fn server_public_key(&self) -> Result<String, ReadError> {
+        trusted_wg_binary(Path::new(WG_BINARY))?;
+        let output = execute_bounded(Path::new(WG_BINARY),
+            &["show", &self.interface, "public-key"], COMMAND_TIMEOUT)?;
+        parse_public_key(&output)
     }
     pub fn snapshot(&self) -> Result<Vec<Peer>, ReadError> {
         trusted_wg_binary(Path::new(WG_BINARY))?;
@@ -184,6 +237,17 @@ mod tests {
     use super::*;
     fn key(c: char) -> String { format!("{}=", c.to_string().repeat(43)) }
     fn row(k: &str, ip: &str) -> String { format!("{k}\t{ip}/32\n") }
+
+    #[test]
+    fn public_key_parser_rejects_missing_ambiguous_and_noncanonical_keys() {
+        let good = format!("{}E=", "A".repeat(42));
+        assert_eq!(parse_public_key(format!("{good}\n").as_bytes()), Ok(good.clone()));
+        for bad in ["".to_owned(), "(none)\n".to_owned(), good.clone(),
+            format!("{good}\n{good}\n"), format!("{good}\r\n"),
+            format!("{}F=\n","A".repeat(42)), format!("{}=\n","A".repeat(43))] {
+            assert!(parse_public_key(bad.as_bytes()).is_err());
+        }
+    }
 
     #[test]
     fn exact_live_rows_and_explicit_empty_are_valid() {
