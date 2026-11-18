@@ -73,6 +73,28 @@ jobs:
           ! grep -F 'linux-tls-wire-lab' src/pairhost.rs
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
 
+      - name: SEC-02 read-only root-owned TLS PEM pin and no-symlink lab
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          openssl version
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-tls-identity-lab --lib tls_identity::tests -- \
+            --test-threads=1 --nocapture
+          # Recheck real encrypted TLS and the original strict HTTP parser
+          # under the stronger identity feature (no disabled tests).
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-tls-identity-lab --lib tls_wire::tests -- \
+            --test-threads=1
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-tls-identity-lab --lib http_one_request::tests -- \
+            --test-threads=1
+          grep -F 'linux-tls-identity-lab = ["linux-tls-wire-lab", "dep:zeroize"]' server-rs/Cargo.toml
+          ! grep -F 'linux-tls-identity-lab' src/pairhost.rs
+          grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
+
       - name: Compile and test opt-in Rust root-only terminal finalization policy
         shell: bash
         env:
@@ -232,6 +254,23 @@ jobs:
           test "$(sudo stat -c '%u:%a' "$conf")" = "0:600"
           test -x "$SPIDERVPN_SEC01_TEST_BIN"
           sudo ip netns exec "$ns" /usr/bin/env SPIDERVPN_SEC01_NS_INTERFACE="$iface" SPIDERVPN_SEC01_NS_CLIENT_PUBLIC_KEY="$client_pub" "$SPIDERVPN_SEC01_TEST_BIN" --nocapture
+      - name: SEC-02 real UID 0 TLS identity ownership and pin filesystem regression
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$PWD/server-rs/target/netns"
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-tls-identity-lab --lib tls_identity::tests \
+            --no-run --message-format=json > "$RUNNER_TEMP/sec02-identity-build.json"
+          binary="$(jq -r 'select(.reason=="compiler-artifact" and .profile.test==true and (.target.kind | index("lib"))) | .executable // empty' "$RUNNER_TEMP/sec02-identity-build.json" | tail -n1)"
+          test -n "$binary"
+          test -x "$binary"
+          # This VM is disposable. Tests create owner-only folders in /tmp,
+          # do not read/overwrite /var/lib/tradechannel or original TLS keys.
+          sudo "$binary" tls_identity::tests --test-threads=1 --nocapture
+
       - name: Execute real root-owned legacy retirement filesystem tests in isolated runner
         shell: bash
         env:
