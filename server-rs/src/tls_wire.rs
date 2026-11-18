@@ -7,7 +7,9 @@
 //!
 //! NOT a production receiver: no real accept loop/public listener, no PEM
 //! loading from server secrets, no legacy token/Revoked authorization, no
-//! JSON HTTP response, no WireGuard mutation, no cutover or restart.
+//! production HTTP JSON response/authorization, no WireGuard mutation, no cutover or restart.
+//! An independent default-OFF feature exercises only a fail-closed JSON
+//! denial envelope over REAL encrypted TLS1.2 application data.
 //! This feature is OFF by default and only activated for Linux tests.
 //!
 //! The TLS server authenticates ITSELF to the client with a certificate,
@@ -42,6 +44,29 @@ pub fn tls12_server_config(
     Ok(Arc::new(config))
 }
 
+/// One shared real TLS1.2 handshake implementation for both read-only
+/// candidate and denial-only JSON wire test. Never authenticate a pairing
+/// request from handshake success (TLS here authenticates server, not client).
+fn finish_tls12_handshake(
+    config: Arc<ServerConfig>,
+    transport: &mut DeadlineIo,
+) -> io::Result<ServerConnection> {
+    let mut tls = ServerConnection::new(config)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SEC-02 TLS config refused"))?;
+    while tls.is_handshaking() {
+        let (read, _written) = tls.complete_io(transport)?;
+        if read == 0 && tls.is_handshaking() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                "SEC-02 TLS handshake terminated before authentication"));
+        }
+    }
+    if tls.protocol_version() != Some(ProtocolVersion::TLSv1_2) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "SEC-02 TLS protocol must be exactly 1.2"));
+    }
+    Ok(tls)
+}
+
 /// Server-side REAL encrypted handshake and ONE decrypted HTTP/1.1 message.
 ///
 /// It uses exactly the same bounded shared worker/reservation policy as
@@ -59,20 +84,7 @@ pub fn spawn_tls12_decrypted_one_request(
         requests,
         stream,
         move |transport: &mut DeadlineIo| {
-            let mut tls = ServerConnection::new(config)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SEC-02 TLS config refused"))?;
-            while tls.is_handshaking() {
-                let (read, _written) = tls.complete_io(transport)?;
-                if read == 0 && tls.is_handshaking() {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                        "SEC-02 TLS handshake terminated before authentication"));
-                }
-            }
-            if tls.protocol_version() != Some(ProtocolVersion::TLSv1_2) {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                    "SEC-02 TLS protocol must be exactly 1.2"));
-            }
-            Ok(tls)
+            finish_tls12_handshake(config, transport)
         },
         |transport, mut tls| {
             // The HTTP parser MUST see the DECRYPTED TLS stream, not the
@@ -80,6 +92,46 @@ pub fn spawn_tls12_decrypted_one_request(
             // remain bound by the absolute HTTP-stage deadline.
             let mut decrypted = Stream::new(&mut tls, transport);
             read_one_request(&mut decrypted)
+        },
+    )
+}
+
+
+/// REAL rustls TLS1.2 encrypted HTTP JSON **DENY-ONLY** lab.
+/// It is intentionally incapable of authorizing an invitation or mutating
+/// server state. Every syntactically valid GET/POST gets a legacy-shaped
+/// `500 {"Code":"InvalidState","Ok":false}`, even with bearer tokens.
+/// Invalid framing gets 400 InvalidRequest. TLS errors/timeouts close.
+/// A trusted ledger and authorizer have NOT been installed.
+#[cfg(feature = "linux-http-deny-response-lab")]
+pub fn spawn_tls12_denial_only_response(
+    handshakes: &HandshakeAdmission,
+    requests: &RequestAdmission,
+    stream: TcpStream,
+    config: Arc<ServerConfig>,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    handshakes.spawn_one_request(
+        requests,
+        stream,
+        move |transport| finish_tls12_handshake(config, transport),
+        |transport, mut tls| {
+            let result = {
+                let mut decrypted = Stream::new(&mut tls, transport);
+                crate::http_fail_closed::serve_denial_only(&mut decrypted)
+            };
+            if result.is_ok() {
+                // A bounded TLS close_notify prevents clients from mistaking
+                // EOF for a truncated HTTP JSON envelope. Do not read more
+                // requests or accept TLS early data / keep-alive.
+                tls.send_close_notify();
+                while tls.wants_write() {
+                    if tls.write_tls(transport)? == 0 {
+                        return Err(io::Error::new(io::ErrorKind::WriteZero,
+                            "SEC-02 TLS close_notify not flushed"));
+                    }
+                }
+            }
+            result
         },
     )
 }

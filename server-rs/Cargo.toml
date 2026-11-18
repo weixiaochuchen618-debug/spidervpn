@@ -41,6 +41,8 @@ linux-tls-wire-lab = ["linux-handshake-admission", "dep:rustls"]
 # Strict root-owned no-symlink, single-inode TLS PEM/pin reader. Default OFF;
 # no listener, state mutation, client changes, service install or cutover.
 linux-tls-identity-lab = ["linux-tls-wire-lab", "dep:zeroize"]
+# An opt-in TLS1.2 loopback JSON error envelope only, never pairing approval.
+linux-http-deny-response-lab = ["linux-tls-identity-lab"]
 
 [[test]]
 name = "wg_namespace_e2e"

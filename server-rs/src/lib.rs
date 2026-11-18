@@ -41,6 +41,10 @@ pub mod tls_wire;
 #[cfg(all(target_os = "linux", feature = "linux-tls-identity-lab"))]
 pub mod tls_identity;
 
+/// SEC-02: opt-in NO-AUTHORITY TLS JSON denial response wire regression lab.
+#[cfg(all(target_os = "linux", feature = "linux-http-deny-response-lab"))]
+pub mod http_fail_closed;
+
 pub mod legacy;
 
 /// Offline legacy RS256 verification ONLY, not a runtime authorization path.
