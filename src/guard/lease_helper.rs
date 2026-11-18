@@ -1333,10 +1333,11 @@ mod tests {
             pipe.send(&committed, deadline, &check).unwrap();
             // This is the exact final-receipt/lifecycle function used by serve_pipe.
             // No BFE writes in this portable test; canary covers native teardown.
-            if std::env::var("SPIDERVPN_LEASE_TEST_FAULT").as_deref() == Ok("wrong-token") {
-                // The native connected peer is correct PID, but intentionally
-                // pin a different session; actual traffic token must fail.
-                identity.session ^= 1;
+            match std::env::var("SPIDERVPN_LEASE_TEST_FAULT").as_deref() {
+                // Actual connected token is unchanged; pinned identity is wrong.
+                Ok("wrong-token") => identity.session ^= 1,
+                Ok("wrong-sid") => identity.sid.push_str("-999"),
+                _ => {}
             }
             let result = finish_and_supervise(&pipe, &nonce, 1, &identity,
                 Instant::now() + Duration::from_secs(3), &check);
@@ -1358,7 +1359,7 @@ mod tests {
 
         let pid = std::process::id();
         let stamp = creation_stamp(unsafe { GetCurrentProcess() }).unwrap();
-        for mode in ["before-receipt", "late-receipt", "after-receipt", "silent-active", "wrong-challenge", "valid-then-close", "wrong-token"] {
+        for mode in ["before-receipt", "late-receipt", "after-receipt", "silent-active", "wrong-challenge", "valid-then-close", "wrong-token", "wrong-sid", "replay"] {
             let nonce = random_nonce();
             let mut child = Cleanup(Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "guard::lease_helper::tests::real_process_channel_faults_revoke_without_kill", "--nocapture"])
@@ -1386,8 +1387,11 @@ mod tests {
                 let pipe = keep_open.as_ref().unwrap();
                 let receipt = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA,
                     nonce: nonce.clone(), state: LeaseState::Receipt }).unwrap();
-                pipe.send(&receipt, deadline, || require_live(handle)).unwrap();
-                if mode == "wrong-token" {
+                // For negative modes the helper may close immediately after
+                // consuming the entire frame. Do not require it to stay alive
+                // after sending; the bounded receive and exit assertions decide.
+                pipe.send(&receipt, deadline, || Ok(())).unwrap();
+                if mode == "wrong-token" || mode == "wrong-sid" {
                     assert!(pipe.receive(4096, deadline, || require_live(handle)).is_err(),
                         "wrong token must not receive Active");
                 } else {
@@ -1396,18 +1400,24 @@ mod tests {
                 }
                 if mode == "after-receipt" {
                     drop(keep_open.take());
-                } else if mode != "silent-active" && mode != "wrong-token" {
+                } else if mode != "silent-active" && mode != "wrong-token" && mode != "wrong-sid" {
                     let challenge = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
                     let mut heartbeat = decode_heartbeat(&challenge, &nonce, 1).unwrap();
                     if mode == "wrong-challenge" {
-                        heartbeat.challenge = "0".repeat(32);
+                        // Well-formed but not the helper's actual challenge.
+                        let replacement = if heartbeat.challenge.starts_with('1') { "2" } else { "1" };
+                        heartbeat.challenge.replace_range(..1, replacement);
                     }
-                    pipe.send(&serde_json::to_vec(&heartbeat).unwrap(), deadline,
-                        || require_live(handle)).unwrap();
-                    if mode == "valid-then-close" {
+                    let response = serde_json::to_vec(&heartbeat).unwrap();
+                    pipe.send(&response, deadline, || Ok(())).unwrap();
+                    if mode == "valid-then-close" || mode == "replay" {
                         let next = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
                         decode_heartbeat(&next, &nonce, 2).unwrap();
-                        drop(keep_open.take());
+                        if mode == "replay" {
+                            pipe.send(&response, deadline, || Ok(())).unwrap();
+                        } else {
+                            drop(keep_open.take());
+                        }
                     }
                 }
             }
@@ -1420,6 +1430,13 @@ mod tests {
                 }
                 assert!(Instant::now() < deadline, "helper orphaned after {mode}");
                 std::thread::sleep(Duration::from_millis(25));
+            }
+            if mode == "late-receipt" {
+                let late = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA,
+                    nonce: nonce.clone(), state: LeaseState::Receipt }).unwrap();
+                assert!(keep_open.as_ref().unwrap().send(&late,
+                    Instant::now() + Duration::from_millis(250), || Ok(())).is_err(),
+                    "late Receipt must not resurrect an expired channel");
             }
             drop(keep_open);
         }
