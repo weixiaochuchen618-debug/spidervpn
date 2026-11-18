@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 pub mod lock;
 
+/// SEC-02 opt-in Linux pre-integration bounded handshake IO policy only.
+/// No TLS implementation, accept loop, HTTP endpoint or production wiring.
+#[cfg(all(target_os = "linux", feature = "linux-handshake-admission"))]
+pub mod handshake_admission;
+
 pub mod legacy;
 
 /// Offline legacy RS256 verification ONLY, not a runtime authorization path.
