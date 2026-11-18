@@ -610,11 +610,24 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     // Transfer the sole client pipe to a process-lifetime worker only on success.
     // On thread creation failure the captured pipe is dropped, independently
     // of whether the parent can terminate the elevated process.
+    let (start, permission) = std::sync::mpsc::sync_channel::<()>(1);
     std::thread::Builder::new().name("spidervpn-lease-channel".into())
         .spawn(move || {
+            // Even if the thread exists, it cannot renew the lease until the
+            // final caller-side checks succeeded. Abandonment drops the sender.
+            if permission.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_err()
+                || Instant::now() >= deadline
+            {
+                return;
+            }
             let _ = maintain_controller_channel(pipe, helper_monitor, &nonce, helper_pid,
                 helper_stamp, &helper_token);
         }).map_err(|e| format!("启动租约信道监督失败：{e}"))?;
+    if !child.running() || Instant::now() >= deadline {
+        return Err("租约监督移交前已超时或 helper 退出".into());
+    }
+    start.send(()).map_err(|_| "租约监督线程未接管".to_string())?;
+    // No fallible caller-side operation can occur after authorizing renewal.
     child.confirmed = true;
     Ok(child)
 }
@@ -1305,7 +1318,7 @@ mod tests {
             let stamp: u64 = std::env::var("SPIDERVPN_LEASE_TEST_STAMP").unwrap().parse().unwrap();
             assert!(open_controller(controller_pid, stamp ^ 1).is_err());
             let controller = open_controller(controller_pid, stamp).unwrap();
-            let identity = token_identity(controller.0).unwrap();
+            let mut identity = token_identity(controller.0).unwrap();
             let own = token_identity(unsafe { GetCurrentProcess() }).unwrap();
             let pipe = Pipe::server(&nonce, &identity, &own).unwrap();
             let deadline = Instant::now() + Duration::from_secs(8);
@@ -1320,6 +1333,11 @@ mod tests {
             pipe.send(&committed, deadline, &check).unwrap();
             // This is the exact final-receipt/lifecycle function used by serve_pipe.
             // No BFE writes in this portable test; canary covers native teardown.
+            if std::env::var("SPIDERVPN_LEASE_TEST_FAULT").as_deref() == Ok("wrong-token") {
+                // The native connected peer is correct PID, but intentionally
+                // pin a different session; actual traffic token must fail.
+                identity.session ^= 1;
+            }
             let result = finish_and_supervise(&pipe, &nonce, 1, &identity,
                 Instant::now() + Duration::from_secs(3), &check);
             assert!(result.is_err(), "an abandoned or forged channel must not return success");
@@ -1340,13 +1358,14 @@ mod tests {
 
         let pid = std::process::id();
         let stamp = creation_stamp(unsafe { GetCurrentProcess() }).unwrap();
-        for mode in ["before-receipt", "late-receipt", "after-receipt", "silent-active", "wrong-challenge", "valid-then-close"] {
+        for mode in ["before-receipt", "late-receipt", "after-receipt", "silent-active", "wrong-challenge", "valid-then-close", "wrong-token"] {
             let nonce = random_nonce();
             let mut child = Cleanup(Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "guard::lease_helper::tests::real_process_channel_faults_revoke_without_kill", "--nocapture"])
                 .env(WORKER, &nonce)
                 .env("SPIDERVPN_LEASE_TEST_PID", pid.to_string())
                 .env("SPIDERVPN_LEASE_TEST_STAMP", stamp.to_string())
+                .env("SPIDERVPN_LEASE_TEST_FAULT", mode)
                 .spawn().unwrap());
             let helper_pid = child.0.id();
             assert_ne!(helper_pid, pid);
@@ -1368,11 +1387,16 @@ mod tests {
                 let receipt = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA,
                     nonce: nonce.clone(), state: LeaseState::Receipt }).unwrap();
                 pipe.send(&receipt, deadline, || require_live(handle)).unwrap();
-                let active = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
-                validate_stage(&active, &nonce, 1, helper_pid, LeaseState::Active).unwrap();
+                if mode == "wrong-token" {
+                    assert!(pipe.receive(4096, deadline, || require_live(handle)).is_err(),
+                        "wrong token must not receive Active");
+                } else {
+                    let active = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
+                    validate_stage(&active, &nonce, 1, helper_pid, LeaseState::Active).unwrap();
+                }
                 if mode == "after-receipt" {
                     drop(keep_open.take());
-                } else if mode != "silent-active" {
+                } else if mode != "silent-active" && mode != "wrong-token" {
                     let challenge = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
                     let mut heartbeat = decode_heartbeat(&challenge, &nonce, 1).unwrap();
                     if mode == "wrong-challenge" {
