@@ -602,6 +602,11 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     let active = pipe.receive(4096, deadline, &check)?;
     validate_stage(&active, &nonce, req.programs.len(), helper_pid, LeaseState::Active)?;
     check()?;
+    // Active alone is not evidence that the helper has consumed a valid
+    // heartbeat. The next challenge can only follow an authenticated round.
+    // Keep ownership here: any failure before worker authorization drops pipe.
+    let pending = confirm_first_heartbeat(&pipe, child.handle, &nonce, helper_pid,
+        helper_stamp, &helper_token, deadline)?;
     let helper_monitor = duplicate_process_handle(child.handle)?;
     if !child.running() || Instant::now() >= deadline {
         return Err("最终租约回执超期或进程退出".into());
@@ -621,7 +626,7 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
                 return;
             }
             let _ = maintain_controller_channel(pipe, helper_monitor, &nonce, helper_pid,
-                helper_stamp, &helper_token);
+                helper_stamp, &helper_token, pending);
         }).map_err(|e| format!("启动租约信道监督失败：{e}"))?;
     if !child.running() || Instant::now() >= deadline {
         return Err("租约监督移交前已超时或 helper 退出".into());
@@ -778,28 +783,61 @@ const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3)
 #[cfg(windows)]
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+// Shared by startup and the long-lived worker. Never reply to a challenge whose
+// sequence, peer process object or token cannot be authenticated.
 #[cfg(windows)]
-fn maintain_controller_channel(pipe: pipe_ipc::Pipe, helper: std::os::windows::io::OwnedHandle,
-    nonce: &str, pid: u32, stamp: u64, identity: &pipe_ipc::TokenIdentity) -> Result<(), String>
+fn controller_heartbeat_check(pipe: &pipe_ipc::Pipe,
+    handle: windows_sys::Win32::Foundation::HANDLE, pid: u32, stamp: u64,
+    identity: &pipe_ipc::TokenIdentity) -> Result<(), String>
 {
     use pipe_ipc::*;
+    require_live(handle)?;
+    pipe.require_peer(pid, false)?;
+    pipe.require_connected()?;
+    if creation_stamp(handle)? != stamp || &token_identity(handle)? != identity {
+        return Err("租约监督期间 helper 身份变化".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn confirm_first_heartbeat(pipe: &pipe_ipc::Pipe,
+    handle: windows_sys::Win32::Foundation::HANDLE, nonce: &str, pid: u32, stamp: u64,
+    identity: &pipe_ipc::TokenIdentity, startup_deadline: std::time::Instant) -> Result<Vec<u8>, String>
+{
+    use std::time::Instant;
+    let deadline = startup_deadline.min(Instant::now() + HEARTBEAT_TIMEOUT + HEARTBEAT_INTERVAL);
+    let check = || controller_heartbeat_check(pipe, handle, pid, stamp, identity);
+    let first = pipe.receive(4096, deadline, &check)?;
+    decode_heartbeat(&first, nonce, 1)?;
+    pipe.send(&first, deadline, &check)?;
+    // Sequence 2 is issued by the authenticated helper only after the first
+    // response was consumed, verified and the lease revalidated. No extra
+    // unauthenticated "success" message or disconnect-as-success path.
+    let next = pipe.receive(4096, deadline, &check)?;
+    decode_heartbeat(&next, nonce, 2)?;
+    check()?;
+    if Instant::now() >= deadline { return Err("首轮租约心跳确认超时".into()); }
+    Ok(next)
+}
+
+#[cfg(windows)]
+fn maintain_controller_channel(pipe: pipe_ipc::Pipe, helper: std::os::windows::io::OwnedHandle,
+    nonce: &str, pid: u32, stamp: u64, identity: &pipe_ipc::TokenIdentity,
+    pending: Vec<u8>) -> Result<(), String>
+{
     use std::os::windows::io::AsRawHandle;
     use std::time::Instant;
-    let check = || -> Result<(), String> {
-        require_live(helper.as_raw_handle())?;
-        pipe.require_peer(pid, false)?;
-        pipe.require_connected()
-    };
-    let mut sequence = 1u64;
+    let check = || controller_heartbeat_check(&pipe, helper.as_raw_handle(), pid, stamp, identity);
+    let mut sequence = 2u64;
+    let mut pending = Some(pending);
     loop {
         let deadline = Instant::now() + HEARTBEAT_TIMEOUT + HEARTBEAT_INTERVAL;
-        let body = pipe.receive(4096, deadline, &check)?;
+        let body = match pending.take() {
+            Some(body) => body,
+            None => pipe.receive(4096, deadline, &check)?,
+        };
         decode_heartbeat(&body, nonce, sequence)?;
-        if creation_stamp(helper.as_raw_handle())? != stamp
-            || &token_identity(helper.as_raw_handle())? != identity
-        {
-            return Err("租约监督期间 helper 身份变化".into());
-        }
         pipe.send(&body, deadline, &check)?;
         sequence = sequence.checked_add(1).ok_or("租约心跳顺序溢出")?;
     }
@@ -1519,6 +1557,15 @@ mod tests {
                 }
                 if mode == "after-receipt" {
                     drop(keep_open.take());
+                } else if mode == "valid-then-close" {
+                    // Exercise the exact startup confirmation used by launch_elevated
+                    // with the real different-process helper and BFE variant.
+                    let identity = token_identity(handle).unwrap();
+                    let stamp = creation_stamp(handle).unwrap();
+                    let next = confirm_first_heartbeat(pipe, handle, &nonce, helper_pid,
+                        stamp, &identity, deadline).unwrap();
+                    assert_eq!(decode_heartbeat(&next, &nonce, 2).unwrap().sequence, 2);
+                    drop(keep_open.take());
                 } else if mode != "silent-active" && mode != "wrong-token" && mode != "wrong-sid" {
                     let challenge = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
                     let mut heartbeat = decode_heartbeat(&challenge, &nonce, 1).unwrap();
@@ -1529,14 +1576,10 @@ mod tests {
                     }
                     let response = serde_json::to_vec(&heartbeat).unwrap();
                     pipe.send(&response, deadline, || Ok(())).unwrap();
-                    if mode == "valid-then-close" || mode == "replay" {
+                    if mode == "replay" {
                         let next = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
                         decode_heartbeat(&next, &nonce, 2).unwrap();
-                        if mode == "replay" {
-                            pipe.send(&response, deadline, || Ok(())).unwrap();
-                        } else {
-                            drop(keep_open.take());
-                        }
+                        pipe.send(&response, deadline, || Ok(())).unwrap();
                     }
                 }
             }
@@ -1589,6 +1632,44 @@ mod tests {
             assert_flow(&a, true);
             assert_flow(&b, true);
             println!("JOINT_BFE_COMPLETE modes={completed_modes} baseline_removed=true tcp_restored=true");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_heartbeat_requires_next_authenticated_sequence_before_success() {
+        let token = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        let stamp = creation_stamp(unsafe { GetCurrentProcess() }).unwrap();
+        let pid = std::process::id();
+        for mode in ["valid", "disconnect", "repeat", "silence"] {
+            let nonce = random_nonce();
+            let server = Pipe::server(&nonce, &token, &token).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let controller = Pipe::client(&nonce, deadline, || Ok(())).unwrap();
+            server.accept(deadline, || Ok(())).unwrap();
+            let server_nonce = nonce.clone();
+            let worker = std::thread::spawn(move || {
+                let first = LeaseHeartbeat { schema: LEASE_SCHEMA,
+                    nonce: server_nonce.clone(), sequence: 1,
+                    challenge: "1234567890abcdef1234567890abcdef".into() };
+                let data = serde_json::to_vec(&first).unwrap();
+                server.send(&data, deadline, || Ok(())).unwrap();
+                assert_eq!(server.receive(4096, deadline, || Ok(())).unwrap(), data);
+                if mode == "disconnect" { return; }
+                if mode == "silence" {
+                    std::thread::sleep(Duration::from_millis(600));
+                    return;
+                }
+                let next = LeaseHeartbeat { sequence: if mode == "repeat" { 1 } else { 2 }, ..first };
+                server.send(&serde_json::to_vec(&next).unwrap(), deadline, || Ok(())).unwrap();
+                // Keep the authenticated server end open until the caller completes.
+                let _ = server.receive(4096, deadline, || Ok(()));
+            });
+            let result = confirm_first_heartbeat(&controller, unsafe { GetCurrentProcess() },
+                &nonce, pid, stamp, &token, Instant::now() + Duration::from_millis(400));
+            assert_eq!(result.is_ok(), mode == "valid", "first heartbeat mode {mode}");
+            drop(controller);
+            worker.join().unwrap();
         }
     }
 
