@@ -294,6 +294,27 @@ fn consume_request(path: &Path) -> Result<LeaseRequest, String> {
     Ok(req)
 }
 
+/// 发布时由文件系统原子拒绝已存在的目标，而不是依赖事前 exists 检查。
+/// 尚不解决父目录路径替换或同用户伪造，仍需可信目录和对端认证。
+fn publish_new_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+        if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::hard_link(source, destination)?;
+        std::fs::remove_file(source)
+    }
+}
+
 /// 先写临时文件再原子改名，防止父进程把半截 Ready 当成功。
 /// 回执仅在 helper 拥有会话时表示 Ready，不代表长期守护已完成全机验收。
 fn write_reply(path: &Path, reply: &LeaseReply) -> Result<(), String> {
@@ -317,7 +338,7 @@ fn write_reply(path: &Path, reply: &LeaseReply) -> Result<(), String> {
         return Err(format!("写租约回执失败：{e}"));
     }
     drop(file);
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = publish_new_file(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("提交租约回执失败：{e}"));
     }
@@ -359,7 +380,7 @@ fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
         return Err(format!("写租约确认失败：{err}"));
     }
     drop(file);
-    if let Err(err) = std::fs::rename(&temporary, path) {
+    if let Err(err) = publish_new_file(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("提交租约确认失败：{err}"));
     }
@@ -645,6 +666,29 @@ mod tests {
         assert_eq!(consume_request(&path).unwrap().nonce, req.nonce);
         assert!(!path.exists());
         assert!(consume_request(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ipc_publication_never_replaces_existing_destination() {
+        let root = std::env::temp_dir().join(format!("spidervpn-lease-publish-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("reply.json.tmp");
+        let destination = root.join("reply.json");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&destination, b"old").unwrap();
+        assert!(publish_new_file(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+        assert_eq!(std::fs::read(&source).unwrap(), b"new");
+        std::fs::remove_file(&destination).unwrap();
+        publish_new_file(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        assert!(!source.exists());
+        let ack = root.join("ack.json");
+        let nonce = sample().nonce;
+        write_ack(&ack, &nonce, false).unwrap();
+        assert!(write_ack(&ack, &nonce, true).is_err());
+        assert!(read_ack(&ack, &nonce).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
