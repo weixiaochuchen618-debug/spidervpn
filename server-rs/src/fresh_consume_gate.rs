@@ -477,24 +477,65 @@ impl VerifiedConsumedRetry<'_> {
     pub fn claims(&self) -> &Claims { &self.claims }
 }
 
-/// Reauthenticate the exact signed consume request, within the original
-/// signed expiry + 120s window, against the same locked consumed record.
-/// The caller MUST supply a complete freshly verified WG inventory observed
-/// while holding this lock; a cached or caller-provided projection is unsafe.
-/// The scope is still an independent trust input, NOT a legacy importer.
-/// No mutation, allocation, authorization signer or reply is reachable here.
+/// Read-only retry under the CURRENT locked store. The trusted local
+/// interface selector must come from independently provisioned configuration,
+/// never an HTTP request. The existing adapter reads kernel inventory,
+/// protected wg.conf and kernel inventory again, rejecting disagreements.
+/// No public API accepts cached, projected or caller-supplied peer rows.
+/// The actual interface identity and exclusion of noncooperating writers
+/// still require deployment acceptance. No production caller or reply here.
 pub fn prepare_consumed_retry<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
-    request: &ParsedRequest, now: i64, live_peers: Option<&[Peer]>)
+    request: &ParsedRequest, interface: &str) -> Result<VerifiedConsumedRetry<'a>,GateError>
+{
+    if !crate::wg_readonly::valid_interface(interface) {
+        return Err(GateError::InvalidState);
+    }
+    prepare_retry_with_observation(store,scope,request,system_utc_seconds,||
+        crate::wg_conf_audit::read_verified_snapshot(interface)
+            .map_err(|_|GateError::InvalidState))
+}
+
+fn system_utc_seconds() -> Result<i64,GateError> {
+    let seconds=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_|GateError::InvalidState)?.as_secs();
+    i64::try_from(seconds).map_err(|_|GateError::InvalidState)
+}
+
+/// Private injection seam for deterministic tests. In the public path
+/// only the concrete system reader and clock are reachable.
+fn prepare_retry_with_observation<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, mut clock: impl FnMut() -> Result<i64,GateError>,
+    observe: impl FnOnce() -> Result<Vec<Peer>,GateError>)
     -> Result<VerifiedConsumedRetry<'a>,GateError>
 {
+    let now=clock()?;
+    let generation=store.generation().map_err(|_|GateError::InvalidState)?;
     let ledger=common(store,scope,request,now,Operation::Retry)?;
     let (claims,_)=verify_consume_claims(scope,request,now)?;
     check_history(ledger,&claims)?;
-    let peers=live_peers.ok_or(GateError::InvalidState)?;
-    if peers.iter().any(|p| !canonical_wg_key(&p.public_key)) {
+    // Authenticate and reject mismatched consumed claims before privileged IO.
+    let Some(InviteState::Consumed(grant))=ledger.state(scope.invite_id) else {
+        return Err(GateError::InvalidState);
+    };
+    if grant.claims!=claims { return Err(GateError::PairingMismatch); }
+    let peers=observe()?;
+    let after=clock()?;
+    // Never extend the signed retry window while reading a slow snapshot,
+    // and do not accept a backward clock jump during this operation.
+    if after<now || store.generation().map_err(|_|GateError::InvalidState)?!=generation {
         return Err(GateError::InvalidState);
     }
-    ledger.retry(&claims,Some(peers)).map_err(|err| match err {
+    let ledger=common(store,scope,request,after,Operation::Retry)?;
+    // Reject ambiguous keys and any duplicate inventory row or address,
+    // even if unrelated to the requested peer.
+    let mut keys=std::collections::BTreeSet::new();
+    let mut addresses=std::collections::BTreeSet::new();
+    if peers.iter().any(|p| !canonical_wg_key(&p.public_key)
+        || !p.address.is_private() || !keys.insert(&p.public_key)
+        || !addresses.insert(p.address)) {
+        return Err(GateError::InvalidState);
+    }
+    ledger.retry(&claims,Some(&peers)).map_err(|err| match err {
         crate::Refusal::ConsumedByAnotherRequest => GateError::PairingMismatch,
         crate::Refusal::Revoked | crate::Refusal::RevokedIdentity => GateError::Revoked,
         _ => GateError::InvalidState,

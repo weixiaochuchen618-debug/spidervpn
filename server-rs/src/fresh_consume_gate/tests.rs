@@ -315,38 +315,38 @@ fn authenticated_consumed_retry_is_bounded_exact_and_read_only() {
     let exp=utc_seconds(EXP).unwrap();
     let req=f.post();
     let claims=prepare_fresh_consume(&f.store,&f.scope(),&req,now).unwrap().claims().clone();
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(&[])).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(&[])).err(),Some(GateError::InvalidState));
     let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
     let grant=f.store.update(|l|l.reserve(claims.clone(),now,pool,Some(&[]))).unwrap();
     let peer=Peer{public_key:claims.public_key.clone(),address:grant.address};
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(std::slice::from_ref(&peer))).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(std::slice::from_ref(&peer))).err(),Some(GateError::InvalidState));
     f.store.update(|l|l.confirm_consumed(INV,Some(std::slice::from_ref(&peer)))).unwrap();
     let gen=f.store.generation().unwrap();
     let live=std::slice::from_ref(&peer);
     for instant in [now,exp,exp+119] {
-        let retry=prepare_consumed_retry(&f.store,&f.scope(),&req,instant,Some(live)).unwrap();
+        let retry=fixture_retry(&f.store,&f.scope(),&req,instant,Some(live)).unwrap();
         assert_eq!(retry.claims(),&claims);
     }
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,exp+120,Some(live)).err(),Some(GateError::InviteExpired));
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,None).err(),Some(GateError::InvalidState));
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(&[])).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,exp+120,Some(live)).err(),Some(GateError::InviteExpired));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,None).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(&[])).err(),Some(GateError::InvalidState));
     let wrong=Peer{public_key:wg(3),address:peer.address};
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(&[wrong])).err(),Some(GateError::InvalidState));
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(&[peer.clone(),peer.clone()])).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(&[wrong])).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(&[peer.clone(),peer.clone()])).err(),Some(GateError::InvalidState));
     let mut body=f.body.clone();
     body["ClientRequest"]["RequestId"]=json!(OTHER_INV);
     body["RequestDigest"]=json!(client_digest(&body["ClientRequest"]).unwrap());
     let changed=f.request(&f.recipient.sign(&body));
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&changed,now,Some(live)).err(),Some(GateError::PairingMismatch));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&changed,now,Some(live)).err(),Some(GateError::PairingMismatch));
     let mut wrong_token=f.post();
     wrong_token.authorization=Some(format!("Bearer {}",encode(&[78;32])));
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&wrong_token,now,Some(live)).err(),Some(GateError::Forbidden));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&wrong_token,now,Some(live)).err(),Some(GateError::Forbidden));
     assert_eq!(f.store.generation().unwrap(),gen);
     assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Consumed(grant)));
     f.store.update(|l|l.begin_revocation(INV)).unwrap();
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(live)).err(),Some(GateError::Revoked));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(live)).err(),Some(GateError::Revoked));
     f.store.update(|l|l.confirm_revocation(INV,Some(&[]))).unwrap();
-    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(live)).err(),Some(GateError::Revoked));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(live)).err(),Some(GateError::Revoked));
 }
 
 #[test]
@@ -404,4 +404,52 @@ fn independent_metadata_pin_binds_bearer_descriptor_and_scope() {
     let duplicate=format!("{{\"InviteId\":\"other\",{}",&body[1..]);
     assert_eq!(verify_pinned_invite_metadata(duplicate.as_bytes(),&pin_for(duplicate.as_bytes()),&f.token).err(),Some(GateError::InvalidState));
     assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Open));
+}
+
+fn fixture_retry<'a>(store: &'a LedgerStore,scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest,now: i64,peers: Option<&[Peer]>)
+    -> Result<VerifiedConsumedRetry<'a>,GateError>
+{
+    prepare_retry_with_observation(store,scope,request,||Ok(now),
+        ||peers.map(<[Peer]>::to_vec).ok_or(GateError::InvalidState))
+}
+
+#[test]
+fn retry_observes_under_current_lock_and_rechecks_clock_after_readback() {
+    let mut f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let exp=utc_seconds(EXP).unwrap();
+    let req=f.post();
+    let claims=prepare_fresh_consume(&f.store,&f.scope(),&req,now).unwrap().claims().clone();
+    let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
+    let grant=f.store.update(|l|l.reserve(claims.clone(),now,pool,Some(&[]))).unwrap();
+    let peer=Peer{public_key:claims.public_key.clone(),address:grant.address};
+    f.store.update(|l|l.confirm_consumed(INV,Some(std::slice::from_ref(&peer)))).unwrap();
+    let generation=f.store.generation().unwrap();
+    let scope=f.scope();
+    let mut times=[exp+119,exp+120].into_iter();
+    assert_eq!(prepare_retry_with_observation(&f.store,&scope,&req,
+        ||Ok(times.next().unwrap()),||{
+            assert!(LedgerStore::open_existing(&f._dir.0,Duration::from_millis(25)).is_err());
+            Ok(vec![peer.clone()])
+        }).err(),Some(GateError::InviteExpired));
+    let mut times=[now,now-1].into_iter();
+    assert_eq!(prepare_retry_with_observation(&f.store,&scope,&req,
+        ||Ok(times.next().unwrap()),||Ok(vec![peer.clone()])).err(),Some(GateError::InvalidState));
+    let mut bad=f.post();
+    bad.authorization=Some(format!("Bearer {}",encode(&[78;32])));
+    assert_eq!(prepare_retry_with_observation(&f.store,&scope,&bad,||Ok(now),
+        ||panic!("unauthenticated request must not read privileged inventory")).err(),Some(GateError::Forbidden));
+    let unrelated=Peer{public_key:wg(3),address:Ipv4Addr::new(10,44,0,9)};
+    assert_eq!(fixture_retry(&f.store,&scope,&req,now,Some(&[peer.clone(),unrelated.clone(),unrelated])).err(),
+        Some(GateError::InvalidState));
+    let proof=prepare_retry_with_observation(&f.store,&scope,&req,||Ok(now),||{
+        assert!(LedgerStore::open_existing(&f._dir.0,Duration::from_millis(25)).is_err());
+        Ok(vec![peer.clone()])
+    }).unwrap();
+    assert_eq!(proof.claims(),&claims);
+    // The external entry point rejects arbitrary selectors even before IO.
+    assert_eq!(prepare_consumed_retry(&f.store,&scope,&req,"all").err(),Some(GateError::InvalidState));
+    assert_eq!(f.store.generation().unwrap(),generation);
+    assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Consumed(grant)));
 }
