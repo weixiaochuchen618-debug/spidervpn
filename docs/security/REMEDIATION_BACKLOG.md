@@ -607,3 +607,12 @@ PR/commit/CI: ...
 - **专项测试**：六组 Rust 真实 loopback TCP（非模拟）回归覆盖边界配置拒绝、单空闲/另一健康连接独立握手、满槽立即拒绝及回收、慢滴答数据不可延长总 deadline、超时后不可写入、错误与 panic 后槽位释放；Linux CI 保持 `--locked`、`RUSTFLAGS=-D warnings` 新增独立专项，而原有状态机、Root 隔离文件系统、真实 WG kernel/netns 均保留。无 Windows UI、连接/WFP、旧 Python 生产启动、main 变更。
 - **本条代码尚未通过同 SHA CI**：正在运行 [Linux #44211032490](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032490)、[MSVC #44211032535](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032535)、[GNU #44211032519](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032519)；必须查终态及新 Rust 单测/回归日志，失败即修正重跑，不可跳过。SEC-02 **P0 OPEN / 生产未修**；SEC-01/08、Issue #5 OPEN，PR Draft，不合并 main。
 
+
+
+## D.54 PR #19 Rust 对抗复查：阻止工作线程晚启动刷新握手截止时间（2026-11-18）
+
+- 初版 `6ec1f401ddbc5bc19b82fa62a36c61ee20890b28` 的 [Linux #44211032490](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032490) **双 Job Completed/Success**：121 库测试/0 failed/ignored，6 条新增真实 loopback TCP handshake policy 测试/0 failed/ignored，旧 server-rs 管理/legacy-retire 与真实 kernel netns 全绿（`--locked`, `-D warnings`）。此结论**不能替代新代码 SHA**。
+- 自我对抗式检查找到绝对时限的时钟起点：虽然 `DeadlineIo` 使用固定 `Instant`，但原实现只在工作线程被 OS 调度**之后**才生成 deadline。恶意卡顿/系统负载可能无意延长握手占用。本轮第二个 Rust commit `1fcda2dcbc1941b4f2b644641ed3e18450ed1e34` 改为**在 CAS 槽位预留、线程 spawn 前**生成绝对 deadline 并传入 IO wrapper；新增第 7 条 Rust 测试，特意延迟 worker 建立，预先送入字节，确认已过 deadline 的读和写都必须 TimedOut。旧六条测试仍完整保留，没有 skip。
+- **PR #19 最新代码 HEAD `1fcda2dcbc1941b4f2b644641ed3e18450ed1e34` 的新三平台 CI 正在运行**：[Linux #44211428730](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428730)、[MSVC #44211428496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428496)、[GNU #44211428529](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428529)。必须分别检查完整结论，任何失败都按当时 SHA 修复，不能套用旧版初次全绿。
+- 仍只属默认禁用的 SEC-02 pre-integration Rust TCP/handshake worker foundation，未实现真正 Rust TLS 证书验证/HTTP，未在 VPS 部署或接管旧 Python。**SEC-02 未修复生产路径**，SEC-01/08 真 root 全写者隔离/撤销历史迁移与 WFP 实机验收仍阻塞，Issue #5 Open、PR #19 Draft、main/UI/连接/WFP 持久 BLOCK 不动。
+

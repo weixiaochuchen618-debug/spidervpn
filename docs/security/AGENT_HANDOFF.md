@@ -472,3 +472,11 @@
 - 新 CI [Linux #44211032490](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032490)、[MSVC #44211032535](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032535)、[GNU #44211032519](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032519) **最初仍 in_progress**。按最新实际代码 SHA 查询；若 Linux Rust E0382/E0277、线程/套接字超时测试红，必须真实定位修 Rust 再重跑，不能忽略/skip；后查 MSVC/GNU 整条工作流而非一个 Build 步骤。
 - 重要不夸大：此模块只生成将来 Rust TLS 接收器必须接线的安全基础；普通合法客户端在 Worker 饱和时仍可能被拒绝，外部 TLS 库绕开 DeadlineIo 或 CPU 占满需实际评估。**SEC-02/SEC-01/SEC-08 P0 未生产验收、Issue #5 Open、所有安全 PR Draft**；真实 VPS root、systemd/reboot/rollback、可信撤销历史、真正 Rust TLS/HTTPS 并发慢握手回归仍待做。PR #18 已完成全平台绿但不代表 SEC-02 可合并。
 
+
+
+## 56. PR #19 初始 Linux 全绿后主动补正 Rust 握手 deadline 起点（2026-11-18）
+
+- SEC-02 初始代码 `6ec1f401ddbc5bc19b82fa62a36c61ee20890b28` 的 [Linux #44211032490](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211032490) 双 Job Success，六项 TCP slow drip/idle 并发/slots/panic 真实 Rust 回归成功、121 library + 真实 WG/netns 也通过。
+- **随后对抗复审发现 worker 调度延迟能推迟 deadline 起点**，主动在第二 commit `1fcda2dcbc1941b4f2b644641ed3e18450ed1e34` 修为 admission 时生成全局绝对截止时刻，再传递进 `DeadlineIo`；新增一条延迟启动、已有连接字节也不允许超时读取/回复的否定测试，共 7 条，之前测试没有删/跳。最新 Draft PR #19 head 为 `1fcda2dc`，base #18；见 [Backlog D.54](./REMEDIATION_BACKLOG.md)。
+- **新 SHA 三 CI 待全程复核**：[Linux #44211428730](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428730)、[Windows MSVC #44211428496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428496)、[GNU #44211428529](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428529)。初版 Linux 绿不能替代。它是默认禁用、暂未接真实 TLS 的 admission policy；即使 CI 全绿，生产 Python 的监听 socket TLS 阻塞仍存在，SEC-02 OPEN，Issue #5 Open、main 未变、不得合并/启用。
+
