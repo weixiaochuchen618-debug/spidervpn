@@ -4933,6 +4933,90 @@ pub mod http {
             let _ = server; // 服务线程阻塞在 accept 上，不等它退出；进程结束时自然回收
         }
 
+        // SEC-02/07: the old Linux receiver creates a self-signed RSA
+        // certificate with a CN, no SAN and CA:TRUE (the default OpenSSL
+        // req -x509 extension). Use a fresh test-only key, not a live key
+        // or a long-lived fixture. Exercise the EXISTING client verifier
+        // and HTTP envelope path, without changing either implementation.
+        fn sec02_legacy_rsa_fixture() -> (Vec<u8>, Vec<u8>) {
+            static FIXTURE: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> =
+                std::sync::OnceLock::new();
+            FIXTURE.get_or_init(|| {
+                use rsa::pkcs8::EncodePrivateKey;
+                let rsa = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+                let pkcs8 = rsa.to_pkcs8_der().unwrap();
+                let der = rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8.as_bytes());
+                let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+                    &der, &rcgen::PKCS_RSA_SHA256,
+                ).unwrap();
+                let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+                params.distinguished_name = rcgen::DistinguishedName::new();
+                params.distinguished_name.push(rcgen::DnType::CommonName, "127.0.0.1");
+                params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+                let now = time::OffsetDateTime::now_utc();
+                params.not_before = now - time::Duration::days(1);
+                params.not_after = now + time::Duration::days(824);
+                let certificate = params.self_signed(&key).unwrap();
+                (certificate.der().to_vec(), key.serialize_der())
+            }).clone()
+        }
+
+        #[test]
+        fn sec02_legacy_rsa_pinned_client_accepts_tls_but_not_denial_envelope() {
+            let (cert, key) = sec02_legacy_rsa_fixture();
+            let (_, parsed) = x509_parser::parse_x509_certificate(&cert).unwrap();
+            assert!(parsed.is_ca());
+            assert!(parsed.subject_alternative_name().unwrap().is_none());
+            let pin = crate::pairing::jwk::sha256_hex(&cert);
+            let body = r#"{"Code":"InvalidState","Ok":false}"#;
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len());
+            let (port, server) = serve(cert, key, response);
+            let reply = get(&invite_for(port, pin), Duration::from_secs(5)).unwrap();
+            assert_eq!(reply.status, 500);
+            assert_eq!(reply.body, body);
+            assert_eq!(data(&reply).unwrap_err().code, "InvalidState");
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn sec02_legacy_rsa_wrong_pin_refused_over_real_tls() {
+            let (cert, key) = sec02_legacy_rsa_fixture();
+            let mut wrong = crate::pairing::jwk::sha256_hex(&cert);
+            let first = if wrong.starts_with('0') { "1" } else { "0" };
+            wrong.replace_range(..1, first);
+            let (port, server) = serve(cert, key,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}".to_owned());
+            assert_eq!(get(&invite_for(port, wrong), Duration::from_secs(5))
+                .unwrap_err().code, "OnlineTlsPinMismatch");
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn sec02_legacy_rsa_matching_pin_does_not_bypass_certificate_validity() {
+            let (der, _key) = sec02_legacy_rsa_fixture();
+            let (_, parsed) = x509_parser::parse_x509_certificate(&der).unwrap();
+            let start = parsed.validity().not_before.timestamp() as u64;
+            let end = parsed.validity().not_after.timestamp() as u64;
+            let cert = CertificateDer::from(der.clone());
+            let host = ServerName::try_from("127.0.0.1").unwrap();
+            for (secs, valid) in [(start - 1, false), (start, true),
+                (end - 1, true), (end, false), (end + 1, false)]
+            {
+                let rejected = Arc::new(AtomicBool::new(false));
+                let verifier = PinnedCert {
+                    pin: crate::pairing::jwk::sha256_hex(&der),
+                    rejected: Arc::clone(&rejected),
+                    provider: Arc::new(rustls::crypto::ring::default_provider()),
+                };
+                let result = verifier.verify_server_cert(&cert, &[], &host, &[],
+                    UnixTime::since_unix_epoch(Duration::from_secs(secs)));
+                assert_eq!(result.is_ok(), valid, "certificate time boundary {secs}");
+                assert_eq!(rejected.load(Ordering::SeqCst), !valid);
+            }
+        }
+
         #[test]
         fn redirects_and_non_json_answers_are_refused() {
             let (cert, key) = keypair();

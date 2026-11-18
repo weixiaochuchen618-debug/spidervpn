@@ -58,6 +58,12 @@ jobs:
           & cargo test --locked --bin spidervpn sec01_sourced_transport_reads_refuse_retired_pairing_host -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: SEC-02 original RSA self-signed certificate pinned client compatibility (MSVC)
+        shell: pwsh
+        run: |
+          & cargo test --locked --bin spidervpn pairing::http::tests::sec02_legacy_rsa_ -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Rust integration tests (each integration target, no duplicate binary unit tests)
         shell: pwsh
         run: |
