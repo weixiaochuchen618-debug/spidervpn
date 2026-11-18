@@ -36,6 +36,11 @@ pub mod http_one_request;
 #[cfg(all(target_os = "linux", feature = "linux-tls-wire-lab"))]
 pub mod tls_wire;
 
+/// SEC-02 trust-boundary-only production-certificate reader candidate.
+/// Never activated without explicit disabled-by-default lab feature.
+#[cfg(all(target_os = "linux", feature = "linux-tls-identity-lab"))]
+pub mod tls_identity;
+
 pub mod legacy;
 
 /// Offline legacy RS256 verification ONLY, not a runtime authorization path.

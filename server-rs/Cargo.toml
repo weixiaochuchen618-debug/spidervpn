@@ -18,6 +18,9 @@ ring = "=0.17.14"
 # Same version and crypto backend as the Windows client, explicitly OFF by
 # default. Real Linux TLS1.2 encrypted loopback lab, NOT deployed receiver.
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+# Zeroize in-memory PEM key buffers on every return path. Same existing
+# vetted version/checksum as the pinned Windows client lock.
+zeroize = { version = "=1.9.1", optional = true }
 
 [features]
 # Only the explicit privileged netns CI job compiles and runs this test.
@@ -35,6 +38,9 @@ linux-handshake-admission = []
 # Build a real rustls TLS1.2 server/client loopback test only on explicit opt-in.
 # Never add to default or any deployed binary until server cutover DoD.
 linux-tls-wire-lab = ["linux-handshake-admission", "dep:rustls"]
+# Strict root-owned no-symlink, single-inode TLS PEM/pin reader. Default OFF;
+# no listener, state mutation, client changes, service install or cutover.
+linux-tls-identity-lab = ["linux-tls-wire-lab", "dep:zeroize"]
 
 [[test]]
 name = "wg_namespace_e2e"
