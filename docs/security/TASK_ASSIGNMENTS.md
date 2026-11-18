@@ -1,6 +1,6 @@
 # SpiderVPN COORD-01 任务分配与迁移快照
 2026-11-18 Asia/Singapore。此文档记录所有权和快照，不将候选升级为已修复。关联 [总 Issue #5](https://github.com/weixiaochuchen618-debug/spidervpn/issues/5)及 https://github.com/weixiaochuchen618-debug/spidervpn/issues/2 。原三份核心文档及全部历史证据完整保留。规则见 [AGENT_COLLABORATION](AGENT_COLLABORATION.md)。
-## 1. 核查结果
+## 1. 初始化历史核查结果（当前状态见第 3、4、6 节）
 - main `857ea7593941ce79f6507db5b1ced076c3a077ba`；#1 已合并于该 SHA（B/C/D/E 先期 Rust 连接配置、代理恢复、IPC、重连修复；不等于这 16 项 DoD）。main SHA 查询未返回直接 workflow，不借其他 SHA 证明。
 - #3 Draft 独立 WFP，`2045acd42554b1ad1472ae41ab247b42d8df5655`，Issue #2 Open。#4 文档 PR Open；初始化前文档 HEAD `5d5bd2205b34dcde3223edee196f628e79425fc4`。
 - #6→#7→#8→#9→#10→#11→#12→#13→#14→#15→#16→#17→#18→#19→#20→#21→#22→#23→#24→#25→#26→#27→#28 为逐层依赖 Draft（均未合 main）。#6 同时包含 Windows 候选与服务器前期核心，不能视作单纯 SEC-10 或随意改其祖先。
@@ -36,8 +36,8 @@ Run 链接前缀 https://github.com/weixiaochuchen618-debug/spidervpn/actions/ru
 本轮 16 项完整 DoD 为 0；不关闭 Issue #2/#5，不将 #1 先期修复重复开发。
 ## 3. 任务与独占文件锁
 ### COORD-D01 / DEV-01 — SEC-01 P0（与 SEC-02/08/07 共享研发依赖）
-- Issue #5，继承 #28 之后的现有分支 `fix/sec01-verified-fresh-consume-gate-20261118`。直接父基准 commit `16bd83adf2f26eac783c68a413e9304313943219`；继承采样 HEAD `21ddfc34ef059158fd1c79f67170944f32e83398`，**HANDOFF_BLOCKED：检测到并发写入，暂只读**。最终接管基准由 COORD-01 在原执行者停止后核实，不能自行认领。若届时已有 PR 继承；仅无 PR 才创建 Draft，以 #28 分支为 base。
-- 核对既有 7 commits，fresh consume gate/feature wiring/RSA 测试，以及可信 Open 邀请 metadata（不是不可信 invites.json）、独立 bearer、Host、管理/服务 pin、签名 JWS、唯一 JSON、完整 Claims、同一个独占 LedgerStore。不得将只读 VerifiedFreshConsume 当已授权 Grant；不得增加生产 caller、签发器或 WG mutation 直到总控安排下一阶段。先补真实旧版失败/候选正反对照与严格编译，不重复实现已有测试。可信历史来源不足默认拒绝。
+- Issue #5，继承 [Draft PR #29](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29) 与唯一现有分支 `fix/sec01-verified-fresh-consume-gate-20261118`。直接父基准 commit `16bd83adf2f26eac783c68a413e9304313943219` (#28)；**最终接管基准 HEAD `81b2f57ea8a3779aff3aebb4216e16e12dda0e89`；ACTIVE，COORD-01 已解除 HANDOFF_BLOCKED，DEV-01 为该分支唯一业务代码写入角色**（2026-11-18 16:27 Asia/Singapore 用户确认旧 Agent 已停写；GitHub 多次 HEAD 核对一致，无其他认领证据）。不得新建分支/PR、重写祖先或改其他 Agent 分支。GitHub 共享凭据不能证明所有外部进程已停止，任何非预期 HEAD 变化须立即停写上报。
+- 继承相对 #28 的全部 10 commits，先核对已有通过的专项与缺口，fresh consume gate/feature wiring/RSA 测试，以及可信 Open 邀请 metadata（不是不可信 invites.json）、独立 bearer、Host、管理/服务 pin、签名 JWS、唯一 JSON、完整 Claims、同一个独占 LedgerStore。不得将只读 VerifiedFreshConsume 当已授权 Grant；不得增加生产 caller、签发器或 WG mutation 直到总控安排下一阶段。先核对现有 gate 真实旧版失败/候选正反对照与严格编译，不重复已有测试。可信历史来源不足默认拒绝。按交接 §83 优先梳理可信 metadata/bearer provenance 持久层与有限只读 retry；在现有授权文件范围推进可独立验证的部分，若需要新模块、ledger mutation、CI 或签名/生产事务接线，先提交最小范围及依赖给 COORD-01 解锁，不越权。
 - 接管后允许写的精确路径：`server-rs/src/fresh_consume_gate.rs`、`server-rs/src/fresh_consume_gate/tests.rs`、`server-rs/src/http_one_request.rs`、`server-rs/src/legacy_request_proof.rs`、`server-rs/src/lib.rs`、`server-rs/Cargo.toml`、必要锁定依赖时 `server-rs/Cargo.lock`。其他路径（含 CI workflows、WG/ledger mutation、生产 Python、Windows src/、WFP、UI、部署、其他分支、全局文档）禁止写；扩范围由总控批准。
 - 验收：Linux cargo build/test --locked，原有 feature 与新 feature 两路径、-D warnings、独立 RSA 金样本、正确请求、篡改 bearer/host/签名/指纹/recipient、重复字段、过期/撤销/已消费不得恢复 peer、锁/generation 变化负例；确保没有授权副作用。MSVC/GNU/Linux 同 HEAD workflow 绿，若新 feature 未被 CI 实际覆盖须报总控调整 CI 所有权；原生产 SEC-01/02/08/07 仍需可信历史/真实授权和 isolated VPS 完整 DoD。
 ### COORD-D02 / DEV-02 — WFP-02 P0 独立长期 helper 安全边界（WFP-01 相关）
@@ -45,13 +45,23 @@ Run 链接前缀 https://github.com/weixiaochuchen618-debug/spidervpn/actions/ru
 - 允许写 `src/guard/lease_helper.rs`、`src/guard/proxy_identity.rs`、`src/guard/egress_policy.rs`、`src/guard/wfp_win.rs`（仅 scoped 动态 lease/测试，不改持久 BLOCK）、`tests/wfp_proxy_canary.rs`、`tests/guard_wfp_layout.rs`。不许改 `src/connect.rs`、`src/main.rs`、`src/guard/mod.rs`、`src/guard/elevate.rs`、`src/guard/evidence.rs`、`src/secretfile.rs`、`src/guard/wfp.rs`、Cargo/workflows、Windows 其他模块、server-rs、文档及其他分支。所需跨文件 ACL helper 若不在现有分支，报告总控；禁止复制不可信实现或降标准。与 DEV-01 写文件集合不相交；与 #6/main 的集成冲突另调度（connect/main/guard mod/MSVC workflow 等）。
 - 验收：Windows MSVC/GNU 精确 HEAD、现有 WFP tests/canary 全保留；证明默认 OFF、未授权请求/伪造 Ready/ACK/PID、reparse/硬链接、取消/UAC拒绝/超时/控制及引擎退出后无遗留动态许可，v1 持久 BLOCK/provider 未受影响，正负例真实可复现。隔离 A/B/C UAC、真实 Proxy/TUN sing-box/Wintun、IPv4/IPv6、端口劫持/断网/重授权/崩溃/重启抓包和过滤器读回仍为 WFP-05 发布门槛，未达到不能合并或称零泄漏。
 ### COORD-R01 / REVIEW-01 — 独立安全审查与验收
-- Issue #5 / #2、PR #6、#27、#28、#3，后续 DEV-01 接管 PR。REVIEW_PENDING；无需远程代码分支：每个 SHA 使用隔离本地 detached checkout，只读。审查基准 #6 `e380e82056c6eecbf237f5661b50af52964c8b9d`、#27 `19765b4c72ac0e2c1902c8646f3a57febe434b44`、#28 `16bd83adf2f26eac783c68a413e9304313943219`、#3 `2045acd42554b1ad1472ae41ab247b42d8df5655`；活跃 gate 只读采样 `21ddfc34ef059158fd1c79f67170944f32e83398` 不作为最终验收。
-- 允许读取全部相关源/测试/历史文档/CI，允许本地临时测试且不推送；GitHub 写范围仅对应 PR review/comment 与 Issue 评论，禁止提交任何仓库文件、修改分支、关闭 Issue、擅自批准/合并。优先复核四组 CI 原始 job/log、失败/既有 skip、实际专项覆盖，检查 Linux denial 并非生产授权；按 SEC03_INSTALL_ACL_ACCEPTANCE / SEC10_WINDOWS_UAC_ACCEPTANCE / SEC09_UNINSTALL_ACCEPTANCE 手册收集三账户结果；WFP-05 验收网络矩阵；记录真实 VPS 迁移/撤销/并发/rollback/reboot 阻塞。没有目标机器不执行生产验证，明确 NOT RUN，完成不依赖实机的审核。
+- Issue #5 / #2、PR #6、#27、#28、#3，后续 DEV-01 接管 PR。REVIEW_PENDING；无需远程代码分支：每个 SHA 使用隔离本地 detached checkout，只读。审查基准 #6 `e380e82056c6eecbf237f5661b50af52964c8b9d`、#27 `19765b4c72ac0e2c1902c8646f3a57febe434b44`、#28 `16bd83adf2f26eac783c68a413e9304313943219`、#3 `2045acd42554b1ad1472ae41ab247b42d8df5655`；新增 #29 最终交接审查基准 `81b2f57ea8a3779aff3aebb4216e16e12dda0e89`；后续 HEAD 变化重新审查。
+- 允许读取全部相关源/测试/历史文档/CI，允许本地临时测试且不推送；GitHub 写范围仅对应 PR review/comment 与 Issue 评论，禁止提交任何仓库文件、修改分支、关闭 Issue、擅自批准/合并。优先复核五组 CI 原始 job/log、失败/既有 skip、实际专项覆盖，检查 Linux denial 并非生产授权；按 SEC03_INSTALL_ACL_ACCEPTANCE / SEC10_WINDOWS_UAC_ACCEPTANCE / SEC09_UNINSTALL_ACCEPTANCE 手册收集三账户结果；WFP-05 验收网络矩阵；记录真实 VPS 迁移/撤销/并发/rollback/reboot 阻塞。没有目标机器不执行生产验证，明确 NOT RUN，完成不依赖实机的审核。
 - 输出每个 PR 精确 SHA、Run ID/job/日志链接、实测命令、正负例、隔离环境、PASS/PARTIAL/FAIL/BLOCKED 和缺口；不得将自己未执行的命令或 CI metadata 伪称实测；HEAD 变化重新审查。共享账号时只写署名 REVIEW-01 评论，不假冒独立 GitHub 批准。
 ## 4. 交接与调度
-DEV-01 暂只读，DEV-02 与 REVIEW-01 可独立工作；原串行执行者须完成独占交接，否则不启动第二写入者。#6 的 Windows 候选不再抢占开发，实机结果先审查、发现问题由总控在独立后续分支调度。新任务不得跨过同一文件锁、不能强拆。COORD-01 每次恢复更新此表，核对最新 PR/CI/Issue；所有合并必须经完整安全 DoD 和用户明确授权。
+DEV-01 已正式 ACTIVE 并独占 #29 分支；DEV-02 保持 ACTIVE、独占 #3 分支；REVIEW-01 保持 REVIEW_PENDING，独立只读。三个角色可按现有范围并行；先在相应 Issue/PR 发布开工记录，不因任务已分配就声称实际开发或审查已完成。#6 的 Windows 候选不再抢占开发，实机结果先审查、发现问题由总控在独立后续分支调度。新任务不得跨过同一文件锁、不能强拆。COORD-01 每次恢复更新此表，核对最新 PR/CI/Issue；所有合并必须经完整安全 DoD 和用户明确授权。
 
-## 5. 初始化回读期间发现的新恢复点（覆盖上文无 PR / CI 的历史采样）
+## 5. 初始化回读期间发现的新恢复点（历史记录，已由第 6 节正式接管替代）
 - 原执行线已创建 [Draft PR #29](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29)，base #28 `16bd83adf2f26eac783c68a413e9304313943219`，HEAD `81b2f57ea8a3779aff3aebb4216e16e12dda0e89`。原执行者仍可能正在写入，COORD-D01 继续 HANDOFF_BLOCKED；停止旧执行者并由总控锁定最终 SHA 后，DEV-01 直接继承 #29，不新建分支/PR。
 - #29 已新增 Linux CI gate 专项（现有差异还含 `.github/workflows/security-pairing-rust-linux.yml`；作为历史已存在改动保留，DEV-01 无该文件写权限）。当前精确 SHA Linux [44258780843](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780843)、GNU [44258780885](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780885)、MSVC [44258780872](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780872) 均 In Progress，不能标绿。核对 feature 是否真正覆盖，不能将候选当 Grant，生产状态仍不改变。REVIEW-01 增加 #29 只读审查，结论锚定该 SHA；待最终 HEAD 重验。
 - 初始化 commit `d1f3addd67976e1360a52a32d180e4d13116234b` 已读回，唯一新增两份协作文档，无源代码修改；main/WFP HEAD 均保持不变。
+
+## 6. COORD-01 正式独占接管与调度更新（2026-11-18 16:27 Asia/Singapore）
+- 用户确认原串行开发 Agent 完成最终交接并停止开发及 GitHub 写入。核对 AGENT_HANDOFF §82–83、Backlog D.84–86、原分支/PR/Issue 评论和 review；最终文档快照 `7aee63d283769c66ff779411ef20c5fc5e08c049`。没有发现新业务提交或其他Agent认领。再次读取分支与 PR #29 HEAD 均 `81b2f57ea8a3779aff3aebb4216e16e12dda0e89`，与初始化最终观察相同；#28 对比 ahead 10/behind 0、7 文件 +712/-7，采样 `21ddfc34ef059158fd1c79f67170944f32e83398` 是祖先（一脉相承 ahead 3/behind 0）。保留全部历史。共享 GitHub 账号不能直接检测其他聊天或后台进程；独占依据用户确认及可观察仓库状态，不是服务端权限撤销。
+- PR #29 仍 open/Draft/未合并，base #28 `16bd83adf2f26eac783c68a413e9304313943219`。准确 SHA 全部 workflow Completed/Success：Linux [44258780843](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780843) job 134646769263/134646769792；GNU [44258780885](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780885) job 134646769104；MSVC [44258780872](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780872) job 134646769473。已核对 workflow 和 job/step metadata，Linux fresh gate 专项步骤成功；D.86 原交接记录 8/8、旧 parser 9/9、HTTP 14/14、core 121/121。原始日志独立复核归 REVIEW-01；真实 VPS/历史迁移/授权事务尚未完成，非生产安全验收。原 §5 in_progress 仅为历史状态。
+| Agent | 任务 | 最新调度状态 | 下一步 |
+|---|---|---|---|
+| DEV-01 | COORD-D01 | **ACTIVE**；PR #29 唯一代码写入角色 | 先认领留痕，继承最终 SHA；可信 scope/token 来源和只读 retry 优先，已有预认证不得重复开发；超范围先报总控 |
+| DEV-02 | COORD-D02 | ACTIVE；PR #3 HEAD `2045acd42554b1ad1472ae41ab247b42d8df5655` 未动 | MSVC 43990452983、GNU 43990452791 仍成功；未发现 DEV-02 新提交/认领评论，先按已有 WFP helper 任务执行并留痕 |
+| REVIEW-01 | COORD-R01 | REVIEW_PENDING；独立只读 | 未查到相关 PR 独立 review 或 REVIEW-01 审查报告；核查 #29 三平台原始日志，继续 #3/#6/#27/#28 和实机验收矩阵，缺环境标 NOT RUN |
+- 两开发 Agent 写路径无交集；禁止擅自接入生产授权或连接、改变 UI/WFP persistent BLOCK、跳过失败测试。共享 CI/模块锁不变。main `857ea7593941ce79f6507db5b1ced076c3a077ba`、Issue #2/#5 Open；所有候选继续 Draft，未经真实验收和用户合并授权不得进入 main。
