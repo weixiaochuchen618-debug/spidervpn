@@ -480,3 +480,10 @@
 - **随后对抗复审发现 worker 调度延迟能推迟 deadline 起点**，主动在第二 commit `1fcda2dcbc1941b4f2b644641ed3e18450ed1e34` 修为 admission 时生成全局绝对截止时刻，再传递进 `DeadlineIo`；新增一条延迟启动、已有连接字节也不允许超时读取/回复的否定测试，共 7 条，之前测试没有删/跳。最新 Draft PR #19 head 为 `1fcda2dc`，base #18；见 [Backlog D.54](./REMEDIATION_BACKLOG.md)。
 - **新 SHA 三 CI 待全程复核**：[Linux #44211428730](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428730)、[Windows MSVC #44211428496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428496)、[GNU #44211428529](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428529)。初版 Linux 绿不能替代。它是默认禁用、暂未接真实 TLS 的 admission policy；即使 CI 全绿，生产 Python 的监听 socket TLS 阻塞仍存在，SEC-02 OPEN，Issue #5 Open、main 未变、不得合并/启用。
 
+
+
+## 57. PR #19 重新按正确 deadline 起点通过最新 SHA Linux 七项真实 TCP tests（2026-11-18）
+
+- 当前 [Draft PR #19](https://github.com/weixiaochuchen618-debug/spidervpn/pull/19) Rust HEAD `1fcda2dcbc1941b4f2b644641ed3e18450ed1e34`；新 [Linux #44211428730](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428730) **两 Job 全部 Completed/Success**，库 121 / 0 failed/ignored，握手 policy 新增**七项真实 loopback TCP** tests / 0 failed/ignored，root 临时目录与真实 WG kernel/netns 也保持 Success。测试强制 worker 延迟启动后，连接即使已发送有效字节，IO 也不得越过 admission 时建立的 deadline。
+- 精确同 SHA [Windows MSVC #44211428496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428496) 与 [GNU #44211428529](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428529) 仍需核对**整条 CI 终态**。父 PR #18 全绿不等于 #19 已验收。原 Python 仍处于 TLS listener wrap 的单连接阻塞风险；Rust feature 默认 OFF，未上线 TLS 并发或 HTTP handler，不能关闭 SEC-02 / Issue #5 或合并 main。见 [Backlog D.55](./REMEDIATION_BACKLOG.md)。
+

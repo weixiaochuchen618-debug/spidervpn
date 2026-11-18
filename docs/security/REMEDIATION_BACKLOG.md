@@ -616,3 +616,11 @@ PR/commit/CI: ...
 - **PR #19 最新代码 HEAD `1fcda2dcbc1941b4f2b644641ed3e18450ed1e34` 的新三平台 CI 正在运行**：[Linux #44211428730](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428730)、[MSVC #44211428496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428496)、[GNU #44211428529](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428529)。必须分别检查完整结论，任何失败都按当时 SHA 修复，不能套用旧版初次全绿。
 - 仍只属默认禁用的 SEC-02 pre-integration Rust TCP/handshake worker foundation，未实现真正 Rust TLS 证书验证/HTTP，未在 VPS 部署或接管旧 Python。**SEC-02 未修复生产路径**，SEC-01/08 真 root 全写者隔离/撤销历史迁移与 WFP 实机验收仍阻塞，Issue #5 Open、PR #19 Draft、main/UI/连接/WFP 持久 BLOCK 不动。
 
+
+
+## D.55 PR #19 最新 Rust SHA Linux 所有 Job 及七条真实 loopback TCP 回归成功（2026-11-18）
+
+- **代码 HEAD `1fcda2dcbc1941b4f2b644641ed3e18450ed1e34`**：同 SHA [Linux workflow #44211428730](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428730) **2/2 Jobs Completed/Success**。原 Rust 库 121 passed / 0 failed / 0 ignored；新 SEC-02 `handshake_admission::tests` **7 passed / 0 failed / 0 ignored**，真实本地 TCP 涵盖正常并行、恶意 idle、慢字节 trickle、满槽拒绝、槽位重用、panic 回收、在 worker 启动前截止时间已过的 read/write 拒绝，均在 Linux `--locked` / `RUSTFLAGS=-D warnings` 下运行。原 root /tmp 隔离退役、Linux WG kernel/netns 与其他 Rust 回归仍 Success；未跳过失败。
+- **严格限定差异**：GitHub compare parent #18 `72533502` 到 #19 新 HEAD 仅 4 个文件：`server-rs/Cargo.toml`（feature **默认关闭**）、`server-rs/src/lib.rs`（条件编译入口）、`server-rs/src/handshake_admission.rs`（新 Rust 非 TLS 策略）、原 Linux CI workflow。没有改变 `assets/tc-pair.py`、`src/pairhost.rs`、Windows UI/连接/WFP；main 未变。
+- 精确同 SHA [Windows MSVC #44211428496](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428496) / [GNU #44211428529](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44211428529) **本条书写时仍在执行**，不能提前声称全绿；如红需查 logs 并修复重跑。SEC-02 仍未接入真正 TLS/HTTP 端口和旧 Python 迁移，**状态不变：P0 OPEN / production vulnerable**；SEC-01/08 和 Issue #5 亦 OPEN、PR #19 Draft、生产安全验收未完成。
+
