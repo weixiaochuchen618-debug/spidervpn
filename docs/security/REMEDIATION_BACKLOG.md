@@ -634,3 +634,12 @@ PR/commit/CI: ...
 - 本 SHA [MSVC #44212209567](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209567) / [GNU #44212209522](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209522) 同样 **进行中**，完整成功必须查同 SHA 每个 Job 和原始日志；原前两个 SHA 绿只能当历史，不可替代。无生产 TLS 接收器；对于无限 CPU 自旋/绕过 wrapper 的外部函数仍无法预先强制中断，未来服务还需隔离处理。
 - SEC-02 **生产 P0 仍 OPEN**，SEC-01/08 / Issue #5 OPEN；PR #19 Draft/unmerged，Windows UI/连接/WFP persistent BLOCK、现役 Python 和 main `857ea759` 均不动。
 
+
+
+## D.57 PR #19 最终代码 SHA Linux 两 Job 与 GNU 全流程成功；MSVC 原步骤成功但完整尚待（2026-11-18）
+
+- **代码 HEAD `9cc7ab6b5fcdf087eec2f80e92ef7581ebe4fe0b`** 不变；[Linux #44212209581](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209581) 现已核对 **两 Job Completed/Success**。独立真实 kernel WG netns Job 成功，7 条 Linux root-only 临时目录退役与后验收 Rust tests 成功；core Job 121 lib/0 failed/ignored + 新 **8 条 SEC-02 真实 loopback TCP/0 failed/ignored**，真实日志显示 `callback_cannot_report_success_after_deadline_without_more_io ... ok`，且已有严格 `--locked`、`RUSTFLAGS=-D warnings` 未改变。
+- 同 SHA [Windows GNU #44212209522](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209522) **Completed/Success**：Rust GNU 编译、Release `SPIDERVPN_ROOT` 信任边界、SEC-10 Guard/身份与 SEC-01 原 SSH writers 回归全部通过；原始 GNU 日志 `deploy::tests::sec01_sourced_transport_reads_refuse_retired_pairing_host ... ok`，仓库既有编译 warnings（如 unused）仍在，不能称零 warning。
+- 同 SHA [Windows MSVC #44212209567](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209567) **Build / SEC-10 / SEC-01 工作流步骤均已 Success**，正在执行 integration/changed-module/full portable unit；其**完整终态仍须验证**，不能称三平台全面成功，更不能引用旧 head `1fcda2dc` 的 Windows 测试。
+- 即使三平台 CI 全部成功，**仍无 Rust TLS 协议栈/HTTP endpoint，生产 Python 监听 socket 慢握手堵塞未修复**；原 server root 全写者/受信撤销 tombstone、Windows UAC/WFP 实机未验收，Issue #5/SEC-01/02/08 OPEN，PR #19 Draft，main/UI/WFP 仍不变。
+

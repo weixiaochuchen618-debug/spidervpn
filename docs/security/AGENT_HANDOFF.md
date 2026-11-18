@@ -495,3 +495,11 @@
 - 最新 [Linux #44212209581](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209581) core Job **Completed/Success**：121 lib / 0 failed/ignored；SEC-02 **8/8 loopback Rust tests / 0 failed/ignored**；kernel/netns root job 还需查最终终态。准确同 SHA [MSVC #44212209567](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209567) / [GNU #44212209522](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209522) 仍在运行。必须依每一条最终 Job 和失败日志作证，不把旧 `1fcda2dc` 7 tests 绿写成新 HEAD 全绿；[Backlog D.56](./REMEDIATION_BACKLOG.md)。
 - 产品安全范围不变：Rust 限时/有界线程只是**默认关闭的独立策略核心**，没有真实 TLS 证书、握手和 HTTP 的服务端生产路径，更无持续活跃连接、公网慢握手对抗验收；SEC-02 不可关闭，Issue #5/SEC-01/08/Win UAC/WFP 等仍在阻塞。PR #19 Draft、不并 main。
 
+
+
+## 59. PR #19 最新 SHA Linux + GNU 完整绿，Windows MSVC 最终仍待核实（2026-11-18）
+
+- Rust HEAD `9cc7ab6b5fcdf087eec2f80e92ef7581ebe4fe0b` 精确同 SHA [Linux #44212209581](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209581) **双 Job Completed/Success**：真实 kernel WG netns + 7 root temp retire、原 121 lib 和新 **8 SEC-02 loopback TCP tests** 全 pass，无 ignore/fail；新 `callback_cannot_report_success_after_deadline_without_more_io` 真执行 ok。[GNU #44212209522](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209522) 也 **全 workflow Completed/Success**，含旧 SSH sourced transport、Guard/身份 Rust tests，保留原 GNU warnings。
+- [MSVC #44212209567](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209567) Rust Build + SEC-10/01 分别 Success，当前在 integration tests，后续 changed-module/full portable suite 必须等所有 job 完成并查失败日志。不能拿 GNU/Linux 绿当 Windows full green。详细见 [Backlog D.57](./REMEDIATION_BACKLOG.md)。
+- 新 SEC-02 Rust policy feature 默认关闭，没有生产真实 TLS/HTTPS 端口或前后兼容验收，不能声称 Python 旧漏洞已修、不能合并 main，SEC-02/SEC-01/SEC-08 / Issue #5 Open。
+
