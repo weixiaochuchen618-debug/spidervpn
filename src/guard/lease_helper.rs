@@ -601,7 +601,9 @@ impl LocalLeaseControl {
             && self.helper.lock().is_ok_and(|h| h.is_none())
     }
 
-    fn revocation_proven(&self) -> Result<bool, String> {
+    fn revocation_proven(&self,
+        read_absence: impl FnOnce(&[super::wfp::Guid]) -> Result<bool, String>) -> Result<bool, String>
+    {
         use std::os::windows::io::AsRawHandle;
         use std::sync::atomic::Ordering;
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
@@ -618,7 +620,7 @@ impl LocalLeaseControl {
             h.keys.clone()
         };
         // No current-slot mutex or I/O gate is held during BFE queries.
-        super::wfp_win::old_dynamic_permits_absent(&keys)
+        read_absence(&keys)
     }
 
     fn authorized<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -719,9 +721,17 @@ impl LocalLeaseSlot {
     // Snapshot, read BFE outside the slot lock, and remove only the exact
     // retired object. Stale readback can never clear a new registration.
     fn reap_verified(&self) -> Result<(), String> {
+        self.reap_verified_with(super::wfp_win::old_dynamic_permits_absent)
+    }
+
+    // Internal only: production always supplies the native BFE read, never
+    // a caller-provided claim. The fixture injects errors into this same path.
+    fn reap_verified_with(&self,
+        read_absence: impl FnOnce(&[super::wfp::Guid]) -> Result<bool, String>) -> Result<(), String>
+    {
         let old = self.0.lock().map_err(|_| "实验租约登记状态异常")?.current.clone();
         let Some(old) = old else { return Ok(()); };
-        if !old.revocation_proven()? {
+        if !old.revocation_proven(read_absence)? {
             return Err("旧动态许可撤销尚未证实，拒绝新实验租约".into());
         }
         let mut slot = self.0.lock().map_err(|_| "实验租约登记状态异常")?;
@@ -2302,6 +2312,16 @@ mod tests {
             flow(app, &old_endpoint, false);
             flow(app, &new_endpoint, false);
         }
+        // Model a BFE read failure after the real old rules were removed.
+        // A failed read must retain the old slot despite actual absence.
+        let err = slot.reap_verified_with(|keys| {
+            assert_eq!(keys, old_keys.as_slice());
+            Err("injected BFE ACCESS_DENIED".into())
+        }).unwrap_err();
+        assert_eq!(err, "injected BFE ACCESS_DENIED");
+        assert!(slot.0.lock().unwrap().current.as_ref()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &control)));
+        println!("A2_BFE_REJECT mode=read-error-injected old_slot_retained=true");
         let new_reg = slot.register(engine_pid, &exe).unwrap();
         assert_ne!(control.nonce, new_reg.control.nonce);
         let new_nonce = decode_nonce(&new_reg.control.nonce).unwrap();
@@ -2503,6 +2523,19 @@ mod tests {
         slot.cancel_current();
         assert!(slot.intent().is_err());
         assert!(slot.register_intent(final_intent, engine_pid, &exe).is_err());
+        let poisoned = LocalLeaseSlot::default();
+        let before_poison = poisoned.intent().unwrap();
+        std::thread::scope(|scope| {
+            let thread = scope.spawn(|| {
+                let _lock = poisoned.0.lock().unwrap();
+                panic!("inject poisoned lease slot");
+            });
+            assert!(thread.join().is_err());
+        });
+        // A disconnect in poisoned state still invalidates and returns.
+        drop(poisoned.begin_disconnect());
+        assert!(poisoned.intent().is_err());
+        assert!(poisoned.register_intent(before_poison, engine_pid, &exe).is_err());
         assert!(engine.0.try_wait().unwrap().is_none());
         drop(engine.0.stdin.take());
         assert!(engine.0.wait().unwrap().success());
