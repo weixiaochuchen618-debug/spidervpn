@@ -421,3 +421,11 @@
 - [MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970) / [GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) 还需查询**同一 SHA**最终完整 Job；不要用旧 PR #16 的结果替代。详见 [Backlog D.46](./REMEDIATION_BACKLOG.md)。
 - 绝不能把 opt-in root 离线退役候选解释成生产的 Rust daemon/security DoD：真实 root 的 systemd 停服/持久 mask/reboot/故障回滚、老版 SSH 与其它 root 隔离、受信撤销 tombstone 与 TLS 监听接管均未验收；Issue #5 Open，PR #17 Draft，main 不变。
 
+
+
+## 49. PR #17 GNU 全 CI Success，MSVC 完整便携 Rust suite 尚未终态（2026-11-18）
+
+- HEAD 仍是 `de8e2e222a31c0290385a0126c0f2538571c33d0`。同 SHA [GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) **Completed/Success**；[Linux #44203644974](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644974) 两 Job **Completed/Success**，6 新 Rust CLI test/0 fail/ignore、121 lib、真 WG netns 和 root /tmp retirement 全绿。与父 PR #16 差异精确三文件：新 Rust CLI、独立 `required-features` manifest、Linux 工作流。
+- 同 SHA [MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970) Rust build、SEC-10/SEC-01、integration、模块回归均已单独 Success，但 `Portable Rust unit suite` 最后查仍 `in_progress`；不可借用旧 SHA 或已成功步骤称整个 MSVC 工作流完成。交接接手必须查最后 Job 状态/原始日志、若失败则修复并重跑。
+- PR #17/Issue #5 状态、生产安全阻塞仍见 [Backlog D.44–D.47](./REMEDIATION_BACKLOG.md)。没有本机或 VPS 真实 root 切换/回滚，不合并 main，不改变旧 UI、连接交互或 WFP 持久 BLOCK。
+

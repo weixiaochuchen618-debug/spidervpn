@@ -550,3 +550,12 @@ PR/commit/CI: ...
 - Linux 原始日志确认新 `spidervpn-pair-retire` **6 项 Rust CLI tests 全部通过、0 failed、0 ignored**，包括拒绝非 root、错误参数、缺授权、重复 shutdown 检查、故障后 fail-closed、非 ASCII/CRLF/EOF；普通 Linux runner 真执行同一 CLI `retire` 后 exit2、`root privileges required`，未在生产 VPS 上执行改动。旧首 SHA `45c5f86` 的 Rust E0382 red 继续按 D.45 真实保留，没有跳过。
 - 同 SHA [MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970) / [GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) 本条记录时仍在运行；不能当作 full success。SEC-01/02/08、Issue #5 OPEN，PR #17 Draft、main/UI/WFP 不改。Linux CI **不等于**在真实 VPS root stop/mask/reboot/rollback 或绝对隔离非协作 root writer。
 
+
+
+## D.47 PR #17 GNU 完整 Success，MSVC 已通过构建/权限/集成/模块回归（2026-11-18）
+
+- 与 PR #17 最新代码 HEAD `de8e2e222a31c0290385a0126c0f2538571c33d0` 精确匹配的 [GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) **Completed/Success**：Windows GNU Rust 编译、Release 不接受 `SPIDERVPN_ROOT` 覆盖、提权 Guard IPC 与身份单测均成功，日志确认 `deploy::tests::sec01_sourced_transport_reads_refuse_retired_pairing_host ... ok`；旧 Rust warnings 未宣称为全部消除。
+- 同 SHA [MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970) 已核查 `Build with Rust`、SEC-10 权限边界、SEC-01 SSH guard、所有 integration targets、changed Rust module regression **分别 Completed/Success**；最后 `Portable Rust unit suite` 仍在运行，**整条 MSVC workflow 不能提前写 Success**。保留既有 1 ignored/8 环境依赖过滤，不为本轮失败加 ignore/skip。
+- GitHub compare `ed8d7a98...de8e2e22` 只涉及 `server-rs/Cargo.toml`、新 `server-rs/src/bin/spidervpn-pair-retire.rs` 和 `.github/workflows/security-pairing-rust-linux.yml`。没有 Windows UI/connection/Guard/WFP、旧 Python 服务的产品变动。Linux 完整成功详见 D.46，旧首次红例详见 D.45。
+- 当前功能候选及本地 CI 在隔离环境通过 ≠ 真实 root VPS systemd mask、旧 SSH writer 隔离、可信 revoke/tombstone 迁移、Rust TLS 生产接管通过；SEC-01/02/08 / Issue #5 OPEN，PR #17 Draft，main 不动。
+
