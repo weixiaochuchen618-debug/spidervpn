@@ -49,6 +49,7 @@ pub enum LeaseState {
     Accepted,
     Committed,
     Receipt,
+    Active,
     Rejected,
     Closed,
 }
@@ -67,6 +68,26 @@ struct LeaseFinish {
     schema: u32,
     nonce: String,
     state: LeaseState,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LeaseHeartbeat {
+    schema: u32,
+    nonce: String,
+    sequence: u64,
+    challenge: String,
+}
+
+#[cfg(any(windows, test))]
+fn decode_heartbeat(body: &[u8], nonce: &str, sequence: u64) -> Result<LeaseHeartbeat, String> {
+    let msg: LeaseHeartbeat = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    if msg.schema != LEASE_SCHEMA || msg.nonce != nonce || msg.sequence != sequence || sequence == 0 {
+        return Err("租约心跳会话、版本或顺序异常".into());
+    }
+    decode_nonce(&msg.challenge)?;
+    Ok(msg)
 }
 
 fn validate_finish(body: &[u8], nonce: &str) -> Result<(), String> {
@@ -463,8 +484,7 @@ fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
 #[cfg(windows)]
 pub struct LeaseChild {
     handle: windows_sys::Win32::Foundation::HANDLE,
-    // 未得到可靠 Ready/ACK 确认的 helper，父进程退出此作用域时必须
-    // 立即终止，不能让一个半启动的动态许可继续放行最多 15 秒。
+    // TerminateProcess is best-effort, never the authority for revocation.
     confirmed: bool,
 }
 #[cfg(windows)]
@@ -480,16 +500,15 @@ impl Drop for LeaseChild {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             if !self.confirmed {
-                // 未完成双向握手：主动终止未信任 helper，让 BFE 动态会话
-                // 立即 rundown；如果 OS 拒绝 TerminateProcess，helper 自己
-                // 仍必须在 15 秒无 ACK 时撤销许可，形成双重保护。
+                // Best effort only; the helper independently fails closed
+                // on disconnect or timeout.
                 unsafe { windows_sys::Win32::System::Threading::TerminateProcess(self.handle, 1); }
             }
             unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle); }
             self.handle = std::ptr::null_mut();
         }
-        // 已确认的 helper 正常运行期间不能因父端局部 handle Drop 而被杀，
-        // 它自己通过真实进程句柄监控引擎和主程序生命期。
+        // The process-lifetime worker owns the confirmed pipe and duplicated
+        // process handle. Dropping this startup handle is not cancellation.
     }
 }
 
@@ -549,7 +568,8 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     let pipe = Pipe::client(&nonce, deadline, || require_live(child.handle))?;
     let check = || -> Result<(), String> {
         require_live(child.handle)?;
-        pipe.require_peer(helper_pid, false)
+        pipe.require_peer(helper_pid, false)?;
+        pipe.require_connected()
     };
     check()?;
     // Authenticate the actual connected process BEFORE sending any request bytes.
@@ -578,10 +598,23 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     let receipt = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state: LeaseState::Receipt })
         .map_err(|e| e.to_string())?;
     pipe.send(&receipt, deadline, &check)?;
-    // The helper may close only after consuming this final receipt. In particular,
-    // it must not close a server handle immediately after writing Committed.
-    pipe.wait_server_closed(deadline, || require_live(child.handle))?;
-    if !child.running() || Instant::now() >= deadline { return Err("最终租约回执超期或进程退出".into()); }
+    // Closing either end is NEVER success.
+    let active = pipe.receive(4096, deadline, &check)?;
+    validate_stage(&active, &nonce, req.programs.len(), helper_pid, LeaseState::Active)?;
+    check()?;
+    let helper_monitor = duplicate_process_handle(child.handle)?;
+    if !child.running() || Instant::now() >= deadline {
+        return Err("最终租约回执超期或进程退出".into());
+    }
+    // The existing connection caller drops LeaseChild after checking running().
+    // Transfer the sole client pipe to a process-lifetime worker only on success.
+    // On thread creation failure the captured pipe is dropped, independently
+    // of whether the parent can terminate the elevated process.
+    std::thread::Builder::new().name("spidervpn-lease-channel".into())
+        .spawn(move || {
+            let _ = maintain_controller_channel(pipe, helper_monitor, &nonce, helper_pid,
+                helper_stamp, &helper_token);
+        }).map_err(|e| format!("启动租约信道监督失败：{e}"))?;
     child.confirmed = true;
     Ok(child)
 }
@@ -644,7 +677,8 @@ fn serve_pipe(nonce: &str, pid: u32, stamp: u64) -> Result<(), String> {
     pipe.accept(deadline, || require_live(controller.0))?;
     let check = || -> Result<(), String> {
         require_live(controller.0)?;
-        pipe.require_peer(pid, true)
+        pipe.require_peer(pid, true)?;
+        pipe.require_connected()
     };
     check()?;
     if token_identity(controller.0)? != controller_token || creation_stamp(controller.0)? != stamp {
@@ -706,11 +740,78 @@ fn serve_pipe(nonce: &str, pid: u32, stamp: u64) -> Result<(), String> {
     pipe.require_client_token(&controller_token)?;
     check_lease()?;
     if Instant::now() >= deadline { return Err("最终回执消费超时".into()); }
-    // No file path is ever opened or written by this privileged protocol.
-    // Release transport after final authorization; actual WFP rundown remains RAII.
-    let lease = lease.take().ok_or("动态租约不可用")?;
-    drop(pipe);
-    lease.supervise_until_exit(&req.engine_executable)
+    let active = serde_json::to_vec(&reply(nonce, LeaseState::Active, String::new(), count))
+        .map_err(|e| e.to_string())?;
+    pipe.send(&active, deadline, &mut check_lease)?;
+    // Never continue dynamic permits without the same authenticated channel.
+    let result = supervise_authenticated_channel(&pipe, nonce, &controller_token, &mut check_lease);
+    let close = match lease.take() {
+        Some(lease) => lease.close().map_err(|e| e.to_string()),
+        None => Ok(()),
+    };
+    result.and(close)
+}
+
+#[cfg(windows)]
+const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(windows)]
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+#[cfg(windows)]
+fn maintain_controller_channel(pipe: pipe_ipc::Pipe, helper: std::os::windows::io::OwnedHandle,
+    nonce: &str, pid: u32, stamp: u64, identity: &pipe_ipc::TokenIdentity) -> Result<(), String>
+{
+    use pipe_ipc::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::time::Instant;
+    let check = || -> Result<(), String> {
+        require_live(helper.as_raw_handle())?;
+        pipe.require_peer(pid, false)?;
+        pipe.require_connected()
+    };
+    let mut sequence = 1u64;
+    loop {
+        let deadline = Instant::now() + HEARTBEAT_TIMEOUT + HEARTBEAT_INTERVAL;
+        let body = pipe.receive(4096, deadline, &check)?;
+        decode_heartbeat(&body, nonce, sequence)?;
+        if creation_stamp(helper.as_raw_handle())? != stamp
+            || &token_identity(helper.as_raw_handle())? != identity
+        {
+            return Err("租约监督期间 helper 身份变化".into());
+        }
+        pipe.send(&body, deadline, &check)?;
+        sequence = sequence.checked_add(1).ok_or("租约心跳顺序溢出")?;
+    }
+}
+
+#[cfg(windows)]
+fn supervise_authenticated_channel(pipe: &pipe_ipc::Pipe, nonce: &str,
+    identity: &pipe_ipc::TokenIdentity, mut check: impl FnMut() -> Result<(), String>) -> Result<(), String>
+{
+    use ring::rand::{SecureRandom, SystemRandom};
+    use std::time::Instant;
+    let random = SystemRandom::new();
+    let mut sequence = 1u64;
+    loop {
+        check()?;
+        let deadline = Instant::now() + HEARTBEAT_TIMEOUT;
+        let mut bytes = [0u8; 16];
+        random.fill(&mut bytes).map_err(|_| "生成租约心跳挑战失败".to_string())?;
+        let challenge = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        decode_nonce(&challenge)?;
+        let expected = LeaseHeartbeat { schema: LEASE_SCHEMA, nonce: nonce.into(), sequence, challenge };
+        let encoded = serde_json::to_vec(&expected).map_err(|e| e.to_string())?;
+        pipe.send(&encoded, deadline, &mut check)?;
+        let body = pipe.receive(4096, deadline, &mut check)?;
+        if decode_heartbeat(&body, nonce, sequence)? != expected {
+            return Err("租约心跳挑战不匹配".into());
+        }
+        pipe.require_client_token(identity)?;
+        check()?;
+        if Instant::now() >= deadline { return Err("租约心跳超时".into()); }
+        sequence = sequence.checked_add(1).ok_or("租约心跳顺序溢出")?;
+        std::thread::sleep(HEARTBEAT_INTERVAL);
+    }
 }
 
 #[cfg(windows)]
@@ -723,6 +824,7 @@ mod pipe_ipc {
     use windows_sys::Win32::Storage::FileSystem::*;
     use windows_sys::Win32::System::Pipes::*;
     use windows_sys::Win32::System::Threading::*;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle as StdOwnedHandle};
 
     pub(super) struct OwnedHandle(pub(super) HANDLE);
     impl Drop for OwnedHandle {
@@ -858,9 +960,33 @@ mod pipe_ipc {
         Ok(format!(r"\\.\pipe\SpiderVPN.Lease.{nonce}").encode_utf16().chain(Some(0)).collect())
     }
 
-    pub(super) struct Pipe(OwnedHandle);
+    pub(super) fn duplicate_process_handle(handle: HANDLE) -> Result<StdOwnedHandle, String> {
+        let current = unsafe { GetCurrentProcess() };
+        let mut duplicate = std::ptr::null_mut();
+        if unsafe { DuplicateHandle(current, handle, current, &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS) } == 0 {
+            return Err(os_error("复制租约监督进程句柄失败"));
+        }
+        if duplicate.is_null() || duplicate == INVALID_HANDLE_VALUE {
+            return Err("复制租约监督进程句柄无效".into());
+        }
+        Ok(unsafe { StdOwnedHandle::from_raw_handle(duplicate) })
+    }
+
+    pub(super) struct Pipe(StdOwnedHandle);
 
     impl Pipe {
+        fn raw(&self) -> HANDLE { self.0.as_raw_handle() }
+
+        pub(super) fn require_connected(&self) -> Result<(), String> {
+            let mut available = 0u32;
+            if unsafe { PeekNamedPipe(self.raw(), std::ptr::null_mut(), 0,
+                std::ptr::null_mut(), &mut available, std::ptr::null_mut()) } == 0
+            {
+                return Err(os_error("租约认证信道已关闭或不可核验"));
+            }
+            Ok(())
+        }
+
         // Only exact process-token user SIDs. No Everyone/Users/Administrators group ACE.
         // The controller needs data and attribute access, not FILE_CREATE_PIPE_INSTANCE.
         // Medium mandatory integrity permits the intended ordinary UI to connect.
@@ -886,7 +1012,7 @@ mod pipe_ipc {
             if h == INVALID_HANDLE_VALUE || h.is_null() {
                 return Err(os_error("建立唯一租约命名管道失败"));
             }
-            Ok(Self(OwnedHandle(h)))
+            Ok(Self(unsafe { StdOwnedHandle::from_raw_handle(h) }))
         }
 
         pub(super) fn client(nonce: &str, deadline: Instant, mut check: impl FnMut() -> Result<(), String>) -> Result<Self, String> {
@@ -897,9 +1023,9 @@ mod pipe_ipc {
                 let h = unsafe { CreateFileW(name.as_ptr(), 0x00120183, 0, std::ptr::null(),
                     OPEN_EXISTING, SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, std::ptr::null_mut()) };
                 if h != INVALID_HANDLE_VALUE && !h.is_null() {
-                    let pipe = Self(OwnedHandle(h));
+                    let pipe = Self(unsafe { StdOwnedHandle::from_raw_handle(h) });
                     let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
-                    if unsafe { SetNamedPipeHandleState(pipe.0.0, &mode, std::ptr::null(), std::ptr::null()) } == 0 {
+                    if unsafe { SetNamedPipeHandleState(pipe.raw(), &mode, std::ptr::null(), std::ptr::null()) } == 0 {
                         return Err(os_error("设置租约管道非阻塞模式失败"));
                     }
                     return Ok(pipe);
@@ -916,7 +1042,7 @@ mod pipe_ipc {
             loop {
                 check()?;
                 if Instant::now() >= deadline { return Err("等待租约控制端超时".into()); }
-                if unsafe { ConnectNamedPipe(self.0.0, std::ptr::null_mut()) } != 0 {
+                if unsafe { ConnectNamedPipe(self.raw(), std::ptr::null_mut()) } != 0 {
                     return Ok(());
                 }
                 let err = unsafe { GetLastError() };
@@ -931,8 +1057,8 @@ mod pipe_ipc {
         pub(super) fn require_peer(&self, expected: u32, server_end: bool) -> Result<(), String> {
             let mut actual = 0u32;
             let ok = unsafe {
-                if server_end { GetNamedPipeClientProcessId(self.0.0, &mut actual) }
-                else { GetNamedPipeServerProcessId(self.0.0, &mut actual) }
+                if server_end { GetNamedPipeClientProcessId(self.raw(), &mut actual) }
+                else { GetNamedPipeServerProcessId(self.raw(), &mut actual) }
             };
             if ok == 0 || expected == 0 || actual != expected {
                 return Err("操作系统返回的租约管道对端 PID 不匹配".into());
@@ -943,7 +1069,7 @@ mod pipe_ipc {
         pub(super) fn require_client_token(&self, expected: &TokenIdentity) -> Result<(), String> {
             // Successful impersonation is immediately scoped. Never access files,
             // WFP or other privileged resources under the peer token.
-            if unsafe { ImpersonateNamedPipeClient(self.0.0) } == 0 {
+            if unsafe { ImpersonateNamedPipeClient(self.raw()) } == 0 {
                 return Err(os_error("无法核验实际管道客户端 token"));
             }
             struct Revert;
@@ -970,6 +1096,7 @@ mod pipe_ipc {
             Ok(())
         }
 
+        #[cfg(test)]
         pub(super) fn wait_server_closed(&self, deadline: Instant,
             mut check: impl FnMut() -> Result<(), String>) -> Result<(), String>
         {
@@ -977,7 +1104,7 @@ mod pipe_ipc {
                 check()?;
                 if Instant::now() >= deadline { return Err("等待最终回执消费超时".into()); }
                 let mut available = 0u32;
-                let ok = unsafe { PeekNamedPipe(self.0.0, std::ptr::null_mut(), 0,
+                let ok = unsafe { PeekNamedPipe(self.raw(), std::ptr::null_mut(), 0,
                     std::ptr::null_mut(), &mut available, std::ptr::null_mut()) };
                 if ok == 0 {
                     let err = unsafe { GetLastError() };
@@ -1002,8 +1129,8 @@ mod pipe_ipc {
                 let chunk = &mut bytes[offset..];
                 let mut count = 0u32;
                 let ok = unsafe {
-                    if read { ReadFile(self.0.0, chunk.as_mut_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
-                    else { WriteFile(self.0.0, chunk.as_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
+                    if read { ReadFile(self.raw(), chunk.as_mut_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
+                    else { WriteFile(self.raw(), chunk.as_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
                 };
                 if ok == 0 {
                     let err = unsafe { GetLastError() };
@@ -1146,13 +1273,26 @@ mod tests {
         let nonce = sample().nonce;
         let ack = serde_json::to_vec(&LeaseAck { schema: LEASE_SCHEMA, nonce: nonce.clone(), accepted: true }).unwrap();
         assert!(validate_finish(&ack, &nonce).is_err());
-        for state in [LeaseState::Ready, LeaseState::Accepted, LeaseState::Receipt, LeaseState::Rejected, LeaseState::Closed] {
+        for state in [LeaseState::Ready, LeaseState::Accepted, LeaseState::Receipt, LeaseState::Active, LeaseState::Rejected, LeaseState::Closed] {
             let bad = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state }).unwrap();
             assert!(validate_finish(&bad, &nonce).is_err());
         }
         let good = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state: LeaseState::Committed }).unwrap();
         assert!(validate_finish(&good, &nonce).is_ok());
         assert!(validate_finish(&good, "ffffffffffffffffffffffffffffffff").is_err());
+    }
+
+    #[test]
+    fn heartbeat_rejects_replay_wrong_session_and_zero_challenge() {
+        let nonce = sample().nonce;
+        let good = LeaseHeartbeat { schema: LEASE_SCHEMA, nonce: nonce.clone(), sequence: 2,
+            challenge: "1234567890abcdef1234567890abcdef".into() };
+        let body = serde_json::to_vec(&good).unwrap();
+        assert_eq!(decode_heartbeat(&body, &nonce, 2).unwrap(), good);
+        assert!(decode_heartbeat(&body, &nonce, 3).is_err());
+        assert!(decode_heartbeat(&body, "ffffffffffffffffffffffffffffffff", 2).is_err());
+        let zero = LeaseHeartbeat { challenge: "0".repeat(32), ..good };
+        assert!(decode_heartbeat(&serde_json::to_vec(&zero).unwrap(), &nonce, 2).is_err());
     }
 
     fn sample() -> LeaseRequest {
