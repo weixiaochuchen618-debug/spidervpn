@@ -61,6 +61,10 @@ pub mod legacy_signed;
 /// Independently pinned original PairRequest evidence, still never import.
 pub mod legacy_request_proof;
 
+/// SEC-01 fresh invitation authentication only; no import or grant.
+#[cfg(all(target_os = "linux", feature = "linux-fresh-consume-gate"))]
+pub mod fresh_consume_gate;
+
 // Cross-crate verification of the ACTUAL Windows SSH guard Rust source on
 // Linux. Test-only, never compiled into the pairing authority binary.
 #[cfg(all(test, target_os = "linux"))]
