@@ -137,7 +137,7 @@ impl Fixture {
     fn scope(&self)->TrustedOpenInvite<'_> {
         TrustedOpenInvite{invite_id:INV,token:&self.token,signed_descriptor:&self.signed_descriptor,
             management_jwk:&self.management.jwk,management_fingerprint:&self.fingerprint,
-            server_binding:&self.binding,public_host:HOST,port:PORT,tls_der_pin:&self.pin}
+            server_binding:&self.binding,public_host:HOST,port:PORT,tls_der_pin:&self.pin,wg_interface:"wg0"}
     }
     fn request(&self,compact:&str)->ParsedRequest {
         let body=serde_json::to_vec(&json!({"PairRequest":compact})).unwrap();
@@ -381,7 +381,7 @@ fn independent_metadata_pin_binds_bearer_descriptor_and_scope() {
     let record=json!({"SchemaVersion":1,"Kind":"SpiderVPN.InviteMetadata",
         "InviteId":INV,"BearerHmacSha256":tag_hex,"SignedDescriptor":f.signed_descriptor,
         "ManagementSigningPublicKey":f.management.jwk,"ManagementFingerprint":f.fingerprint,
-        "ServerBinding":f.binding,"PublicHost":HOST,"Port":PORT,"TlsSha256":f.pin});
+        "ServerBinding":f.binding,"PublicHost":HOST,"Port":PORT,"TlsSha256":f.pin,"WgInterface":"wg0"});
     let pin_for=|raw:&[u8]| -> String {
         digest::digest(&digest::SHA256,raw).as_ref().iter().map(|b|format!("{b:02x}")).collect()
     };
@@ -391,6 +391,10 @@ fn independent_metadata_pin_binds_bearer_descriptor_and_scope() {
     let scope=authenticated.scope().unwrap();
     assert!(read_open_descriptor(&f.store,&scope,&f.get(),now).is_ok());
     assert!(prepare_fresh_consume(&f.store,&scope,&f.post(),now).is_ok());
+    assert_eq!(check_retry_interface(&scope,"wg0"),Ok(()));
+    for wrong in ["wg1","wg00","WG0","all",""] {
+        assert_eq!(check_retry_interface(&scope,wrong),Err(GateError::InvalidState));
+    }
     let other=encode(&[78;32]);
     assert_eq!(verify_pinned_invite_metadata(&raw,&pin,&other).err(),Some(GateError::Forbidden));
     assert_eq!(verify_pinned_invite_metadata(&raw,&"f".repeat(64),&f.token).err(),Some(GateError::InvalidState));
@@ -398,6 +402,22 @@ fn independent_metadata_pin_binds_bearer_descriptor_and_scope() {
         let mut altered=record.clone();
         altered[field]=json!("attacker controlled");
         assert_eq!(verify_pinned_invite_metadata(&serde_json::to_vec(&altered).unwrap(),&pin,&f.token).err(),Some(GateError::InvalidState));
+    }
+    // A valid but different interface name must not survive the original pin.
+    let mut changed=record.clone();
+    changed["WgInterface"]=json!("wg1");
+    assert_eq!(verify_pinned_invite_metadata(&serde_json::to_vec(&changed).unwrap(),&pin,&f.token).err(),Some(GateError::InvalidState));
+    // No implicit default or selector fallback; even an independently
+    // pinned malformed record must be refused.
+    let mut missing=record.clone();
+    missing.as_object_mut().unwrap().remove("WgInterface");
+    let bytes=serde_json::to_vec(&missing).unwrap();
+    assert_eq!(verify_pinned_invite_metadata(&bytes,&pin_for(&bytes),&f.token).err(),Some(GateError::InvalidState));
+    for name in ["all","interfaces","../wg0","wg0;id","WG 0",""] {
+        let mut bad=record.clone();
+        bad["WgInterface"]=json!(name);
+        let bytes=serde_json::to_vec(&bad).unwrap();
+        assert_eq!(verify_pinned_invite_metadata(&bytes,&pin_for(&bytes),&f.token).err(),Some(GateError::InvalidState));
     }
     // Even if independently pinned, ambiguous JSON must never become a scope.
     let body=String::from_utf8(raw.clone()).unwrap();
@@ -450,6 +470,9 @@ fn retry_observes_under_current_lock_and_rechecks_clock_after_readback() {
     assert_eq!(proof.claims(),&claims);
     // The external entry point rejects arbitrary selectors even before IO.
     assert_eq!(prepare_consumed_retry(&f.store,&scope,&req,"all").err(),Some(GateError::InvalidState));
+    // A syntactically valid but differently named interface is also rejected
+    // before privileged IO, even if it happens to contain identical peers.
+    assert_eq!(prepare_consumed_retry(&f.store,&scope,&req,"wg1").err(),Some(GateError::InvalidState));
     assert_eq!(f.store.generation().unwrap(),generation);
     assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Consumed(grant)));
 }

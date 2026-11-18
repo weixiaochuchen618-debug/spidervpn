@@ -33,6 +33,7 @@ pub struct TrustedOpenInvite<'a> {
     public_host: &'a str,
     port: u16,
     tls_der_pin: &'a str,
+    wg_interface: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +181,7 @@ impl AuthenticatedInviteMetadata<'_> {
             port:v.get("Port").and_then(Value::as_u64)
                 .and_then(|n|u16::try_from(n).ok()).filter(|n|*n!=0).ok_or(invalid)?,
             tls_der_pin:text(v,"TlsSha256").ok_or(invalid)?,
+            wg_interface:text(v,"WgInterface").filter(|name|crate::wg_readonly::valid_interface(name)).ok_or(invalid)?,
         })
     }
 }
@@ -194,6 +196,8 @@ fn decode_sha256_hex(s: &str) -> Option<Vec<u8>> {
 /// the canonical high-entropy bearer against its pinned HMAC tag. The pin
 /// is a trust input; do not derive it from HTTP, legacy invites.json, or this
 /// record. No signer, pin registry, migration or trusted persistence here.
+/// WgInterface names the independently provisioned local target; it is not
+/// a legacy signed descriptor field or proof of the current kernel key.
 /// All GET/fresh/retry calls still check the signed descriptor and current
 /// locked ledger. Authentic metadata alone cannot establish revocation history.
 pub fn verify_pinned_invite_metadata<'a>(raw: &[u8], pinned_sha256: &str,
@@ -208,7 +212,7 @@ pub fn verify_pinned_invite_metadata<'a>(raw: &[u8], pinned_sha256: &str,
     }
     let record=unique_json(raw).ok_or(invalid)?;
     if !version_kind(&record,"SpiderVPN.InviteMetadata")
-        || record.as_object().is_none_or(|o|o.len()!=11) {
+        || record.as_object().is_none_or(|o|o.len()!=12) {
         return Err(invalid);
     }
     let tag=decode_sha256_hex(text(&record,"BearerHmacSha256").ok_or(invalid)?)
@@ -341,6 +345,7 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
         || !hex_sha256(scope.tls_der_pin) || !valid_binding(scope.server_binding)
         || scope.public_host.is_empty() || scope.public_host.len()>253
         || !scope.public_host.bytes().all(|b| b.is_ascii_graphic())
+        || !crate::wg_readonly::valid_interface(scope.wg_interface)
         || scope.port==0 || now<0
         || management_fingerprint(scope.management_jwk).as_deref()!=Some(scope.management_fingerprint)
     { return Err(GateError::InvalidState); }
@@ -477,19 +482,29 @@ impl VerifiedConsumedRetry<'_> {
     pub fn claims(&self) -> &Claims { &self.claims }
 }
 
-/// Read-only retry under the CURRENT locked store. The trusted local
-/// interface selector must come from independently provisioned configuration,
-/// never an HTTP request. The existing adapter reads kernel inventory,
-/// protected wg.conf and kernel inventory again, rejecting disagreements.
-/// No public API accepts cached, projected or caller-supplied peer rows.
-/// The actual interface identity and exclusion of noncooperating writers
-/// still require deployment acceptance. No production caller or reply here.
+/// Verify the local selector against the independently pinned invitation
+/// metadata, not merely its syntax. The actual kernel server public key
+/// and protected config identity must still be independently verified
+/// before production integration; a name is not proof of key ownership.
+fn check_retry_interface(scope: &TrustedOpenInvite<'_>, interface: &str)
+    -> Result<(),GateError>
+{
+    if !crate::wg_readonly::valid_interface(interface) || interface!=scope.wg_interface {
+        return Err(GateError::InvalidState);
+    }
+    Ok(())
+}
+
+/// Read-only retry under the CURRENT locked store. The local service
+/// selector must exactly match independently pinned WgInterface metadata.
+/// The existing adapter reads kernel inventory, protected wg.conf and kernel
+/// inventory again, rejecting disagreements. No public API accepts cached
+/// or projected rows. Kernel/config server-key identity and writer exclusion
+/// are still integration gates. No production caller or reply here.
 pub fn prepare_consumed_retry<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
     request: &ParsedRequest, interface: &str) -> Result<VerifiedConsumedRetry<'a>,GateError>
 {
-    if !crate::wg_readonly::valid_interface(interface) {
-        return Err(GateError::InvalidState);
-    }
+    check_retry_interface(scope,interface)?;
     prepare_retry_with_observation(store,scope,request,system_utc_seconds,||
         crate::wg_conf_audit::read_verified_snapshot(interface)
             .map_err(|_|GateError::InvalidState))
