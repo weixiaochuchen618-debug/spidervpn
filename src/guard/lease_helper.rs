@@ -60,7 +60,9 @@ struct LeaseAck {
 /// 从同一个已打开的对象验证文件类型、链接数、长度，再有界读取。
 /// Windows 不跟随末级 reparse point，且读取期间不共享写入或删除。
 /// 这不是目录 DACL 或 IPC 对端身份认证的替代品。
-fn read_ipc_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
+fn open_ipc_file(path: &Path, limit: usize, consume: bool)
+    -> Result<Option<(std::fs::File, Vec<u8>)>, String>
+{
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -71,9 +73,16 @@ fn read_ipc_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
         };
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).share_mode(FILE_SHARE_READ);
+        if consume {
+            // DELETE (standard access right 0x00010000) plus GENERIC_READ.
+            // 独占打开请求：不允许另一个 helper 同时消费同一个文件对象。
+            use windows_sys::Win32::Foundation::GENERIC_READ;
+            options.access_mode(GENERIC_READ | 0x0001_0000).share_mode(0);
+        }
     }
     #[cfg(not(windows))]
     {
+        let _ = consume;
         // 非 Windows 只有协议测试，不运行 WFP；避免跟随普通符号链接。
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_file() => {}
@@ -82,7 +91,7 @@ fn read_ipc_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
             Err(e) => return Err(format!("检查租约 IPC 失败：{e}")),
         }
     }
-    let file = match options.open(path) {
+    let mut file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("打开租约 IPC 失败：{e}")),
@@ -114,12 +123,16 @@ fn read_ipc_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
         return Err("租约 IPC 不是有效的普通有界文件".into());
     }
     let mut body = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut body)
+    (&mut file).take(limit as u64 + 1).read_to_end(&mut body)
         .map_err(|e| format!("读取租约 IPC 失败：{e}"))?;
     if body.is_empty() || body.len() > limit || body.len() as u64 != meta.len() {
         return Err("租约 IPC 内容长度异常或在读取期间改变".into());
     }
-    Ok(Some(body))
+    Ok(Some((file, body)))
+}
+
+fn read_ipc_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
+    Ok(open_ipc_file(path, limit, false)?.map(|(_, body)| body))
 }
 
 /// Ready 只是启动协商，不能孤立地当作父进程已接管成功。
@@ -246,10 +259,39 @@ fn validate_session_directory(path: &Path, nonce: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(test, not(windows)))]
 fn read_request(path: &Path) -> Result<LeaseRequest, String> {
     let data = read_ipc_file(path, MAX_LEASE_IPC_BYTES)?
         .ok_or("租约请求不存在")?;
     serde_json::from_slice(&data).map_err(|e| format!("租约 JSON 无效：{e}"))
+}
+
+/// 验证后消费同一个打开的请求对象；不能通过再次解析路径来删除文件。
+/// 删除失败必须拒绝许可，不能留下可直接重复消费的原请求。
+#[cfg(windows)]
+fn consume_request(path: &Path) -> Result<LeaseRequest, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let (file, data) = open_ipc_file(path, MAX_LEASE_IPC_BYTES, true)?
+        .ok_or("租约请求不存在或已经消费")?;
+    let req: LeaseRequest = serde_json::from_slice(&data)
+        .map_err(|e| format!("租约 JSON 无效：{e}"))?;
+    validate_request(&req)?;
+    validate_session_directory(path, &req.nonce)?;
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(), FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0 {
+        return Err(format!("消费租约请求失败：{}", std::io::Error::last_os_error()));
+    }
+    drop(file);
+    Ok(req)
 }
 
 /// 先写临时文件再原子改名，防止父进程把半截 Ready 当成功。
@@ -476,7 +518,11 @@ pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
             "没有管理员权限，动态交易许可未开启".into(), 0));
         return 2;
     }
-    let req = match read_request(req_path) {
+    #[cfg(windows)]
+    let request = consume_request(req_path);
+    #[cfg(not(windows))]
+    let request = read_request(req_path);
+    let req = match request {
         Ok(req) => req,
         Err(reason) => {
             let _ = write_reply(reply_path, &reply("", LeaseState::Rejected, reason, 0));
@@ -490,8 +536,7 @@ pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
             return 2;
         }
     };
-    // 不依据刚刚读取的路径再次删除文件：该路径可能已被替换。
-    // 目录完整性及清理责任属于后续可信 IPC 生命周期设计。
+    // Windows 已通过原始文件句柄消费请求；仍需独立的目录与对端认证。
     if validate_session_directory(req_path, &req.nonce).is_err() {
         return 2;
     }
@@ -578,6 +623,29 @@ mod tests {
                 device_path: "a".into(),
             }],
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validated_request_is_consumed_once_by_handle() {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut bytes = [0u8; 16];
+        SystemRandom::new().fill(&mut bytes).unwrap();
+        let mut req = sample();
+        req.nonce = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let root = std::env::temp_dir().join(format!("spidervpn-lease-{}", req.nonce));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("request.json");
+        std::fs::write(&path, serde_json::to_vec(&req).unwrap()).unwrap();
+        let alias = root.join("alias.json");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(consume_request(&path).is_err());
+        assert!(path.exists() && alias.exists(), "拒绝硬链接不得删除目标");
+        std::fs::remove_file(&alias).unwrap();
+        assert_eq!(consume_request(&path).unwrap().nonce, req.nonce);
+        assert!(!path.exists());
+        assert!(consume_request(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
