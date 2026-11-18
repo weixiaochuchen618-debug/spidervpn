@@ -364,4 +364,219 @@ mod tests {
         assert_eq!(req.active_requests(), 0);
     }
 
+    #[cfg(feature = "linux-persistent-listener-lab")]
+    mod persistent_tests {
+        use super::*;
+        use crate::persistent_listener_lab::{run_persistent_denial_lab, ServiceReport};
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread::{self, JoinHandle};
+        use std::time::Instant;
+
+        struct Harness {
+            addr: SocketAddr,
+            stop: Arc<AtomicBool>,
+            hand: HandshakeAdmission,
+            req: RequestAdmission,
+            worker: Option<JoinHandle<io::Result<ServiceReport>>>,
+        }
+
+        impl Harness {
+            fn start(global: usize, source: usize) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let hand = HandshakeAdmission::new(global, Duration::from_secs(5)).unwrap();
+                let req = RequestAdmission::new(global, Duration::from_secs(5)).unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let (h, r, s) = (hand.clone(), req.clone(), Arc::clone(&stop));
+                let config = server_config();
+                let worker = thread::spawn(move || run_persistent_denial_lab(
+                    listener, &h, &r, config, global, source, &s));
+                Self { addr, stop, hand, req, worker: Some(worker) }
+            }
+
+            fn finish(mut self) -> ServiceReport {
+                self.stop.store(true, Ordering::Release);
+                let result = self.worker.take().unwrap().join().unwrap().unwrap();
+                assert_eq!(self.hand.active_handshakes(), 0);
+                assert_eq!(self.req.active_requests(), 0);
+                assert_eq!(result.accepted, result.global_rejected + result.source_rejected
+                    + result.handshake_rejected + result.stopped_before_admission
+                    + result.denied + result.failed);
+                result
+            }
+        }
+
+        impl Drop for Harness {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Release);
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+
+        fn wait_for(mut predicate: impl FnMut() -> bool) {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !predicate() {
+                assert!(Instant::now() < until, "persistent-listener state transition timed out");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn tls_client(addr: SocketAddr) -> StreamOwned<ClientConnection, TcpStream> {
+            let socket = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let conn = ClientConnection::new(client_config(),
+                ServerName::try_from("localhost").unwrap()).unwrap();
+            StreamOwned::new(conn, socket)
+        }
+
+        fn healthy_request(addr: SocketAddr) {
+            let mut client = tls_client(addr);
+            client.write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            client.flush().unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).unwrap();
+            let (head, json) = parse_envelope(&response);
+            assert!(head.starts_with("HTTP/1.1 500 "));
+            assert_eq!(json, serde_json::json!({"Code":"InvalidState","Ok":false}));
+        }
+
+        fn assert_immediate_close(addr: SocketAddr) {
+            let mut rejected = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).unwrap();
+            rejected.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut b = [0u8; 1];
+            match rejected.read(&mut b) {
+                Ok(0) => {}
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                other => panic!("over-capacity socket was not closed: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn source_limit_spans_post_handshake_and_other_real_source_is_independent() {
+            // Use a real second kernel source, not spoofed HTTP headers.
+            // OpenSSL is only the independent TLS test peer; all listener
+            // admission, TLS processing and responses are the Rust code.
+            let h = Harness::start(3, 1);
+            let mut held = tls_client(h.addr);
+            held.conn.complete_io(&mut held.sock).unwrap();
+            wait_for(|| h.req.active_requests() == 1);
+            assert_eq!(h.hand.active_handshakes(), 0);
+            assert_immediate_close(h.addr);
+            let dir = std::env::temp_dir().join(format!(
+                "spider-persistent-source-ca-{}", std::process::id()));
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("ca.der"), &fixture().ca).unwrap();
+            let conversion = Command::new("openssl").current_dir(&dir)
+                .args(["x509", "-inform", "DER", "-in", "ca.der", "-out", "ca.pem"])
+                .status().unwrap();
+            assert!(conversion.success());
+            let mut peer = Command::new("openssl").current_dir(&dir)
+                .args(["s_client", "-connect", &h.addr.to_string(),
+                    "-bind", "127.0.0.2:0", "-tls1_2", "-quiet",
+                    "-verify_return_error", "-verify_hostname", "localhost",
+                    "-CAfile", "ca.pem", "-no-CApath", "-no-CAstore"])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                .spawn().unwrap();
+            peer.stdin.take().unwrap().write_all(
+                b"GET /other HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            let output = peer.wait_with_output().unwrap();
+            fs::remove_dir_all(&dir).unwrap();
+            assert!(output.status.success(), "second source: {}",
+                String::from_utf8_lossy(&output.stderr));
+            let (_, json) = parse_envelope(&output.stdout);
+            assert_eq!(json, serde_json::json!({"Code":"InvalidState","Ok":false}));
+            assert_eq!(h.req.active_requests(), 1, "first source still holds request slot");
+            drop(held);
+            wait_for(|| h.req.active_requests() == 0);
+            // Give continuous reaping time to reclaim the completed handle.
+            thread::sleep(Duration::from_millis(25));
+            healthy_request(h.addr);
+            let result = h.finish();
+            assert_eq!(result.accepted, 4);
+            assert_eq!(result.source_rejected, 1);
+            assert_eq!(result.global_rejected, 0);
+            assert_eq!(result.denied, 2);
+            assert_eq!(result.failed, 1);
+            assert_eq!(result.peak_workers, 2);
+        }
+
+        #[test]
+        fn global_capacity_rejects_and_recovers_after_handshake_disconnect() {
+            let h = Harness::start(1, 1);
+            let idle = TcpStream::connect(h.addr).unwrap();
+            wait_for(|| h.hand.active_handshakes() == 1);
+            assert_immediate_close(h.addr);
+            drop(idle);
+            wait_for(|| h.hand.active_handshakes() == 0);
+            thread::sleep(Duration::from_millis(25));
+            healthy_request(h.addr);
+            let result = h.finish();
+            assert_eq!(result.global_rejected, 1);
+            assert_eq!(result.source_rejected, 0);
+            assert_eq!(result.denied, 1);
+            assert_eq!(result.failed, 1);
+            assert_eq!(result.peak_workers, 1);
+        }
+
+        #[test]
+        fn persistent_listener_reaps_more_than_previous_64_connection_limit() {
+            let h = Harness::start(4, 4);
+            for _ in 0..80 {
+                healthy_request(h.addr);
+                wait_for(|| h.req.active_requests() == 0);
+                thread::sleep(Duration::from_millis(10));
+            }
+            let result = h.finish();
+            assert_eq!(result.accepted, 80);
+            assert_eq!(result.denied, 80);
+            assert_eq!(result.failed, 0);
+            assert_eq!(result.global_rejected + result.source_rejected
+                + result.handshake_rejected, 0);
+            assert!(result.peak_workers <= 4);
+        }
+
+        #[test]
+        fn stop_closes_listener_before_draining_existing_worker() {
+            let h = Harness::start(2, 2);
+            let idle = TcpStream::connect(h.addr).unwrap();
+            wait_for(|| h.hand.active_handshakes() == 1);
+            h.stop.store(true, Ordering::Release);
+            wait_for(|| match TcpStream::connect_timeout(&h.addr, Duration::from_millis(100)) {
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => true,
+                _ => false,
+            });
+            assert_eq!(h.hand.active_handshakes(), 1, "listener must close before worker drain");
+            drop(idle);
+            let result = h.finish();
+            assert_eq!(result.denied, 0);
+            assert_eq!(result.failed, 1);
+        }
+
+        #[test]
+        fn invalid_caps_public_bind_and_pre_stopped_listener_fail_closed() {
+            let hand = HandshakeAdmission::new(1, Duration::from_secs(1)).unwrap();
+            let req = RequestAdmission::new(1, Duration::from_secs(1)).unwrap();
+            let stop = AtomicBool::new(true);
+            for (global, source) in [(0, 1), (65, 1), (1, 0), (1, 2)] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                assert_eq!(run_persistent_denial_lab(listener, &hand, &req,
+                    server_config(), global, source, &stop).unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput);
+            }
+            let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+            assert_eq!(run_persistent_denial_lab(listener, &hand, &req, server_config(),
+                1, 1, &stop).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            assert_eq!(run_persistent_denial_lab(listener, &hand, &req, server_config(),
+                1, 1, &stop).unwrap(), ServiceReport::default());
+            assert_eq!(TcpStream::connect(address).unwrap_err().kind(),
+                io::ErrorKind::ConnectionRefused);
+        }
+    }
+
 }
