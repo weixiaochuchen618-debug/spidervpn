@@ -972,7 +972,8 @@ mod pipe_ipc {
             return Err("租约进程句柄与 PID 不匹配".into());
         }
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        super::super::proxy_identity::verify_process_executable(pid, &exe)?;
+        // This exact process object is already retained by the launcher/server.
+        unsafe { super::super::proxy_identity::verify_live_process_handle(handle, pid, &exe)?; }
         require_live(handle)
     }
 
