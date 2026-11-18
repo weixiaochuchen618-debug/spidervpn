@@ -22,6 +22,12 @@ pub fn verify_proxy_owner(
     expected_pid: u32,
     expected_executable: &Path,
 ) -> Result<ListenerOwner, String> {
+    verify_listener_owner(endpoint, expected_pid)?;
+    platform::verify_executable(expected_pid, expected_executable)?;
+    Ok(ListenerOwner { endpoint, pid: expected_pid })
+}
+
+fn verify_listener_owner(endpoint: SocketAddr, expected_pid: u32) -> Result<(), String> {
     if expected_pid == 0 {
         return Err("可信代理引擎 PID 为 0，拒绝授权".into());
     }
@@ -39,8 +45,31 @@ pub fn verify_proxy_owner(
             "代理端点 {endpoint} 的监听进程与预期引擎 PID={expected_pid} 不符（实际={owners:?}），拒绝授权"
         ));
     }
-    platform::verify_executable(expected_pid, expected_executable)?;
-    Ok(ListenerOwner { endpoint, pid: expected_pid })
+    Ok(())
+}
+
+/// Confirm the retained live process object instead of a new OpenProcess(pid).
+/// # Safety
+/// handle must remain a valid process handle with query and SYNCHRONIZE rights
+/// throughout this call; its owner must not concurrently close it.
+#[cfg(windows)]
+pub unsafe fn verify_live_process_handle(handle: windows_sys::Win32::Foundation::HANDLE,
+    pid: u32, expected: &Path) -> Result<(), String>
+{
+    platform::verify_live_handle(handle, pid, expected)
+}
+
+/// # Safety
+/// The handle must meet verify_live_process_handle's contract.
+#[cfg(windows)]
+pub unsafe fn verify_proxy_owner_on_handle(
+    endpoint: SocketAddr, pid: u32, expected: &Path,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<ListenerOwner, String> {
+    verify_live_process_handle(handle, pid, expected)?;
+    verify_listener_owner(endpoint, pid)?;
+    verify_live_process_handle(handle, pid, expected)?;
+    Ok(ListenerOwner { endpoint, pid })
 }
 
 /// 独立的进程身份核验：长期 WFP helper 必须确认 controller PID
@@ -188,26 +217,47 @@ mod platform {
     }
 
     pub fn verify_executable(pid: u32, expected: &Path) -> Result<(), String> {
-        let expected = expected.canonicalize()
-            .map_err(|e| format!("可信引擎 exe 路径不可核验：{e}"))?;
         let process = ProcessHandle(unsafe {
             Thread::OpenProcess(Thread::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
         });
         if process.0.is_null() {
             return Err("无法读取代理监听进程路径，拒绝将端口视为可信".into());
         }
+        verify_image_path(process.0, expected)
+    }
+
+    pub(super) fn verify_live_handle(handle: windows_sys::Win32::Foundation::HANDLE,
+        pid: u32, expected: &Path) -> Result<(), String>
+    {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        let live = || pid != 0 && unsafe {
+            Thread::GetProcessId(handle) == pid && Thread::WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        };
+        if !live() { return Err("受监督进程句柄/PID 不匹配或进程已退出".into()); }
+        verify_image_path(handle, expected)?;
+        if !live() { return Err("路径核验期间进程已退出".into()); }
+        Ok(())
+    }
+
+    fn verify_image_path(handle: windows_sys::Win32::Foundation::HANDLE, expected: &Path) -> Result<(), String> {
+        let expected = expected.canonicalize()
+            .map_err(|e| format!("可信引擎 exe 路径不可核验：{e}"))?;
         let mut buf = vec![0u16; 32768];
         let mut len = buf.len() as u32;
         let ok = unsafe {
-            Thread::QueryFullProcessImageNameW(process.0, 0, buf.as_mut_ptr(), &mut len)
+            Thread::QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len)
         };
-        if ok == 0 || len == 0 {
+        if ok == 0 || len == 0 || len as usize > buf.len() {
             return Err("读取引擎进程 exe 路径失败".into());
         }
-        let actual = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]))
+        let image = String::from_utf16(&buf[..len as usize])
+            .map_err(|_| "进程路径包含无效 UTF-16，拒绝授权")?;
+        let actual = std::path::PathBuf::from(image)
             .canonicalize()
             .map_err(|e| format!("监听进程 exe 路径不可核验：{e}"))?;
-        if !actual.to_string_lossy().eq_ignore_ascii_case(&expected.to_string_lossy()) {
+        let actual = actual.to_str().ok_or("实际进程规范路径不可无损表示")?;
+        let expected_text = expected.to_str().ok_or("预期进程规范路径不可无损表示")?;
+        if !actual.eq_ignore_ascii_case(expected_text) {
             return Err(format!(
                 "代理监听进程 exe 路径不匹配（预期={}），拒绝授权", expected.display()
             ));
@@ -241,6 +291,29 @@ mod tests {
             std::process::id(),
             &std::env::temp_dir().join("not-spidervpn.exe"),
         ).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_handle_binds_listener_and_image_to_same_live_process() {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        let pid = std::process::id();
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) };
+        assert!(!raw.is_null());
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let expected = std::env::current_exe().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        unsafe {
+            assert!(verify_live_process_handle(handle.as_raw_handle(), pid, &expected).is_ok());
+            assert!(verify_live_process_handle(handle.as_raw_handle(), pid ^ 1, &expected).is_err());
+            assert!(verify_live_process_handle(handle.as_raw_handle(), pid, &expected.with_extension("missing.exe")).is_err());
+            assert!(verify_proxy_owner_on_handle(endpoint, pid, &expected, handle.as_raw_handle()).is_ok());
+            assert!(verify_proxy_owner_on_handle(endpoint, pid ^ 1, &expected, handle.as_raw_handle()).is_err());
+        }
+        drop(listener);
+        assert!(unsafe { verify_proxy_owner_on_handle(endpoint, pid, &expected, handle.as_raw_handle()) }.is_err());
     }
 
     #[test]
