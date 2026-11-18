@@ -1,11 +1,13 @@
-//! SEC-02 untrusted one-message HTTP/1.1 framing on an existing DeadlineIo.
+//! SEC-02 untrusted one-message HTTP/1.1 framing over a bounded Read stream.
 //! NOT a TLS listener, HTTP responder, authentication or import authority.
 //! The caller must provide real independently validated TLS and close after
 //! exactly one response. Bytes after one parsed request are never dispatched.
 //! Limits are fixed, not drawn from a legacy JSON config or remote request.
 #![cfg(all(target_os = "linux", feature = "linux-handshake-admission"))]
 
-use crate::handshake_admission::DeadlineIo;
+// A generic Read boundary is essential: production HTTP must consume only
+// decrypted rustls Stream data, while DeadlineIo remains the bounded encrypted
+// transport underneath. This type does not provide authorization.
 use std::fmt;
 use std::io::{self, Read};
 
@@ -41,7 +43,7 @@ fn invalid(msg: &'static str) -> io::Error {
 }
 
 /// No read-ahead into pipelined request bytes; rejects bare LF and embedded CR.
-fn crlf_line(io: &mut DeadlineIo, max: usize) -> io::Result<Vec<u8>> {
+fn crlf_line<R: Read>(io: &mut R, max: usize) -> io::Result<Vec<u8>> {
     let mut line = Vec::new();
     loop {
         let mut b = [0u8];
@@ -104,7 +106,9 @@ fn parse_length(raw: &[u8]) -> io::Result<usize> {
     Ok(len)
 }
 
-/// Decode exactly one bounded HTTP/1.1 message from already protected IO.
+/// Decode exactly one bounded HTTP/1.1 message from a caller-protected Read.
+/// For encrypted connections this MUST be the post-handshake DECRYPTED
+/// rustls Stream, never the raw TLS ciphertext transport.
 /// A real caller must complete TLS authentication first, reject invalid Host
 /// binding, verify bearer/Revoked state and emit one JSON response then close.
 /// This pure decoder neither grants privileges nor generates responses.
@@ -113,7 +117,7 @@ fn parse_length(raw: &[u8]) -> io::Result<usize> {
 /// GET: no body (Content-Length absent or 0). HTTP Host exactly once.
 /// Duplicate CL/Host/Auth, obs-fold, Expect, Upgrade and malformed CRLF fail.
 /// An extra pipelined request is left unread and must be dropped on close.
-pub fn read_one_request(io: &mut DeadlineIo) -> io::Result<ParsedRequest> {
+pub fn read_one_request<R: Read>(io: &mut R) -> io::Result<ParsedRequest> {
     let (method, target) = request_line(&crlf_line(io, MAX_REQUEST_LINE)?)?;
     let mut bytes = 0usize;
     let mut fields = 0usize;

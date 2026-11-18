@@ -55,6 +55,24 @@ jobs:
           grep -F 'pub struct RequestAdmission' server-rs/src/handshake_admission.rs
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
 
+      - name: SEC-02 real rustls TLS1.2 decrypted HTTP wire lab (feature OFF by default)
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          openssl version
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-tls-wire-lab --lib tls_wire::tests -- \
+            --test-threads=1 --nocapture
+          # Both encrypted transport and HTTP decoder compile in one feature.
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-tls-wire-lab --lib http_one_request::tests -- \
+            --test-threads=1
+          grep -F 'linux-tls-wire-lab = ["linux-handshake-admission", "dep:rustls"]' server-rs/Cargo.toml
+          ! grep -F 'linux-tls-wire-lab' src/pairhost.rs
+          grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
+
       - name: Compile and test opt-in Rust root-only terminal finalization policy
         shell: bash
         env:
