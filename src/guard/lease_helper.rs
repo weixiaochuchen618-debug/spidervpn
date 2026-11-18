@@ -481,6 +481,135 @@ fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
 
 /// 启动器显式返回的子进程句柄。释放 handle 不会结束 Windows 进程；
 /// helper 自己负责在 sing-box 或主程序退出时撤销动态 WFP 许可。
+// Exactly one local experimental controller registration. Never infer an
+// external process's ownership from a runtime PID or a file.
+#[cfg(windows)]
+#[derive(Default)]
+struct LocalLeaseSlot(std::sync::Mutex<Option<std::sync::Arc<LocalLeaseControl>>>);
+
+#[cfg(windows)]
+struct LocalLeaseControl {
+    nonce: String,
+    controller_pid: u32,
+    controller_stamp: u64,
+    engine_pid: u32,
+    engine_stamp: u64,
+    engine: std::os::windows::io::OwnedHandle,
+    cancelled: std::sync::atomic::AtomicBool,
+    // Serialize cancellation with the final gate and each nonblocking write.
+    // No polling, sleeping, UAC or BFE work under this lock.
+    write_gate: std::sync::Mutex<()>,
+}
+
+#[cfg(windows)]
+static LOCAL_LEASE: LocalLeaseSlot = LocalLeaseSlot(std::sync::Mutex::new(None));
+
+#[cfg(windows)]
+impl LocalLeaseControl {
+    fn require_active(&self) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err("本次实验租约已取消".into());
+        }
+        Ok(())
+    }
+
+    fn require_identity(&self) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessId};
+        self.require_active()?;
+        let handle = self.engine.as_raw_handle();
+        pipe_ipc::require_live(handle)?;
+        if unsafe { GetProcessId(handle) } != self.engine_pid
+            || pipe_ipc::creation_stamp(handle)? != self.engine_stamp
+            || self.controller_pid != std::process::id()
+            || pipe_ipc::creation_stamp(unsafe { GetCurrentProcess() })? != self.controller_stamp
+        {
+            return Err("实验租约控制者或引擎身份已变化".into());
+        }
+        self.require_active()
+    }
+
+    fn authorized<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _gate = self.write_gate.lock().map_err(|_| "租约取消门状态异常")?;
+        self.require_active()?;
+        action()
+    }
+
+    fn cancel(&self) {
+        // On poison still revoke. Never turn poison into authorization.
+        let _gate = self.write_gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancelled.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct LocalLeaseRegistration<'a> {
+    slot: &'a LocalLeaseSlot,
+    control: std::sync::Arc<LocalLeaseControl>,
+}
+
+#[cfg(windows)]
+impl Drop for LocalLeaseRegistration<'_> {
+    fn drop(&mut self) {
+        self.control.cancel();
+        let mut slot = self.slot.0.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.control)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl LocalLeaseSlot {
+    fn register(&self, engine_pid: u32, executable: &Path) -> Result<LocalLeaseRegistration<'_>, String> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut slot = self.0.lock().map_err(|_| "实验租约登记状态异常")?;
+        if slot.is_some() { return Err("本进程已有尚未退出的实验租约".into()); }
+        if engine_pid == 0 || engine_pid == std::process::id() {
+            return Err("实验租约引擎 PID 无效".into());
+        }
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, engine_pid) };
+        if raw.is_null() { return Err("无法取得实验引擎真实进程句柄".into()); }
+        let engine = unsafe { OwnedHandle::from_raw_handle(raw) };
+        unsafe { super::proxy_identity::verify_live_process_handle(engine.as_raw_handle(), engine_pid, executable)?; }
+        let engine_stamp = pipe_ipc::creation_stamp(engine.as_raw_handle())?;
+        let controller_stamp = pipe_ipc::creation_stamp(unsafe { GetCurrentProcess() })?;
+        let mut bytes = [0u8; 16];
+        SystemRandom::new().fill(&mut bytes).map_err(|_| "生成动态许可 nonce 失败".to_string())?;
+        let nonce = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        decode_nonce(&nonce)?;
+        let control = std::sync::Arc::new(LocalLeaseControl {
+            nonce, controller_pid: std::process::id(), controller_stamp,
+            engine_pid, engine_stamp, engine,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            write_gate: std::sync::Mutex::new(()),
+        });
+        *slot = Some(control.clone());
+        Ok(LocalLeaseRegistration { slot: self, control })
+    }
+
+    fn cancel_current(&self) {
+        let slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(control) = slot.as_ref() { control.cancel(); }
+        // Do not free the slot here. Only its pipe-owning registration drops it.
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn register_experimental_lease(engine_pid: u32, executable: &Path)
+    -> Result<LocalLeaseRegistration<'static>, String>
+{
+    LOCAL_LEASE.register(engine_pid, executable)
+}
+
+#[cfg(windows)]
+pub(crate) fn cancel_current_experimental_lease() {
+    LOCAL_LEASE.cancel_current();
+}
+
 #[cfg(windows)]
 pub struct LeaseChild {
     handle: windows_sys::Win32::Foundation::HANDLE,
@@ -514,9 +643,8 @@ impl Drop for LeaseChild {
 
 /// 默认关闭的实验入口调用此启动器；不改变生产连接或持久规则。
 #[cfg(windows)]
-pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
+pub(crate) fn launch_elevated(request: &LeaseRequest, registration: LocalLeaseRegistration<'static>) -> Result<LeaseChild, String> {
     use pipe_ipc::*;
-    use ring::rand::{SecureRandom, SystemRandom};
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::GetLastError;
@@ -530,9 +658,12 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     let own = unsafe { GetCurrentProcess() };
     let controller_token = token_identity(own)?;
     let controller_stamp = creation_stamp(own)?;
-    let mut bytes = [0u8; 16];
-    SystemRandom::new().fill(&mut bytes).map_err(|_| "生成动态许可 nonce 失败".to_string())?;
-    let nonce = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let control = registration.control.clone();
+    control.require_identity()?;
+    if request.engine_pid != control.engine_pid || controller_stamp != control.controller_stamp {
+        return Err("实验租约登记与请求身份不匹配".into());
+    }
+    let nonce = control.nonce.clone();
     let mut req = request.clone();
     req.nonce = nonce.clone();
     validate_request(&req)?;
@@ -552,11 +683,13 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     info.lpFile = exe_w.as_ptr();
     info.lpParameters = args_w.as_ptr();
     info.nShow = SW_HIDE;
+    control.require_identity()?;
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         return Err(format!("无法启动提权 WFP helper（Win32={}）", unsafe { GetLastError() }));
     }
     if info.hProcess.is_null() { return Err("启动后未获得 helper 进程句柄".into()); }
     let mut child = LeaseChild { handle: info.hProcess, confirmed: false };
+    control.require_identity()?;
     let helper_pid = unsafe { GetProcessId(child.handle) };
     verify_same_image(child.handle, helper_pid)?;
     let helper_stamp = creation_stamp(child.handle)?;
@@ -565,8 +698,12 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
         return Err("helper 未提权或不在相同交互会话".into());
     }
     let deadline = Instant::now() + Duration::from_secs(20);
-    let pipe = Pipe::client(&nonce, deadline, || require_live(child.handle))?;
+    let pipe = Pipe::client(&nonce, deadline, || {
+        control.require_identity()?;
+        require_live(child.handle)
+    })?;
     let check = || -> Result<(), String> {
+        control.require_identity()?;
         require_live(child.handle)?;
         pipe.require_peer(helper_pid, false)?;
         pipe.require_connected()
@@ -576,12 +713,12 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     if creation_stamp(child.handle)? != helper_stamp || token_identity(child.handle)? != helper_token {
         return Err("helper 创建时间或 token 变化".into());
     }
-    pipe.send(&data, deadline, &check)?;
+    pipe.send_guarded(&data, deadline, &check, &control)?;
     let ready = pipe.receive(4096, deadline, &check)?;
     validate_stage(&ready, &nonce, req.programs.len(), helper_pid, LeaseState::Ready)?;
     let ack = serde_json::to_vec(&LeaseAck { schema: LEASE_SCHEMA, nonce: nonce.clone(), accepted: true })
         .map_err(|e| e.to_string())?;
-    pipe.send(&ack, deadline, &check)?;
+    pipe.send_guarded(&ack, deadline, &check, &control)?;
     let accepted = pipe.receive(4096, deadline, &check)?;
     validate_stage(&accepted, &nonce, req.programs.len(), helper_pid, LeaseState::Accepted)?;
     // A distinct final authorization is sent only after the authenticated consumption
@@ -591,13 +728,13 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     }
     let finish = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state: LeaseState::Committed })
         .map_err(|e| e.to_string())?;
-    pipe.send(&finish, deadline, &check)?;
+    pipe.send_guarded(&finish, deadline, &check, &control)?;
     let committed = pipe.receive(4096, deadline, &check)?;
     validate_stage(&committed, &nonce, req.programs.len(), helper_pid, LeaseState::Committed)?;
     check()?;
     let receipt = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA, nonce: nonce.clone(), state: LeaseState::Receipt })
         .map_err(|e| e.to_string())?;
-    pipe.send(&receipt, deadline, &check)?;
+    pipe.send_guarded(&receipt, deadline, &check, &control)?;
     // Closing either end is NEVER success.
     let active = pipe.receive(4096, deadline, &check)?;
     validate_stage(&active, &nonce, req.programs.len(), helper_pid, LeaseState::Active)?;
@@ -606,7 +743,7 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     // heartbeat. The next challenge can only follow an authenticated round.
     // Keep ownership here: any failure before worker authorization drops pipe.
     let pending = confirm_first_heartbeat(&pipe, child.handle, &nonce, helper_pid,
-        helper_stamp, &helper_token, deadline)?;
+        helper_stamp, &helper_token, deadline, Some(&control))?;
     let helper_monitor = duplicate_process_handle(child.handle)?;
     if !child.running() || Instant::now() >= deadline {
         return Err("最终租约回执超期或进程退出".into());
@@ -618,20 +755,23 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
     let (start, permission) = std::sync::mpsc::sync_channel::<()>(1);
     std::thread::Builder::new().name("spidervpn-lease-channel".into())
         .spawn(move || {
-            // Even if the thread exists, it cannot renew the lease until the
-            // final caller-side checks succeeded. Abandonment drops the sender.
+            // Drop the sole pipe BEFORE releasing the registration, including
+            // on timeout or panic. The next start cannot overlap this pipe.
+            let registration = registration;
+            let pipe = pipe;
             if permission.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_err()
                 || Instant::now() >= deadline
+                || registration.control.require_identity().is_err()
             {
                 return;
             }
             let _ = maintain_controller_channel(pipe, helper_monitor, &nonce, helper_pid,
-                helper_stamp, &helper_token, pending);
+                helper_stamp, &helper_token, pending, &registration.control);
         }).map_err(|e| format!("启动租约信道监督失败：{e}"))?;
     if !child.running() || Instant::now() >= deadline {
         return Err("租约监督移交前已超时或 helper 退出".into());
     }
-    start.send(()).map_err(|_| "租约监督线程未接管".to_string())?;
+    control.authorized(|| start.send(()).map_err(|_| "租约监督线程未接管".to_string()))?;
     // No fallible caller-side operation can occur after authorizing renewal.
     child.confirmed = true;
     Ok(child)
@@ -803,14 +943,21 @@ fn controller_heartbeat_check(pipe: &pipe_ipc::Pipe,
 #[cfg(windows)]
 fn confirm_first_heartbeat(pipe: &pipe_ipc::Pipe,
     handle: windows_sys::Win32::Foundation::HANDLE, nonce: &str, pid: u32, stamp: u64,
-    identity: &pipe_ipc::TokenIdentity, startup_deadline: std::time::Instant) -> Result<Vec<u8>, String>
+    identity: &pipe_ipc::TokenIdentity, startup_deadline: std::time::Instant,
+    control: Option<&LocalLeaseControl>) -> Result<Vec<u8>, String>
 {
     use std::time::Instant;
     let deadline = startup_deadline.min(Instant::now() + HEARTBEAT_TIMEOUT + HEARTBEAT_INTERVAL);
-    let check = || controller_heartbeat_check(pipe, handle, pid, stamp, identity);
+    let check = || {
+        if let Some(control) = control { control.require_identity()?; }
+        controller_heartbeat_check(pipe, handle, pid, stamp, identity)
+    };
     let first = pipe.receive(4096, deadline, &check)?;
     decode_heartbeat(&first, nonce, 1)?;
-    pipe.send(&first, deadline, &check)?;
+    match control {
+        Some(control) => pipe.send_guarded(&first, deadline, &check, control)?,
+        None => pipe.send(&first, deadline, &check)?,
+    }
     // Sequence 2 is issued by the authenticated helper only after the first
     // response was consumed, verified and the lease revalidated. No extra
     // unauthenticated "success" message or disconnect-as-success path.
@@ -824,11 +971,14 @@ fn confirm_first_heartbeat(pipe: &pipe_ipc::Pipe,
 #[cfg(windows)]
 fn maintain_controller_channel(pipe: pipe_ipc::Pipe, helper: std::os::windows::io::OwnedHandle,
     nonce: &str, pid: u32, stamp: u64, identity: &pipe_ipc::TokenIdentity,
-    pending: Vec<u8>) -> Result<(), String>
+    pending: Vec<u8>, control: &LocalLeaseControl) -> Result<(), String>
 {
     use std::os::windows::io::AsRawHandle;
     use std::time::Instant;
-    let check = || controller_heartbeat_check(&pipe, helper.as_raw_handle(), pid, stamp, identity);
+    let check = || {
+        control.require_identity()?;
+        controller_heartbeat_check(&pipe, helper.as_raw_handle(), pid, stamp, identity)
+    };
     let mut sequence = 2u64;
     let mut pending = Some(pending);
     loop {
@@ -838,7 +988,7 @@ fn maintain_controller_channel(pipe: pipe_ipc::Pipe, helper: std::os::windows::i
             None => pipe.receive(4096, deadline, &check)?,
         };
         decode_heartbeat(&body, nonce, sequence)?;
-        pipe.send(&body, deadline, &check)?;
+        pipe.send_guarded(&body, deadline, &check, control)?;
         sequence = sequence.checked_add(1).ok_or("租约心跳顺序溢出")?;
     }
 }
@@ -1180,7 +1330,8 @@ mod pipe_ipc {
         }
 
         fn transfer(&self, read: bool, bytes: &mut [u8], deadline: Instant,
-            check: &mut impl FnMut() -> Result<(), String>) -> Result<(), String>
+            check: &mut impl FnMut() -> Result<(), String>,
+            control: Option<&super::LocalLeaseControl>) -> Result<(), String>
         {
             let mut offset = 0usize;
             while offset < bytes.len() {
@@ -1188,12 +1339,19 @@ mod pipe_ipc {
                 if Instant::now() >= deadline { return Err("租约管道 I/O 超时".into()); }
                 let chunk = &mut bytes[offset..];
                 let mut count = 0u32;
-                let ok = unsafe {
-                    if read { ReadFile(self.raw(), chunk.as_mut_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
-                    else { WriteFile(self.raw(), chunk.as_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
+                let mut io = || {
+                    let ok = unsafe {
+                        if read { ReadFile(self.raw(), chunk.as_mut_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
+                        else { WriteFile(self.raw(), chunk.as_ptr(), chunk.len() as u32, &mut count, std::ptr::null_mut()) }
+                    };
+                    // Capture thread-local Win32 error before releasing gate.
+                    Ok((ok, if ok == 0 { unsafe { GetLastError() } } else { 0 }))
+                };
+                let (ok, err) = match control {
+                    Some(control) => control.authorized(io)?,
+                    None => io()?,
                 };
                 if ok == 0 {
-                    let err = unsafe { GetLastError() };
                     if err != ERROR_NO_DATA {
                         return Err(format!("租约管道 I/O 失败：Win32={err}"));
                     }
@@ -1218,20 +1376,32 @@ mod pipe_ipc {
             let mut frame = Vec::with_capacity(bytes.len() + 4);
             frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             frame.extend_from_slice(bytes);
-            self.transfer(false, &mut frame, deadline, &mut check)
+            self.transfer(false, &mut frame, deadline, &mut check, None)
+        }
+
+        pub(super) fn send_guarded(&self, bytes: &[u8], deadline: Instant,
+            mut check: impl FnMut() -> Result<(), String>, control: &super::LocalLeaseControl) -> Result<(), String>
+        {
+            if bytes.is_empty() || bytes.len() > MAX_LEASE_IPC_BYTES {
+                return Err("租约管道发送长度异常".into());
+            }
+            let mut frame = Vec::with_capacity(bytes.len() + 4);
+            frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            frame.extend_from_slice(bytes);
+            self.transfer(false, &mut frame, deadline, &mut check, Some(control))
         }
 
         pub(super) fn receive(&self, limit: usize, deadline: Instant,
             mut check: impl FnMut() -> Result<(), String>) -> Result<Vec<u8>, String>
         {
             let mut header = [0u8; 4];
-            self.transfer(true, &mut header, deadline, &mut check)?;
+            self.transfer(true, &mut header, deadline, &mut check, None)?;
             let size = u32::from_le_bytes(header) as usize;
             if size == 0 || size > limit || size > MAX_LEASE_IPC_BYTES {
                 return Err("租约管道消息长度异常".into());
             }
             let mut body = vec![0u8; size];
-            self.transfer(true, &mut body, deadline, &mut check)?;
+            self.transfer(true, &mut body, deadline, &mut check, None)?;
             Ok(body)
         }
     }
@@ -1563,7 +1733,7 @@ mod tests {
                     let identity = token_identity(handle).unwrap();
                     let stamp = creation_stamp(handle).unwrap();
                     let next = confirm_first_heartbeat(pipe, handle, &nonce, helper_pid,
-                        stamp, &identity, deadline).unwrap();
+                        stamp, &identity, deadline, None).unwrap();
                     assert_eq!(decode_heartbeat(&next, &nonce, 2).unwrap().sequence, 2);
                     drop(keep_open.take());
                 } else if mode != "silent-active" && mode != "wrong-token" && mode != "wrong-sid" {
@@ -1666,7 +1836,7 @@ mod tests {
                 let _ = server.receive(4096, deadline, || Ok(()));
             });
             let result = confirm_first_heartbeat(&controller, unsafe { GetCurrentProcess() },
-                &nonce, pid, stamp, &token, Instant::now() + Duration::from_millis(400));
+                &nonce, pid, stamp, &token, Instant::now() + Duration::from_millis(400), None);
             assert_eq!(result.is_ok(), mode == "valid", "first heartbeat mode {mode}");
             drop(controller);
             worker.join().unwrap();
