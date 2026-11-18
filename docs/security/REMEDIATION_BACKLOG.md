@@ -662,3 +662,11 @@ PR/commit/CI: ...
 - **首次 SHA CI 待验证终态**：[Linux #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337)、[MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354)、[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452)。本条书写时 Linux netns Job Success、core 正在编译；不能借父 PR #19 的成功冒充此 SHA；一旦失败须修 Rust 而不是跳过测试。
 - **真实安全验收上限**：这还只是默认关闭的 Rust callback + TCP 资源策略，未实现加密 TLS 1.2 服务端、证书/指纹兼容、正式 HTTP parser、身份验证/撤销历史、global root writer 排他或 VPS 实机部署；用户服务仍使用有慢握手 DoS 缺陷的 Python 端。CPU 无限阻塞也无法由纯 socket wrapper 中断。故 SEC-02/SEC-01/08、Issue #5 **OPEN**，PR #20 Draft、不合并 main。
 
+
+
+## D.60 PR #20 Linux 同一 SHA 两 Job Success 与 13 项真实 socket 回归（2026-11-18）
+
+- 新代码 HEAD `a773fe881eb02954279d068d2c7d05dacbab5a3e`，[Linux CI #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337) **两个 Job 均 Completed/Success**，原始 core 日志：**121 library passed / 0 failed / 0 ignored**、`handshake_admission::tests` **13 passed / 0 failed / 0 ignored**（包含新增五组）；原旧脚本隔离/CLI 回归、真实 root owner-only 临时目录原子退役与独立真 WG kernel/netns Job 都完成成功。保留 `cargo --locked`、Linux `RUSTFLAGS=-D warnings`，没有移除或忽略任何失败测试。
+- 与父 PR #19 的 `9cc7ab6b` GitHub compare 精确**只有两个文件**：新 Rust 服务端 `server-rs/src/handshake_admission.rs` 和原 Linux CI yaml。新 `spawn_one_request` 对成功握手后**单个请求处理回调**做第二配额和总期限保护；当前没有 HTTP parser，**无法以这段源码证明网络上严格解析/限制为恰好一条 HTTP/1.1 请求**。未来 TLS + HTTP 服务接线时必须独立验证 headers/body bounds、Transfer-Encoding/Content-Length、keepalive 拒绝、授权 token 与恶意输入；纯 CPU 无限循环/阻塞外部调用也未被强制中断。
+- 同 SHA [MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354) Rust 编译和现有部分回归已在运行，[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452) 仍在编译，**需核实最终完整 Job**；不能借用父 #19 已绿冒充新 SHA 的全部绿。真正 Python `wrap_socket(listener)` 慢握手 P0 风险仍在 production；SEC-02/01/08、Issue #5 Open，PR #20 Draft，main/UI/连接/WFP 保持原样。
+

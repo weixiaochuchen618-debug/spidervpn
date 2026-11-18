@@ -519,3 +519,10 @@
 - 五组新真 TCP 正反向回归与原 8 条 handshake tests 都须在 Linux `--locked` / `-D warnings` 执行，真实 WG netns、root fs 不删。首 SHA [Linux #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337) netns Job 已 Success、core 正在运行；[MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354)、[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452) 仍要读终态。新 agent 先查这三条精确 SHA 工作流，红例不可 skip。
 - 即使所有测试绿，生产 `tc-pair.py` 还是 TLS wrap listening socket 旧实现，未切换 Rust server，更未完成证书/握手/HTTP/Revoked data 的安全验收；SEC-02、SEC-01、SEC-08、Issue #5 OPEN、PR #20/全部父 PR Draft，main/UI/连接/WFP persistent BLOCK 不变。
 
+
+
+## 62. PR #20 精确 SHA Linux Core + 真 WG netns 全部 Success，Windows 待终态（2026-11-18）
+
+- [Draft PR #20](https://github.com/weixiaochuchen618-debug/spidervpn/pull/20) HEAD `a773fe881eb02954279d068d2c7d05dacbab5a3e` 的 [Linux #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337) **两个 Job Completed/Success**。原始日志新旧 13 项 Rust TCP handshake + posthandshake bounded callback 测试和 121 lib test 0 failed/ignored，真 WG kernel/netns 及 root 临时目录 FS 均成功，Linux locked + deny warnings 保留。代码相对 #19 仅 Rust 新模块和 Linux workflow 两文件，旧 Windows/UI/WFP/连接与 Python 无变更。
+- **重要验收限制**：Rust handoff 保证一个 handler callback、容量、绝对时限和完成后关闭 socket，**不是真 HTTP parser**，不能证明一个 callback 内绝不处理多 HTTP 请求；今后必须添加真实 TLS、HTTP1.1 协议解析/长度限制、可信 token/证书绑定。它不修复生产 Python listener DoS，不在 main。当前 [MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354)、[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452) 需核对整个相同 SHA 的 Job 终态，红则修、不 skip。See [Backlog D.60](./REMEDIATION_BACKLOG.md)。SEC-02/01/08 Issue #5 OPEN，PR #20 Draft。
+
