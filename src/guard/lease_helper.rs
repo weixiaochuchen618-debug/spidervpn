@@ -139,15 +139,31 @@ fn read_ipc_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
 
 /// Ready 只是启动协商，不能孤立地当作父进程已接管成功。
 /// 辅助进程只接受同一个随机目录的 ack.json，绝不接受另一会话旧 nonce。
+#[cfg(test)]
 fn read_ack(path: &Path, nonce: &str) -> Result<bool, String> {
     let Some(body) = read_ipc_file(path, 4096)? else {
         return Ok(false);
     };
-    let ack: LeaseAck = serde_json::from_slice(&body)
+    parse_ack(&body, nonce)?;
+    Ok(true)
+}
+
+fn parse_ack(body: &[u8], nonce: &str) -> Result<(), String> {
+    let ack: LeaseAck = serde_json::from_slice(body)
         .map_err(|e| format!("租约确认文件不是合法协议：{e}"))?;
     if ack.schema != LEASE_SCHEMA || ack.nonce != nonce || !ack.accepted {
         return Err("启动方确认的会话版本、nonce 或决定不匹配".into());
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn consume_ack(path: &Path, nonce: &str) -> Result<bool, String> {
+    let Some((file, body)) = open_ipc_file(path, 4096, true)? else {
+        return Ok(false);
+    };
+    parse_ack(&body, nonce)?;
+    delete_consumed_file(file)?;
     Ok(true)
 }
 
@@ -272,16 +288,22 @@ fn read_request(path: &Path) -> Result<LeaseRequest, String> {
 /// 删除失败必须拒绝许可，不能留下可直接重复消费的原请求。
 #[cfg(windows)]
 fn consume_request(path: &Path) -> Result<LeaseRequest, String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
-    };
     let (file, data) = open_ipc_file(path, MAX_LEASE_IPC_BYTES, true)?
         .ok_or("租约请求不存在或已经消费")?;
     let req: LeaseRequest = serde_json::from_slice(&data)
         .map_err(|e| format!("租约 JSON 无效：{e}"))?;
     validate_request(&req)?;
     validate_session_directory(path, &req.nonce)?;
+    delete_consumed_file(file)?;
+    Ok(req)
+}
+
+#[cfg(windows)]
+fn delete_consumed_file(file: std::fs::File) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     if unsafe {
         SetFileInformationByHandle(
@@ -293,7 +315,7 @@ fn consume_request(path: &Path) -> Result<LeaseRequest, String> {
         return Err(format!("消费租约请求失败：{}", std::io::Error::last_os_error()));
     }
     drop(file);
-    Ok(req)
+    Ok(())
 }
 
 /// 发布时由文件系统原子拒绝已存在的目标，而不是依赖事前 exists 检查。
@@ -625,7 +647,7 @@ pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
             if std::time::Instant::now() >= deadline {
                 return 6;
             }
-            let accepted = match read_ack(&ack_path, &req.nonce) {
+            let accepted = match consume_ack(&ack_path, &req.nonce) {
                 Ok(value) => value,
                 Err(_) => return 6, // lease 被 Drop，动态会话随之关闭
             };
@@ -850,6 +872,31 @@ mod tests {
         )).unwrap()).unwrap();
         assert!(read_ready(&path, &nonce, 1, std::process::id()).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ack_consumption_rejects_alias_and_removes_only_valid_object() {
+        let root = std::env::temp_dir().join(format!("spidervpn-lease-ack-consume-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("ack.json");
+        let alias = root.join("alias.json");
+        let nonce = sample().nonce;
+        assert!(!consume_ack(&path, &nonce).unwrap());
+        write_ack(&path, &nonce, true).unwrap();
+        assert!(consume_ack(&path, "ffffffffffffffffffffffffffffffff").is_err());
+        assert!(path.exists());
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(consume_ack(&path, &nonce).is_err());
+        assert!(path.exists() && alias.exists());
+        std::fs::remove_file(alias).unwrap();
+        assert!(consume_ack(&path, &nonce).unwrap());
+        assert!(!path.exists());
+        assert!(!consume_ack(&path, &nonce).unwrap());
+        write_ack(&path, &nonce, false).unwrap();
+        assert!(consume_ack(&path, &nonce).is_err());
+        assert!(path.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
