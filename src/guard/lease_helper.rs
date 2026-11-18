@@ -1308,9 +1308,46 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn real_process_channel_faults_revoke_without_kill() {
+        run_channel_fault_cases(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "显式隔离 BFE runner：真实产品监督函数与动态 WFP 过滤器联合验证"]
+    fn real_process_channel_faults_with_bfe() {
+        assert_eq!(std::env::var("SPIDERVPN_WFP_CANARY").as_deref(), Ok("1"));
+        run_channel_fault_cases(true);
+    }
+
+    #[cfg(windows)]
+    fn run_channel_fault_cases(native_bfe: bool) {
+        use super::super::wfp_win::{WfpEngine, RawFilter, app_id_from_path, filter_add, filter_get_by_id};
+        use std::net::{TcpListener, TcpStream, SocketAddr};
         use std::os::windows::io::AsRawHandle;
         use std::process::{Child, Command};
         use windows_sys::Win32::System::Threading::GetProcessId;
+
+        fn wait_for(deadline: Instant, mut condition: impl FnMut() -> bool, why: &str) {
+            while !condition() {
+                assert!(Instant::now() < deadline, "{why}");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn assert_flow(listener: &TcpListener, permit: bool) {
+            let addr = listener.local_addr().unwrap();
+            let outcome = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+            assert_eq!(outcome.is_ok(), permit, "new TCP classification for {addr}");
+            if let Ok(stream) = outcome {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                wait_for(deadline, || match listener.accept() {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(e) => panic!("listener acceptance failed: {e}"),
+                }, "positive flow was not accepted");
+                drop(stream);
+            }
+        }
 
         const WORKER: &str = "SPIDERVPN_LEASE_CHANNEL_TEST_WORKER";
         if let Ok(nonce) = std::env::var(WORKER) {
@@ -1329,10 +1366,26 @@ mod tests {
                 pipe.require_peer(controller_pid, true)?;
                 pipe.require_connected()
             };
+            // The opt-in joint fixture uses the real filter builders, targeting
+            // only this disposable test executable; both sessions are dynamic.
+            let mut fixture = None;
+            let mut fixture_dir = None;
+            if native_bfe {
+                let dir = std::path::PathBuf::from(std::env::var_os("SPIDERVPN_LEASE_BFE_DIR").unwrap());
+                let endpoint: SocketAddr = std::env::var("SPIDERVPN_LEASE_BFE_ENDPOINT").unwrap().parse().unwrap();
+                let app = app_id_from_path(&std::env::current_exe().unwrap()).unwrap();
+                let engine = WfpEngine::open_dynamic().unwrap();
+                let raw = RawFilter::isolated_lifecycle_filter(&app, Some(endpoint), &decode_nonce(&nonce).unwrap()).unwrap();
+                let id = filter_add(&engine, &raw).unwrap();
+                std::fs::write(dir.join("permit"), id.to_string()).unwrap();
+                fixture = Some(engine);
+                fixture_dir = Some(dir);
+            }
             let committed = serde_json::to_vec(&reply(&nonce, LeaseState::Committed, String::new(), 1)).unwrap();
             pipe.send(&committed, deadline, &check).unwrap();
-            // This is the exact final-receipt/lifecycle function used by serve_pipe.
-            // No BFE writes in this portable test; canary covers native teardown.
+            // The exact final-receipt/lifecycle function used by serve_pipe.
+            // The old portable test still runs without BFE. Only the explicitly
+            // enabled variant holds a real dynamic WFP session.
             match std::env::var("SPIDERVPN_LEASE_TEST_FAULT").as_deref() {
                 // Actual connected token is unchanged; pinned identity is wrong.
                 Ok("wrong-token") => identity.session ^= 1,
@@ -1343,6 +1396,15 @@ mod tests {
                 Instant::now() + Duration::from_secs(3), &check);
             assert!(result.is_err(), "an abandoned or forged channel must not return success");
             require_live(controller.0).expect("controller stayed alive; no owner exit shortcut");
+            if let Some(engine) = fixture.take() {
+                engine.close_checked().expect("close real WFP dynamic session");
+                drop(pipe); // release immediately, before waiting for independent readback
+                let dir = fixture_dir.unwrap();
+                std::fs::write(dir.join("revoked"), b"closed").unwrap();
+                // Keep process ALIVE after WFP close, proving more than RPC rundown.
+                wait_for(Instant::now() + Duration::from_secs(10), || dir.join("exit").exists(),
+                    "parent did not verify BFE teardown");
+            }
             return;
         }
 
@@ -1359,15 +1421,47 @@ mod tests {
 
         let pid = std::process::id();
         let stamp = creation_stamp(unsafe { GetCurrentProcess() }).unwrap();
+        let mut bfe = None;
+        if native_bfe {
+            let a = TcpListener::bind("127.0.0.1:0").unwrap();
+            let b = TcpListener::bind("127.0.0.1:0").unwrap();
+            a.set_nonblocking(true).unwrap();
+            b.set_nonblocking(true).unwrap();
+            assert_flow(&a, true);
+            assert_flow(&b, true);
+            let app = app_id_from_path(&std::env::current_exe().unwrap()).unwrap();
+            let baseline = WfpEngine::open_dynamic().unwrap();
+            let audit = WfpEngine::open().unwrap();
+            let filter = RawFilter::isolated_lifecycle_filter(&app, None, &[1u8; 16]).unwrap();
+            let block = filter_add(&baseline, &filter).unwrap();
+            assert!(filter_get_by_id(&audit, block).unwrap().is_some());
+            assert_flow(&a, false);
+            assert_flow(&b, false);
+            bfe = Some((baseline, audit, block, a, b));
+        }
         for mode in ["before-receipt", "late-receipt", "after-receipt", "silent-active", "wrong-challenge", "valid-then-close", "wrong-token", "wrong-sid", "replay"] {
             let nonce = random_nonce();
-            let mut child = Cleanup(Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "guard::lease_helper::tests::real_process_channel_faults_revoke_without_kill", "--nocapture"])
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            let test_name = if native_bfe {
+                command.arg("--ignored");
+                "guard::lease_helper::tests::real_process_channel_faults_with_bfe"
+            } else {
+                "guard::lease_helper::tests::real_process_channel_faults_revoke_without_kill"
+            };
+            command.args(["--exact", test_name, "--nocapture"])
                 .env(WORKER, &nonce)
                 .env("SPIDERVPN_LEASE_TEST_PID", pid.to_string())
                 .env("SPIDERVPN_LEASE_TEST_STAMP", stamp.to_string())
-                .env("SPIDERVPN_LEASE_TEST_FAULT", mode)
-                .spawn().unwrap());
+                .env("SPIDERVPN_LEASE_TEST_FAULT", mode);
+            let mut fixture_dir = None;
+            if let Some((_, _, _, a, _)) = &bfe {
+                let dir = std::env::temp_dir().join(format!("spidervpn-joint-bfe-{nonce}"));
+                std::fs::create_dir(&dir).unwrap();
+                command.env("SPIDERVPN_LEASE_BFE_DIR", &dir)
+                    .env("SPIDERVPN_LEASE_BFE_ENDPOINT", a.local_addr().unwrap().to_string());
+                fixture_dir = Some(dir);
+            }
+            let mut child = Cleanup(command.spawn().unwrap());
             let helper_pid = child.0.id();
             assert_ne!(helper_pid, pid);
             let handle = child.0.as_raw_handle();
@@ -1378,6 +1472,27 @@ mod tests {
             assert!(pipe.require_peer(pid, false).is_err());
             let committed = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
             validate_stage(&committed, &nonce, 1, helper_pid, LeaseState::Committed).unwrap();
+            let mut permit_id = None;
+            if let Some((_, audit, block, a, b)) = &bfe {
+                let dir = fixture_dir.as_ref().unwrap();
+                let id: u64 = std::fs::read_to_string(dir.join("permit")).unwrap().parse().unwrap();
+                assert!(filter_get_by_id(audit, id).unwrap().is_some());
+                assert!(filter_get_by_id(audit, *block).unwrap().is_some());
+                assert_flow(a, true);
+                assert_flow(b, false);
+                permit_id = Some(id);
+                // Actually attempt termination with a handle lacking that right.
+                // The full Child handle is reserved for panic cleanup only.
+                use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess};
+                use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
+                let limited = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, helper_pid) };
+                assert!(!limited.is_null());
+                let ok = unsafe { TerminateProcess(limited, 1) };
+                let error = unsafe { GetLastError() };
+                unsafe { CloseHandle(limited); }
+                assert_eq!(ok, 0);
+                assert_eq!(error, ERROR_ACCESS_DENIED);
+            }
             let mut keep_open = Some(pipe);
             if mode == "before-receipt" {
                 drop(keep_open.take());
@@ -1422,6 +1537,23 @@ mod tests {
                 }
             }
             // In silent modes keep the handle open until helper times itself out.
+            // Joint fixture proves filter removal while both processes remain alive.
+            if let Some((_, audit, block, a, b)) = &bfe {
+                let dir = fixture_dir.as_ref().unwrap();
+                wait_for(deadline, || {
+                    assert!(child.0.try_wait().unwrap().is_none(), "owner exited before teardown proof");
+                    dir.join("revoked").exists()
+                }, "helper did not close its BFE session");
+                let id = permit_id.unwrap();
+                wait_for(deadline, || filter_get_by_id(audit, id).unwrap().is_none(),
+                    "dynamic permit remained in BFE");
+                assert!(child.0.try_wait().unwrap().is_none());
+                assert!(filter_get_by_id(audit, *block).unwrap().is_some());
+                assert_flow(a, false);
+                assert_flow(b, false);
+                assert!(child.0.try_wait().unwrap().is_none());
+                std::fs::write(dir.join("exit"), b"verified").unwrap();
+            }
             // Parent stays alive, no call to kill, and child must exit normally.
             loop {
                 if let Some(status) = child.0.try_wait().unwrap() {
@@ -1439,6 +1571,15 @@ mod tests {
                     "late Receipt must not resurrect an expired channel");
             }
             drop(keep_open);
+            if let Some(dir) = fixture_dir {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+        if let Some((baseline, audit, block, a, b)) = bfe {
+            baseline.close_checked().unwrap();
+            assert!(filter_get_by_id(&audit, block).unwrap().is_none());
+            assert_flow(&a, true);
+            assert_flow(&b, true);
         }
     }
 
