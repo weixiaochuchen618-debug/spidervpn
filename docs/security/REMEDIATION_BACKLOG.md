@@ -559,3 +559,16 @@ PR/commit/CI: ...
 - GitHub compare `ed8d7a98...de8e2e22` 只涉及 `server-rs/Cargo.toml`、新 `server-rs/src/bin/spidervpn-pair-retire.rs` 和 `.github/workflows/security-pairing-rust-linux.yml`。没有 Windows UI/connection/Guard/WFP、旧 Python 服务的产品变动。Linux 完整成功详见 D.46，旧首次红例详见 D.45。
 - 当前功能候选及本地 CI 在隔离环境通过 ≠ 真实 root VPS systemd mask、旧 SSH writer 隔离、可信 revoke/tombstone 迁移、Rust TLS 生产接管通过；SEC-01/02/08 / Issue #5 OPEN，PR #17 Draft，main 不动。
 
+
+
+## D.48 PR #17 同一代码 SHA 三平台终态全绿，原始 MSVC 全量测试日志核对（2026-11-18）
+
+- 最新 PR #17 代码 SHA `de8e2e222a31c0290385a0126c0f2538571c33d0`：[Linux #44203644974](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644974) 双 Job **Completed/Success**；[Windows GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) **Completed/Success**；[Windows MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970) 终态也已核实 **Completed/Success**。MSVC 原始日志最后一轮 **1429 passed / 0 failed / 1 ignored（原有）/ 8 filtered out（原有环境依赖）**；实际 Build、SEC-10、SEC-01、全部集成测试、changed Rust module regression 和 Portable Rust unit suite 所有步骤 Success，不跳过失败项。Linux 真 kernel/netns、root 隔离文件系统、121 lib + 六条新 CLI、非 root 实际拒绝通过。
+- 前一失败 SHA `45c5f86` Linux Rust E0382 编译错误仍真实保留在 D.45；改为 `as_deref()` 后的上述结果**只属于新 SHA**。PR #17 保持 Draft/unmerged，main `857ea759` 与 WFP 持久 BLOCK、旧 UI/连接不变，真实 Linux VPS 退役 / root 写者排他未验收。
+
+## D.49 PR #18 新增重启后只读 Rust 退役复核入口（2026-11-18）
+
+- 新代码 [Draft PR #18](https://github.com/weixiaochuchen618-debug/spidervpn/pull/18) 叠在 [PR #17](https://github.com/weixiaochuchen618-debug/spidervpn/pull/17) 之上，branch `fix/sec01-postboot-offline-retire-verification-20261118`，首 HEAD `72533502c1e361d6d1a3d029b5da99cb7499f57f`。旧 root TTY CLI 有 `retire`，但没有只读 post-reboot 确认，容易误拿重跑变更命令代替核验。新增同一默认禁用的 Rust CLI `verify` 固定动词：**euid root、无可控路径、无需 tty（只读），前后真实 systemd 持久 mask + inactive + 无旧 Python 进程 + 真实旧端口监听快照**，中间调用已有 `observe_offline_retired_entrypoint()` 再观察完整旧脚本目录 tombstone / protected quarantine / 无暂存；任何失败、失踪、symlink、残留 stage、被恢复的旧 Python 脚本都拒绝，不自动恢复/回滚或写 WireGuard。
+- 额外三组 Rust CLI tests（正确确认调用顺序、非 root/多余参数/第一次或第二次 shutdown 失败、损坏 witness 拒绝）+ 两组真实 Linux owner-only 临时目录根文件系统回归（模拟 reboot 后复核成功、丢失隔离源/伪 symlink/重入 stage/重建可执行路径均 fail-closed）。Linux CI 现同时调用真实非 root `retire` 与 `verify` 两条路径，均需 exit2；既有 root WireGuard netns 与 legacy_retire 真实 fs 测试保留。不更改默认构建、Windows UI/连接、WFP、旧 Python 生产服务和 main。
+- **新 SHA 尚未完成 CI**：必须从 [PR #18 Actions](https://github.com/weixiaochuchen618-debug/spidervpn/actions) 精确取 Linux/MSVC/GNU runs，逐一核对 Rust 编译、3+2 定向、真实 root /tmp 文件系统、完整 MSVC/GNU 回归；不能拿父 PR #17 已绿替代。该只读核验**不是**真实服务器 reboot/power-loss 证据，更不能排除其它 root/SSH writer；SEC-01/02/08、Issue #5 均 OPEN，PR Draft，不合并 main。
+

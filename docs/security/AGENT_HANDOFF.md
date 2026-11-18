@@ -429,3 +429,14 @@
 - 同 SHA [MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970) Rust build、SEC-10/SEC-01、integration、模块回归均已单独 Success，但 `Portable Rust unit suite` 最后查仍 `in_progress`；不可借用旧 SHA 或已成功步骤称整个 MSVC 工作流完成。交接接手必须查最后 Job 状态/原始日志、若失败则修复并重跑。
 - PR #17/Issue #5 状态、生产安全阻塞仍见 [Backlog D.44–D.47](./REMEDIATION_BACKLOG.md)。没有本机或 VPS 真实 root 切换/回滚，不合并 main，不改变旧 UI、连接交互或 WFP 持久 BLOCK。
 
+
+
+## 50. PR #17 三平台最终 Success 核证（2026-11-18）
+
+- 在同一代码 SHA `de8e2e222a31c0290385a0126c0f2538571c33d0`：[Linux #44203644974](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644974) / [GNU #44203644991](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644991) / [MSVC #44203644970](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44203644970) 三个工作流全部 **Completed/Success**。MSVC 原始日志最终 1429 passed/0 failed/1 ignored（原有）/8 filtered out（原有环境依赖）。新 root-only Rust CLI 6 tests、Linux kernel WG netns 和 root /tmp 原子退役测试均已通过。首轮旧 SHA Linux E0382 Failure 在 Backlog D.45 如实保留。PR #17 仍 Draft，未部署 VPS、没有真正全写者排他或撤销历史认证。
+
+## 51. 新 Draft PR #18：只读 verify 旧 Python 入口重启后退役状态（2026-11-18）
+
+- [PR #18](https://github.com/weixiaochuchen618-debug/spidervpn/pull/18) stacked on #17，分支 `fix/sec01-postboot-offline-retire-verification-20261118`，初始代码 SHA `72533502c1e361d6d1a3d029b5da99cb7499f57f`。扩展**仅 Linux opt-in Rust** `spidervpn-pair-retire` 二进制 `verify` 固定动词：root-only、无 TTY、只读，对已停机/持久 mask/无旧端口监听进行前后确认，并且严格核实旧脚本 root-only 空目录 + 隔离备份原脚本 + 无遗留 staging；任何不符 fail-closed。**绝不自动执行 retire/restore，不导入邀请、不启动 listener、不修改 WireGuard**；原 `retire` 路径不变。
+- 新 Rust binary 三组正反向测试、root 临时目录两组断电/重启情境模拟回归、Linux CI 非 root `verify`/ `retire` 真执行拒绝均已提交，**还未证明 CI 通过**。交接下一步：先按此 SHA 查看完整 Linux / Windows MSVC / Windows GNU workflow 终态和原始失败日志；一旦有红必须修代码、推新 SHA、重测，更新 docs/Issue。禁止将模拟 reboot 说成 VPS 实机 power-loss 验收。详见 [Backlog D.49](./REMEDIATION_BACKLOG.md)。main/UI/WFP 不动，SEC-01/02/08 与 Issue #5 OPEN。
+
