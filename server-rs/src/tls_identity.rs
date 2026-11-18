@@ -367,6 +367,83 @@ mod tests {
         assert_eq!(requests.active_requests(), 0);
     }
 
+    // Exact certificate generation command from legacy tc-pair.py::ensure_cert,
+    // not a newly CA-signed leaf. Use real OpenSSL verification as an independent
+    // test peer; the listener, identity loader, TLS server and HTTP denial are
+    // all the existing Rust implementations. The Windows client pin verifier
+    // is tested separately against an equivalent RSA CA:TRUE/no-SAN fixture.
+    #[cfg(feature = "linux-bounded-accept-lab")]
+    #[test]
+    fn sec02_legacy_openssl_rsa_identity_serves_real_tls12_denial() {
+        use crate::loopback_denial_lab::{run_loopback_denial_lab, LabReport};
+        let root = TempRoot::new();
+        let generated = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-sha256",
+                "-days", "825", "-nodes", "-keyout", KEY_NAME,
+                "-out", CERT_NAME, "-subj", "/CN=127.0.0.1"])
+            .current_dir(&root.path)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        assert!(generated.success(), "legacy certificate fixture generation failed");
+        fs::set_permissions(root.path.join(KEY_NAME),
+            fs::Permissions::from_mode(0o600)).unwrap();
+        let details = Command::new("openssl")
+            .args(["x509", "-in", CERT_NAME, "-noout", "-text"])
+            .current_dir(&root.path).output().unwrap();
+        assert!(details.status.success());
+        let text = String::from_utf8(details.stdout).unwrap();
+        assert!(text.contains("CA:TRUE"), "expected legacy self-signed CA:TRUE");
+        assert!(!text.contains("X509v3 Subject Alternative Name"));
+        assert!(text.contains("rsaEncryption"));
+        let conversion = Command::new("openssl")
+            .args(["x509", "-in", CERT_NAME, "-outform", "DER", "-out", "tls.der"])
+            .current_dir(&root.path).status().unwrap();
+        assert!(conversion.success());
+        let digest = Command::new("openssl")
+            .args(["dgst", "-sha256", "-r", "tls.der"])
+            .current_dir(&root.path).output().unwrap();
+        assert!(digest.status.success());
+        let hash = String::from_utf8(digest.stdout).unwrap();
+        let pin = hash.split_whitespace().next().unwrap();
+        assert_eq!(pin, legacy_leaf_der_sha256(&fs::read(root.path.join("tls.der")).unwrap()));
+        assert!(check(&root, &"0".repeat(64)).is_err());
+        let identity = check(&root, pin).unwrap();
+        assert_eq!(identity.leaf_der_sha256, pin);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let hand = HandshakeAdmission::new(1, Duration::from_secs(3)).unwrap();
+        let requests = RequestAdmission::new(1, Duration::from_secs(3)).unwrap();
+        // OpenSSL independently verifies this exact self-signed certificate
+        // as the test trust anchor, with normal certificate validity checks.
+        // No public CA, hostname/SAN upgrade, or verification bypass.
+        let mut peer = Command::new("openssl")
+            .args(["s_client", "-connect", &address, "-tls1_2", "-quiet",
+                "-verify_return_error", "-CAfile", CERT_NAME, "-no-CApath", "-no-CAstore"])
+            .current_dir(&root.path).stdin(Stdio::piped())
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        peer.stdin.take().unwrap().write_all(
+            b"GET /v1/invitations/id HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer FIXTURE-SECRET\r\nConnection: close\r\n\r\n"
+        ).unwrap();
+        let report = run_loopback_denial_lab(listener, &hand, &requests,
+            identity.server_config, 1, Duration::from_secs(4));
+        if report.is_err() {
+            let _ = peer.kill();
+        }
+        let output = peer.wait_with_output().unwrap();
+        assert_eq!(report.unwrap(), LabReport {
+            accepted: 1, denied: 1, saturated: 0, failed: 0,
+        });
+        assert!(output.status.success(), "legacy TLS peer failed: {}",
+            String::from_utf8_lossy(&output.stderr));
+        let raw = String::from_utf8(output.stdout).unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 500 "));
+        assert!(head.contains("Connection: close"));
+        assert_eq!(body, r#"{"Code":"InvalidState","Ok":false}"#);
+        assert!(!raw.contains("FIXTURE-SECRET"));
+        assert_eq!(hand.active_handshakes(), 0);
+        assert_eq!(requests.active_requests(), 0);
+    }
+
     #[test]
     fn wrong_missing_or_uppercase_pin_refused_without_network_io() {
         let root = TempRoot::new();
