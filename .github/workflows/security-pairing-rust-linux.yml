@@ -73,6 +73,25 @@ jobs:
           ! grep -F 'linux-tls-wire-lab' src/pairhost.rs
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
 
+      - name: SEC-02 Rust TLS1.2 fail-closed HTTP JSON response wire lab (feature OFF)
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          # This builds the same Rust code in non-test mode, not just cfg(test).
+          cargo build --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-http-deny-response-lab --lib
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-http-deny-response-lab --lib http_fail_closed::tests -- \
+            --test-threads=1 --nocapture
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-http-deny-response-lab --lib tls_wire::tests -- \
+            --test-threads=1 --nocapture
+          grep -F 'linux-http-deny-response-lab = ["linux-tls-identity-lab"]' server-rs/Cargo.toml
+          ! grep -F 'linux-http-deny-response-lab' src/pairhost.rs
+          grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
+
       - name: SEC-02 read-only root-owned TLS PEM pin and no-symlink lab
         shell: bash
         env:
