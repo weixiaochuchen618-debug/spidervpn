@@ -46,6 +46,7 @@ pub struct LeaseReply {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LeaseState {
     Ready,
+    Accepted,
     Rejected,
     Closed,
 }
@@ -349,6 +350,12 @@ fn write_reply(path: &Path, reply: &LeaseReply) -> Result<(), String> {
 /// 父进程必须检查回执来自本次会话且 filter_count 与请求完全一致；
 /// "Ready" 文件本身不能证明子进程仍活着，启动器还必须检查 hProcess。
 fn read_ready(path: &Path, nonce: &str, expected_count: usize, expected_helper_pid: u32) -> Result<Option<()>, String> {
+    read_stage(path, nonce, expected_count, expected_helper_pid, LeaseState::Ready)
+}
+
+fn read_stage(path: &Path, nonce: &str, expected_count: usize, expected_helper_pid: u32,
+    expected_state: LeaseState) -> Result<Option<()>, String>
+{
     let Some(body) = read_ipc_file(path, 4096)? else {
         return Ok(None);
     };
@@ -357,7 +364,7 @@ fn read_ready(path: &Path, nonce: &str, expected_count: usize, expected_helper_p
     if reply.schema != LEASE_SCHEMA || reply.nonce != nonce {
         return Err("租约 Ready 回执版本或 nonce 不匹配".into());
     }
-    if reply.state != LeaseState::Ready {
+    if reply.state != expected_state {
         return Err(format!("租约 helper 拒绝启动：{}", reply.reason));
     }
     if expected_helper_pid == 0 || reply.helper_pid != expected_helper_pid {
@@ -515,8 +522,23 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
                 if !child.running() || Instant::now() >= deadline {
                     return Err("租约确认后 helper 已退出，拒绝报告连接已受保护".into());
                 }
-                child.confirmed = true;
-                return Ok(child);
+                // Do not treat publishing ACK as proof that the helper consumed it.
+                let accepted_path = directory_receipt(&child.directory);
+                loop {
+                    if !child.running() || Instant::now() >= deadline {
+                        return Err("等待 helper 实际消费 ACK 超时或进程退出".into());
+                    }
+                    if read_stage(&accepted_path, &nonce, req.programs.len(), helper_pid,
+                        LeaseState::Accepted)?.is_some()
+                    {
+                        if !child.running() || Instant::now() >= deadline {
+                            return Err("最终租约回执已失效".into());
+                        }
+                        child.confirmed = true;
+                        return Ok(child);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
             Err(e) => {
                 let _ = write_ack(&ack_path, &nonce, false);
@@ -526,6 +548,10 @@ pub fn launch_elevated(request: &LeaseRequest) -> Result<LeaseChild, String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn directory_receipt(directory: &Path) -> PathBuf {
+    directory.join("accepted.json")
 }
 
 fn reply(nonce: &str, state: LeaseState, reason: String, count: usize) -> LeaseReply {
@@ -615,6 +641,13 @@ pub fn serve(req_path: &Path, reply_path: &Path) -> i32 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Only publish the second-stage receipt after accepting ACK and revalidating.
+        let accepted_path = directory_receipt(reply_path.parent().expect("validated parent"));
+        if write_reply(&accepted_path, &reply(&req.nonce, LeaseState::Accepted,
+            String::new(), count)).is_err()
+        {
+            return 6;
         }
         // helper 自己退出/崩溃时，BFE 动态 session 自动撤销临时 PERMIT。
         return if lease.supervise_until_exit(&req.engine_executable).is_ok() { 0 } else { 5 };
@@ -817,6 +850,27 @@ mod tests {
         )).unwrap()).unwrap();
         assert!(read_ready(&path, &nonce, 1, std::process::id()).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn final_receipt_requires_accepted_stage_and_matching_identity() {
+        let root = std::env::temp_dir().join(format!("spidervpn-lease-final-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = directory_receipt(&root);
+        let nonce = sample().nonce;
+        let pid = std::process::id();
+        let check = || read_stage(&path, &nonce, 1, pid, LeaseState::Accepted);
+        assert!(check().unwrap().is_none());
+        write_reply(&path, &reply(&nonce, LeaseState::Ready, String::new(), 1)).unwrap();
+        assert!(check().is_err());
+        std::fs::remove_file(&path).unwrap();
+        write_reply(&path, &reply(&nonce, LeaseState::Accepted, String::new(), 1)).unwrap();
+        assert!(check().unwrap().is_some());
+        assert!(read_ready(&path, &nonce, 1, pid).is_err());
+        assert!(read_stage(&path, &nonce, 1, pid ^ 1, LeaseState::Accepted).is_err());
+        assert!(read_stage(&path, &nonce, 2, pid, LeaseState::Accepted).is_err());
+        assert!(read_stage(&path, "ffffffffffffffffffffffffffffffff", 1, pid, LeaseState::Accepted).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
