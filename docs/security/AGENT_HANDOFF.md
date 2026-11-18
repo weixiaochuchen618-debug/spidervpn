@@ -661,3 +661,9 @@
 - 新 [Draft PR #27](https://github.com/weixiaochuchen618-debug/spidervpn/pull/27)，HEAD `19765b4c72ac0e2c1902c8646f3a57febe434b44`，branch `fix/sec02-persistent-bounded-listener-20261118`，6 个 server-rs Rust/Cargo/CI 文件。default-off `linux-persistent-listener-lab`；可长期循环 accept、全生命周期含 HTTP 的全局及每真实来源 IP 限额，IPv4 映射规范化，无无限线程句柄/来源表；stop flag 下先关 listener 后 drain，保留握手和单请求 deadline。仍 loopback/deny-only/无 service 或授权。
 - 真实 TCP/TLS 回归：源阻塞后第二真实源正常、全局限额及断开恢复、80 次连续、stop 后拒绝新连接仍 drain、非法容量与 wildcard；仅代码提交，待 [Linux #44255321383](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321383)、[GNU #44255321600](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321600)、准确 SHA MSVC workflow/原始日志；不允许 skip/ignore 新失败。下一步优先查 CI 终态、真实专项与根因修复，随后推进信号生命周期/授权依赖、真实迁移阻塞。
 - main `857ea7593941ce79f6507db5b1ced076c3a077ba` 固定；WFP #3 Draft，Issue #5 OPEN；不动 UI/连接/WFP；实际生产旧 Python TLS accept DoS 仍存在。不得把实验 CA/loopback/安全拒绝等同现网正常授权、VPS 安全切换和 UAC/WFP 实机验收，不合 main。
+
+
+## 79. PR #27 Linux 完整通过，Windows 待终态（2026-11-18）
+
+- 最新 [Draft PR #27](https://github.com/weixiaochuchen618-debug/spidervpn/pull/27) HEAD `19765b4c72ac0e2c1902c8646f3a57febe434b44`。[Linux #44255321383](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321383) 2/2 Jobs Completed/Success；实际日志：新 1 个来源规范化 + 5 个真实 TLS 长期接收器测试通过，HTTP 相关 14/14，root TLS identity 9/9、实际 WG netns 1/1、root FS 7/7、既有 Rust 121/121 等通过。严格编译 `--locked`/`-D warnings`。详见 [Backlog D.80](./REMEDIATION_BACKLOG.md)。
+- 下一轮先核对精确 SHA 的 [GNU #44255321600](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321600) 与 [MSVC #44255321332](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44255321332) 完整终态及原始日志；失败先修不跳过。然后推进可执行服务的可信启动和信号退出、授权/状态迁移阻塞。不能将实验 localhost denial 当生产功能，main/UI/连接/WFP persistent BLOCK 不动，PR #27 Draft；Issue #5 与生产 SEC-01/02/08 仍 OPEN，旧 Python accept 风险仍存在。
