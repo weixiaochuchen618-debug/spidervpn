@@ -30,6 +30,8 @@ jobs:
           # SpiderVPN's persistent WFP provider or the user's firewall.
           & cargo test --locked --test wfp_proxy_canary -- --ignored --test-threads=1 --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo test --locked --bin spidervpn guard::lease_helper::tests::real_process_channel_faults_with_bfe -- --ignored --exact --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Rust integration tests (each integration target, no duplicate binary unit tests)
         shell: pwsh
