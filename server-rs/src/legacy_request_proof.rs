@@ -47,7 +47,7 @@ fn text<'a>(object: &'a Value, field: &str) -> Option<&'a str> {
 fn sha256_lower(bytes: &[u8]) -> String {
     digest(&SHA256, bytes).as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
-fn recipient_digest(recipient: &Value) -> Result<String, RequestProofError> {
+pub(crate) fn recipient_digest(recipient: &Value) -> Result<String, RequestProofError> {
     let o = recipient.as_object().ok_or(RequestProofError::InvalidOriginalRequest)?;
     if o.len() != 3 || text(recipient,"kty") != Some("RSA") {
         return Err(RequestProofError::InvalidOriginalRequest);
@@ -67,7 +67,7 @@ fn recipient_digest(recipient: &Value) -> Result<String, RequestProofError> {
     let json = format!("{{\"e\":\"{e}\",\"kty\":\"RSA\",\"n\":\"{n}\"}}");
     Ok(sha256_lower(json.as_bytes()))
 }
-fn client_digest(inner: &Value) -> Result<String, RequestProofError> {
+pub(crate) fn client_digest(inner: &Value) -> Result<String, RequestProofError> {
     if inner.get("SchemaVersion").and_then(Value::as_u64)!=Some(1)
         || text(inner,"Kind")!=Some("TradeChannel.ClientRequest")
         || inner.get("AddressFamilies") != Some(&serde_json::json!(["IPv4"])) {
