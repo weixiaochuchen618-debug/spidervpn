@@ -20,9 +20,20 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::Peer;
+#[cfg(feature = "linux-fresh-consume-gate")]
 use crate::ledger_disk::LedgerStore;
+#[cfg(feature = "linux-fresh-consume-gate")]
+use crate::wg_readonly::derive_public_key;
+#[cfg(feature = "linux-fresh-consume-gate")]
 use zeroize::Zeroizing;
-use crate::wg_readonly::{canonical_key, derive_public_key, parse_allowed_ips, valid_interface, LiveWgReader, ReadError};
+use crate::wg_readonly::{canonical_key, parse_allowed_ips, valid_interface, LiveWgReader, ReadError};
+
+// The opt-in identity path always zeroizes the protected file buffer.
+// Without that feature, retain the original inventory-only reader.
+#[cfg(feature = "linux-fresh-consume-gate")]
+type ProtectedConfigBytes = Zeroizing<Vec<u8>>;
+#[cfg(not(feature = "linux-fresh-consume-gate"))]
+type ProtectedConfigBytes = Vec<u8>;
 
 const ROOT: &str = "/etc/wireguard";
 const MAX_CONF_BYTES: usize = 1024 * 1024;
@@ -215,7 +226,7 @@ pub fn read_pinned_conf(interface: &str) -> Result<Vec<Peer>, ConfigError> {
     parse_wg_quick_conf(&bytes)
 }
 
-fn read_pinned_conf_bytes(interface: &str) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
+fn read_pinned_conf_bytes(interface: &str) -> Result<ProtectedConfigBytes, ConfigError> {
     if !valid_interface(interface) { return Err(ConfigError::InvalidInterface); }
     validate_root()?;
     let path: PathBuf = Path::new(ROOT).join(format!("{interface}.conf"));
@@ -228,7 +239,10 @@ fn read_pinned_conf_bytes(interface: &str) -> Result<Zeroizing<Vec<u8>>, ConfigE
         return Err(ConfigError::InvalidPermissions);
     }
     if before.len() > MAX_CONF_BYTES as u64 { return Err(ConfigError::TooLarge); }
+    #[cfg(feature = "linux-fresh-consume-gate")]
     let mut data = Zeroizing::new(Vec::with_capacity(MAX_CONF_BYTES + 1));
+    #[cfg(not(feature = "linux-fresh-consume-gate"))]
+    let mut data = Vec::with_capacity(MAX_CONF_BYTES + 1);
     file.take((MAX_CONF_BYTES + 1) as u64)
         .read_to_end(&mut data).map_err(|_| ConfigError::Io)?;
     if data.len() > MAX_CONF_BYTES { return Err(ConfigError::TooLarge); }
@@ -288,6 +302,7 @@ pub fn read_verified_snapshot(interface: &str) -> Result<Vec<Peer>, ConfigError>
 /// public key. Repeated key/peer observations are NOT atomic against a
 /// noncooperating privileged writer or ABA; production writer exclusion is
 /// still required. No private key, cached peer rows or grant returned.
+#[cfg(feature = "linux-fresh-consume-gate")]
 pub fn read_verified_identity_snapshot(store: &LedgerStore, interface: &str,
     expected_public_key: &str) -> Result<Vec<Peer>, ConfigError>
 {

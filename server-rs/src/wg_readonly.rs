@@ -18,6 +18,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(feature = "linux-fresh-consume-gate")]
 use zeroize::Zeroizing;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::MetadataExt;
@@ -66,6 +67,7 @@ pub(crate) fn canonical_key(key: &str) -> bool {
         && key.as_bytes()[..43].iter().any(|b| *b != b'A')
 }
 
+#[cfg(any(test, feature = "linux-fresh-consume-gate"))]
 fn parse_public_key(bytes: &[u8]) -> Result<String, ReadError> {
     let key = std::str::from_utf8(bytes).map_err(|_| ReadError::InvalidUtf8)?
         .strip_suffix('\n').ok_or(ReadError::MalformedOutput)?;
@@ -195,6 +197,7 @@ fn execute_bounded_input(program: &Path, args: &[&str], timeout: Duration,
 }
 
 /// Derive ONLY a public key from a protected, canonical private key.
+#[cfg(feature = "linux-fresh-consume-gate")]
 pub(crate) fn derive_public_key(private_key: &str) -> Result<String, ReadError> {
     if !canonical_key(private_key) { return Err(ReadError::InvalidPublicKey); }
     trusted_wg_binary(Path::new(WG_BINARY))?;
@@ -218,6 +221,7 @@ impl LiveWgReader {
         Ok(Self { interface: interface.to_string() })
     }
     /// Kernel interface public key, never the private-key or dump selector.
+    #[cfg(feature = "linux-fresh-consume-gate")]
     pub fn server_public_key(&self) -> Result<String, ReadError> {
         trusted_wg_binary(Path::new(WG_BINARY))?;
         let output = execute_bounded(Path::new(WG_BINARY),
