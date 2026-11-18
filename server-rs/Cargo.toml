@@ -27,6 +27,8 @@ linux-cutover-preflight = []
 linux-legacy-retire = ["linux-cutover-preflight"]
 # A distinct, opt-in root-TTY CLI; no release/default command or HTTP route.
 linux-legacy-retire-cli = ["linux-legacy-retire"]
+# SEC-02 pre-integration concurrency/deadline policy only; no TLS or listener.
+linux-handshake-admission = []
 
 [[test]]
 name = "wg_namespace_e2e"
