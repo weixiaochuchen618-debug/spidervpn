@@ -104,13 +104,15 @@ impl HandshakeAdmission {
         R: Send + 'static,
     {
         let permit = self.reserve()?;
-        let total = self.deadline;
+        // The budget begins at admission, never when the OS schedules the
+        // worker. Delayed scheduling cannot silently refresh the deadline.
+        let absolute_deadline = Instant::now() + self.deadline;
         thread::Builder::new()
             .name("spider-pair-handshake".to_owned())
             .spawn(move || {
                 // Dropped on normal exit, error, or unwind; no leaked slot.
                 let _permit = permit;
-                let mut timed = DeadlineIo::new(stream, total);
+                let mut timed = DeadlineIo::new(stream, absolute_deadline);
                 handshake(&mut timed)
             })
     }
@@ -124,9 +126,8 @@ pub struct DeadlineIo {
 }
 
 impl DeadlineIo {
-    fn new(stream: TcpStream, total: Duration) -> Self {
-        // AdmissionPolicy caps total at 30s, so monotonic addition is safe.
-        Self { stream, deadline: Instant::now() + total }
+    fn new(stream: TcpStream, absolute_deadline: Instant) -> Self {
+        Self { stream, deadline: absolute_deadline }
     }
 
     fn remaining(&self) -> io::Result<Duration> {
@@ -256,6 +257,22 @@ mod tests {
         }).unwrap();
         client.write_all(b"B").unwrap();
         assert_eq!(finished.join().unwrap().unwrap(), b'B');
+    }
+
+    #[test]
+    fn delayed_worker_start_cannot_reset_the_admission_deadline() {
+        let (socket, mut client) = pair();
+        let admission_deadline = Instant::now() + Duration::from_millis(100);
+        // Simulate delayed scheduling after admission. Even queued inbound
+        // bytes must not make an expired handshake valid.
+        thread::sleep(Duration::from_millis(130));
+        client.write_all(b"late").unwrap();
+        let mut io = DeadlineIo::new(socket, admission_deadline);
+        let mut buf = [0u8; 4];
+        assert_eq!(io.read_exact(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::TimedOut);
+        assert_eq!(io.write_all(b"reply").unwrap_err().kind(),
+            io::ErrorKind::TimedOut);
     }
 
     #[test]
