@@ -526,3 +526,11 @@
 - [Draft PR #20](https://github.com/weixiaochuchen618-debug/spidervpn/pull/20) HEAD `a773fe881eb02954279d068d2c7d05dacbab5a3e` 的 [Linux #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337) **两个 Job Completed/Success**。原始日志新旧 13 项 Rust TCP handshake + posthandshake bounded callback 测试和 121 lib test 0 failed/ignored，真 WG kernel/netns 及 root 临时目录 FS 均成功，Linux locked + deny warnings 保留。代码相对 #19 仅 Rust 新模块和 Linux workflow 两文件，旧 Windows/UI/WFP/连接与 Python 无变更。
 - **重要验收限制**：Rust handoff 保证一个 handler callback、容量、绝对时限和完成后关闭 socket，**不是真 HTTP parser**，不能证明一个 callback 内绝不处理多 HTTP 请求；今后必须添加真实 TLS、HTTP1.1 协议解析/长度限制、可信 token/证书绑定。它不修复生产 Python listener DoS，不在 main。当前 [MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354)、[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452) 需核对整个相同 SHA 的 Job 终态，红则修、不 skip。See [Backlog D.60](./REMEDIATION_BACKLOG.md)。SEC-02/01/08 Issue #5 OPEN，PR #20 Draft。
 
+
+
+## 63. PR #20 GNU 全绿、MSVC 末轮待结束与未来 TLS1.2/HTTP1.1 真实协议测试矩阵（2026-11-18）
+
+- PR #20 SHA `a773fe881eb02954279d068d2c7d05dacbab5a3e`，[Linux #44218336337](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336337) 2/2 Jobs Success，121 lib + 13 新旧 real-loopback Rust TCP tests 0 fail/ignore、real kernel netns 和 root fs；[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452) **完整 workflow Completed/Success**，有原有 GNU warnings；[MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354) 编译、SEC-10/01、integration、changed module 单步成功，最后 portable full suite **仍在运行**，务必继续查准确 SHA 终态与 log。详见 [Backlog D.61](./REMEDIATION_BACKLOG.md)。
+- 下一项真正 SEC-02 Rust 接收器必须对齐旧 `assets/tc-pair.py`：TLS1.2（当前 minimum==maximum）、HTTP1.1、旧 JSON response `Content-Length`、`Connection: close`、POST body 1..131072 字节且禁止 Transfer-Encoding。增加真实 TLS 握手、空闲/慢流隔离、请求 header/body size/timeouts、重复 `Content-Length`、无/错误 bearer token、HTTP pipelining/长连接、证书/指纹兼容验收，不能把 `spawn_one_request` 当前“一次 callback”说成真正单条 HTTP wire request。
+- 新候选仅默认禁用的 server-rs policy，原生产 Python DoS 尚未修复。SEC-01/02/08 / Issue #5 Open，所有 PR Draft，main/UI/连接/WFP 不动。
+

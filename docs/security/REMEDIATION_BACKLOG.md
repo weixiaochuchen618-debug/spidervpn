@@ -670,3 +670,12 @@ PR/commit/CI: ...
 - 与父 PR #19 的 `9cc7ab6b` GitHub compare 精确**只有两个文件**：新 Rust 服务端 `server-rs/src/handshake_admission.rs` 和原 Linux CI yaml。新 `spawn_one_request` 对成功握手后**单个请求处理回调**做第二配额和总期限保护；当前没有 HTTP parser，**无法以这段源码证明网络上严格解析/限制为恰好一条 HTTP/1.1 请求**。未来 TLS + HTTP 服务接线时必须独立验证 headers/body bounds、Transfer-Encoding/Content-Length、keepalive 拒绝、授权 token 与恶意输入；纯 CPU 无限循环/阻塞外部调用也未被强制中断。
 - 同 SHA [MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354) Rust 编译和现有部分回归已在运行，[GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452) 仍在编译，**需核实最终完整 Job**；不能借用父 #19 已绿冒充新 SHA 的全部绿。真正 Python `wrap_socket(listener)` 慢握手 P0 风险仍在 production；SEC-02/01/08、Issue #5 Open，PR #20 Draft，main/UI/连接/WFP 保持原样。
 
+
+
+## D.61 PR #20 GNU 完整 Success、MSVC 专项与模块回归成功；旧 Python HTTP 兼容边界（2026-11-18）
+
+- 代码最新 HEAD 仍为 `a773fe881eb02954279d068d2c7d05dacbab5a3e`。同 SHA [Windows GNU #44218336452](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336452) **Completed/Success**，Rust Build、Release root trust guard、SEC-10 IPC identity、SEC-01 SSH `source transport.env` tests 均在原始日志实际成功（仓库已有 GNU compiler warnings，不能称 0 warnings）。
+- 同 SHA [Windows MSVC #44218336354](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44218336354) 的 Rust Build、SEC-10/SEC-01 安全专项、全部 integration、changed-module regression **分别 Completed/Success**，最后 `Portable Rust unit suite` **本条记录时仍 in_progress**，整个 MSVC 尚不能声称完成。Linux 两 Job 完整 Success、13 新旧 TCP 资源测试参见 D.60。若 MSVC 最终失败，必须取日志、修 Rust、按新 SHA 全部重测；不可 skip。
+- 经源文件逐项复核：目前现役 `assets/tc-pair.py` 只使用 TLS1.2（`SSLContext.minimum_version/maximum_version` 均设 TLSv1_2）；HTTP/1.1 旧 JSON 响应带 `Content-Type: application/json`、`Content-Length` 与 `Connection: close`，请求 POST body 允许 1..**131072 字节**，必须具备数字 `Content-Length`，拒绝任何 `Transfer-Encoding`。未来真正的 Rust TLS/HTTP 迁移必须以协议金样本验证这些兼容边界，并增加 header 整体/单字段大小限制、短读/slowloris/重复长度/请求重放/超时/keepalive/HTTP pipelining 反例；本 PR #20 没有实现/声称已实现真实 TLS/HTTP parser/授权。
+- 因旧 Python 接收端没改、生产 SEC-02 仍存在，当前 PR #20 **Draft**、Issue #5 和 SEC-01/02/08 OPEN，不合 main，不更改 UI/连接/WFP 持久 BLOCK。
+
