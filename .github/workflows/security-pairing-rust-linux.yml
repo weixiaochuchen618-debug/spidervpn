@@ -136,6 +136,25 @@ jobs:
           ! grep -F 'linux-persistent-listener-lab' src/pairhost.rs
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
 
+      - name: SEC-01 actual signed fresh invite GET and consume preauthorization under locked ledger
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          openssl version
+          cargo build --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-fresh-consume-gate --lib
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-fresh-consume-gate --lib fresh_consume_gate::tests -- \
+            --test-threads=1 --nocapture
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-fresh-consume-gate --lib http_one_request::tests -- \
+            --test-threads=1 --nocapture
+          grep -F 'linux-fresh-consume-gate = ["linux-handshake-admission"]' server-rs/Cargo.toml
+          ! grep -F 'fresh_consume_gate' src/pairhost.rs
+          grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
+
       - name: SEC-02 opt-in Rust denial process build and unprivileged denial
         shell: bash
         env:
