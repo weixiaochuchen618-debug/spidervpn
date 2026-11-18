@@ -542,3 +542,12 @@
 - 此 PR **只有两个 Linux Rust/CI 文件改变**、默认 feature OFF；没有现役 Python、HTTP parser、真正 TLS、Windows UI/connection/WFP 或 main 改动。类型上只执行**一次 handler callback** 并防无限线程和慢连接超时，不证明严格一个 HTTP wire request；未来必须加真实 TLS1.2/证书与指纹验证，符合旧协议的 HTTP1.1 单请求（header/body/错误分支/POST 131072 大小/anti-pipelining）和有效 token/撤销 ledger，真实 VPS 端口监听并发 + rollback 演练。详见 [Backlog D.59–62](./REMEDIATION_BACKLOG.md)。
 - SEC-01/02/08 和 Issue #5 Open，PR #20 与父级 Draft 不合并。main/UI/正常连接/WFP 持久 BLOCK 不变。安全整改下一轮可以由这些 evidence 接着做真实 TLS/HTTP 接收候选，但不得自动迁移旧 Consumed/Revoked 数据或宣称已上线。
 
+
+
+## 65. PR #21 严格 Rust HTTP1.1 decoder，首 CI 失败已定位并重新提修（2026-11-18）
+
+- 从三平台同 SHA 全绿的 [Draft PR #20](https://github.com/weixiaochuchen618-debug/spidervpn/pull/20) `a773fe881eb02954279d068d2c7d05dacbab5a3e` 叠新 [Draft PR #21](https://github.com/weixiaochuchen618-debug/spidervpn/pull/21)，首 `9e392b84122569e0375f0e6afb0a09470369bf80`，现在 Rust HEAD `4f770d2f90686785d99f31e41b60ca71e6d3c48f`。只有 Rust 新 `http_one_request.rs`、`lib.rs` feature gate 与原 Linux CI 共 3 文件，default OFF，main、旧 Python、Windows UI/连接/WFP 不改。详见 [Backlog D.63](./REMEDIATION_BACKLOG.md)。
+- 新 Rust `read_one_request(&mut DeadlineIo)` 在既有 request-stage 有界资源名额和绝对时限下解析**唯一一条**未认证的 HTTP/1.1 GET/POST message：POST 1..131072 字节，header block 16384，header line 4096，request line 2048，header fields 64，拒绝 CL 重复/不合法、TE/CL+TE、obs-fold、Host/Auth 重复、CRLF 等畸形；并且不得把 token/POST body 打在 Debug。**没有真实 TLS、接口身份与权限校验，也不构成配对 server / HTTP endpoint。**
+- **确切第一轮失败**：首 SHA [Linux #44224651210](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224651210) core Failed，8/9 新 parser 测试通过，`pipelined_second_request_unread_and_socket_closed` 对未读第二 request 的 TCP 关闭错误地只接受 EOF，Linux 真实返回 `ConnectionReset`；后续 Rust commit `4f770d2f...` 精确修此测试为接受 EOF 或 RST，仍必须 assert 第二 request 无处理且 request/handshake permit 清零。此前旧 13 tests 均 pass，未 skip/删用例。
+- **下一步先复核新 SHA 三条 CI 终态**：[Linux #44224794790](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794790)、[GNU #44224794789](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794789)、[MSVC #44224794780](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794780)。如果 Linux/Windows 有任何红，立即定位新 SHA 原始 logs、修 Rust 且不忽略失败测试。SEC-02 部署 Python TLS listener 仍未修、SEC-01/08 与 Issue #5 OPEN、PR Draft、main/WFP/UI 不变。
+
