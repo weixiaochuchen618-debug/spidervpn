@@ -15,6 +15,9 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 # Vetted RSA-SHA256 verifier from the existing Windows Cargo.lock.
 ring = "=0.17.14"
+# Same version and crypto backend as the Windows client, explicitly OFF by
+# default. Real Linux TLS1.2 encrypted loopback lab, NOT deployed receiver.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 
 [features]
 # Only the explicit privileged netns CI job compiles and runs this test.
@@ -29,6 +32,9 @@ linux-legacy-retire = ["linux-cutover-preflight"]
 linux-legacy-retire-cli = ["linux-legacy-retire"]
 # SEC-02 pre-integration concurrency/deadline policy only; no TLS or listener.
 linux-handshake-admission = []
+# Build a real rustls TLS1.2 server/client loopback test only on explicit opt-in.
+# Never add to default or any deployed binary until server cutover DoD.
+linux-tls-wire-lab = ["linux-handshake-admission", "dep:rustls"]
 
 [[test]]
 name = "wg_namespace_e2e"

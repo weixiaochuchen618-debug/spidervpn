@@ -31,6 +31,11 @@ pub mod handshake_admission;
 #[cfg(all(target_os = "linux", feature = "linux-handshake-admission"))]
 pub mod http_one_request;
 
+/// SEC-02: opt-in real rustls TLS1.2 handshake + decrypted HTTP wire lab.
+/// No production listener, authorization, keys or service startup.
+#[cfg(all(target_os = "linux", feature = "linux-tls-wire-lab"))]
+pub mod tls_wire;
+
 pub mod legacy;
 
 /// Offline legacy RS256 verification ONLY, not a runtime authorization path.
