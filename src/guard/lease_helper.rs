@@ -496,6 +496,8 @@ struct LocalLeaseControl {
     engine_stamp: u64,
     engine: std::os::windows::io::OwnedHandle,
     cancelled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    observed_sequence: std::sync::atomic::AtomicU64,
     // Serialize cancellation with the final gate and each nonblocking write.
     // No polling, sleeping, UAC or BFE work under this lock.
     write_gate: std::sync::Mutex<()>,
@@ -585,6 +587,8 @@ impl LocalLeaseSlot {
             nonce, controller_pid: std::process::id(), controller_stamp,
             engine_pid, engine_stamp, engine,
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            observed_sequence: std::sync::atomic::AtomicU64::new(0),
             write_gate: std::sync::Mutex::new(()),
         });
         *slot = Some(control.clone());
@@ -1012,6 +1016,8 @@ fn maintain_controller_channel(pipe: &pipe_ipc::Pipe, helper: std::os::windows::
             None => pipe.receive(4096, deadline, &check)?,
         };
         decode_heartbeat(&body, nonce, sequence)?;
+        #[cfg(test)]
+        control.observed_sequence.store(sequence, std::sync::atomic::Ordering::Release);
         pipe.send_guarded(&body, deadline, &check, control)?;
         sequence = sequence.checked_add(1).ok_or("租约心跳顺序溢出")?;
     }
@@ -1582,6 +1588,17 @@ mod tests {
             }
         }
 
+        // A third, real engine process remains live through every cancellation
+        // case. Its stdin is closed only after the parent verifies all teardown.
+        const ENGINE: &str = "SPIDERVPN_LEASE_CANCEL_ENGINE_FIXTURE";
+        if std::env::var(ENGINE).as_deref() == Ok("1") {
+            assert!(native_bfe);
+            use std::io::Read;
+            let mut byte = [0u8; 1];
+            assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
+            return;
+        }
+
         const WORKER: &str = "SPIDERVPN_LEASE_CHANNEL_TEST_WORKER";
         if let Ok(nonce) = std::env::var(WORKER) {
             let controller_pid: u32 = std::env::var("SPIDERVPN_LEASE_TEST_PID").unwrap().parse().unwrap();
@@ -1672,10 +1689,37 @@ mod tests {
             assert_flow(&b, false);
             bfe = Some((baseline, audit, block, a, b));
         }
+        let mut engine = if native_bfe {
+            Some(Cleanup(Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "guard::lease_helper::tests::real_process_channel_faults_with_bfe", "--nocapture"])
+                .env(ENGINE, "1").stdin(std::process::Stdio::piped()).spawn().unwrap()))
+        } else { None };
+
+        // Preserve the original nine scenarios and original evidence count.
+        let old_modes = ["before-receipt", "late-receipt", "after-receipt", "silent-active", "wrong-challenge", "valid-then-close", "wrong-token", "wrong-sid", "replay"];
+        let cancel_modes = ["cancel-start", "cancel-handoff", "cancel-active-kill-error",
+            "cancel-active-normal", "cancel-no-runtime", "cancel-corrupt-runtime", "cancel-shutdown"];
         let mut completed_modes = 0usize;
-        for mode in ["before-receipt", "late-receipt", "after-receipt", "silent-active", "wrong-challenge", "valid-then-close", "wrong-token", "wrong-sid", "replay"] {
-            if native_bfe { println!("JOINT_BFE_BEGIN mode={mode}"); }
-            let nonce = random_nonce();
+        let mut cancelled_modes = 0usize;
+        let mut retired: Option<std::sync::Arc<LocalLeaseControl>> = None;
+        for mode in old_modes.into_iter().chain(cancel_modes.into_iter().filter(|_| native_bfe)) {
+            let is_cancel = mode.starts_with("cancel-");
+            if native_bfe {
+                println!("{}_BEGIN mode={mode}", if is_cancel { "CANCEL_BFE" } else { "JOINT_BFE" });
+            }
+            let mut registration = if is_cancel {
+                let engine = engine.as_ref().unwrap();
+                let reg = register_experimental_lease(engine.0.id(), &std::env::current_exe().unwrap()).unwrap();
+                if let Some(stale) = retired.take() {
+                    assert_ne!(stale.nonce, reg.control.nonce);
+                    stale.cancel();
+                    assert!(stale.authorized(|| Ok(())).is_err());
+                    reg.control.require_identity().unwrap();
+                }
+                Some(reg)
+            } else { None };
+            let control = registration.as_ref().map(|reg| reg.control.clone());
+            let nonce = control.as_ref().map(|c| c.nonce.clone()).unwrap_or_else(random_nonce);
             let mut command = Command::new(std::env::current_exe().unwrap());
             let test_name = if native_bfe {
                 command.arg("--ignored");
@@ -1727,10 +1771,24 @@ mod tests {
                 unsafe { CloseHandle(limited); }
                 assert_eq!(ok, 0);
                 assert_eq!(error, ERROR_ACCESS_DENIED);
-                println!("JOINT_BFE_LIVE mode={mode} permit_present=true block_present=true tcp_exact_allowed=true tcp_other_denied=true terminate_access_denied=true");
+                println!("{}_LIVE mode={mode} permit_present=true block_present=true tcp_exact_allowed=true tcp_other_denied=true terminate_access_denied=true",
+                    if is_cancel { "CANCEL_BFE" } else { "JOINT_BFE" });
             }
             let mut keep_open = Some(pipe);
-            if mode == "before-receipt" {
+            if mode == "cancel-start" {
+                let control = control.as_ref().unwrap();
+                let dir = fixture_dir.as_ref().unwrap();
+                // Actual disconnect, while this startup registration owns the pipe.
+                invoke_fixture_disconnect(mode, dir, control);
+                let pipe = keep_open.as_ref().unwrap();
+                let receipt = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA,
+                    nonce: nonce.clone(), state: LeaseState::Receipt }).unwrap();
+                assert!(pipe.send_guarded(&receipt, deadline, || Ok(()), control).is_err(),
+                    "canceled startup wrote a late Receipt");
+                assert!(register_experimental_lease(control.engine_pid, &std::env::current_exe().unwrap()).is_err());
+                drop(keep_open.take());
+                drop(registration.take());
+            } else if mode == "before-receipt" {
                 drop(keep_open.take());
             } else if mode == "late-receipt" {
                 // Keep the live pipe without sending Receipt past the deadline.
@@ -1749,7 +1807,31 @@ mod tests {
                     let active = pipe.receive(4096, deadline, || require_live(handle)).unwrap();
                     validate_stage(&active, &nonce, 1, helper_pid, LeaseState::Active).unwrap();
                 }
-                if mode == "after-receipt" {
+                if is_cancel {
+                    let control = control.as_ref().unwrap();
+                    let identity = token_identity(handle).unwrap();
+                    let stamp = creation_stamp(handle).unwrap();
+                    let pending = confirm_first_heartbeat(pipe, handle, &nonce, helper_pid,
+                        stamp, &identity, deadline, Some(control)).unwrap();
+                    let channel = RegisteredChannel {
+                        pipe: keep_open.take().unwrap(),
+                        registration: registration.take().unwrap(),
+                    };
+                    let start = spawn_controller_worker(channel, duplicate_process_handle(handle).unwrap(),
+                        nonce.clone(), helper_pid, stamp, identity, pending, deadline).unwrap();
+                    if mode == "cancel-handoff" {
+                        // Cancellation wins before authorization of the real worker.
+                        invoke_fixture_disconnect(mode, fixture_dir.as_ref().unwrap(), control);
+                        assert!(control.authorized(|| start.send(()).map_err(|e| e.to_string())).is_err());
+                        drop(start);
+                    } else {
+                        control.authorized(|| start.send(()).map_err(|e| e.to_string())).unwrap();
+                        // Seq3 proves the real helper consumed the worker's seq2.
+                        wait_for(deadline, || control.observed_sequence.load(std::sync::atomic::Ordering::Acquire) >= 3,
+                            "worker never completed an authenticated renewal");
+                        invoke_fixture_disconnect(mode, fixture_dir.as_ref().unwrap(), control);
+                    }
+                } else if mode == "after-receipt" {
                     drop(keep_open.take());
                 } else if mode == "valid-then-close" {
                     // Exercise the exact startup confirmation used by launch_elevated
@@ -1793,7 +1875,17 @@ mod tests {
                 assert_flow(a, false);
                 assert_flow(b, false);
                 assert!(child.0.try_wait().unwrap().is_none());
-                println!("JOINT_BFE_REVOKED mode={mode} permit_absent=true block_present=true tcp_exact_denied=true tcp_other_denied=true owner_alive=true");
+                println!("{}_REVOKED mode={mode} permit_absent=true block_present=true tcp_exact_denied=true tcp_other_denied=true owner_alive=true",
+                    if is_cancel { "CANCEL_BFE" } else { "JOINT_BFE" });
+                if let Some(control) = control.as_ref() {
+                    assert!(control.require_active().is_err());
+                    assert!(control.authorized(|| Ok(())).is_err());
+                    assert!(engine.as_mut().unwrap().0.try_wait().unwrap().is_none(),
+                        "engine must remain live through readback");
+                    wait_for(deadline, || LOCAL_LEASE.0.lock().unwrap().is_none(),
+                        "canceled channel owner did not release its registration");
+                    cancel_current_experimental_lease(); // no-op after release
+                }
                 std::fs::write(dir.join("exit"), b"verified").unwrap();
             }
             // Parent stays alive, no call to kill, and child must exit normally.
@@ -1816,10 +1908,26 @@ mod tests {
             if let Some(dir) = fixture_dir {
                 std::fs::remove_dir_all(dir).unwrap();
             }
-            completed_modes += 1;
-            if native_bfe { println!("JOINT_BFE_PASS mode={mode}"); }
+            if is_cancel {
+                retired = control;
+                cancelled_modes += 1;
+                println!("CANCEL_BFE_PASS mode={mode} engine_alive=true");
+            } else {
+                completed_modes += 1;
+                if native_bfe { println!("JOINT_BFE_PASS mode={mode}"); }
+            }
         }
         assert_eq!(completed_modes, 9, "all nine distinct fault modes must run");
+        if native_bfe {
+            assert_eq!(cancelled_modes, cancel_modes.len());
+            println!("CANCEL_BFE_COMPLETE modes={cancelled_modes} stale_rejected=true repeat_noop=true engine_alive=true");
+        }
+        if let Some(engine) = engine.as_mut() {
+            drop(engine.0.stdin.take());
+            wait_for(Instant::now() + Duration::from_secs(5), || engine.0.try_wait().unwrap().is_some(),
+                "engine fixture did not exit after explicit release");
+            assert!(engine.0.wait().unwrap().success());
+        }
         if let Some((baseline, audit, block, a, b)) = bfe {
             baseline.close_checked().unwrap();
             assert!(filter_get_by_id(&audit, block).unwrap().is_none());
@@ -1827,6 +1935,71 @@ mod tests {
             assert_flow(&b, true);
             println!("JOINT_BFE_COMPLETE modes={completed_modes} baseline_removed=true tcp_restored=true");
         }
+    }
+
+    // The real connect.rs disconnect entry, with a disposable runtime directory.
+    // The injected kill result deliberately never terminates the engine. For
+    // kill-error also call the native API with a real restricted engine handle.
+    #[cfg(windows)]
+    fn invoke_fixture_disconnect(mode: &str, dir: &Path, control: &LocalLeaseControl) {
+        use std::cell::Cell;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED};
+        let runtime = dir.join("runtime.json");
+        let journal = dir.join("proxy-journal.json");
+        if mode == "cancel-corrupt-runtime" {
+            std::fs::write(&runtime, b"not-json").unwrap();
+        } else if mode != "cancel-no-runtime" {
+            std::fs::write(&runtime, serde_json::json!({
+                "SchemaVersion": 1, "SupervisorPid": std::process::id(),
+                "EnginePid": control.engine_pid, "StartedAt": "2026-10-26T00:00:00Z",
+                "State": "Running", "Error": null, "CleanupError": false,
+                "TradingDirectAccessBlocked": true, "BootStartedAt": "2026-10-26T00:00:00Z"
+            }).to_string()).unwrap();
+        }
+        let store = crate::proxy::ProxyStore { key_path: format!("Software\\SpiderVPN\\tests\\cancel-{}", control.nonce) };
+        let calls = Cell::new(0);
+        let kill = |pid: i64| {
+            calls.set(calls.get() + 1);
+            assert_eq!(pid, i64::from(control.engine_pid));
+            assert!(control.require_active().is_err(), "cancel must precede the existing kill");
+            if mode == "cancel-active-kill-error" {
+                let ok = unsafe { TerminateProcess(control.engine.as_raw_handle(), 1) };
+                let error = unsafe { GetLastError() };
+                assert_eq!(ok, 0);
+                assert_eq!(error, ERROR_ACCESS_DENIED, "real limited engine handle cannot terminate");
+                return Err("injected stop error after native ACCESS_DENIED".to_string());
+            }
+            Ok(())
+        };
+        let deps = crate::connect::Deps {
+            store: &store, apply: &|_, _| panic!("no proxy writes expected"),
+            spawn: &|_| panic!("disconnect cannot spawn"), kill: &kill,
+            alive: &|_| true, elevated: &|| true, journal_path: &journal,
+            runtime_path: &runtime, now: 1_700_000_000.0, guard: None,
+        };
+        let origin = crate::events::Origin::other();
+        if mode == "cancel-shutdown" {
+            assert!(!crate::connect::shutdown_cleanup(None, &deps, &origin).unwrap().is_empty());
+        } else {
+            let result = crate::connect::disconnect_with_origin(None, &deps, &origin);
+            match mode {
+                "cancel-active-kill-error" => {
+                    assert_eq!(result.unwrap_err(), "injected stop error after native ACCESS_DENIED");
+                    assert!(runtime.exists(), "old kill error must preserve runtime record");
+                }
+                "cancel-no-runtime" | "cancel-corrupt-runtime" =>
+                    assert_eq!(result.unwrap(), crate::connect::Outcome::AlreadyDone),
+                _ => assert!(matches!(result.unwrap(), crate::connect::Outcome::Done(_))),
+            }
+        }
+        assert_eq!(calls.get(), if matches!(mode, "cancel-no-runtime" | "cancel-corrupt-runtime") { 0 } else { 1 });
+        assert!(control.require_active().is_err());
+        cancel_current_experimental_lease();
+        cancel_current_experimental_lease();
+        pipe_ipc::require_live(control.engine.as_raw_handle()).unwrap();
+        println!("CANCEL_ENTRY mode={mode} cancelled_before_stop=true old_result_preserved=true engine_alive=true");
     }
 
     #[cfg(windows)]
