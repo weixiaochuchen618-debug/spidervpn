@@ -108,6 +108,10 @@ jobs:
           cargo test --locked --manifest-path server-rs/Cargo.toml \
             --features linux-bounded-accept-lab --lib tls_wire::tests -- \
             --test-threads=1 --nocapture
+          # Reproduce the original OpenSSL self-signed RSA certificate profile.
+          cargo test --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-bounded-accept-lab --lib tls_identity::tests::sec02_legacy_openssl_rsa_identity_serves_real_tls12_denial -- \
+            --test-threads=1 --nocapture
           grep -F 'linux-bounded-accept-lab = ["linux-http-deny-response-lab"]' server-rs/Cargo.toml
           grep -F 'listener.local_addr()?.ip().is_loopback()' server-rs/src/loopback_denial_lab.rs
           ! grep -F 'linux-bounded-accept-lab' src/pairhost.rs
@@ -306,7 +310,7 @@ jobs:
           set -euo pipefail
           export CARGO_TARGET_DIR="$PWD/server-rs/target/netns"
           cargo test --locked --manifest-path server-rs/Cargo.toml \
-            --features linux-tls-identity-lab --lib tls_identity::tests \
+            --features linux-bounded-accept-lab --lib tls_identity::tests \
             --no-run --message-format=json > "$RUNNER_TEMP/sec02-identity-build.json"
           binary="$(jq -r 'select(.reason=="compiler-artifact" and .profile.test==true and (.target.kind | index("lib"))) | .executable // empty' "$RUNNER_TEMP/sec02-identity-build.json" | tail -n1)"
           test -n "$binary"
