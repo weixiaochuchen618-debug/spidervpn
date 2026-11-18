@@ -307,3 +307,67 @@ fn legacy_golden_original_request_digest_and_recipient_proof_still_agree() {
     assert_eq!(recipient_digest(&verified["RecipientJwk"]).unwrap(),
         fixture["independentlyPinnedRecipientDigest"].as_str().unwrap());
 }
+
+#[test]
+fn authenticated_consumed_retry_is_bounded_exact_and_read_only() {
+    let mut f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let exp=utc_seconds(EXP).unwrap();
+    let req=f.post();
+    let claims=prepare_fresh_consume(&f.store,&f.scope(),&req,now).unwrap().claims().clone();
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(&[])).err(),Some(GateError::InvalidState));
+    let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
+    let grant=f.store.update(|l|l.reserve(claims.clone(),now,pool,Some(&[]))).unwrap();
+    let peer=Peer{public_key:claims.public_key.clone(),address:grant.address};
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(std::slice::from_ref(&peer))).err(),Some(GateError::InvalidState));
+    f.store.update(|l|l.confirm_consumed(INV,Some(std::slice::from_ref(&peer)))).unwrap();
+    let gen=f.store.generation().unwrap();
+    let live=std::slice::from_ref(&peer);
+    for instant in [now,exp,exp+119] {
+        let retry=prepare_consumed_retry(&f.store,&f.scope(),&req,instant,Some(live)).unwrap();
+        assert_eq!(retry.claims(),&claims);
+    }
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,exp+120,Some(live)).err(),Some(GateError::InviteExpired));
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,None).err(),Some(GateError::InvalidState));
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(&[])).err(),Some(GateError::InvalidState));
+    let wrong=Peer{public_key:wg(3),address:peer.address};
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(&[wrong])).err(),Some(GateError::InvalidState));
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(&[peer.clone(),peer.clone()])).err(),Some(GateError::InvalidState));
+    let mut body=f.body.clone();
+    body["ClientRequest"]["RequestId"]=json!(OTHER_INV);
+    body["RequestDigest"]=json!(client_digest(&body["ClientRequest"]).unwrap());
+    let changed=f.request(&f.recipient.sign(&body));
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&changed,now,Some(live)).err(),Some(GateError::PairingMismatch));
+    let mut wrong_token=f.post();
+    wrong_token.authorization=Some(format!("Bearer {}",encode(&[78;32])));
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&wrong_token,now,Some(live)).err(),Some(GateError::Forbidden));
+    assert_eq!(f.store.generation().unwrap(),gen);
+    assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Consumed(grant)));
+    f.store.update(|l|l.begin_revocation(INV)).unwrap();
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(live)).err(),Some(GateError::Revoked));
+    f.store.update(|l|l.confirm_revocation(INV,Some(&[]))).unwrap();
+    assert_eq!(prepare_consumed_retry(&f.store,&f.scope(),&req,now,Some(live)).err(),Some(GateError::Revoked));
+}
+
+#[test]
+fn noncanonical_historical_revoking_key_cannot_evade_fresh_gate() {
+    let mut f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let mut claims=prepare_fresh_consume(&f.store,&f.scope(),&f.post(),now).unwrap().claims().clone();
+    // Change only unused base64 pad bits: old wg_key shape accepts it.
+    let mut alias=wg(1);
+    assert_eq!(&alias[42..43],"E");
+    alias.replace_range(42..43,"F");
+    assert!(wg_key(&alias));
+    assert!(!canonical_wg_key(&alias));
+    claims.invite_id=OTHER_INV.into();
+    claims.device_id=OTHER_INV.into();
+    claims.public_key=alias;
+    let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
+    f.store.update(|l|l.insert_open(OTHER_INV,utc_seconds(EXP).unwrap())).unwrap();
+    f.store.update(|l|l.reserve(claims,now,pool,Some(&[]))).unwrap();
+    f.store.update(|l|l.begin_revocation(OTHER_INV)).unwrap();
+    let gen=f.store.generation().unwrap();
+    assert_eq!(f.error(&f.post()),Some(GateError::InvalidState));
+    assert_eq!(f.store.generation().unwrap(),gen);
+}

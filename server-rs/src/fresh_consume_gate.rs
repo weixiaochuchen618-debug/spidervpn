@@ -12,7 +12,7 @@ use crate::http_one_request::{Method, ParsedRequest, MAX_BODY_BYTES};
 use crate::ledger_disk::LedgerStore;
 use crate::legacy_request_proof::{client_digest, recipient_digest};
 use crate::legacy_signed::{b64u, verify_jws};
-use crate::{hex_sha256, lower_uuid, wg_key, Claims, InviteState, Ledger};
+use crate::{hex_sha256, lower_uuid, wg_key, Claims, InviteState, Ledger, Peer};
 use ring::hmac;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -260,8 +260,11 @@ fn check_descriptor(scope: &TrustedOpenInvite<'_>, expires: i64, now: i64)
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operation { Get, Fresh, Retry }
+
 fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
-    request: &ParsedRequest, now: i64, consume: bool) -> Result<&'a Ledger, GateError>
+    request: &ParsedRequest, now: i64, operation: Operation) -> Result<&'a Ledger, GateError>
 {
     if !lower_uuid(scope.invite_id) || !token_shape(scope.token)
         || !hex_sha256(scope.tls_der_pin) || !valid_binding(scope.server_binding)
@@ -270,6 +273,7 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
         || scope.port==0 || now<0
         || management_fingerprint(scope.management_jwk).as_deref()!=Some(scope.management_fingerprint)
     { return Err(GateError::InvalidState); }
+    let consume = operation != Operation::Get;
     let route = format!("/v1/invitations/{}{}",scope.invite_id,
         if consume {"/consume"} else {""});
     if request.target!=route || request.method!=if consume {Method::Post} else {Method::Get}
@@ -283,11 +287,18 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
         .ok_or(GateError::Forbidden)?;
     if !token_matches(scope.token,presented) { return Err(GateError::Forbidden); }
     match inv.state {
+        InviteState::Open if operation == Operation::Retry => return Err(GateError::InvalidState),
         InviteState::Open if now>=inv.expires_unix => return Err(GateError::InviteExpired),
         InviteState::Open => {},
         InviteState::Cancelled => return Err(GateError::InviteCancelled),
         InviteState::Expired => return Err(GateError::InviteExpired),
         InviteState::Revoking(_) | InviteState::Revoked(_) => return Err(GateError::Revoked),
+        InviteState::Consumed(_) if operation == Operation::Retry => {
+            // Exclusive upper bound: never extend the signed legacy window.
+            if now >= inv.expires_unix.checked_add(120).ok_or(GateError::InvalidState)? {
+                return Err(GateError::InviteExpired);
+            }
+        }
         InviteState::Consumed(_) => return Err(GateError::InviteConsumed),
         InviteState::Pending(_) => return Err(GateError::InvalidState),
     }
@@ -300,7 +311,7 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
 pub fn read_open_descriptor<'a>(store: &LedgerStore, scope: &TrustedOpenInvite<'a>,
     request: &ParsedRequest, now: i64) -> Result<OpenDescriptor<'a>,GateError>
 {
-    common(store,scope,request,now,false)?;
+    common(store,scope,request,now,Operation::Get)?;
     if !request.body.is_empty() { return Err(GateError::InvalidRequest); }
     Ok(OpenDescriptor { signed_descriptor:scope.signed_descriptor })
 }
@@ -311,7 +322,18 @@ pub fn read_open_descriptor<'a>(store: &LedgerStore, scope: &TrustedOpenInvite<'
 pub fn prepare_fresh_consume<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
     request: &ParsedRequest, now: i64) -> Result<VerifiedFreshConsume<'a>,GateError>
 {
-    let ledger=common(store,scope,request,now,true)?;
+    let ledger=common(store,scope,request,now,Operation::Fresh)?;
+    let (claims, recipient_jwk)=verify_consume_claims(scope,request,now)?;
+    check_history(ledger,&claims)?;
+    // No address allocation is attempted without real peer inventory.
+    // A future transaction must recheck policy under this same lock before
+    // persisting Pending; a verified self-signature is not an approval.
+    Ok(VerifiedFreshConsume { claims,recipient_jwk,_store:store })
+}
+
+fn verify_consume_claims(scope: &TrustedOpenInvite<'_>, request: &ParsedRequest,
+    now: i64) -> Result<(Claims, Value),GateError>
+{
     if request.body.is_empty() || request.body.len()>MAX_BODY_BYTES {
         return Err(GateError::InvalidRequest);
     }
@@ -353,16 +375,60 @@ pub fn prepare_fresh_consume<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvi
         public_key:key.to_owned(),request_digest:computed,recipient_jwk_digest,
     };
     if !crate::claims_valid(&claims) { return Err(invalid); }
-    // Legacy policy accepted noncanonical key strings. Do not let an alias
-    // of a historical key evade a tombstone comparison in the fresh gate.
-    if ledger.revoked_keys.iter().any(|k| !canonical_wg_key(k)) {
+    Ok((claims,recipient.clone()))
+}
+
+fn check_history(ledger: &Ledger, claims: &Claims) -> Result<(),GateError> {
+    // Old shape-only validation admitted noncanonical aliases, including
+    // grants in Revoking before they have durable tombstones. Fail closed
+    // until that history can be independently reconciled.
+    if ledger.revoked_keys.iter().any(|k| !canonical_wg_key(k))
+        || ledger.invitations.values().any(|inv| match &inv.state {
+            InviteState::Pending(g) | InviteState::Consumed(g)
+            | InviteState::Revoking(g) | InviteState::Revoked(g) =>
+                !canonical_wg_key(&g.claims.public_key),
+            _ => false,
+        })
+    {
         return Err(GateError::InvalidState);
     }
-    if ledger.denied_identity(&claims) { return Err(GateError::Revoked); }
-    // No address allocation is attempted without real peer inventory.
-    // A future transaction must recheck policy under this same lock before
-    // persisting Pending; a verified self-signature is not an approval.
-    Ok(VerifiedFreshConsume { claims,recipient_jwk:recipient.clone(),_store:store })
+    if ledger.denied_identity(claims) { return Err(GateError::Revoked); }
+    Ok(())
+}
+
+/// Read-only, lock-borrowing retry evidence, NOT a new Grant or response.
+/// Cannot be constructed by network deserialization or used to add a peer.
+pub struct VerifiedConsumedRetry<'a> {
+    claims: Claims,
+    _store: &'a LedgerStore,
+}
+impl VerifiedConsumedRetry<'_> {
+    pub fn claims(&self) -> &Claims { &self.claims }
+}
+
+/// Reauthenticate the exact signed consume request, within the original
+/// signed expiry + 120s window, against the same locked consumed record.
+/// The caller MUST supply a complete freshly verified WG inventory observed
+/// while holding this lock; a cached or caller-provided projection is unsafe.
+/// The scope is still an independent trust input, NOT a legacy importer.
+/// No mutation, allocation, authorization signer or reply is reachable here.
+pub fn prepare_consumed_retry<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, now: i64, live_peers: Option<&[Peer]>)
+    -> Result<VerifiedConsumedRetry<'a>,GateError>
+{
+    let ledger=common(store,scope,request,now,Operation::Retry)?;
+    let (claims,_)=verify_consume_claims(scope,request,now)?;
+    check_history(ledger,&claims)?;
+    let peers=live_peers.ok_or(GateError::InvalidState)?;
+    if peers.iter().any(|p| !canonical_wg_key(&p.public_key)) {
+        return Err(GateError::InvalidState);
+    }
+    ledger.retry(&claims,Some(peers)).map_err(|err| match err {
+        crate::Refusal::ConsumedByAnotherRequest => GateError::PairingMismatch,
+        crate::Refusal::Revoked | crate::Refusal::RevokedIdentity => GateError::Revoked,
+        _ => GateError::InvalidState,
+    })?;
+    Ok(VerifiedConsumedRetry { claims,_store:store })
 }
 
 #[cfg(test)]
