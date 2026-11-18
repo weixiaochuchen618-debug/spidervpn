@@ -575,3 +575,12 @@
 - **首轮 Linux #44227662295 真实 FAILED**：原 121/13/9 已 PASS，Rustls 新测试编译因为 `-D warnings` 报一个 `unused import Read`，未跑新七条；新 commit `63f84bce...` 删除此导入，不改告警门槛、不跳过任何单测。必须立即查新 [Linux #44227864860](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864860)、[GNU #44227864808](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864808)、[MSVC #44227864692](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864692) 准确 SHA 各 Job 终态，再用日志证明真实 TLS crypto/wire tests 是否 pass；失败再修 Rust、完整复跑。不得称 SEC-02 production fixed/合并 main。
 - 仍缺真实 Linux TLS 接受端 daemon 与 root-only PEM 证书、身份认证及可信 Revoked/Consumed 状态、HTTP1.1 JSON 合规响应、实际 Python 退出/systemd/reboot/rollback 与真实 Windows WFP/UAC 演练。SEC-01/02/08/Issue #5 OPEN、PR Draft，WFP 持久 BLOCK不动。
 
+
+
+## 69. PR #22 同新 SHA 真 TLS1.2 Rustls wire / 解密 HTTP 测试 Linux 完整绿（2026-11-18）
+
+- 新 [Draft PR #22](https://github.com/weixiaochuchen618-debug/spidervpn/pull/22) 继承 #21 三平台同 SHA 全绿基线，在 `server-rs` 新增默认关闭 `linux-tls-wire-lab` feature + pinned rustls 0.23.46/ring/TLS1.2（主客户端 lock 精确相同版本和依赖校验），以真实 `ServerConnection.complete_io(DeadlineIo)` 完成加密握手，交给 `rustls::Stream` 已**解密**的 HTTP1.1 数据进入泛型 `Read` 严格 parser。现有 handshake CAS slot/绝对 deadline、独立 request slot/绝对 deadline 都保留。编译来源是 Rust，OpenSSL 仅作为临时 localhost cert fixture generator，**无** Python 生产重写、HTTP response/任何凭证授权、VPS listener 上线。见 [Backlog D.66–67](./REMEDIATION_BACKLOG.md)。
+- 首代码 `d205763fe8e4eb774a9be1ed216fc8105f56d41c` [Linux #44227662295](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227662295) **core Failure**（`-D warnings` 拦 unused Read，7 条真 TLS 当时尚未执行），新 commit **`63f84bce9c75865727d2d8b409d08b4198d4d181`** 删除 unused import，保留 `-D warnings` 和全部测试。新 [Linux #44227864860](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864860) **两 Job Completed/Success**，原日志证明 **7/7 新 TLS1.2 真加密/解密回归** + 13 旧 handshake/request + 9 旧 HTTP parser、121 库 test 全通过/0 fail/ignore，真实 WG netns + root fs tests 继续通过。
+- [MSVC #44227864692](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864692)、[GNU #44227864808](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44227864808) 同新 SHA 在执行，必须继续查全量编译、SEC-01/SEC-10、安全与集成测试**终态/日志**，禁止称三平台完成或借 #21 成绩。
+- 安全等级不变：此功能是 default-off 真实 TLS protocol **实验测试**，不包含 production root-owned PEM loading、证书旧指纹兼容验证、实际 HTTP response、可信 Token/撤销历史、全 root 写者禁用或 VPS systemd/重启/rollback 演练。旧 Python 接收线程仍可被慢 TLS 卡住，SEC-02 **生产未修**；Issue #5/SEC-01/02/08 Open，PR #22 Draft，main/Windows UI/连接/WFP persistent BLOCK 不动。
+
