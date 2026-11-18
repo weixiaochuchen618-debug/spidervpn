@@ -243,6 +243,7 @@ fn try_start_experimental_proxy_lease(
     engine_pid: i64,
     blocked: bool,
     tun: bool,
+    intent: crate::guard::lease_helper::LocalLeaseIntent<'static>,
 ) -> Result<usize, String> {
     if tun {
         return Err("TUN 的下一跳/重新授权防泄漏尚未验收，不允许试验许可".into());
@@ -250,12 +251,12 @@ fn try_start_experimental_proxy_lease(
     if !blocked {
         return Err("持久交易程序 BLOCK 未成功核验，不允许动态放行".into());
     }
-    // Register at the earliest authorized experimental entry, before identity
-    // resolution or UAC. Concurrent disconnect cancels this exact reservation.
+    // Consume the intent captured before the connection transaction. A late
+    // continuation cannot mint a new intent after a completed disconnect.
     let pid: u32 = engine_pid.try_into()
         .map_err(|_| "引擎 PID 超出 Windows 进程标识范围".to_string())?;
     let registration = crate::guard::lease_helper::register_experimental_lease(
-        pid, std::path::Path::new(&engine.binary),
+        intent, pid, std::path::Path::new(&engine.binary),
     )?;
     let resolved = crate::guard::trade_identities(cfg);
     if resolved.programs.is_empty() || !resolved.all_participated() {
@@ -290,6 +291,14 @@ fn connect_inner(
     deps: &Deps,
     legacy_running: bool,
 ) -> Result<Outcome, String> {
+    // Snapshot only the opt-in experimental intent at entry. Failure never
+    // interrupts the existing connection transaction or its error paths.
+    #[cfg(windows)]
+    let experimental_intent = if std::env::var("SPIDERVPN_WFP_LEASE_EXPERIMENT").as_deref() == Ok("1") {
+        Some(crate::guard::lease_helper::capture_experimental_intent())
+    } else {
+        None
+    };
     // 没有线路就没有连接可言：这里必须拒绝，而不是拿一个空端点去改系统代理。
     let Some(line) = cfg.current_line() else {
         return Err("未配置线路：请先导入线路或用 --set-line 写入一条".to_string());
@@ -436,10 +445,10 @@ fn connect_inner(
     // 此位置要求引擎已真正活着、运行时记录已原子提交，并且 0.7 步
     // WFP 持久阻断结果明确。失败绝不删除已有 BLOCK 或误报已放行。
     #[cfg(windows)]
-    if std::env::var("SPIDERVPN_WFP_LEASE_EXPERIMENT").as_deref() == Ok("1") {
-        match try_start_experimental_proxy_lease(
-            cfg, engine, &endpoint, pid, trading_blocked, tun,
-        ) {
+    if let Some(intent) = experimental_intent {
+        match intent.and_then(|intent| try_start_experimental_proxy_lease(
+            cfg, engine, &endpoint, pid, trading_blocked, tun, intent,
+        )) {
             Ok(count) => did.push(format!(
                 "WFP 临时代理租约已在隔离试验模式启动（{count} 个交易程序）"
             )),
