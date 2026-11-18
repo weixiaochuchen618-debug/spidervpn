@@ -50,3 +50,8 @@ Run 链接前缀 https://github.com/weixiaochuchen618-debug/spidervpn/actions/ru
 - 输出每个 PR 精确 SHA、Run ID/job/日志链接、实测命令、正负例、隔离环境、PASS/PARTIAL/FAIL/BLOCKED 和缺口；不得将自己未执行的命令或 CI metadata 伪称实测；HEAD 变化重新审查。共享账号时只写署名 REVIEW-01 评论，不假冒独立 GitHub 批准。
 ## 4. 交接与调度
 DEV-01 暂只读，DEV-02 与 REVIEW-01 可独立工作；原串行执行者须完成独占交接，否则不启动第二写入者。#6 的 Windows 候选不再抢占开发，实机结果先审查、发现问题由总控在独立后续分支调度。新任务不得跨过同一文件锁、不能强拆。COORD-01 每次恢复更新此表，核对最新 PR/CI/Issue；所有合并必须经完整安全 DoD 和用户明确授权。
+
+## 5. 初始化回读期间发现的新恢复点（覆盖上文无 PR / CI 的历史采样）
+- 原执行线已创建 [Draft PR #29](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29)，base #28 `16bd83adf2f26eac783c68a413e9304313943219`，HEAD `81b2f57ea8a3779aff3aebb4216e16e12dda0e89`。原执行者仍可能正在写入，COORD-D01 继续 HANDOFF_BLOCKED；停止旧执行者并由总控锁定最终 SHA 后，DEV-01 直接继承 #29，不新建分支/PR。
+- #29 已新增 Linux CI gate 专项（现有差异还含 `.github/workflows/security-pairing-rust-linux.yml`；作为历史已存在改动保留，DEV-01 无该文件写权限）。当前精确 SHA Linux [44258780843](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780843)、GNU [44258780885](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780885)、MSVC [44258780872](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780872) 均 In Progress，不能标绿。核对 feature 是否真正覆盖，不能将候选当 Grant，生产状态仍不改变。REVIEW-01 增加 #29 只读审查，结论锚定该 SHA；待最终 HEAD 重验。
+- 初始化 commit `d1f3addd67976e1360a52a32d180e4d13116234b` 已读回，唯一新增两份协作文档，无源代码修改；main/WFP HEAD 均保持不变。
