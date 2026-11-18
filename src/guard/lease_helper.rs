@@ -485,7 +485,14 @@ fn write_ack(path: &Path, nonce: &str, accepted: bool) -> Result<(), String> {
 // external process's ownership from a runtime PID or a file.
 #[cfg(windows)]
 #[derive(Default)]
-struct LocalLeaseSlot(std::sync::Mutex<Option<std::sync::Arc<LocalLeaseControl>>>);
+struct LocalLeaseSlot(std::sync::Mutex<LocalLeaseState>);
+
+#[cfg(windows)]
+#[derive(Default)]
+struct LocalLeaseState {
+    current: Option<std::sync::Arc<LocalLeaseControl>>,
+    disconnects: usize,
+}
 
 #[cfg(windows)]
 struct LocalLeaseControl {
@@ -504,7 +511,9 @@ struct LocalLeaseControl {
 }
 
 #[cfg(windows)]
-static LOCAL_LEASE: LocalLeaseSlot = LocalLeaseSlot(std::sync::Mutex::new(None));
+static LOCAL_LEASE: LocalLeaseSlot = LocalLeaseSlot(std::sync::Mutex::new(
+    LocalLeaseState { current: None, disconnects: 0 }
+));
 
 #[cfg(windows)]
 impl LocalLeaseControl {
@@ -556,8 +565,8 @@ impl Drop for LocalLeaseRegistration<'_> {
     fn drop(&mut self) {
         self.control.cancel();
         let mut slot = self.slot.0.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.control)) {
-            *slot = None;
+        if slot.current.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.control)) {
+            slot.current = None;
         }
     }
 }
@@ -569,7 +578,8 @@ impl LocalLeaseSlot {
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
         use ring::rand::{SecureRandom, SystemRandom};
         let mut slot = self.0.lock().map_err(|_| "实验租约登记状态异常")?;
-        if slot.is_some() { return Err("本进程已有尚未退出的实验租约".into()); }
+        if slot.disconnects != 0 { return Err("本进程正在断开，不启动实验租约".into()); }
+        if slot.current.is_some() { return Err("本进程已有尚未退出的实验租约".into()); }
         if engine_pid == 0 || engine_pid == std::process::id() {
             return Err("实验租约引擎 PID 无效".into());
         }
@@ -591,14 +601,34 @@ impl LocalLeaseSlot {
             observed_sequence: std::sync::atomic::AtomicU64::new(0),
             write_gate: std::sync::Mutex::new(()),
         });
-        *slot = Some(control.clone());
+        slot.current = Some(control.clone());
         Ok(LocalLeaseRegistration { slot: self, control })
     }
 
-    fn cancel_current(&self) {
-        let slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(control) = slot.as_ref() { control.cancel(); }
+    fn begin_disconnect(&self) -> LocalDisconnectGuard<'_> {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // Prevent a new startup throughout the existing disconnect operation,
+        // even if there was no active registration at this instant.
+        slot.disconnects = slot.disconnects.checked_add(1).expect("disconnect nesting overflow");
+        if let Some(control) = slot.current.as_ref() { control.cancel(); }
         // Do not free the slot here. Only its pipe-owning registration drops it.
+        LocalDisconnectGuard(self)
+    }
+
+    #[cfg(test)]
+    fn cancel_current(&self) {
+        drop(self.begin_disconnect());
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct LocalDisconnectGuard<'a>(&'a LocalLeaseSlot);
+
+#[cfg(windows)]
+impl Drop for LocalDisconnectGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.disconnects -= 1;
     }
 }
 
@@ -610,7 +640,12 @@ pub(crate) fn register_experimental_lease(engine_pid: u32, executable: &Path)
 }
 
 #[cfg(windows)]
-pub(crate) fn cancel_current_experimental_lease() {
+pub(crate) fn begin_experimental_disconnect() -> LocalDisconnectGuard<'static> {
+    LOCAL_LEASE.begin_disconnect()
+}
+
+#[cfg(all(windows, test))]
+fn cancel_current_experimental_lease() {
     LOCAL_LEASE.cancel_current();
 }
 
@@ -1882,7 +1917,7 @@ mod tests {
                     assert!(control.authorized(|| Ok(())).is_err());
                     assert!(engine.as_mut().unwrap().0.try_wait().unwrap().is_none(),
                         "engine must remain live through readback");
-                    wait_for(deadline, || LOCAL_LEASE.0.lock().unwrap().is_none(),
+                    wait_for(deadline, || LOCAL_LEASE.0.lock().unwrap().current.is_none(),
                         "canceled channel owner did not release its registration");
                     cancel_current_experimental_lease(); // no-op after release
                 }
@@ -1964,6 +1999,8 @@ mod tests {
             calls.set(calls.get() + 1);
             assert_eq!(pid, i64::from(control.engine_pid));
             assert!(control.require_active().is_err(), "cancel must precede the existing kill");
+            assert!(register_experimental_lease(control.engine_pid, &std::env::current_exe().unwrap()).is_err(),
+                "new registration forbidden while disconnect executes");
             if mode == "cancel-active-kill-error" {
                 let ok = unsafe { TerminateProcess(control.engine.as_raw_handle(), 1) };
                 let error = unsafe { GetLastError() };
@@ -2000,6 +2037,87 @@ mod tests {
         cancel_current_experimental_lease();
         pipe_ipc::require_live(control.engine.as_raw_handle()).unwrap();
         println!("CANCEL_ENTRY mode={mode} cancelled_before_stop=true old_result_preserved=true engine_alive=true");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_cancel_gate_serializes_writes_disconnects_and_stale_registrations() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        const ENGINE: &str = "SPIDERVPN_CANCEL_GATE_ENGINE_CHILD";
+        if std::env::var(ENGINE).as_deref() == Ok("1") {
+            let mut byte = [0u8; 1];
+            assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
+            return;
+        }
+        struct Cleanup(std::process::Child);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let exe = std::env::current_exe().unwrap();
+        let mut engine = Cleanup(Command::new(&exe)
+            .args(["--exact", "guard::lease_helper::tests::local_cancel_gate_serializes_writes_disconnects_and_stale_registrations", "--nocapture"])
+            .env(ENGINE, "1").stdin(Stdio::piped()).spawn().unwrap());
+        let engine_pid = engine.0.id();
+        let slot = LocalLeaseSlot::default();
+        // Cancellation with no current lease remains a safe registration barrier
+        // until every overlapping disconnect returns.
+        let d1 = slot.begin_disconnect();
+        let d2 = slot.begin_disconnect();
+        assert!(slot.register(engine_pid, &exe).is_err());
+        drop(d1);
+        assert!(slot.register(engine_pid, &exe).is_err());
+        drop(d2);
+        let reg = slot.register(engine_pid, &exe).unwrap();
+        let stale = reg.control.clone();
+        assert!(slot.register(engine_pid, &exe).is_err());
+        let identity = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        let server = Pipe::server(&stale.nonce, &identity, &identity).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let client = Pipe::client(&stale.nonce, deadline, || Ok(())).unwrap();
+        server.accept(deadline, || Ok(())).unwrap();
+        client.send_guarded(b"before", deadline, || Ok(()), &stale).unwrap();
+        assert_eq!(server.receive(4096, deadline, || Ok(())).unwrap(), b"before");
+        // A real concurrent cancellation competes with the exact authorization gate.
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let gate = stale.write_gate.lock().unwrap();
+            scope.spawn(|| {
+                barrier.wait();
+                slot.cancel_current();
+            });
+            barrier.wait();
+            drop(gate);
+        });
+        assert!(stale.require_identity().is_err());
+        assert!(stale.authorized(|| Ok(())).is_err());
+        assert!(client.send_guarded(b"after", deadline, || Ok(()), &stale).is_err());
+        assert!(slot.register(engine_pid, &exe).is_err());
+        drop(client);
+        assert!(server.require_connected().is_err());
+        drop(server);
+        drop(reg);
+        slot.cancel_current();
+        let new_reg = slot.register(engine_pid, &exe).unwrap();
+        assert_ne!(new_reg.control.nonce, stale.nonce);
+        stale.cancel();
+        assert!(stale.authorized(|| Ok(())).is_err());
+        new_reg.control.require_identity().unwrap();
+        let disconnect = slot.begin_disconnect();
+        assert!(new_reg.control.require_identity().is_err());
+        drop(new_reg);
+        // With no current reservation the in-flight disconnect still forbids startup.
+        assert!(slot.register(engine_pid, &exe).is_err());
+        drop(disconnect);
+        assert!(slot.register(engine_pid, &exe).is_ok());
+        assert!(engine.0.try_wait().unwrap().is_none());
+        drop(engine.0.stdin.take());
+        assert!(engine.0.wait().unwrap().success());
     }
 
     #[cfg(windows)]
