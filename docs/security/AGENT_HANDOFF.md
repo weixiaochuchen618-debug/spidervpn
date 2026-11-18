@@ -551,3 +551,11 @@
 - **确切第一轮失败**：首 SHA [Linux #44224651210](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224651210) core Failed，8/9 新 parser 测试通过，`pipelined_second_request_unread_and_socket_closed` 对未读第二 request 的 TCP 关闭错误地只接受 EOF，Linux 真实返回 `ConnectionReset`；后续 Rust commit `4f770d2f...` 精确修此测试为接受 EOF 或 RST，仍必须 assert 第二 request 无处理且 request/handshake permit 清零。此前旧 13 tests 均 pass，未 skip/删用例。
 - **下一步先复核新 SHA 三条 CI 终态**：[Linux #44224794790](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794790)、[GNU #44224794789](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794789)、[MSVC #44224794780](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794780)。如果 Linux/Windows 有任何红，立即定位新 SHA 原始 logs、修 Rust 且不忽略失败测试。SEC-02 部署 Python TLS listener 仍未修、SEC-01/08 与 Issue #5 OPEN、PR Draft、main/WFP/UI 不变。
 
+
+
+## 66. PR #21 最新新 SHA Linux + GNU 全绿，MSVC 全量最后待核（2026-11-18）
+
+- [Draft PR #21](https://github.com/weixiaochuchen618-debug/spidervpn/pull/21) HEAD `4f770d2f90686785d99f31e41b60ca71e6d3c48f`，[Linux #44224794790](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794790) **两 Job Completed/Success**：121 lib、13 old handshake/request tests、9 new Rust strict HTTP1.1 parser real TCP tests 全 pass / 0 ignored/fail，root tmp 与真 WireGuard netns。首 SHA `9e392b84` 原 Linux 8/9 的管线连接 EOF-only 测试 FAILED，已改成 Linux 合法 EOF **或** RST 才是关闭，原测试未删除/skip。见 [Backlog D.63–64](./REMEDIATION_BACKLOG.md)。
+- [GNU #44224794789](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794789) 同新 SHA **整个 workflow Completed/Success**（原有 compiler warnings），Guard/身份、SEC-01 sourced transport SSH tests 实测通过。[MSVC #44224794780](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794780) 同新 SHA Build、SEC-10/01 已 Success，继续等待 integration/changed-module/full portable unit 的**完整终态**和真实日志；禁止提前记三平台 CI 成功。
+- 对接真正 TLS 的技术缺口：当前 `http_one_request::read_one_request` 接受 `&mut DeadlineIo`，真实 TLS1.2 端必须先将 rustls/验证通过的 TLS 解密层实现为**独立受时限约束的读取接口**再交给 parser；直接把 TLS raw ciphertext 交给当前 parser 是错误的。尚无生产 listener、HTTP response、可信 token/Revoked 数据。Issue #5/SEC-01/02/08 Open，PR #21 Draft，main/UI/WFP 不变。
+

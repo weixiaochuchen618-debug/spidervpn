@@ -698,3 +698,12 @@ PR/commit/CI: ...
 - 最新 HEAD 的新 CI 已启动：[Linux #44224794790](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794790)、[MSVC #44224794780](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794780)、[GNU #44224794789](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794789)，本条撰写时均**in_progress**，须核对准确 SHA 原始日志并修复任何再次失败；不能借父 #20 的成功。
 - 验收上限：这还不是 TLS-decrypted HTTP 接收器/证书与身份绑定/授权 token/真实路由和 JSON response/Revoked 历史可信性，也**没有通过网络端到端验证真正的 TLS1.2**；请求 parser 单次调用不能限制未来错误的重复调用方。旧 Python listening TLS wrap DoS 仍在，SEC-01/SEC-02/SEC-08、Issue #5 OPEN，PR #21 Draft，不合 main。
 
+
+
+## D.64 PR #21 新 HEAD Linux+GNU 完整 Success，Windows MSVC 全量仍待（2026-11-18）
+
+- 实际代码 HEAD **`4f770d2f90686785d99f31e41b60ca71e6d3c48f`**（修复首 SHA 测试断言，不删除反例）。[Linux #44224794790](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794790) **两个 Job Completed/Success**：库 121 passed / 0 failed / 0 ignored；旧握手+请求两阶段 **13/13**、新 `http_one_request::tests` **9/9** 真实 TCP tests / 0 failed/ignored，含修正后的 pipelined 第二请求拒绝；独立 root netns 真实 WireGuard kernel 1 test、root-only tmp 退役 FS 7 tests Success。保留 Linux `--locked`、`RUSTFLAGS=-D warnings`，没有忽略失败。
+- [Windows GNU #44224794789](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794789) 同 SHA **Completed/Success**：Rust build、Release environment root boundary、Guard IPC/身份、旧 SEC-01 SSH writer gate 实测通过；原始日志 `deploy::tests::sec01_sourced_transport_reads_refuse_retired_pairing_host ... ok`。GNU 有原仓既有 unused warning，不能称 0 warning。
+- [Windows MSVC #44224794780](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44224794780) 同 SHA **Build、SEC-10 和 SEC-01 已成功**，后续 integrations、changed modules、portable Rust 全量正在执行；整个 MSVC 未完整完成前，不得声称三平台全绿。父 PR #20 的 1429 pass 不可当新 SHA 的证据。
+- GitHub compare `a773fe88..4f770d2f` **仅三文件**：`.github/workflows/security-pairing-rust-linux.yml`、`server-rs/src/lib.rs` 和新 Rust `server-rs/src/http_one_request.rs`（默认 feature 禁用）。现 `read_one_request(&mut DeadlineIo)` 仅针对**Rust 有界明文字节流/真实 TCP 测试**，不是 TLS 解密后的 Rustls/HTTP 整合接口；未来真正 Rust TLS 服务必须确保解析读取的是**已解密且经验证的 TLS application data**、底层 IO 仍受限、一个客户端连接只允许一次 handler，不能把当前 plaintext 套在 TLS ciphertext 上。旧 `assets/tc-pair.py` 仍是生产，TLS accept DoS 未修，旧撤销历史与跨 root 写者未验收。SEC-01/02/08、Issue #5 OPEN，PR #21 Draft，不合 main/UI/连接/WFP 均不动。
+
