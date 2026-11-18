@@ -502,6 +502,11 @@ struct LocalLeaseControl {
     engine_pid: u32,
     engine_stamp: u64,
     engine: std::os::windows::io::OwnedHandle,
+    // Once any request may have reached a helper, keep that process identity
+    // until it has actually exited. Pipe closure initiates revocation, but
+    // alone is not proof that an old WFP session has already closed.
+    helper: std::sync::Mutex<Option<std::os::windows::io::OwnedHandle>>,
+    owner_finished: std::sync::atomic::AtomicBool,
     cancelled: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     observed_sequence: std::sync::atomic::AtomicU64,
@@ -541,6 +546,27 @@ impl LocalLeaseControl {
         self.require_active()
     }
 
+    fn bind_helper(&self, handle: windows_sys::Win32::Foundation::HANDLE) -> Result<(), String> {
+        let duplicate = pipe_ipc::duplicate_process_handle(handle)?;
+        let mut helper = self.helper.lock().map_err(|_| "实验租约 helper 身份登记异常")?;
+        if helper.is_some() { return Err("实验租约 helper 已登记".into()); }
+        *helper = Some(duplicate);
+        Ok(())
+    }
+
+    fn finished_and_helper_exited(&self) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        if !self.owner_finished.load(Ordering::Acquire) { return false; }
+        let Ok(helper) = self.helper.lock() else { return false; };
+        match helper.as_ref() {
+            None => true, // no request could have reached an unregistered helper
+            Some(h) => unsafe { WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_OBJECT_0 },
+        }
+    }
+
     fn authorized<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let _gate = self.write_gate.lock().map_err(|_| "租约取消门状态异常")?;
         self.require_active()?;
@@ -564,8 +590,11 @@ pub(crate) struct LocalLeaseRegistration<'a> {
 impl Drop for LocalLeaseRegistration<'_> {
     fn drop(&mut self) {
         self.control.cancel();
+        self.control.owner_finished.store(true, std::sync::atomic::Ordering::Release);
         let mut slot = self.slot.0.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.current.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.control)) {
+        if slot.current.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.control))
+            && self.control.finished_and_helper_exited()
+        {
             slot.current = None;
         }
     }
@@ -579,6 +608,7 @@ impl LocalLeaseSlot {
         use ring::rand::{SecureRandom, SystemRandom};
         let mut slot = self.0.lock().map_err(|_| "实验租约登记状态异常")?;
         if slot.disconnects != 0 { return Err("本进程正在断开，不启动实验租约".into()); }
+        Self::reap_finished(&mut slot);
         if slot.current.is_some() { return Err("本进程已有尚未退出的实验租约".into()); }
         if engine_pid == 0 || engine_pid == std::process::id() {
             return Err("实验租约引擎 PID 无效".into());
@@ -596,6 +626,8 @@ impl LocalLeaseSlot {
         let control = std::sync::Arc::new(LocalLeaseControl {
             nonce, controller_pid: std::process::id(), controller_stamp,
             engine_pid, engine_stamp, engine,
+            helper: std::sync::Mutex::new(None),
+            owner_finished: std::sync::atomic::AtomicBool::new(false),
             cancelled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             observed_sequence: std::sync::atomic::AtomicU64::new(0),
@@ -605,8 +637,15 @@ impl LocalLeaseSlot {
         Ok(LocalLeaseRegistration { slot: self, control })
     }
 
+    fn reap_finished(slot: &mut LocalLeaseState) {
+        if slot.current.as_ref().is_some_and(|c| c.finished_and_helper_exited()) {
+            slot.current = None;
+        }
+    }
+
     fn begin_disconnect(&self) -> LocalDisconnectGuard<'_> {
         let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Self::reap_finished(&mut slot);
         // Prevent a new startup throughout the existing disconnect operation,
         // even if there was no active registration at this instant.
         slot.disconnects = slot.disconnects.checked_add(1).expect("disconnect nesting overflow");
@@ -763,6 +802,9 @@ pub(crate) fn launch_elevated(request: &LeaseRequest, registration: LocalLeaseRe
     if creation_stamp(child.handle)? != helper_stamp || token_identity(child.handle)? != helper_token {
         return Err("helper 创建时间或 token 变化".into());
     }
+    // The old slot cannot be replaced after pipe closure until the actual
+    // helper exits. Bind before the first request write, even on later error.
+    control.bind_helper(child.handle)?;
     pipe.send_guarded(&data, deadline, &check, &control)?;
     let ready = pipe.receive(4096, deadline, &check)?;
     validate_stage(&ready, &nonce, req.programs.len(), helper_pid, LeaseState::Ready)?;
@@ -1780,6 +1822,7 @@ mod tests {
             assert_ne!(helper_pid, pid);
             let handle = child.0.as_raw_handle();
             assert_eq!(unsafe { GetProcessId(handle) }, helper_pid);
+            if let Some(control) = control.as_ref() { control.bind_helper(handle).unwrap(); }
             let deadline = Instant::now() + Duration::from_secs(10);
             let pipe = Pipe::client(&nonce, deadline, || require_live(handle)).unwrap();
             pipe.require_peer(helper_pid, false).unwrap();
@@ -1917,9 +1960,11 @@ mod tests {
                     assert!(control.authorized(|| Ok(())).is_err());
                     assert!(engine.as_mut().unwrap().0.try_wait().unwrap().is_none(),
                         "engine must remain live through readback");
-                    wait_for(deadline, || LOCAL_LEASE.0.lock().unwrap().current.is_none(),
-                        "canceled channel owner did not release its registration");
-                    cancel_current_experimental_lease(); // no-op after release
+                    wait_for(deadline, || control.owner_finished.load(std::sync::atomic::Ordering::Acquire),
+                        "canceled channel owner did not finish");
+                    assert!(register_experimental_lease(control.engine_pid, &std::env::current_exe().unwrap()).is_err(),
+                        "old helper still alive; cannot replace its registration");
+                    cancel_current_experimental_lease(); // still cannot replace old helper
                 }
                 std::fs::write(dir.join("exit"), b"verified").unwrap();
             }
@@ -1944,6 +1989,9 @@ mod tests {
                 std::fs::remove_dir_all(dir).unwrap();
             }
             if is_cancel {
+                // Only observed actual helper exit allows the old slot to be reaped.
+                cancel_current_experimental_lease();
+                assert!(LOCAL_LEASE.0.lock().unwrap().current.is_none());
                 retired = control;
                 cancelled_modes += 1;
                 println!("CANCEL_BFE_PASS mode={mode} engine_alive=true");
