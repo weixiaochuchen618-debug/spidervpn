@@ -610,9 +610,18 @@ pub(crate) fn cancel_current_experimental_lease() {
     LOCAL_LEASE.cancel_current();
 }
 
+// Field order is significant: close the sole client pipe before releasing
+// the reservation, even when spawning the worker fails or unwinding.
+#[cfg(windows)]
+struct RegisteredChannel<'a> {
+    pipe: pipe_ipc::Pipe,
+    registration: LocalLeaseRegistration<'a>,
+}
+
 #[cfg(windows)]
 pub struct LeaseChild {
     handle: windows_sys::Win32::Foundation::HANDLE,
+    control: std::sync::Arc<LocalLeaseControl>,
     // TerminateProcess is best-effort, never the authority for revocation.
     confirmed: bool,
 }
@@ -621,7 +630,8 @@ impl LeaseChild {
     pub fn running(&self) -> bool {
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
         use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
-        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT }
+        self.control.require_active().is_ok()
+            && unsafe { WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT }
     }
 }
 #[cfg(windows)]
@@ -631,6 +641,7 @@ impl Drop for LeaseChild {
             if !self.confirmed {
                 // Best effort only; the helper independently fails closed
                 // on disconnect or timeout.
+                self.control.cancel();
                 unsafe { windows_sys::Win32::System::Threading::TerminateProcess(self.handle, 1); }
             }
             unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle); }
@@ -688,7 +699,7 @@ pub(crate) fn launch_elevated(request: &LeaseRequest, registration: LocalLeaseRe
         return Err(format!("无法启动提权 WFP helper（Win32={}）", unsafe { GetLastError() }));
     }
     if info.hProcess.is_null() { return Err("启动后未获得 helper 进程句柄".into()); }
-    let mut child = LeaseChild { handle: info.hProcess, confirmed: false };
+    let mut child = LeaseChild { handle: info.hProcess, control: control.clone(), confirmed: false };
     control.require_identity()?;
     let helper_pid = unsafe { GetProcessId(child.handle) };
     verify_same_image(child.handle, helper_pid)?;
@@ -752,22 +763,9 @@ pub(crate) fn launch_elevated(request: &LeaseRequest, registration: LocalLeaseRe
     // Transfer the sole client pipe to a process-lifetime worker only on success.
     // On thread creation failure the captured pipe is dropped, independently
     // of whether the parent can terminate the elevated process.
-    let (start, permission) = std::sync::mpsc::sync_channel::<()>(1);
-    std::thread::Builder::new().name("spidervpn-lease-channel".into())
-        .spawn(move || {
-            // Drop the sole pipe BEFORE releasing the registration, including
-            // on timeout or panic. The next start cannot overlap this pipe.
-            let registration = registration;
-            let pipe = pipe;
-            if permission.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_err()
-                || Instant::now() >= deadline
-                || registration.control.require_identity().is_err()
-            {
-                return;
-            }
-            let _ = maintain_controller_channel(pipe, helper_monitor, &nonce, helper_pid,
-                helper_stamp, &helper_token, pending, &registration.control);
-        }).map_err(|e| format!("启动租约信道监督失败：{e}"))?;
+    let channel = RegisteredChannel { pipe, registration };
+    let start = spawn_controller_worker(channel, helper_monitor, nonce, helper_pid,
+        helper_stamp, helper_token, pending, deadline)?;
     if !child.running() || Instant::now() >= deadline {
         return Err("租约监督移交前已超时或 helper 退出".into());
     }
@@ -968,8 +966,34 @@ fn confirm_first_heartbeat(pipe: &pipe_ipc::Pipe,
     Ok(next)
 }
 
+// Both production and the real-process+BFE fixture exercise this exact
+// worker handoff, including the one-shot authorization gate.
 #[cfg(windows)]
-fn maintain_controller_channel(pipe: pipe_ipc::Pipe, helper: std::os::windows::io::OwnedHandle,
+fn spawn_controller_worker(channel: RegisteredChannel<'static>,
+    helper: std::os::windows::io::OwnedHandle, nonce: String, pid: u32, stamp: u64,
+    identity: pipe_ipc::TokenIdentity, pending: Vec<u8>, deadline: std::time::Instant)
+    -> Result<std::sync::mpsc::SyncSender<()>, String>
+{
+    use std::time::Instant;
+    let (start, permission) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::Builder::new().name("spidervpn-lease-channel".into())
+        .spawn(move || {
+            // Capture the whole struct, never disjoint fields in the closure.
+            let channel = channel;
+            if permission.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_err()
+                || Instant::now() >= deadline
+                || channel.registration.control.require_identity().is_err()
+            {
+                return;
+            }
+            let _ = maintain_controller_channel(&channel.pipe, helper, &nonce, pid,
+                stamp, &identity, pending, &channel.registration.control);
+        }).map_err(|e| format!("启动租约信道监督失败：{e}"))?;
+    Ok(start)
+}
+
+#[cfg(windows)]
+fn maintain_controller_channel(pipe: &pipe_ipc::Pipe, helper: std::os::windows::io::OwnedHandle,
     nonce: &str, pid: u32, stamp: u64, identity: &pipe_ipc::TokenIdentity,
     pending: Vec<u8>, control: &LocalLeaseControl) -> Result<(), String>
 {
@@ -977,7 +1001,7 @@ fn maintain_controller_channel(pipe: pipe_ipc::Pipe, helper: std::os::windows::i
     use std::time::Instant;
     let check = || {
         control.require_identity()?;
-        controller_heartbeat_check(&pipe, helper.as_raw_handle(), pid, stamp, identity)
+        controller_heartbeat_check(pipe, helper.as_raw_handle(), pid, stamp, identity)
     };
     let mut sequence = 2u64;
     let mut pending = Some(pending);
