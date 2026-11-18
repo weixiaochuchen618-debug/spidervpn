@@ -26,7 +26,7 @@ use ring::digest::{digest, SHA256};
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
@@ -222,6 +222,7 @@ mod tests {
     use rustls::client::ClientConnection;
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, RootCertStore, StreamOwned};
+    use std::fs;
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::{symlink, PermissionsExt};

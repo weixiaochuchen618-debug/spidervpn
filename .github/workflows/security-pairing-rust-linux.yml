@@ -80,6 +80,10 @@ jobs:
         run: |
           set -euo pipefail
           openssl version
+          # Verify the feature-enabled NON-TEST Rust library compiles with
+          # the same strict warnings; unit tests can hide unused imports.
+          cargo build --locked --manifest-path server-rs/Cargo.toml \
+            --features linux-tls-identity-lab --lib
           cargo test --locked --manifest-path server-rs/Cargo.toml \
             --features linux-tls-identity-lab --lib tls_identity::tests -- \
             --test-threads=1 --nocapture
