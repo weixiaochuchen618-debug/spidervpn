@@ -503,3 +503,11 @@
 - [MSVC #44212209567](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209567) Rust Build + SEC-10/01 分别 Success，当前在 integration tests，后续 changed-module/full portable suite 必须等所有 job 完成并查失败日志。不能拿 GNU/Linux 绿当 Windows full green。详细见 [Backlog D.57](./REMEDIATION_BACKLOG.md)。
 - 新 SEC-02 Rust policy feature 默认关闭，没有生产真实 TLS/HTTPS 端口或前后兼容验收，不能声称 Python 旧漏洞已修、不能合并 main，SEC-02/SEC-01/SEC-08 / Issue #5 Open。
 
+
+
+## 60. PR #19 同一最终 SHA 三平台成功，下一步接握手后的 HTTP 资源边界（2026-11-18）
+
+- 精确 Rust HEAD `9cc7ab6b5fcdf087eec2f80e92ef7581ebe4fe0b`：Linux [#44212209581](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209581) 2/2 Jobs Success，8 新 Rust true-TCP tests/0 failed/ignored、121 库 tests/0 failed/ignored，真实 WG kernel/netns 和 root /tmp；GNU [#44212209522](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209522) Success；MSVC [#44212209567](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44212209567) **Completed/Success**，末尾完整便携 unit 日志 `1429 passed; 0 failed; 1 ignored; 8 filtered`，原有环境排除，全部 6 个主要 CI 阶段成功。
+- 当前模块 `HandshakeAdmission::spawn` 成功后可返回任何 `R`，但没有全局**握手后 HTTP 请求阶段**的并发名额与独立绝对 deadline；不得假定只限制 handshake 就能防止后续无限 HTTP worker/慢请求。可独立开发下一张默认关闭的 Rust 有界 request handoff 候选，保持旧 `spawn` 不变，不接生产 TLS/HTTP，设计每一连接一请求/关闭与 session 容量。具体见 Backlog D.58。
+- 生产 SEC-02 不通过：旧 Python TLS on listening socket 尚未替换，真实证书/TLS1.2 compatibility 与 HTTP/撤销状态无法自动迁移；Issue #5 OPEN，全部安全 PR Draft，main/UI/WFP 持久 BLOCK 保持原样。
+
