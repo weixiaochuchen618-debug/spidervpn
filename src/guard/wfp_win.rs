@@ -1231,10 +1231,14 @@ mod imp {
             // SpiderVPN exe，不能用一个任意长寿进程冒充控制者。
             let controller_exe = std::env::current_exe()
                 .map_err(|e| format!("无法确认 WFP helper 自身程序路径：{e}"))?;
-            super::super::proxy_identity::verify_process_executable(
-                controller_pid, &controller_exe,
-            )?;
-            super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
+            unsafe {
+                super::super::proxy_identity::verify_live_process_handle(
+                    controller_process.0, controller_pid, &controller_exe,
+                )?;
+                super::super::proxy_identity::verify_proxy_owner_on_handle(
+                    endpoint, owner_pid, executable, watched_process.0,
+                )?;
+            }
             watched_process.require_alive()?;
             controller_process.require_alive()?;
             let engine = WfpEngine::open_dynamic().map_err(|e| e.to_string())?;
@@ -1268,7 +1272,9 @@ mod imp {
                 return Err("WFP provider 存在未预期或重复过滤器，拒绝临时放行".into());
             }
             // owner 检查可能与 BFE 枚举并发；真正写入之前再次核验。
-            super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
+            unsafe { super::super::proxy_identity::verify_proxy_owner_on_handle(
+                endpoint, owner_pid, executable, watched_process.0,
+            )?; }
             let mut permits = Vec::with_capacity(ids.len());
             for id in ids {
                 let raw = RawFilter::trusted_ephemeral_proxy_permit(
@@ -1284,7 +1290,9 @@ mod imp {
             }
             // 安装过程也可能跨越代理退出或端口重新绑定；失败直接 Drop
             // 动态 engine，BFE 会移除已经装上的所有 permits。
-            super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, executable)?;
+            unsafe { super::super::proxy_identity::verify_proxy_owner_on_handle(
+                endpoint, owner_pid, executable, watched_process.0,
+            )?; }
             watched_process.require_alive()?;
             controller_process.require_alive()?;
             Ok(Self {
@@ -1298,9 +1306,9 @@ mod imp {
         pub fn revalidate(self, executable: &Path) -> Result<Self, String> {
             self.controller_process.require_alive()?;
             self.watched_process.require_alive()?;
-            super::super::proxy_identity::verify_proxy_owner(
-                self.endpoint, self.owner_pid, executable,
-            )?;
+            unsafe { super::super::proxy_identity::verify_proxy_owner_on_handle(
+                self.endpoint, self.owner_pid, executable, self.watched_process.0,
+            )?; }
             self.watched_process.require_alive()?;
             self.controller_process.require_alive()?;
             Ok(self)
