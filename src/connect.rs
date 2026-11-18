@@ -536,7 +536,7 @@ fn disconnect_inner(cfg: Option<&AppConfig>, deps: &Deps) -> Result<Outcome, Str
     // is absent/corrupt or the following engine stop returns Err. No lease is
     // a no-op; never infer another process's ownership from runtime.json.
     #[cfg(windows)]
-    crate::guard::lease_helper::cancel_current_experimental_lease();
+    let _lease_disconnect = crate::guard::lease_helper::begin_experimental_disconnect();
 
     // 1) 先停引擎：否则还原代理之后，引擎仍在跑，流量会绕过代理直连。
     //    这里必须按 EnginePid 停——守护就是我们自己，照着 SupervisorPid 去 kill 等于自杀。
