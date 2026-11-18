@@ -198,6 +198,24 @@ fn read_from_verified_dir(dir: &File, uid: u32, expected_pin: &str)
     Ok(VerifiedTlsIdentity { server_config, leaf_der_sha256: calculated })
 }
 
+/// Separate disposable process-lab TLS material. Never fall back to the
+/// production certificate or to a caller-controlled directory/environment.
+/// Only the root startup phase may read this exact protected directory.
+#[cfg(feature = "linux-denial-process-lab")]
+pub fn read_disposable_process_identity(expected_pin: &str)
+    -> io::Result<VerifiedTlsIdentity>
+{
+    if unsafe { geteuid() } != 0 {
+        return Err(denied("SEC-02 root required to load disposable lab TLS identity"));
+    }
+    if !is_valid_pin(expected_pin) {
+        return Err(invalid("SEC-02 no independently supplied lab certificate pin"));
+    }
+    let slash = File::open("/")?;
+    let root = open_trusted_tree(&slash, &["run", "spidervpn-pair-denial-lab"], 0)?;
+    read_from_verified_dir(&root, 0, expected_pin)
+}
+
 /// Production path is FIXED and verified component-by-component, never taken
 /// from TC_PAIR_ROOT, server.json, SSH config, a caller-provided directory,
 /// or an untrusted network input. Requires effective root UID and an

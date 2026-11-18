@@ -21,6 +21,8 @@ rustls = { version = "=0.23.46", default-features = false, features = ["ring", "
 # Zeroize in-memory PEM key buffers on every return path. Same existing
 # vetted version/checksum as the pinned Windows client lock.
 zeroize = { version = "=1.9.1", optional = true }
+# Existing pinned transitive libc; expose only for the opted-in Linux process lab.
+libc = { version = "=0.2.191", optional = true }
 
 [features]
 # Only the explicit privileged netns CI job compiles and runs this test.
@@ -48,6 +50,8 @@ linux-http-deny-response-lab = ["linux-tls-identity-lab"]
 linux-bounded-accept-lab = ["linux-http-deny-response-lab"]
 # Opt-in stoppable, long-lived loopback listener; no deployment entry point.
 linux-persistent-listener-lab = ["linux-bounded-accept-lab"]
+# Explicit disposable process lab, NOT installed or deployed.
+linux-denial-process-lab = ["linux-persistent-listener-lab", "dep:libc"]
 
 [[test]]
 name = "wg_namespace_e2e"
@@ -63,3 +67,13 @@ required-features = ["linux-cutover-preflight"]
 name = "spidervpn-pair-retire"
 path = "src/bin/spidervpn-pair-retire.rs"
 required-features = ["linux-legacy-retire-cli"]
+
+[[bin]]
+name = "spidervpn-pair-denial-lab"
+path = "src/bin/spidervpn-pair-denial-lab.rs"
+required-features = ["linux-denial-process-lab"]
+
+[[test]]
+name = "denial_process_e2e"
+path = "tests/denial_process_e2e.rs"
+required-features = ["linux-denial-process-lab"]
