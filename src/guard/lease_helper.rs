@@ -1841,6 +1841,12 @@ mod tests {
             }
         }
 
+        if let Ok(role) = std::env::var("SPIDERVPN_LIFECYCLE_LAB_ROLE") {
+            assert!(native_bfe);
+            lifecycle_lab_worker(&role);
+            return;
+        }
+
         // A3b workers are deliberately separate from the production lease
         // protocol and the existing nine + seven + A2 fixtures.
         if let Ok(role) = std::env::var("SPIDERVPN_A3B_ROLE") {
@@ -2227,6 +2233,7 @@ mod tests {
             generation_barrier_bfe(engine.0.id());
             a3b_cross_process_bfe_lab();
             a3b_actual_acquire_denial_bfe();
+            lifecycle_lock_bfe_lab(engine.0.id());
             assert!(engine.0.try_wait().unwrap().is_none());
             drop(engine.0.stdin.take());
             wait_for(Instant::now() + Duration::from_secs(5), || engine.0.try_wait().unwrap().is_some(),
@@ -3284,6 +3291,346 @@ mod tests {
         verify_product();
         for witness in &witnesses { flow(&trader, app, witness, true); }
         println!("A3B_DENY_COMPLETE direct_denied=2 helper_rejected=2 no_new_permit=true baseline_unchanged=true product_objects_unchanged=true residual_preserved=true tcp_restored=true production_barrier_proven=false");
+    }
+
+    #[cfg(windows)]
+    fn lifecycle_lab_worker(role: &str) {
+        use super::super::wfp_win::lifecycle_lab as lock;
+        use windows_sys::Win32::Foundation::*;
+        use std::io::Read;
+        let name = std::env::var("SPIDERVPN_LIFECYCLE_LAB_NAME").unwrap();
+        let own = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        let h = lock::open(&name, lock::USE_LOCK).expect("open same kernel mutex");
+        h.verify(&own.sid).unwrap();
+        println!("LIFECYCLE_WORKER role={role} pid={} elevated={} session={} actual_token_verified=true",
+            std::process::id(), own.elevated, own.session);
+        let (rc, last_error) = h.wait(150);
+        println!("LIFECYCLE_WAIT role={role} pid={} rc={rc:#x} last_error={last_error}",
+            std::process::id());
+        match role {
+            "contend" => assert_eq!(rc, WAIT_TIMEOUT),
+            "acquire" => {
+                assert_eq!(rc, WAIT_OBJECT_0);
+                h.release().unwrap();
+            }
+            "hold" => {
+                assert_eq!(rc, WAIT_OBJECT_0);
+                let dir = std::path::PathBuf::from(std::env::var_os("SPIDERVPN_LIFECYCLE_LAB_DIR").unwrap());
+                a3b_lab_mark(&dir, "lock-held");
+                let mut byte = [0u8; 1];
+                assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
+                h.release().unwrap();
+                println!("LIFECYCLE_HOLDER_RELEASE pid={}", std::process::id());
+            }
+            _ => panic!("unknown lifecycle lab role"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn lifecycle_lock_bfe_lab(engine_pid: u32) {
+        use super::super::wfp_win::{lifecycle_lab as lock, WfpEngine, RawFilter,
+            app_id_from_path, filter_add, filter_get_by_id, dynamic_permit_key,
+            old_dynamic_permits_absent, lab_enum_layer};
+        use super::super::wfp::{Layer, CONDITION_ALE_APP_ID};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Child, Command, Stdio};
+        use windows_sys::Win32::Foundation::*;
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        struct RemoveDir(std::path::PathBuf);
+        impl Drop for RemoveDir {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        fn fresh_name() -> String {
+            format!(r"Global\SpiderVPN-Lifecycle-Lab-{}", random_nonce())
+        }
+        fn cmd(exe: &Path) -> Command {
+            let mut c = Command::new(exe);
+            c.args(["--ignored", "--exact", "guard::lease_helper::tests::real_process_channel_faults_with_bfe", "--nocapture"]);
+            c
+        }
+        fn await_child(child: &mut Child, deadline: Instant) {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "lifecycle child failed: {status}");
+                    return;
+                }
+                assert!(Instant::now() < deadline, "lifecycle child timed out");
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        fn wait_marker(dir: &Path, marker: &str) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !dir.join(marker).is_file() {
+                assert!(Instant::now() < deadline, "lifecycle marker missing: {marker}");
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        fn wait_rc(h: &lock::TestHandle, ms: u32, expected: u32, label: &str) {
+            let (rc, last_error) = h.wait(ms);
+            println!("LIFECYCLE_WAIT role={label} pid={} rc={rc:#x} last_error={last_error}",
+                std::process::id());
+            assert_eq!(rc, expected, "{label}");
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let own = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        assert!(own.elevated);
+        let sddl = lock::expected_sddl(&own.sid);
+        let name = fresh_name();
+        let (gate, create_rc) = lock::create(&name, &sddl).expect("fresh lifecycle mutex");
+        assert_eq!(create_rc, 0);
+        gate.verify(&own.sid).unwrap();
+        println!("LIFECYCLE_BEGIN pid={} elevated={} session={} create_last_error={create_rc}",
+            std::process::id(), own.elevated, own.session);
+        let dir = exe.parent().unwrap().join(format!("spidervpn-lifecycle-{}", random_nonce()));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = RemoveDir(dir.clone());
+        let spawn = |role: &str, name: &str| {
+            let child = ChildGuard(cmd(&exe)
+                .env("SPIDERVPN_LIFECYCLE_LAB_ROLE", role)
+                .env("SPIDERVPN_LIFECYCLE_LAB_NAME", name)
+                .env("SPIDERVPN_LIFECYCLE_LAB_DIR", &dir)
+                .stdin(Stdio::piped()).spawn().unwrap());
+            let handle = child.0.as_raw_handle();
+            let child_token = token_identity(handle).unwrap();
+            assert_eq!(child_token, own, "same actual process token identity required");
+            assert_ne!(child.0.id(), std::process::id());
+            verify_same_image(handle, child.0.id()).unwrap();
+            println!("LIFECYCLE_PEER role={role} pid={} same_sid=true same_token_identity=true elevated={} session={}",
+                child.0.id(), child_token.elevated, child_token.session);
+            child
+        };
+
+        // Opening with reduced rights does not manufacture modify access.
+        let limited = lock::open(&name, lock::SYNC_ONLY).unwrap();
+        let deny = lock::open(&name, lock::DELETE_RIGHT).err()
+            .expect("DELETE access must be rejected by actual DACL");
+        assert_eq!(deny, ERROR_ACCESS_DENIED);
+        assert!(limited.verify(&own.sid).is_err(), "SYNCHRONIZE alone cannot read owner/DACL");
+        wait_rc(&gate, 0, WAIT_OBJECT_0, "parent-first");
+        wait_rc(&gate, 0, WAIT_OBJECT_0, "same-thread-recursion");
+        let release_error = limited.release().unwrap_err();
+        assert_eq!(release_error, ERROR_ACCESS_DENIED);
+        println!("LIFECYCLE_ACCESS delete_open_rc={deny} sync_only_release_rc={release_error} sync_only_read_refused=true");
+        let thread_name = name.clone();
+        let thread_sid = own.sid.clone();
+        assert!(std::thread::spawn(move || {
+            let h = lock::open(&thread_name, lock::USE_LOCK).unwrap();
+            h.verify(&thread_sid).unwrap();
+            wait_rc(&h, 150, WAIT_TIMEOUT, "other-thread");
+            true
+        }).join().unwrap());
+
+        // Real synchronous parent -> child acquisition while parent holds
+        // both recursion counts. Bounded child timeout demonstrates why a
+        // parent cannot hold the common gate while waiting for a child to
+        // take the same gate. No deliberately unbounded deadlock.
+        let mut denied = spawn("contend", &name);
+        await_child(&mut denied.0, Instant::now() + Duration::from_secs(5));
+        gate.release().unwrap();
+        let mut still_denied = spawn("contend", &name);
+        await_child(&mut still_denied.0, Instant::now() + Duration::from_secs(5));
+        gate.release().unwrap();
+        let mut allowed = spawn("acquire", &name);
+        await_child(&mut allowed.0, Instant::now() + Duration::from_secs(5));
+        println!("LIFECYCLE_CONTENTION same_thread_recursive=true other_thread_timeout=true child_timeouts=2 child_acquire_after_release=true parent_wait_child_conflict=true");
+        drop(limited);
+
+        // Creation cannot authenticate existing names: even an exact DACL
+        // can be pre-created by a process with the same real SID.
+        let (duplicate, rc) = lock::create(&name, &sddl).unwrap();
+        assert_eq!(rc, ERROR_ALREADY_EXISTS);
+        duplicate.verify(&own.sid).unwrap();
+        println!("LIFECYCLE_PRECREATE mode=matching_acl existing_rc={rc} rejected=true");
+        drop(duplicate);
+        let bad_name = fresh_name();
+        let broad_sddl = format!("O:{}D:P(A;;0x00120001;;;{})(A;;0x00120001;;;WD)", own.sid, own.sid);
+        let (broad, rc) = lock::create(&bad_name, &broad_sddl).unwrap();
+        assert_eq!(rc, 0);
+        // It is a real broad DACL; the expected descriptor supplied on a
+        // second CreateMutexEx cannot replace it.
+        let (bad_open, existing) = lock::create(&bad_name, &sddl).unwrap();
+        assert_eq!(existing, ERROR_ALREADY_EXISTS);
+        let acl_error = bad_open.verify(&own.sid).unwrap_err();
+        assert!(acl_error.contains("ACE count"));
+        println!("LIFECYCLE_PRECREATE mode=broad_acl existing_rc={existing} reason={acl_error:?} rejected=true");
+        drop(bad_open);
+        drop(broad);
+        let wide_mask_name = fresh_name();
+        let wide_mask = format!("O:{}D:P(A;;0x001f0001;;;{})", own.sid, own.sid);
+        let (wide_acl, rc) = lock::create(&wide_mask_name, &wide_mask).unwrap();
+        assert_eq!(rc, 0);
+        let err = wide_acl.verify(&own.sid).unwrap_err();
+        assert!(err.contains("mask"));
+        println!("LIFECYCLE_PRECREATE mode=overbroad_mask reason={err:?} rejected=true");
+        let wrong_name = fresh_name();
+        let _event = lock::wrong_type(&wrong_name);
+        let wrong_rc = lock::create(&wrong_name, &sddl).err().expect("same-name event must not be accepted");
+        assert_eq!(wrong_rc, ERROR_INVALID_HANDLE);
+        println!("LIFECYCLE_PRECREATE mode=wrong_type create_rc={wrong_rc} rejected=true");
+
+        // Actual owner mismatch in readback, with a real but different
+        // expected SID. This is an expected-identity negative, NOT a process
+        // executing under another account.
+        let other_sid = if own.sid == "S-1-5-18" { "S-1-5-19" } else { "S-1-5-18" };
+        let wrong_owner = gate.verify(other_sid).unwrap_err();
+        assert!(wrong_owner.contains("owner mismatch"));
+        println!("LIFECYCLE_OWNER_NEGATIVE actual_owner_read=true expected_sid_mismatch=true cross_sid_process_test=false");
+        // Retain gate handle so the named object survives the owner crash.
+        let mut abandoned = spawn("hold", &name);
+        wait_marker(&dir, "lock-held");
+        wait_rc(&gate, 0, WAIT_TIMEOUT, "before-owner-death");
+        abandoned.0.kill().unwrap();
+        assert!(!abandoned.0.wait().unwrap().success());
+        wait_rc(&gate, 1000, WAIT_ABANDONED_0, "abandoned-owner");
+        // WAIT_ABANDONED grants ownership at the OS level, but cannot
+        // authorize a safety-sensitive write. Release this fixture ownership.
+        gate.release().unwrap();
+        println!("LIFECYCLE_ABANDONED retained_handle=true abnormal_owner_exit=true native_ownership_released=true admission_denied=true history_proven=false");
+        std::fs::remove_file(dir.join("lock-held")).unwrap();
+
+        // BFE cancellation with a different process holding the isolated
+        // outer gate. Existing authenticated supervisor + cancel machinery
+        // is reused, never the production denied acquire path.
+        let mut holder = spawn("hold", &name);
+        wait_marker(&dir, "lock-held");
+        wait_rc(&gate, 0, WAIT_TIMEOUT, "outer-gate-held");
+        let app = app_id_from_path(&exe).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let witness = TcpListener::bind("127.0.0.1:0").unwrap();
+        for l in [&listener, &witness] { l.set_nonblocking(true).unwrap(); }
+        let flow = |l: &TcpListener, expected: bool| {
+            let addr = l.local_addr().unwrap();
+            let result = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+            println!("LIFECYCLE_TCP endpoint={addr} expected={expected} actual={} error={:?}",
+                result.is_ok(), result.as_ref().err());
+            assert_eq!(result.is_ok(), expected);
+            if expected {
+                drop(result.unwrap());
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match l.accept() {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("lifecycle TCP accept: {e}"),
+                    }
+                }
+            } else { assert_eq!(result.unwrap_err().raw_os_error(), Some(10013)); }
+        };
+        flow(&listener, true);
+        flow(&witness, true);
+        let base = WfpEngine::open_dynamic().unwrap();
+        let audit = WfpEngine::open().unwrap();
+        let bid = filter_add(&base, &RawFilter::isolated_lifecycle_filter(&app, None, &[1;16]).unwrap()).unwrap();
+        let block = filter_get_by_id(&audit, bid).unwrap().unwrap();
+        let scan = || {
+            let mut rows = lab_enum_layer(&audit, Layer::V4, 4096).unwrap();
+            rows.extend(lab_enum_layer(&audit, Layer::V6, 4096).unwrap());
+            let mut scoped: Vec<_> = rows.into_iter().filter(|r|
+                r.raw.conditions.iter().any(|c| c.field_key == CONDITION_ALE_APP_ID
+                    && c.blob.as_ref() == Some(&app))).map(|r| r.raw).collect();
+            scoped.sort_by_key(|r| r.filter_key.to_u128());
+            scoped
+        };
+        let baseline = scan();
+        assert!(baseline.iter().any(|r| r == &block));
+        flow(&listener, false);
+        flow(&witness, false);
+        let registration = register_fixture_lease(engine_pid, &exe).unwrap();
+        let control = registration.control.clone();
+        let nonce = control.nonce.clone();
+        let addr = listener.local_addr().unwrap();
+        let key = dynamic_permit_key(&app, addr, &decode_nonce(&nonce).unwrap()).unwrap();
+        assert!(old_dynamic_permits_absent(&[key]).unwrap());
+        let stamp = creation_stamp(unsafe { GetCurrentProcess() }).unwrap();
+        let mut helper = ChildGuard(cmd(&exe)
+            .env("SPIDERVPN_LEASE_CHANNEL_TEST_WORKER", &nonce)
+            .env("SPIDERVPN_LEASE_TEST_PID", std::process::id().to_string())
+            .env("SPIDERVPN_LEASE_TEST_STAMP", stamp.to_string())
+            .env("SPIDERVPN_LEASE_TEST_FAULT", "cancel-active-normal")
+            .env("SPIDERVPN_LEASE_BFE_DIR", &dir)
+            .env("SPIDERVPN_LEASE_BFE_ENDPOINT", addr.to_string()).spawn().unwrap());
+        let hh = helper.0.as_raw_handle();
+        let hp = helper.0.id();
+        assert_ne!(hp, holder.0.id());
+        let identity = token_identity(hh).unwrap();
+        let helper_stamp = creation_stamp(hh).unwrap();
+        verify_same_image(hh, hp).unwrap();
+        control.bind_helper(hh, vec![key]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pipe = Pipe::client(&nonce, deadline, || require_live(hh)).unwrap();
+        pipe.require_peer(hp, false).unwrap();
+        let committed = pipe.receive(4096, deadline, || require_live(hh)).unwrap();
+        validate_stage(&committed, &nonce, 1, hp, LeaseState::Committed).unwrap();
+        control.record_acquire_complete().unwrap();
+        let permit_id: u64 = std::fs::read_to_string(dir.join("permit")).unwrap().parse().unwrap();
+        assert!(!old_dynamic_permits_absent(&[key]).unwrap());
+        assert!(filter_get_by_id(&audit, permit_id).unwrap().is_some());
+        let mut expected_active = baseline.clone();
+        expected_active.push(filter_get_by_id(&audit, permit_id).unwrap().unwrap());
+        expected_active.sort_by_key(|r| r.filter_key.to_u128());
+        assert_eq!(scan(), expected_active);
+        flow(&listener, true);
+        flow(&witness, false);
+        let receipt = serde_json::to_vec(&LeaseFinish { schema: LEASE_SCHEMA,
+            nonce: nonce.clone(), state: LeaseState::Receipt }).unwrap();
+        pipe.send(&receipt, deadline, || require_live(hh)).unwrap();
+        let active = pipe.receive(4096, deadline, || require_live(hh)).unwrap();
+        validate_stage(&active, &nonce, 1, hp, LeaseState::Active).unwrap();
+        let pending = confirm_first_heartbeat(&pipe, hh, &nonce, hp, helper_stamp,
+            &identity, deadline, Some(&control)).unwrap();
+        let channel = RegisteredChannel { pipe, registration };
+        let start = spawn_controller_worker(channel, duplicate_process_handle(hh).unwrap(),
+            nonce.clone(), hp, helper_stamp, identity, pending, deadline).unwrap();
+        control.authorized(|| start.send(()).map_err(|e| e.to_string())).unwrap();
+        while control.observed_sequence.load(std::sync::atomic::Ordering::Acquire) < 3 {
+            assert!(Instant::now() < deadline, "active renewal not consumed");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        wait_rc(&gate, 0, WAIT_TIMEOUT, "outer-held-before-cancel");
+        let started = Instant::now();
+        // Reuse real cancellation/teardown entry exercised by old tests.
+        // No outer gate acquisition added to the existing path.
+        invoke_fixture_disconnect("cancel-active-normal", &dir, &control);
+        assert!(control.require_active().is_err());
+        wait_marker(&dir, "revoked");
+        assert!(helper.0.try_wait().unwrap().is_none());
+        assert!(holder.0.try_wait().unwrap().is_none());
+        wait_rc(&gate, 0, WAIT_TIMEOUT, "outer-held-after-native-close");
+        assert!(old_dynamic_permits_absent(&[key]).unwrap());
+        assert!(filter_get_by_id(&audit, permit_id).unwrap().is_none());
+        assert_eq!(filter_get_by_id(&audit, bid).unwrap().unwrap(), block);
+        assert_eq!(scan(), baseline);
+        flow(&listener, false);
+        flow(&witness, false);
+        println!("LIFECYCLE_CANCEL_CLOSE elapsed_ms={} active_renewal=true outer_holder_alive=true outer_still_locked=true helper_alive=true bfe_permit_absent=true baseline_unchanged=true no_new_permit=true",
+            started.elapsed().as_millis());
+        a3b_lab_mark(&dir, "exit");
+        await_child(&mut helper.0, Instant::now() + Duration::from_secs(5));
+        LOCAL_LEASE.reap_verified().unwrap();
+        wait_rc(&gate, 0, WAIT_TIMEOUT, "outer-held-after-helper-exit");
+        drop(holder.0.stdin.take());
+        await_child(&mut holder.0, Instant::now() + Duration::from_secs(5));
+        wait_rc(&gate, 0, WAIT_OBJECT_0, "outer-released");
+        gate.release().unwrap();
+        base.close_checked().unwrap();
+        assert!(filter_get_by_id(&audit, bid).unwrap().is_none());
+        flow(&listener, true);
+        flow(&witness, true);
+        println!("LIFECYCLE_LAB_COMPLETE actual_kernel_lock=true owner_dacl_readback=true same_sid_processes=true reentry=true precreate_rejected=true abandoned_rejected=true cancel_close_while_held=true tcp_restored=true cross_sid_not_run=true production_gate_proven=false");
     }
 
     // The real connect.rs disconnect entry, with a disposable runtime directory.
