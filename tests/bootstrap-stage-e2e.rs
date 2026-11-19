@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
     Foundation::LocalFree,
-    Security::{SECURITY_ATTRIBUTES, OWNER_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION},
-    Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT,
+    Security::{SECURITY_ATTRIBUTES, OWNER_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl},
+    Security::Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
         ConvertStringSecurityDescriptorToSecurityDescriptorW,
         ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1},
     Storage::FileSystem::{CreateDirectoryW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
@@ -158,7 +159,9 @@ fn cleanup_stage(p:&Path) {
     fs::remove_dir(p.join("install")).unwrap();
     fs::remove_dir(p).unwrap();fs::remove_dir(slot()).unwrap();
 }
-fn verify_stage(f:&Fixture,p:&Path) {
+fn verify_stage(f:&Fixture,p:&Path,expected:&[u8],digest:&str) {
+    assert_eq!(hash(expected),digest);
+    let manifest:Value=serde_json::from_slice(expected.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(expected)).unwrap();
     let mut dirs=Vec::new();
     for d in [slot(),p.to_owned(),p.join("install")] {
         let dir=open(&d);exact_acl(&dir);dirs.push(identity(&dir));
@@ -173,8 +176,14 @@ fn verify_stage(f:&Fixture,p:&Path) {
         let mut src=Vec::new();let mut dst=Vec::new();
         s.read_to_end(&mut src).unwrap();d.read_to_end(&mut dst).unwrap();
         assert_eq!(hash(&src),hash(&dst));assert_eq!(src,dst);
+        if n=="manifest.json" {assert_eq!(dst.as_slice(),expected);assert_eq!(hash(&dst),digest);}
+        else {
+            let entry=manifest["files"].as_array().unwrap().iter().find(|e|e["path"]==n).unwrap();
+            assert_eq!(dst.len() as u64,entry["size"].as_u64().unwrap());
+            assert_eq!(hash(&dst),entry["sha256"].as_str().unwrap());
+        }
         exact_acl(&d);
-        println!("BOOTSTRAP_E2E_READBACK name={n} source_id={a:?} target_id={b:?} sha256={} owner_acl=true",hash(&dst));
+        println!("BOOTSTRAP_E2E_READBACK name={n} source_id={a:?} target_id={b:?} sha256={} owner_acl=true original_expected_match=true",hash(&dst));
     }
     assert_eq!(fs::read_dir(p).unwrap().count(),11);
     assert_eq!(fs::read_dir(p.join("install")).unwrap().count(),3);
@@ -257,6 +266,13 @@ fn real_bootstrap_content_and_object_boundaries() {
     assert!(output.status.success(),"{}",log(&output));
     refuse(&f.source,&digest,SOURCE_SHA,"OBJECT_TYPE_OR_LINK");
     fs::remove_dir(&install).unwrap();fs::rename(&saved,&install).unwrap();
+    for dir in [&f.source,&install] {
+        let stream=PathBuf::from(format!("{}:hidden-directory-stream",dir.display()));
+        fs::write(&stream,b"directory alternate data").unwrap();
+        refuse(&f.source,&digest,SOURCE_SHA,"OBJECT_ALTERNATE_STREAM");
+        fs::remove_file(&stream).unwrap();
+        println!("BOOTSTRAP_E2E_DIRECTORY_ADS path={dir:?} refused=true");
+    }
     let alias=f.source.join("..").join("source");
     refuse(&alias,&digest,SOURCE_SHA,"PATH_ALIAS_OR_TRAVERSAL");
     f.neighbor();
@@ -282,11 +298,12 @@ fn real_bootstrap_content_and_object_boundaries() {
     assert!(msg.contains("BOOTSTRAP_CONTENT_MATCH files=13"));
     assert!(msg.contains("install_authorized=false zip_origin_verified=false"));
     let p1=checked_stage(msg.lines().find(|l|l.starts_with("BOOTSTRAP_STAGE_UNREADY path=")).unwrap());
-    verify_stage(&f,&p1);let first_id=identity(&open(&p1));cleanup_stage(&p1);
+    let expected=fs::read(f.source.join("manifest.json")).unwrap();
+    verify_stage(&f,&p1,&expected,&digest);let first_id=identity(&open(&p1));cleanup_stage(&p1);
     let out=command(&f.source,&digest,SOURCE_SHA).output().unwrap();let msg=log(&out);
     assert!(out.status.success(),"{msg}");
     let p2=checked_stage(msg.lines().find(|l|l.starts_with("BOOTSTRAP_STAGE_UNREADY path=")).unwrap());
-    assert_ne!(p1,p2);assert_ne!(first_id,identity(&open(&p2)));verify_stage(&f,&p2);cleanup_stage(&p2);
+    assert_ne!(p1,p2);assert_ne!(first_id,identity(&open(&p2)));verify_stage(&f,&p2,&expected,&digest);cleanup_stage(&p2);
     f.neighbor();
 
     // Real competing create during staging. The next file is the manifest
@@ -294,7 +311,7 @@ fn real_bootstrap_content_and_object_boundaries() {
     // no untrusted executable, same elevated test account only.
     let mut large=File::create(path(&f.source,NAMES[0])).unwrap();
     let block=vec![0x5au8;1024*1024];
-    for _ in 0..32 {large.write_all(&block).unwrap();}
+    for _ in 0..128 {large.write_all(&block).unwrap();}
     large.sync_all().unwrap();drop(large);let digest=f.restore_manifest();
     let mut child=command(&f.source,&digest,SOURCE_SHA).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut reader=BufReader::new(child.stdout.take().unwrap());let mut observed=String::new();
@@ -314,5 +331,94 @@ fn real_bootstrap_content_and_object_boundaries() {
     assert_eq!(fs::read(stage.join("manifest.json")).unwrap(),b"competing object sentinel");
     println!("BOOTSTRAP_E2E_STAGE_FILE_COLLISION {}",observed.lines().find(|l|l.contains("BOOTSTRAP_REFUSED")).unwrap());
     cleanup_stage(&stage);f.neighbor();
-    println!("BOOTSTRAP_E2E_COMPLETE real_exe=true files=13 same_object_readback=true stage_acl=true slot_collision=true file_collision=true fixture_executed=false release=false install=false cross_sid_not_run=true");
+
+    // The actual child emits its stage path AFTER validating and retaining
+    // all source handles. The large first payload provides a bounded window
+    // without sleeps or production-only test switches.
+    let expected=fs::read(f.source.join("manifest.json")).unwrap();
+    let source_leaf=path(&f.source,NAMES[0]);
+    let leaf_before=identity(&open(&source_leaf));
+    let parent_before=identity(&open(&f.source));
+    let ancestor_before=identity(&open(&f.root));
+    let replacement=f.root.join("replacement");
+    fs::write(&replacement,b"replacement sentinel").unwrap();
+    let replacement_before=identity(&open(&replacement));
+    let mut child=command(&f.source,&digest,SOURCE_SHA).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut reader=BufReader::new(child.stdout.take().unwrap());let mut observed=String::new();
+    let stage=loop {
+        let mut line=String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(),0,"{observed}");
+        observed.push_str(&line);
+        if line.starts_with("BOOTSTRAP_STAGE_UNREADY path="){break checked_stage(&line);}
+    };
+    fn denied<T: std::fmt::Debug>(r:std::io::Result<T>,label:&str,expected:&[i32])->i32 {
+        let e=r.expect_err(label);let rc=e.raw_os_error().unwrap();
+        assert!(expected.contains(&rc),"{label}: unexpected win32={rc}: {e}");rc
+    }
+    let write_rc=denied(OpenOptions::new().write(true).share_mode(7).open(&source_leaf),"source write after verification",&[32]);
+    let rename_rc=denied(fs::rename(&source_leaf,f.root.join("renamed")), "source rename after verification",&[5,32]);
+    let replace_rc=denied(fs::rename(&replacement,&source_leaf),"source replacement after verification",&[5,32]);
+    let parent_rc=denied(fs::rename(&f.source,f.root.join("moved-source")),"source parent move",&[5,32]);
+    let ancestor_rc=denied(fs::rename(&f.root,f.root.with_extension("moved-ancestor")),"source ancestor move",&[5,32]);
+    assert!(child.try_wait().unwrap().is_none(),"child must still hold source objects");
+    reader.read_to_string(&mut observed).unwrap();drop(reader);
+    let out=child.wait_with_output().unwrap();observed.push_str(&log(&out));
+    assert!(out.status.success()&&observed.contains("BOOTSTRAP_CONTENT_MATCH"),"{observed}");
+    assert_eq!(identity(&open(&source_leaf)),leaf_before);
+    assert_eq!(identity(&open(&f.source)),parent_before);
+    assert_eq!(identity(&open(&f.root)),ancestor_before);
+    assert_eq!(identity(&open(&replacement)),replacement_before);
+    assert_eq!(fs::read(&replacement).unwrap(),b"replacement sentinel");
+    verify_stage(&f,&stage,&expected,&digest);cleanup_stage(&stage);
+    println!("BOOTSTRAP_E2E_SOURCE_COMPETITION write={write_rc} rename={rename_rc} replace={replace_rc} parent={parent_rc} ancestor={ancestor_rc} identity_preserved=true original_expected_match=true");
+
+    // Modify only the new random isolated stage object, never Program Files,
+    // the volume root or the fixed staging slot. Add a synthetic unmapped SID
+    // full-control ACE to prove actual DACL rejection (not a collision).
+    // The randomized SID is not a granted real account and the original
+    // protected slot stays unchanged; this is a same-admin fault experiment.
+    fn set_dacl(file:&File,s:&str) {
+        let mut sd=null_mut();
+        assert_ne!(unsafe{ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide(OsStr::new(s)).as_ptr(),SDDL_REVISION_1,&mut sd,null_mut())},0);
+        let mut present=0;let mut defaulted=0;let mut dacl=null_mut();
+        assert_ne!(unsafe{GetSecurityDescriptorDacl(sd,&mut present,&mut dacl,&mut defaulted)},0);
+        assert_ne!(present,0);assert!(!dacl.is_null());
+        let rc=unsafe{SetSecurityInfo(file.as_raw_handle(),SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION|PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),null_mut(),dacl,null_mut())};
+        unsafe{LocalFree(sd.cast());}
+        assert_eq!(rc,0,"actual stage DACL mutation");
+    }
+    let mut child=command(&f.source,&digest,SOURCE_SHA).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut reader=BufReader::new(child.stdout.take().unwrap());let mut observed=String::new();
+    let stage=loop {
+        let mut line=String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(),0,"{observed}");
+        observed.push_str(&line);
+        if line.starts_with("BOOTSTRAP_STAGE_UNREADY path="){break checked_stage(&line);}
+    };
+    let dir=OpenOptions::new().access_mode(0x0006_0080).share_mode(7)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT).open(&stage).unwrap();
+    let before_id=identity(&dir);exact_acl(&dir);
+    let mut random=[0u8;16];SystemRandom::new().fill(&mut random).unwrap();
+    let nums:Vec<_>=random.chunks_exact(4).map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let sid=format!("S-1-5-21-{}-{}-{}-{}",nums[0],nums[1],nums[2],nums[3]);
+    let widened=format!("{ACL}(A;;FA;;;{sid})");
+    set_dacl(&dir,&widened);
+    let actual=sddl(&dir);
+    assert!(actual.contains(&format!("(A;;FA;;;{sid})")),"real widened ACL: {actual}");
+    assert_eq!(identity(&dir),before_id);
+    assert!(child.try_wait().unwrap().is_none(),"child must still have stage handles");
+    reader.read_to_string(&mut observed).unwrap();drop(reader);
+    let out=child.wait_with_output().unwrap();observed.push_str(&log(&out));
+    assert_eq!(out.status.code(),Some(1),"{observed}");
+    assert!(observed.contains("BOOTSTRAP_REFUSED ACL_COUNT")&&observed.contains("count=3"),"{observed}");
+    assert!(!observed.contains("BOOTSTRAP_CONTENT_MATCH"));
+    assert_eq!(identity(&dir),before_id);
+    assert_eq!(sddl(&dir),actual);exact_acl(&open(&slot()));
+    set_dacl(&dir,ACL);exact_acl(&dir);drop(dir);
+    println!("BOOTSTRAP_E2E_ACTUAL_ACL_REJECT actual={actual} owner_id_preserved=true slot_acl_unchanged=true refusal=ACL_COUNT");
+    cleanup_stage(&stage);f.neighbor();
+    println!("BOOTSTRAP_E2E_COMPLETE real_exe=true files=13 same_object_readback=true stage_acl=true slot_collision=true file_collision=true source_competition=true directory_ads=true actual_acl_rejected=true fixture_executed=false release=false install=false cross_sid_not_run=true");
 }

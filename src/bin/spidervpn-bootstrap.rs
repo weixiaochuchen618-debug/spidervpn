@@ -24,7 +24,7 @@ mod stage {
             GetDriveTypeW, GetFileType, GetFileInformationByHandle, GetFinalPathNameByHandleW,
             GetFileInformationByHandleEx, FileStreamInfo,
             BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_ATTRIBUTE_DEVICE, FILE_TYPE_DISK, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+            FILE_ATTRIBUTE_DEVICE, FILE_TYPE_DISK, FILE_READ_ATTRIBUTES, FILE_LIST_DIRECTORY, FILE_SHARE_READ,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS},
         UI::Shell::{SHGetKnownFolderPath, FOLDERID_ProgramFiles},
         System::Com::CoTaskMemFree,
@@ -211,12 +211,16 @@ mod stage {
     // Reject named alternate data streams from the actual leaf handle.
     // FILE_STREAM_INFO has a 24-byte fixed prefix followed by UTF-16 name.
     // Only a single unnamed $DATA stream is allowed; unknown FS is a refusal.
-    fn unnamed_stream_only(file: &File, path: &Path) -> Result<()> {
+    fn unnamed_stream_only(file: &File, path: &Path, dir: bool) -> Result<()> {
         let mut aligned = vec![0u64; 8192];
         let bytes = unsafe { std::slice::from_raw_parts_mut(aligned.as_mut_ptr().cast::<u8>(), aligned.len()*8) };
         if unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), FileStreamInfo,
             bytes.as_mut_ptr().cast(), bytes.len() as u32) } == 0 {
-            return Err(last("STREAM_INFO", path));
+            let e = std::io::Error::last_os_error();
+            // NTFS directories without a named $DATA stream can report EOF.
+            // Do not accept any other error as evidence of an empty stream set.
+            if dir && e.raw_os_error() == Some(38) { return Ok(()); }
+            return Err(err("STREAM_INFO", path, e));
         }
         let next = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
@@ -243,7 +247,7 @@ mod stage {
         if !actual.strip_prefix(r"\\?\").is_some_and(|s| path.to_str().is_some_and(|p| s.eq_ignore_ascii_case(p))) {
             return Err(format!("OBJECT_PATH_ALIAS expected={path:?} actual={actual:?}"));
         }
-        if !dir { unnamed_stream_only(file,path)?; }
+        if !dir { unnamed_stream_only(file,path,false)?; }
         Ok(i)
     }
     fn unchanged(a: &BY_HANDLE_FILE_INFORMATION,b:&BY_HANDLE_FILE_INFORMATION) -> bool {
@@ -256,7 +260,10 @@ mod stage {
     impl Object {
         fn open(path: &Path, dir: bool, security: bool) -> Result<Self> {
             let mut op = OpenOptions::new();
-            if dir { op.access_mode(FILE_READ_ATTRIBUTES | if security { READ_CONTROL } else { 0 }); }
+            // Attribute-only opens do not reliably participate in Windows
+            // sharing checks. LIST_DIRECTORY requests actual read access so
+            // the held handle fences competing write/delete opens as well.
+            if dir { op.access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | if security { READ_CONTROL } else { 0 }); }
             else { op.read(true); }
             let f=op.share_mode(FILE_SHARE_READ).custom_flags(FLAGS).open(path)
                 .map_err(|e| err("OBJECT_OPEN",path,e))?;
@@ -265,6 +272,10 @@ mod stage {
         fn from_file(path: &Path, file: File, dir: bool) -> Result<Self> {
             let before=info(&file,path,dir)?;
             Ok(Self { path:path.to_owned(),file,before,dir })
+        }
+        fn check_dir_streams(&self) -> Result<()> {
+            if !self.dir { return Err("EXPECTED_DIRECTORY".into()); }
+            unnamed_stream_only(&self.file, &self.path, true)
         }
         fn check(&self) -> Result<()> {
             let now=info(&self.file,&self.path,self.dir)?;
@@ -340,6 +351,7 @@ mod stage {
         // create are necessary; ACL readback on the new handle is separate.
         let o=Object::open(path,true,true)?;
         acl(&o.file,path,true,false)?;
+        o.check_dir_streams()?;
         Ok(o)
     }
     fn create_file(path:&Path)->Result<File> {
@@ -363,7 +375,7 @@ mod stage {
             let got=file.read(&mut buf[..chunk]).map_err(|e|format!("STREAM_READ {e}"))?;
             if got==0 {return Err("STREAM_TOO_SHORT".into());}
             digest.update(&buf[..got]);
-            if let Some(f)=out.as_deref_mut() {f.write_all(&buf[..got]).map_err(|e|format!("STAGE_COPY {e}"))?;}
+            if let Some(f)=out.as_deref_mut() {f.write_all(&buf[..got]).map_err(|e|format!("STAGE_COPY win32={:?} {e}",e.raw_os_error()))?;}
             rest-=got as u64;
         }
         if file.read(&mut buf[..1]).map_err(|e|format!("STREAM_EOF {e}"))?!=0 {return Err("STREAM_TOO_LONG".into());}
@@ -402,6 +414,10 @@ mod stage {
         let root=PathBuf::from(args[1].as_os_str());
         let source_dirs=chain(&root,false)?;
         let install=Object::open(&root.join("install"),true,false)?;
+        // Only package-owned directories are part of the manifest boundary.
+        // OS ancestors are held and validated but their streams are not imported.
+        source_dirs.last().ok_or("SOURCE_ROOT_MISSING")?.check_dir_streams()?;
+        install.check_dir_streams()?;
         let mut mf=Object::open(&root.join(MANIFEST),false,false)?;
         if size(&mf.before)>MAX_MANIFEST {return Err("MANIFEST_LENGTH".into());}
         let mut raw=Vec::new();
@@ -419,7 +435,9 @@ mod stage {
             obj.check()?;
             files.push(obj);
         }
-        check_chain(&source_dirs)?; install.check()?; file_set(&root)?;
+        check_chain(&source_dirs)?; install.check()?;
+        source_dirs.last().ok_or("SOURCE_ROOT_MISSING")?.check_dir_streams()?;
+        install.check_dir_streams()?; file_set(&root)?;
         let parent=program_files()?;
         let trusted=chain(&parent,true)?;
         // Fixed, exclusive staging slot: an existing slot (even with a
@@ -442,11 +460,13 @@ mod stage {
         }
         targets.push(copy(&mut mf,&stage_path.join(MANIFEST),raw.len() as u64,expected)?);
         check_chain(&source_dirs)?; install.check()?; mf.check()?;
+        source_dirs.last().ok_or("SOURCE_ROOT_MISSING")?.check_dir_streams()?;
+        install.check_dir_streams()?;
         for src in &files {src.check()?;}
         file_set(&root)?;
         check_chain(&trusted)?;
         for (i,o) in trusted.iter().enumerate() {acl(&o.file,&o.path,false,i+1==trusted.len())?;}
-        for o in [&slot,&stage,&stage_install] {o.check()?;acl(&o.file,&o.path,true,false)?;}
+        for o in [&slot,&stage,&stage_install] {o.check()?;acl(&o.file,&o.path,true,false)?;o.check_dir_streams()?;}
         for (i,o) in targets.iter_mut().enumerate() {
             o.check()?;
             let (n,digest)=if i<manifest.files.len() {
