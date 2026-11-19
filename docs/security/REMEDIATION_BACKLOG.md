@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 更新基准 2026-11-17；**文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.87 与 [任务分配表](./TASK_ASSIGNMENTS.md) §23 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -894,3 +894,22 @@ PR/commit/CI: ...
 
 - [Draft PR #29](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29) HEAD `81b2f57ea8a3779aff3aebb4216e16e12dda0e89`，[Linux #44258780843](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780843) **Completed/Success，2/2 Jobs**（core 134646769263、root/netns 134646769792）。原始 core log `fresh_consume_gate::tests` **8 passed / 0 failed / 0 ignored**，实际 RSA scope/descriptor/inner request 兼容、真实 locked ledger 正路径无写入、token/Host/route/expiry、错误签名者/绑定/摘要/时间/WG 键、签名内外重复 JSON、真实持久账本 Pending/Consumed/Revoking/Revoked 以及跨邀请码撤销拒绝、UTC、原请求 golden fixture 全通过。解析器原 9/9、HTTP TLS 14/14、基础库121/121、真实进程/root/WG netns 同步通过。严格非 test Rust build、`--locked`/`-D warnings`，未增加跳过。
 - [GNU #44258780885](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780885)、[MSVC #44258780872](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780872) 均准确 SHA in_progress，待完整终态及日志。未部署，无真实授权成功事务或历史迁移。下一步优先可信 scope/token 持久层及有限 retry/真实事务。SEC-01/02/08/07、Issue #5 OPEN，main/WFP/UI 保持，所有候选 Draft。
+
+
+## D.87 COORD-01 整改账本补充：2026-11-19 §23 当前状态与冻结证据索引
+本节替代前述历史快照中的当前HEAD/CI_PENDING描述，不删除历史证据，不替代原DoD；具体任务归属、写锁、授权基准及恢复步骤以 [TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §11–23 为准。依据总控授权 [3992eba87e297eaa98ab53341775db3fbb602633](https://github.com/weixiaochuchen618-debug/spidervpn/commit/3992eba87e297eaa98ab53341775db3fbb602633)、本轮两次PR HEAD复核及准确SHA的CI状态，无新候选变动。
+
+| 缺陷/跟踪项 | 当前证据边界 | 尚未达到的条件 |
+|---|---|---|
+| SEC-01/08、R01-005/007/010 | #29 Rust fresh gate、WG只读/真实netns及L1本地锁内证据隔离候选，任务表§8–13已有验收 | L2/L3独立撤销历史/恢复域与实际执行隔离、真实成功授权事务/WG/迁移；生产Python未替换 |
+| SEC-02/07、R01-004 | #28 denial-only TLS/降权/停机及#29继承FD/stdio隔离候选，§15–16 | 实际合法成功授权、证书轮换、独立服务身份、VPS切换/回滚及生产并发验收 |
+| SEC-03/10、R01-008/012 | #6候选、#29 R01-012实际启动/探测门隔离PASS及A1候选构建/打包验证器隔离PASS（§19/21） | 实际独立可信工具/引擎/DLL/license/包外approval、固定Rust release及完整真实打包、受保护stage/旧写者/UAC/安装升级；008-B仍QUEUED |
+| SEC-09、R01-009 D1/D2/D3 | D1有界同句柄只读隔离PASS；D2-LAB FAIL/ACTIVE；C生命周期锁原语隔离PASS | D2实际同对象删除隔离尚失败；实际可信恢复入口、共同生命周期门及真实安装/卸载未接线或未验 |
+| WFP-01/02/04、R01-002 | #3 A2/A3a/A3b-LAB和DENY及生命周期隔离实证，§13–23；真实unknown history gate拒绝新许可 | 全机可信历史及旧writer/迟到RPC、实际产品跨进程接线、跨SID/UAC、持久BLOCK/recovery |
+| WFP-03/05 | 未完成生产TUN/Wintun及实机零泄漏 | 真实Proxy/TUN IPv4/IPv6故障、端口劫持、断网/重启及抓包/独立BFE读回 |
+| SEC-04/05/06/11、AUX | 保留原任务表§2及本账本全部风险与既有候选，不在本轮宣称新增完成 | 与既有权限/共享文件边界及完整原DoD相符的后续整改/审查 |
+
+**当前复核恢复点**：
+- [#29](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29) `fix/sec01-verified-fresh-consume-gate-20261118`：`f3b92e920a52f7689f159e9599abb8c1401d8b05`。D2-LAB新增五项在 [MSVC 44486609014](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44486609014) 和 [GNU 44486609016](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44486609016) 均11 passed/5 failed， [Linux 44486608927](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44486608927) success，Windows后续未跑不能算绿。实际报告 [D 7003940517](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29#issuecomment-7003940517)。路径一致性拒绝已确认，具体根因未确认；B仅原test-only范围整改，不改变D1严格生产判据，不减测试。冻结A1准确SHA096e2c9ff91d01bcec71dd99ab6a22d9b0edd30a的绿灯不能替代当前失败HEAD。
+- [#3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) `fix/wfp-trade-egress-p0-20261116`：`bde8e360f8aa1d89db130e968e1bc896bc7664ca`，[MSVC 44486688478](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44486688478)/[GNU 44486688576](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44486688576) success。独立 [D 7004080316](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3#issuecomment-7004080316)，MSVC1448/0fail/2原ignored/8原filtered，实际同SID不同进程互斥、Token/DACL、预创建/abandoned拒绝、外锁持有时真实动态fixture许可撤销；新增TCP10=5允许/5拒绝10013。跨SID、生产门、产品持久BLOCK未证明；GNU特权父NOT RUN。冻结已验收实验，不重新开启许可或重复实验。保留旧失败。
+- main仍 `857ea7593941ce79f6507db5b1ced076c3a077ba`，#3/#29 Draft、#6/#28依赖链不重写，Issue #2/#5保持OPEN；无新增合并准入，**16项原完整DoD仍无新增关闭**。先B D2整改与D独立验收，再统一串行生产门/可信bootstrap/恢复入口，真实外部材料及跨SID/UAC/WFP05/Windows/VPS环境仍BLOCKED_REAL_ACCEPTANCE。§14用户已计划提供独立电脑/服务器，不视为已连接或已验证独立历史域。当前无新编译/实机执行。
