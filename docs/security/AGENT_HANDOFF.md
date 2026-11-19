@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §87、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §26 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.90；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §88、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §27 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.91；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -715,3 +715,7 @@
 ## 87. 2026-11-19 §26最新恢复入口：B1已执行范围待终审，R2真实I/O故障独立阻塞
 - [§26](https://github.com/weixiaochuchen618-debug/spidervpn/commit/ee2b5ac842d581b8eeb3a46af76e616227f51060) 与 [Backlog D.90](./REMEDIATION_BACKLOG.md) 已生效。#30 Draft `dcca33733828c07fc2af16e65472f0e03ae052b8` 四workflow全success，双ABI实际源竞争/ACL/ADS及原回归通过，A实读新MSVC/GNU-B日志；D新MSVC独立终态和B停写声明尚未出现，B唯一写锁、C只读，B1 CI_PASS/ACCEPTANCE_PENDING。D只复核新准确SHA最终结果，不重做已验收旧LAB。待D已执行范围PASS/B停写/A核定后才移交C共同门。
 - R2真实复制写入与刷盘故障均NOT RUN，独立BLOCKED_REAL_ACCEPTANCE，实机准入依据§26安全隔离故障矩阵，不能用创建80、模拟Err或源码传播替代；目标目录ADS注入/真实跨SID等另保留。不在真实系统填盘、改OS ACL、强制故障或降低判据。不消费B1结果、不开放实际安装卸载或WFP许可、不发布。真实外部锚、L2/L3/UAC/WFP05、本地Windows/VPS仍未验；总控[7009901989](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7009901989)。
+
+## 88. 2026-11-19 §27最新恢复入口：B1已执行范围冻结，C独占实际生命周期门G1
+- [§27](https://github.com/weixiaochuchen618-debug/spidervpn/commit/a182e3a8ff17657ef0b89a2ad05815689a2bd16d) 和 [Backlog D.91](./REMEDIATION_BACKLOG.md) 生效；#30 Draft HEAD `dcca33733828c07fc2af16e65472f0e03ae052b8`，B停写7009961168与D最终PASS7010034438均已核实，B1只冻结已执行范围，R2按§26继续独立BLOCKED_REAL_ACCEPTANCE，禁止宣称完整生产PASS。
+- C唯一写锁接管 integration/security-remediation-20261119，以该SHA执行实际COORD-INT-LIFECYCLE-GATE/R01-009-G1，保留所有原行为与回归；新固定机器域短门拒绝已有对象不证明全机历史，真实Guard执行端生命周期→短Guard→BFE/证据，父不持锁等UAC，动态许可unknown拒绝保持，取消/close独立。仅§27授权路径，G2启动占用登记及安装卸载维护接线不提前实施。B只读，D独立审新SHA，A唯一调度。尚无G1新源码/CI，不能消费B1/开启维护写入；真实R2故障、包外锚、跨SID/UAC/WFP05/L2/L3/Windows/VPS/可运行恢复未验，main及原分支不变。总控[7010636270](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7010636270)。
