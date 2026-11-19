@@ -978,7 +978,7 @@ fn main() -> ExitCode {
     // 注销/关机钩子：尽力而为，抓不到强杀（那靠下面的自愈）。
     // Only the actual instance owner performing a connection/cleanup action
     // may install a callback that stops engines or restores the proxy.
-    register_owner_cleanup(guard.is_some(), &argv, || lifecycle::install(&layout.root));
+    register_owner_cleanup(guard.as_ref(), &argv, || lifecycle::install(&layout.root));
     let preview_only = std::env::args().any(|a| a == "--plan" || a == "--restore");
     // **不持锁就不自愈**：自愈是状态变更（还原系统代理、消费上次退出的提示），不是读。
     // 不持锁说明另一个实例在管这件事，`--status` 这种只读命令不能替它做决定。
@@ -3685,7 +3685,7 @@ fn validated_command(argv: &[String]) -> Result<Option<&str>, String> {
         if let Some((_, need, usage, example)) = VALUED_ARGS.iter().find(|(f, _, _, _)| *f == a) {
             let take: Vec<&String> = argv.iter().skip(i + 1).take(*need).collect();
             if take.len() < *need || take.iter().any(|v| v.starts_with("--")) {
-                return Err(format!("需要参数：{usage}\\n用法：{example}"));
+                return Err(format!("需要参数：{usage}\n用法：{example}"));
             }
             i += 1 + *need;
             // This command has exactly one documented optional positional value.
@@ -3700,7 +3700,7 @@ fn validated_command(argv: &[String]) -> Result<Option<&str>, String> {
             }
             i += 1;
         } else {
-            return Err(format!("未知参数：{a}\\n不带参数运行可打开界面"));
+            return Err(format!("未知参数：{a}\n不带参数运行可打开界面"));
         }
         if flags.contains(&a) {
             return Err(format!("重复参数：{a}"));
@@ -3729,8 +3729,8 @@ fn main_command(argv: &[String]) -> Option<&str> {
     validated_command(argv).ok().flatten()
 }
 
-fn register_owner_cleanup(owns_instance: bool, argv: &[String], install: impl FnOnce()) {
-    if owns_instance && (argv.is_empty() || matches!(main_command(argv),
+fn register_owner_cleanup(owner: Option<&instance::InstanceGuard>, argv: &[String], install: impl FnOnce()) {
+    if owner.is_some() && (argv.is_empty() || matches!(main_command(argv),
         Some("--connect" | "--disconnect" | "--apply" | "--restore-apply")))
     {
         install();
@@ -4583,13 +4583,20 @@ mod tests {
             (&["--guard-remove"], false), (&["--use", "line"], false),
             (&["--plan", "--disconnect"], false),
         ];
+        // Keep a real OS instance handle alive through the positive route.
+        // Inject only the registration call, never the ownership result.
+        let name = format!("{}a3a-cleanup-{}", isolation::Rewrite::MUTEX_PREFIX, std::process::id());
+        let owner = instance::acquire(&name).expect("real cleanup-owner instance guard");
+        assert!(matches!(instance::acquire(&name), Err(instance::AcquireError::AlreadyRunning)));
         for (argv, expected) in cases {
-            let calls = std::cell::Cell::new(0);
-            register_owner_cleanup(false, &args(argv), || calls.set(calls.get() + 1));
+            let calls = std::cell::Cell::new(0usize);
+            register_owner_cleanup(None, &args(argv), || calls.set(calls.get() + 1));
             assert_eq!(calls.get(), 0, "non-owner: {argv:?}");
-            register_owner_cleanup(true, &args(argv), || calls.set(calls.get() + 1));
-            assert_eq!(calls.get(), usize::from(*expected), "owner: {argv:?}");
+            register_owner_cleanup(Some(&owner), &args(argv), || calls.set(calls.get() + 1));
+            assert_eq!(calls.get(), if *expected { 1 } else { 0 }, "owner: {argv:?}");
         }
+        drop(owner);
+        assert!(instance::acquire(&name).is_ok());
     }
 
     #[test]
