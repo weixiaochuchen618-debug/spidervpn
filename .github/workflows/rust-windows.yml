@@ -159,3 +159,18 @@ jobs:
             if (($output -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G1 exact test did not execute' }
             if (($output -join "`n") -notmatch $case.Marker) { throw "G1 missing real execution marker $($case.Marker)" }
           }
+
+          # §28: actual parent-generated requests and independent holders.
+          $output = & cargo test --locked --bin spidervpn guard::elevate::tests::g1_parent_chain -- --ignored --exact --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          $log = $output -join "`n"
+          if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G1 parent chain test did not execute' }
+          if ($log -notmatch 'G1_PARENT_CHAIN_COMPLETE entries=5 cases=18 spy_cases=15 real_cli_cases=3 distinct_nonces=18 independent_holders=true bounded_wait=true parent_request_preserved=true') { throw 'G1 parent chain complete marker missing' }
+          foreach ($entry in @('install', 'sync', 'disconnect', 'remove', 'verify', 'verify-cli')) {
+            foreach ($scenario in @('success', 'outer', 'short')) {
+              $pattern = "G1_PARENT_CASE entry=$entry action=\w+ scenario=$scenario nonce=\w+ child_pid=\d+ holder_pid=\d+ exit="
+              if ([regex]::Matches($log, $pattern).Count -ne 1) { throw "G1 parent case missing or duplicate: $entry $scenario" }
+            }
+          }
