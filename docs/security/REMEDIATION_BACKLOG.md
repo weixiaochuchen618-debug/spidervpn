@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.89 与 [任务分配表](./TASK_ASSIGNMENTS.md) §25 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.90 与 [任务分配表](./TASK_ASSIGNMENTS.md) §26 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -921,3 +921,7 @@ PR/commit/CI: ...
 ## D.89 2026-11-19 §25：双父集成候选PASS冻结，可信暂存首段ACTIVE
 - #30 Draft `e67316d5a82e6f6c7b8a303be406ca3671c46a58` 双父B0944db44/Cbde8e360，D独立[7007771368](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7007771368)确认完整300叶、四共享语义及四workflow五job实际通过；MSVC44509725420 portable1500/0fail/2原ignored/8原filtered，GNU-B44509725385、GNU-C44509725511、Linux44509725411 success；历史lines-e2e import失败原因未知，本轮未复现。生产16项未新增关闭。
 - [§25正式授权](https://github.com/weixiaochuchen618-debug/spidervpn/commit/e4b17d3d00bb878a2f67b7f2fd1fab0f9808cb84)：C停写、B唯一集成分支写锁，COORD-INT-TRUST-STAGE / R01-008-B1 ACTIVE，真实独立Rust包外验证与新受保护stage，固定12项与独立核定digest/commit，禁止执行包内文件、实际安装卸载及WFP写入，不形成安装授权。尚无B1提交/CI。后续共同门、008-B完整接线、D2/D3及可运行恢复仍排队；外部可信锚、旧writer/跨SID/UAC/WFP05/L2/L3、Windows/VPS仍未验。#3/#29冻结、#30 Draft、main未动。
+
+## D.90 2026-11-19 §26：B1自动CI通过，真实故障验收独立阻塞
+- #30 `dcca33733828c07fc2af16e65472f0e03ae052b8`，MSVC44526802391/GNU-B44526802493/GNU-C44526802812/Linux44526802390全success，A实际读取双ABI新日志：各39拒绝场景、39独立回读、5源竞争均32，实际stage ACL拒绝与源目录ADS；MSVC1500/0fail/2原ignored/8原filtered、IPC209/209、lines-e2e21/21（历史根因未知）。D新MSVC独立终审及B停写尚待，不冻结完整B1。
+- [§26裁定](https://github.com/weixiaochuchen618-debug/spidervpn/commit/ee2b5ac842d581b8eeb3a46af76e616227f51060)：R2真实STAGE_COPY/FlushFileBuffers两类故障均NOT RUN，独立BLOCKED_REAL_ACCEPTANCE，必须在安全可销毁隔离Windows环境保持实际EXE的固定OS父目录及保护判据分别真实触发/取证，禁止系统填盘、改OS ACL、生产故障开关或将CREATE_NEW80当复制失败。目标目录ADS单独注入、真实异SID/祖先ACL拒绝亦留实机。即使已执行范围后续冻结，R2不得关闭，在真实安装升级卸载/发布准入前必须实证。B唯一写锁、C只读，D终审/B停写后A才转C，实际生产入口仍不开放；独立可信外部材料、L2/L3/UAC/WFP05/Windows/VPS仍阻塞，main未动。
