@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §85、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §24 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.88；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §86、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §25 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.89；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -707,3 +707,7 @@
 ## 85. 2026-11-19 §24最新恢复入口：统一集成基线
 - [TASK_ASSIGNMENTS §24](https://github.com/weixiaochuchen618-debug/spidervpn/commit/d49a52361f190b09566e4b137d35793fe7830041) 已生效，替代§84中B D2 FAIL的当前指令。B #29 `0944db440867313f93519f3596e61047865a6aaf` D2隔离PASS冻结，C #3 `bde8e360f8aa1d89db130e968e1bc896bc7664ca` 冻结；参见 [Backlog D.88](./REMEDIATION_BACKLOG.md)。B只读，D独立验收。保留同SHA历史lines-e2e失败，未证明根因。
 - A已创建 `integration/security-remediation-20261119`，初始仅B SHA；C独占COORD-INT-BASE，按§24限定16路径保留双父历史、完整合流并建立一个新Draft PR（直接base=#29分支），实际新SHA三平台CI及D复核，若有冲突或扩锁问题先记录。当前无合流提交、集成PR或CI；不得误称集成完成。B/C原分支不写，main保持原SHA，实际生产共同门、008-B/D2/D3及真实可信恢复入口待后续A串行授权，真实外部材料、跨SID/UAC/WFP05、本地Windows/VPS仍未验。总控调度[7006267731](https://github.com/weixiaochuchen618-debug/spidervpn/issues/5#issuecomment-7006267731)。
+
+## 86. 2026-11-19 §25最新恢复入口：集成基线冻结，B执行可信暂存
+- [§25](https://github.com/weixiaochuchen618-debug/spidervpn/commit/e4b17d3d00bb878a2f67b7f2fd1fab0f9808cb84)，#30 Draft双父精确候选 `e67316d5a82e6f6c7b8a303be406ca3671c46a58` 正式PASS冻结，D独立[7007771368](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7007771368)，详[Backlog D.89](./REMEDIATION_BACKLOG.md)。四workflow五job完整成功，历史lines-e2e失败根因未证，保留风险。
+- C已停写，撤销集成源码写权；B独占integration/security-remediation-20261119，基准上述SHA，实际COORD-INT-TRUST-STAGE / R01-008-B1实施，唯一范围、真实EXE测试与四workflow按§25，B GNU准确路径security-guard-gnu.yml。包外独立核定来源为外部前置条件，仅受保护stage，不执行包内程序或产生安装授权票据，不接线真实安装卸载/WFP。当前仅授权，尚无新B1提交或CI。D独立审查新精确SHA，C只读等待后续串行门实施；原#3/#29冻结、main不变，无实际供应链锚/跨SID/UAC/WFP05/L2/L3/Windows/VPS验收，不发布合并。总控[7007933446](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7007933446)。
