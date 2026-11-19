@@ -601,7 +601,8 @@ mod tests {
         use windows_sys::Win32::{
             Foundation::GENERIC_READ,
             Storage::FileSystem::{
-                GetDriveTypeW, GetFileInformationByHandleEx, SetFileInformationByHandle,
+                GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+                SetFileInformationByHandle,
                 BY_HANDLE_FILE_INFORMATION, FILE_DISPOSITION_INFO, FILE_STANDARD_INFO,
                 FileDispositionInfo, FileStandardInfo, DELETE, FILE_READ_ATTRIBUTES,
                 FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE,
@@ -621,8 +622,13 @@ mod tests {
                 let mut nonce = [0u8; 16];
                 SystemRandom::new().fill(&mut nonce).unwrap();
                 let suffix: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
-                let path = std::env::temp_dir().join(format!("spider-d2-lab-{}-{suffix}", std::process::id()));
+                // Resolve only the test fixture base, never a candidate
+                // launcher. Retain the checked handles until fixture creation.
+                let (base, base_handles) = fixture_base().expect("D2 canonical isolated temp base");
+                let path = base.join(format!("spider-d2-lab-{}-{suffix}", std::process::id()));
                 fs::create_dir(&path).expect("fresh exclusively created D2 fixture");
+                check_ancestors(&base_handles).expect("D2 temp base stable after create");
+                drop(base_handles);
                 let fixture = Self(path);
                 for dir in [fixture.desktop(), fixture.install(), fixture.neighbor(), fixture.install().join("bin")] {
                     fs::create_dir(dir).unwrap();
@@ -668,21 +674,103 @@ mod tests {
             format!("{where_} win32={:?}: {e}", e.raw_os_error())
         }
         type Ancestors = Vec<(PathBuf, File, BY_HANDLE_FILE_INFORMATION)>;
-        fn hold_ancestors(path: &Path) -> Result<Ancestors, String> {
-            let parts = launcher_path_parts(path)?;
+
+        // Diagnostic only: the original production D1 path comparison is
+        // always the decision for candidate and canonical ancestor objects.
+        fn dos_path(file: &File) -> Result<PathBuf, String> {
+            let mut buffer = vec![0u16; 32768];
+            let n = unsafe {
+                GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(),
+                    buffer.len() as u32, 0)
+            } as usize;
+            if n == 0 { return Err(open_error("D2_FINAL_PATH", std::io::Error::last_os_error())); }
+            if n >= buffer.len() { return Err("D2_FINAL_PATH_OVERSIZE".into()); }
+            let actual = String::from_utf16(&buffer[..n]).map_err(|_| "D2_FINAL_PATH_UTF16")?;
+            let dos = actual.strip_prefix(r"\\?\").ok_or("D2_FINAL_PATH_NOT_DOS")?;
+            Ok(PathBuf::from(dos))
+        }
+        fn strict_path(file: &File, expected: &Path) -> Result<(), String> {
+            launcher_handle_path(file, expected).map_err(|reason| {
+                let actual = dos_path(file);
+                marker(&format!("D2_LAB_PATH_REJECT expected={expected:?} actual={actual:?} reason={reason}"));
+                format!("{reason}; expected={expected:?} actual={actual:?}")
+            })
+        }
+        fn fixed_drive(parts: &[PathBuf]) -> Result<(), String> {
             let drive: Vec<u16> = parts[0].as_os_str().encode_wide().chain(Some(0)).collect();
             if unsafe { GetDriveTypeW(drive.as_ptr()) } != 3 {
                 return Err("D2_NOT_FIXED_DISK".into());
             }
+            Ok(())
+        }
+        fn open_dir(path: &Path) -> Result<File, String> {
+            OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ).custom_flags(FLAGS)
+                .open(path).map_err(|e| format!("{} component={path:?}", open_error("D2_OPEN_PARENT", e)))
+        }
+        fn fixture_base() -> Result<(PathBuf, Ancestors), String> {
+            let raw = std::env::temp_dir();
+            marker(&format!("D2_LAB_TEMP_RAW path={raw:?}"));
+            let original = launcher_path_parts(&raw)?;
+            fixed_drive(&original)?;
+            // No canonicalize()/follow-reparse shortcut: inspect each
+            // lexical component with OPEN_REPARSE_POINT, retaining handles.
+            let mut first = Vec::new();
+            let mut normalized = Vec::new();
+            for path in &original {
+                let file = open_dir(path)?;
+                let info = launcher_handle_info(&file, true)
+                    .map_err(|e| format!("D2_TEMP_OBJECT component={path:?} {e}"))?;
+                let actual = dos_path(&file)?;
+                let same_spelling = path.to_str().ok_or("D2_TEMP_UTF8")?
+                    .eq_ignore_ascii_case(actual.to_str().ok_or("D2_TEMP_UTF8")?);
+                marker(&format!("D2_LAB_TEMP_COMPONENT expected={path:?} actual={actual:?} strict_spelling={same_spelling} id={:?} nonreparse=true", id(&info)));
+                normalized.push(actual);
+                first.push((path.clone(), file, info));
+            }
+            let base = normalized.last().ok_or("D2_TEMP_EMPTY")?.clone();
+            let canonical = launcher_path_parts(&base)?;
+            fixed_drive(&canonical)?;
+            // Only accept an alternative DOS spelling of the same component
+            // chain. No redirected drive, skipped ancestor or symlink target.
+            if canonical.len() != original.len()
+                || !canonical[0].to_str().ok_or("D2_TEMP_UTF8")?
+                    .eq_ignore_ascii_case(original[0].to_str().ok_or("D2_TEMP_UTF8")?)
+            {
+                return Err("D2_TEMP_CHAIN_CHANGED".into());
+            }
+            let mut held = Vec::new();
+            for ((path, actual), (_, original_file, before)) in
+                canonical.iter().zip(&normalized).zip(&first)
+            {
+                let file = open_dir(path)?;
+                let info = launcher_handle_info(&file, true)?;
+                strict_path(&file, path)?;
+                strict_path(original_file, actual)?;
+                let now = launcher_handle_info(original_file, true)?;
+                if id(&info) != id(before) || id(&now) != id(before)
+                    || (info.nFileIndexHigh == 0 && info.nFileIndexLow == 0)
+                    || !path.to_str().ok_or("D2_TEMP_UTF8")?
+                        .eq_ignore_ascii_case(actual.to_str().ok_or("D2_TEMP_UTF8")?)
+                {
+                    return Err(format!("D2_TEMP_ID_OR_CHAIN_MISMATCH component={path:?} actual={actual:?}"));
+                }
+                held.push((path.clone(), file, info));
+            }
+            check_ancestors(&held)?;
+            marker(&format!("D2_LAB_TEMP_VERIFIED raw={raw:?} canonical={base:?} fixed_disk=true same_component_ids=true nonreparse=true strict_canonical=true"));
+            Ok((base, held))
+        }
+        fn hold_ancestors(path: &Path) -> Result<Ancestors, String> {
+            let parts = launcher_path_parts(path)?;
+            fixed_drive(&parts)?;
             let (_, parents) = parts.split_last().ok_or("D2_NO_PARENTS")?;
             let mut held = Vec::new();
             for parent in parents {
-                let file = OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES)
-                    .share_mode(FILE_SHARE_READ).custom_flags(FLAGS)
-                    .open(parent).map_err(|e| open_error("D2_OPEN_PARENT", e))?;
+                let file = open_dir(parent)?;
                 let info = launcher_handle_info(&file, true)
-                    .map_err(|e| format!("D2_PARENT_OBJECT {e}"))?;
-                launcher_handle_path(&file, parent)?;
+                    .map_err(|e| format!("D2_PARENT_OBJECT component={parent:?} {e}"))?;
+                strict_path(&file, parent)?;
                 held.push((parent.clone(), file, info));
             }
             Ok(held)
@@ -691,7 +779,7 @@ mod tests {
             for (path, file, before) in held {
                 let now = launcher_handle_info(file, true)?;
                 if id(before) != id(&now) { return Err("D2_PARENT_ID_CHANGED".into()); }
-                launcher_handle_path(file, path)?;
+                strict_path(file, path)?;
             }
             Ok(())
         }
@@ -744,7 +832,7 @@ mod tests {
             }
             fn recheck(&mut self) -> Result<(), String> {
                 check_ancestors(&self.parents)?;
-                launcher_handle_path(&self.file, &self.path)?;
+                strict_path(&self.file, &self.path)?;
                 let first = launcher_handle_info(&self.file, false)
                     .map_err(|e| format!("D2_LEAF_OBJECT {e}"))?;
                 if !unchanged(&self.before, &first) || launcher_size(&first) > MAX_LAUNCHER_BYTES {
@@ -758,7 +846,7 @@ mod tests {
                 {
                     return Err("D2_TEMPLATE_OR_IDENTITY_MISMATCH".into());
                 }
-                launcher_handle_path(&self.file, &self.path)?;
+                strict_path(&self.file, &self.path)?;
                 check_ancestors(&self.parents)?;
                 if pending(&self.file).map_err(|e| open_error("D2_PENDING_QUERY", e))? {
                     return Err("D2_ALREADY_PENDING".into());
@@ -814,8 +902,19 @@ mod tests {
             code
         }
         fn snapshot(path: &Path) -> ((u32, u32, u32), Vec<u8>) {
-            let file = independent_read(path).unwrap();
-            (id(&launcher_handle_info(&file, false).unwrap()), fs::read(path).unwrap())
+            // Identity and bytes must come from one independently opened
+            // object; no second pathname open between those observations.
+            let mut file = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ)
+                .custom_flags(FLAGS).open(path).unwrap();
+            let before = launcher_handle_info(&file, false).unwrap();
+            strict_path(&file, path).unwrap();
+            assert!(launcher_size(&before) <= MAX_LAUNCHER_BYTES);
+            let bytes = read_launcher_bounded(&mut file).unwrap();
+            let after = launcher_handle_info(&file, false).unwrap();
+            strict_path(&file, path).unwrap();
+            assert!(unchanged(&before, &after));
+            assert_eq!(bytes.len() as u64, launcher_size(&after));
+            (id(&before), bytes)
         }
         fn marker(line: &str) {
             // Direct stdout is not swallowed by libtest's normal capture;
@@ -977,7 +1076,7 @@ mod tests {
             for path in &paths {
                 let file = open_delete_read(path).map_err(|e| open_error("D2_RECOVERY_MEMBER_OPEN", e))?;
                 launcher_handle_info(&file, false)?;
-                launcher_handle_path(&file, path)?;
+                strict_path(&file, path)?;
                 files.push(file);
             }
             check_ancestors(&parents)?;
@@ -1002,6 +1101,27 @@ mod tests {
             assert!(!pending(&reader).unwrap());
             drop(reader);
             assert_eq!(snapshot(&path), original);
+            // Distinct actual disposition failure on a fully validated
+            // DELETE+read handle: classic FileDispositionInfo cannot mark
+            // a read-only file for deletion. No attribute change is made
+            // by the candidate. Restore the fixture attribute only after
+            // verifying that the original object remains intact.
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&path, permissions).unwrap();
+            let readonly_before = snapshot(&path);
+            let mut verified = Verified::open(&fixture, which).unwrap();
+            assert_eq!(id(&verified.before), readonly_before.0);
+            let disposition_error = refusal(verified.mark(), "D2_DISPOSITION_FAILED win32=Some(5)");
+            assert!(!pending(&verified.file).unwrap());
+            drop(verified);
+            assert_eq!(snapshot(&path), readonly_before);
+            assert!(fs::metadata(&path).unwrap().permissions().readonly());
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&path, permissions).unwrap();
+            assert_eq!(snapshot(&path), original);
+            marker(&format!("D2_LAB_VALIDATED_DISPOSITION_ERROR error={disposition_error:?} granted_delete=true read_only=true pending=false same_id_bytes=true"));
             let bin = fixture.install().join("bin");
             let exe = bin.join("spidervpn.exe");
             let dll = bin.join("WebView2Loader.dll");
