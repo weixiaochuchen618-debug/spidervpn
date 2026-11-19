@@ -32,6 +32,12 @@ jobs:
             throw "SEC-09 uninstall wrapper has PowerShell syntax errors"
           }
 
+      - name: SEC-03 isolated candidate packaging integrity tests (not a release)
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tests/package-candidate-e2e.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build with Rust
         run: cargo build --locked
 
