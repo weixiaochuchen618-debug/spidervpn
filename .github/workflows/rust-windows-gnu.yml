@@ -1,0 +1,62 @@
+name: Windows GNU Rust release-path validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-gnu:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      # UCRT64 supplies a complete MinGW-w64 GCC/binutils/dlltool suite.
+      # This validates the Windows GNU ABI of build.ps1; the developer's
+      # exact local WinLibs distribution remains a separate release check.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Install Windows GNU Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+
+      - name: Verify full MinGW linker tools
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          foreach ($name in @('x86_64-w64-mingw32-gcc.exe', 'dlltool.exe', 'windres.exe')) {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+              throw "Missing GNU tool: $name"
+            }
+          }
+          & x86_64-w64-mingw32-gcc.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build through the repository GNU script
+        shell: powershell
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          .\build.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Validate WFP, scoped egress and TUN identity Rust tests on GNU target
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
+          foreach ($filter in @('guard::wfp::tests::', 'guard::wfp_win::imp::scoped_v2_tests::', 'guard::egress_policy::tests::', 'guard::tun_identity::tests::', 'guard::proxy_identity::tests::', 'guard::lease_helper::tests::', 'guard::wfp_win::imp::dynamic_proxy_lease_tests::')) {
+            Write-Host "Running GNU Rust tests: $filter"
+            & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn $filter -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

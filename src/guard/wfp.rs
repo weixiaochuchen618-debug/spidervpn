@@ -78,6 +78,9 @@ pub const ACTION_BLOCK: u32 = 0x1001;
 pub const ACTION_PERMIT: u32 = 0x1002;
 /// `FWP_MATCH_EQUAL`（0）。
 pub const MATCH_EQUAL: i32 = 0;
+/// `FWP_MATCH_NOT_EQUAL`（10）：v2 候选的地址/端口/协议补集判断。
+/// 注意 BFE 的 NULL 条件字段**不等价**于正常取值不相等，TUN 必须另设缺失值保护。
+pub const MATCH_NOT_EQUAL: i32 = 10;
 /// `FWP_UINT64` 数据类型的编号（`FWP_VALUE0.type`）。
 pub const FWP_TYPE_UINT64: i32 = 4;
 /// `FWP_BYTE_BLOB` 数据类型的编号（`FWP_CONDITION_VALUE0.type`）。

@@ -111,6 +111,32 @@ mod windows_layout {
     }
 
     #[test]
+    fn v2_candidate_condition_types_are_the_exact_windows_sdk_values() {
+        // 原生候选规则只在通过 Win11 隔离流量验证后启用：
+        //   APP_ID + REMOTE_ADDRESS != localhost
+        //   APP_ID + REMOTE_PORT != proxy_port
+        //   APP_ID + PROTOCOL != TCP
+        // 条件必须是三条独立的 BLOCK，而不是一个条件数组里三项 AND。
+        assert_eq!(wfp::MATCH_NOT_EQUAL, W::FWP_MATCH_NOT_EQUAL);
+        assert_eq!(W::FWP_MATCH_NOT_EQUAL, 10);
+        assert_eq!(W::FWP_UINT8, 1);
+        assert_eq!(W::FWP_UINT16, 2);
+        assert_eq!(W::FWP_UINT32, 3);
+        assert_eq!(W::FWP_BYTE_ARRAY16_TYPE, 11);
+        // TUN 用的是下一跳网卡身份，绝不误读为「本机源地址所属接口」：
+        // 两者 GUID 不同、含义不同，后者不能证明包会从 TUN 发出去。
+        let next = W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE;
+        let local = W::FWPM_CONDITION_IP_LOCAL_INTERFACE;
+        assert!(next.data1 != local.data1 || next.data2 != local.data2
+            || next.data3 != local.data3 || next.data4 != local.data4);
+        let remote = W::FWPM_CONDITION_IP_REMOTE_ADDRESS;
+        let port = W::FWPM_CONDITION_IP_REMOTE_PORT;
+        let protocol = W::FWPM_CONDITION_IP_PROTOCOL;
+        assert_ne!(remote.data1, port.data1);
+        assert_ne!(port.data1, protocol.data1);
+    }
+
+    #[test]
     fn abi_constants_match_the_sdk() {
         assert_eq!(wfp::ACTION_BLOCK, W::FWP_ACTION_BLOCK);
         assert_eq!(wfp::ACTION_PERMIT, W::FWP_ACTION_PERMIT);

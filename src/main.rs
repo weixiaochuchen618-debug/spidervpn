@@ -158,6 +158,16 @@ fn main() -> ExitCode {
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(exit::ENVIRONMENT) };
     }
 
+    // `--guard-lease-serve`：长期受监督 WFP 会话的内部入口。
+    // 必须先于单实例互斥，且绝不接管现有界面/连接流程。
+    // 父进程启动与就绪核验正式接线前，不作为可用生产功能。
+    if let Some(vals) = arg_values(guard::lease_helper::LEASE_FLAG, 2) {
+        let req = std::path::PathBuf::from(&vals[0]);
+        let reply = std::path::PathBuf::from(&vals[1]);
+        let code = guard::lease_helper::serve(&req, &reply);
+        return ExitCode::from(code as u8);
+    }
+
     // `--guard-apply`：一次性提权子进程的内部入口。
     // 必须放在单实例锁之前——父进程正持有那把锁，子进程再抢会被误判成「重复启动」。
     if let Some(vals) = arg_values("--guard-apply", 2) {
@@ -916,20 +926,7 @@ fn main() -> ExitCode {
 
     // 只读命令不得在启动预处理阶段触发 schema 迁移或兼容线路合并。
     // 此判断必须早于 merge_compatible_lines（它内部通过 config::load 会执行落盘迁移）。
-    let readonly_cmd = READONLY_COMMANDS.iter().any(|flag| std::env::args().any(|a| a == *flag));
-
-    // 2.5 老数据结构收口：把「同一台服务器的两条线路」并成一条（幂等，失败不拦启动）。
-    //
-    // 上一版给每台服务器登记两条线路（`自建 · host` + `自建 · host（兼容连接）`），
-    // 而线路卡片上的「标准/兼容」开关对前者是按不动的。现在改成一条线路两套方式，
-    // 这里把已经产生的成对线路并掉；并之前先把参数落成附属文件，任何一步失败就停在那里。
-    if !readonly_cmd {
-        match servercmd::merge_compatible_lines(&layout.root) {
-            Ok(0) => {}
-            Ok(count) => println!("  已合并 {count} 条重复的兼容连接线路"),
-            Err(error) => eprintln!("  合并重复线路失败（不影响启动）：{error}"),
-        }
-    }
+    let readonly_cmd = is_readonly_command(&argv);
 
     // 3. 单实例：名字必须带本程序前缀，不能和旧版共用。
     let mutex_name = format!(
@@ -939,7 +936,7 @@ fn main() -> ExitCode {
         simple_hash(&layout.root.to_string_lossy())
     );
     // 锁的目的是「防两个守护同时接管代理」，纯读命令不需要它：界面开着时在终端查状态是最常见的用法，
-    // 拒掉它（exit 4）只会被当成出错。所以只读命令抢不到锁时**不持锁继续走**，其它逻辑一字不动。
+    // 拒掉它（exit 6）只会被当成出错。所以只读命令抢不到锁时**不持锁继续走**，其它逻辑一字不动。
     let shared_read = is_shared_read(&argv);
     let guard = match instance::acquire(&mutex_name) {
         Ok(g) => Some(g),
@@ -954,6 +951,19 @@ fn main() -> ExitCode {
         }
     };
 
+    // 2.5 老数据结构收口：把「同一台服务器的两条线路」并成一条（幂等，失败不拦启动）。
+    //
+    // 上一版给每台服务器登记两条线路（`自建 · host` + `自建 · host（兼容连接）`），
+    // 而线路卡片上的「标准/兼容」开关对前者是按不动的。现在改成一条线路两套方式，
+    // 这里把已经产生的成对线路并掉；并之前先把参数落成附属文件，任何一步失败就停在那里。
+    if guard.is_some() && !readonly_cmd {
+        match servercmd::merge_compatible_lines(&layout.root) {
+            Ok(0) => {}
+            Ok(count) => println!("  已合并 {count} 条重复的兼容连接线路"),
+            Err(error) => eprintln!("  合并重复线路失败（不影响启动）：{error}"),
+        }
+    }
+
     println!("{} {}", isolation::Rewrite::PRODUCT_NAME, env!("CARGO_PKG_VERSION"));
     println!("  安装目录：{}", isolation::install_dir().display());
     println!("  数据根  ：{}", layout.root.display());
@@ -966,7 +976,9 @@ fn main() -> ExitCode {
     // 不在这里修，用户下次开机就是断网。除了纯预览命令（--plan/--restore 只回答「会改什么」），
     // 一律先自愈再继续——它不依赖任何回调，是异常退出的主防线。
     // 注销/关机钩子：尽力而为，抓不到强杀（那靠下面的自愈）。
-    lifecycle::install(&layout.root);
+    // Only the actual instance owner performing a connection/cleanup action
+    // may install a callback that stops engines or restores the proxy.
+    register_owner_cleanup(guard.as_ref(), &argv, || lifecycle::install(&layout.root));
     let preview_only = std::env::args().any(|a| a == "--plan" || a == "--restore");
     // **不持锁就不自愈**：自愈是状态变更（还原系统代理、消费上次退出的提示），不是读。
     // 不持锁说明另一个实例在管这件事，`--status` 这种只读命令不能替它做决定。
@@ -2420,6 +2432,23 @@ fn main() -> ExitCode {
         }
     }
 
+    // A shared-read headless process must NEVER become a control server.
+    // The original owner may exit between the conflict check and bind.
+    if guard.is_none() {
+        if main_command(&argv) != Some("--headless") {
+            eprintln!("未持有单实例锁，不启动控制接口");
+            return ExitCode::from(exit::CONFLICT);
+        }
+        let pipe_name = ipc::name_for(&layout.root.to_string_lossy());
+        let control_ready = ipc::ping(&pipe_name, 500);
+        println!("  控制接口：{}", if control_ready { "可用" } else { "不可用" });
+        let ev = ipc::evidence(&layout.root, cfg.is_some(), control_ready);
+        let pres = presentation::present(&ev);
+        println!("  当前状态：{} — {}", pres.title, pres.detail);
+        print_headless_summary(cfg.as_ref());
+        return ExitCode::SUCCESS;
+    }
+
     // 4. 控制接口：先起服务端，再探测。名字由数据根派生，天然与旧版隔离。
     let pipe_name = ipc::name_for(&layout.root.to_string_lossy());
 
@@ -2545,15 +2574,7 @@ fn main() -> ExitCode {
     if std::env::args().any(|a| a == "--headless") {
         // **自检命令一律 exit 0**：它不执行动作，「尚未配置」是合法状态，写进输出就够。
         // 让 CI 在新机器上直接失败没有意义；13 只留给需要线路才能执行动作的命令。
-        println!("  （headless：不创建窗口，仅自检）");
-        let line_desc = cfg
-            .as_ref()
-            .and_then(|c| c.current_line())
-            .map(|l| l.name.clone())
-            .unwrap_or_else(|| "尚未配置".to_string());
-        let engine_desc = if engine_missing(cfg.as_ref()) { "尚未配置" } else { "已配置" };
-        let n = cfg.as_ref().map(|c| c.lines.len()).unwrap_or(0);
-        println!("  自检：线路={line_desc}（共 {n} 条）  引擎={engine_desc}");
+        print_headless_summary(cfg.as_ref());
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         return ExitCode::SUCCESS;
     }
@@ -3490,6 +3511,7 @@ const VALUED_ARGS: &[(&str, usize, &str, &str)] = &[
     ("--fingerprint", 1, "--fingerprint SHA256:…（首次连接确认用）", "--server-inspect root@1.2.3.4 --fingerprint SHA256:abc…"),
     // 内部提权子进程：由本程序自己起，用户不需要手工输入。放在这里是为了让参数校验认识它。
     ("--guard-apply", 2, "--guard-apply <request.json> <response.json>（内部提权子进程）", "不由用户手工执行"),
+    ("--guard-lease-serve", 2, "--guard-lease-serve <request.json> <reply.json>（内部长期提权辅助进程）", "不由用户手工执行"),
 ];
 
 /// 不带值的开关。
@@ -3625,38 +3647,103 @@ fn print_usage() {
     println!("    按旧值判断的脚本需要改成 4（未连接）与 3（配置类）。");
 }
 
-/// 校验命令行参数：只做三件事——缺值、未知参数、多余参数。
-/// 不带任何参数 = 正常打开界面（保持原样）；带了参数就必须是认识的、且值给全。
-fn validate_argv(argv: &[String]) -> Result<(), String> {
+/// One top-level command. All other flags in the existing argument tables
+/// are main commands unless explicitly listed here as modifiers.
+fn modifier_allowed(flag: &str, command: &str) -> bool {
+    match flag {
+        "--engine" | "--port" | "--line-name" => command == "--import",
+        "--tun" => matches!(command, "--import" | "--connect"),
+        "--to" => matches!(command, "--split-add-process" | "--split-add-domain"
+            | "--split-remove-process" | "--split-remove-domain"),
+        "--fingerprint" => matches!(command, "--server-trust" | "--server-inspect" | "--server-setup"),
+        "--backup" => command == "--server-transport-export",
+        "--force" => command == "--server-transport-restore-apply",
+        "--invite-id" => matches!(command, "--invite-status" | "--invite-cancel"),
+        "--lifetime" | "--device" => command == "--invite-create",
+        "--acknowledge-running" => matches!(command, "--guard-install" | "--guard-sync"
+            | "--guard-remove" | "--guard-verify"),
+        _ => false,
+    }
+}
+
+fn is_modifier(flag: &str) -> bool {
+    matches!(flag, "--engine" | "--port" | "--line-name" | "--tun" | "--to"
+        | "--fingerprint" | "--backup" | "--force" | "--invite-id"
+        | "--lifetime" | "--device" | "--acknowledge-running")
+}
+
+/// Validate all tokens before any isolation, directory, config or proxy work.
+/// Values are consumed in the same positions as the existing command handlers.
+fn validated_command(argv: &[String]) -> Result<Option<&str>, String> {
+    let mut flags = Vec::new();
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
         if !a.starts_with("--") {
-            i += 1; // 这是某个参数的值，已在上一步跳过
-            continue;
+            return Err(format!("多余参数：{a}"));
         }
         if let Some((_, need, usage, example)) = VALUED_ARGS.iter().find(|(f, _, _, _)| *f == a) {
             let take: Vec<&String> = argv.iter().skip(i + 1).take(*need).collect();
-            // 值不够，或者"值"其实是另一个参数（`--use --status` 这种）→ 都算缺值
-            let bad = take.len() < *need || take.iter().any(|v| v.starts_with("--"));
-            if bad {
+            if take.len() < *need || take.iter().any(|v| v.starts_with("--")) {
                 return Err(format!("需要参数：{usage}\n用法：{example}"));
             }
             i += 1 + *need;
-            continue;
-        }
-        if FLAG_ARGS.contains(&a) {
+            // This command has exactly one documented optional positional value.
+            if a == "--provider-add" && argv.get(i).is_some_and(|v| !v.starts_with("--")) {
+                i += 1;
+            }
+        } else if FLAG_ARGS.contains(&a) {
             if let Some(next) = argv.get(i + 1) {
                 if !next.starts_with("--") {
                     return Err(format!("多余参数：{next}（{a} 不需要参数）"));
                 }
             }
             i += 1;
-            continue;
+        } else {
+            return Err(format!("未知参数：{a}\n不带参数运行可打开界面"));
         }
-        return Err(format!("未知参数：{a}\n不带参数运行可打开界面"));
+        if flags.contains(&a) {
+            return Err(format!("重复参数：{a}"));
+        }
+        flags.push(a);
     }
-    Ok(())
+    if flags.is_empty() { return Ok(None); } // GUI
+    let mut commands = flags.iter().copied().filter(|flag| !is_modifier(flag));
+    let command = commands.next().ok_or("缺少主命令：辅助参数不能单独使用")?;
+    if let Some(other) = commands.next() {
+        return Err(format!("不能混合主命令：{command} 与 {other}"));
+    }
+    for flag in flags.into_iter().filter(|flag| is_modifier(flag)) {
+        if !modifier_allowed(flag, command) {
+            return Err(format!("辅助参数 {flag} 不适用于 {command}"));
+        }
+    }
+    Ok(Some(command))
+}
+
+fn validate_argv(argv: &[String]) -> Result<(), String> {
+    validated_command(argv).map(|_| ())
+}
+
+fn main_command(argv: &[String]) -> Option<&str> {
+    validated_command(argv).ok().flatten()
+}
+
+fn register_owner_cleanup(owner: Option<&instance::InstanceGuard>, argv: &[String], install: impl FnOnce()) {
+    if owner.is_some() && (argv.is_empty() || matches!(main_command(argv),
+        Some("--connect" | "--disconnect" | "--apply" | "--restore-apply")))
+    {
+        install();
+    }
+}
+
+fn print_headless_summary(cfg: Option<&config::AppConfig>) {
+    println!("  （headless：不创建窗口，仅自检）");
+    let line_desc = cfg.and_then(|c| c.current_line()).map(|l| l.name.clone())
+        .unwrap_or_else(|| "尚未配置".to_string());
+    let engine_desc = if engine_missing(cfg) { "尚未配置" } else { "已配置" };
+    let n = cfg.map(|c| c.lines.len()).unwrap_or(0);
+    println!("  自检：线路={line_desc}（共 {n} 条）  引擎={engine_desc}");
 }
 
 /// 启动期致命错误时的用户提示。命令行模式只打印（有控制台可看），
@@ -3813,13 +3900,20 @@ const READONLY_COMMANDS: [&str; 14] = [
 
 /// 可与其他实例（界面开着）并存的只读命令：它们不接管代理、不写配置，读的是当前快照。
 ///
-/// 与 `READONLY_COMMANDS` **不是一回事**：那个说的是「不写用户配置」，其中 `--restore` 会改代理，
+/// 与 `READONLY_COMMANDS` **不是一回事**：那个说的是「不写用户配置」，其中 `--restore` 仍需独占，
 /// 必须独占；这里说的是「不需要单实例锁」。两者重叠但语义不同，别合并。
 const SHARED_READ_COMMANDS: [&str; 11] = ["--status", "--lines", "--exits", "--plan", "--headless", "--providers", "--provider-discover", "--diagnose", "--history", "--guard-status", "--desktop-shortcut"];
 
 /// 这次命令行是不是「可与界面并存」的只读命令。
 fn is_shared_read(args: &[String]) -> bool {
-    SHARED_READ_COMMANDS.iter().any(|flag| args.iter().any(|a| a == flag))
+    main_command(args).is_some_and(|command| SHARED_READ_COMMANDS.contains(&command))
+}
+
+// All shared reads must also avoid config migrations and startup merges.
+// Keep the original exclusive, non-config-writing Guard/restore commands.
+fn is_readonly_command(args: &[String]) -> bool {
+    main_command(args).is_some_and(|command|
+        READONLY_COMMANDS.contains(&command) || SHARED_READ_COMMANDS.contains(&command))
 }
 
 /// 「没配置就不许改设置」的统一说法（三个开关命令共用）。
@@ -4426,6 +4520,83 @@ mod tests {
             lines[8],
             format!("  提示      ：{}", guard::state::PERSPECTIVE_NOTE_ELEVATED)
         );
+    }
+
+    #[test]
+    fn a3a_command_classification_preserves_modifiers_and_rejects_ambiguity() {
+        let args = |s: &[&str]| s.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        let valid: &[&[&str]] = &[
+            &[], &["--status"], &["--headless"], &["--connect", "--tun"],
+            &["--import", "profile.json", "--engine", "sing-box.exe", "--port", "17890",
+                "--line-name", "线路", "--tun"],
+            &["--port", "17890", "--import", "profile.json", "--engine", "sing-box.exe"],
+            &["--split-add-process", "trader.exe", "--to", "trade"],
+            &["--split-remove-domain", "example.com", "--to", "daily"],
+            &["--provider-add", "clashverge", "name", "directory", "7890"],
+            &["--provider-add", "clashverge", "name", "directory", "7890", "a.example.com,b.example.com"],
+            &["--server-inspect", "root@127.0.0.1", "--fingerprint", "SHA256:abc"],
+            &["--server-trust", "root@127.0.0.1", "--fingerprint", "SHA256:abc"],
+            &["--server-setup", "root@127.0.0.1", "--fingerprint", "SHA256:abc"],
+            &["--server-transport-export", "root@127.0.0.1", "--backup", "backup.json"],
+            &["--server-transport-restore-apply", "backup.json", "--force"],
+            &["--invite-create", "root@127.0.0.1", "--device", "PC", "--lifetime", "1800"],
+            &["--invite-status", "root@127.0.0.1", "--invite-id", "id"],
+            &["--invite-cancel", "root@127.0.0.1", "--invite-id", "id"],
+            &["--guard-install", "--acknowledge-running"], &["--guard-sync", "--acknowledge-running"],
+            &["--guard-apply", "request.json", "response.json"],
+            &["--guard-lease-serve", "nonce", "123-456"],
+        ];
+        for v in valid { assert!(validate_argv(&args(v)).is_ok(), "{v:?}"); }
+        let invalid: &[&[&str]] = &[
+            &["--plan", "--disconnect"], &["--disconnect", "--plan"],
+            &["--plan", "--connect"], &["--headless", "--apply"],
+            &["--status", "--guard-remove"], &["--status", "--status"],
+            &["--connect", "--disconnect"], &["--status", "--tun"],
+            &["--tun"], &["--engine", "program.exe"], &["stray"],
+            &["--use", "line", "stray"], &["--provider-add", "kind", "name", "dir", "7890", "a", "b"],
+            &["--import", "profile", "--engine", "a", "--engine", "b"],
+            &["--guard-apply", "req", "res", "--status"],
+        ];
+        for v in invalid {
+            let v = args(v);
+            assert!(validate_argv(&v).is_err(), "{v:?}");
+            assert!(!is_shared_read(&v));
+            assert!(!is_readonly_command(&v));
+        }
+        for f in SHARED_READ_COMMANDS {
+            assert!(is_shared_read(&args(&[f])));
+            assert!(is_readonly_command(&args(&[f])));
+        }
+        for f in ["--guard-install", "--guard-sync", "--guard-remove", "--guard-verify", "--restore"] {
+            assert!(is_readonly_command(&args(&[f])));
+            assert!(!is_shared_read(&args(&[f])));
+        }
+    }
+
+    #[test]
+    fn a3a_cleanup_callback_requires_lock_and_connection_owner_role() {
+        let args = |s: &[&str]| s.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        let cases: &[(&[&str], bool)] = &[
+            (&[], true), (&["--connect"], true), (&["--connect", "--tun"], true),
+            (&["--disconnect"], true), (&["--apply"], true), (&["--restore-apply"], true),
+            (&["--status"], false), (&["--headless"], false), (&["--plan"], false),
+            (&["--guard-remove"], false), (&["--use", "line"], false),
+            (&["--plan", "--disconnect"], false),
+        ];
+        // Keep a real OS instance handle alive through the positive route.
+        // Inject only the registration call, never the ownership result.
+        let name = format!("{}a3a-cleanup-{}", isolation::Rewrite::MUTEX_PREFIX, std::process::id());
+        let owner = instance::acquire(&name).expect("real cleanup-owner instance guard");
+        assert!(matches!(instance::acquire(&name), Err(instance::AcquireError::AlreadyRunning)));
+        for (argv, expected) in cases {
+            let calls = std::cell::Cell::new(0usize);
+            register_owner_cleanup(None, &args(argv), || calls.set(calls.get() + 1));
+            assert_eq!(calls.get(), 0, "non-owner: {argv:?}");
+            register_owner_cleanup(Some(&owner), &args(argv), || calls.set(calls.get() + 1));
+            assert_eq!(calls.get(), if *expected { 1 } else { 0 }, "owner: {argv:?}");
+        }
+        drop(owner);
+        assert!(instance::acquire(&name).is_ok());
     }
 
     #[test]

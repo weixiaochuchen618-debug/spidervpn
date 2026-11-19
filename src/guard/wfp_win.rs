@@ -135,19 +135,46 @@ mod imp {
             Ok(WfpEngine { handle: Some(handle) })
         }
 
+        /// 打开**动态** WFP 会话：本会话内的非持久过滤器在进程崩溃/
+        /// 句柄被 BFE 回收后自动消失。与原有的持久安装 open() 严格分开。
+        /// 这只是构造能力；未来必须由受监督的单独进程持有至引擎退出。
+        pub fn open_dynamic() -> Result<WfpEngine, WfpError> {
+            let mut session: W::FWPM_SESSION0 = unsafe { std::mem::zeroed() };
+            session.flags = W::FWPM_SESSION_FLAG_DYNAMIC;
+            let mut handle: HANDLE = std::ptr::null_mut();
+            let rc = unsafe {
+                W::FwpmEngineOpen0(
+                    std::ptr::null(),
+                    RPC_C_AUTHN_WINNT,
+                    std::ptr::null(),
+                    &session,
+                    &mut handle,
+                )
+            };
+            if rc != 0 { return Err(classify(rc)); }
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return Err(WfpError::InvalidState);
+            }
+            Ok(WfpEngine { handle: Some(handle) })
+        }
+
         pub fn raw(&self) -> HANDLE {
             self.handle.unwrap_or(std::ptr::null_mut())
         }
 
         /// 显式关闭：失败要返回给调用方（close 失败时策略状态不可确认）。
         pub fn close_checked(mut self) -> Result<(), WfpError> {
-            let Some(h) = self.handle.take() else {
+            let Some(h) = self.handle else {
                 return Ok(());
             };
             let rc = unsafe { W::FwpmEngineClose0(h) };
             if rc != 0 {
+                // FwpmEngineClose0 返回失败时不能先遗失 handle。
+                // 让接下来 self 的 Drop 再尝试一次关闭；临时许可持有进程
+                // 结束后的 RPC rundown 仍是最后一道 fail-closed 兜底。
                 return Err(classify(rc));
             }
+            self.handle = None;
             Ok(())
         }
     }
@@ -405,6 +432,69 @@ mod imp {
         }
     }
 
+    // Single source of truth: the controller records every possible dynamic
+    // key BEFORE request delivery; the helper's actual builder uses this exact
+    // function after independently validating the supplied APP_IDs.
+    pub(crate) fn dynamic_permit_key(app_id: &[u8], endpoint: std::net::SocketAddr,
+        lease_nonce: &[u8]) -> Result<Guid, String>
+    {
+        use sha2::{Digest, Sha256};
+        use super::super::egress_policy::EgressPolicy;
+        if !matches!(EgressPolicy::local_proxy(&endpoint.to_string()),
+            Ok(EgressPolicy::LocalProxy { .. })) {
+            return Err("临时 WFP 许可必须是精确本地代理端点".into());
+        }
+        if app_id.is_empty() || app_id.len() % 2 != 0 || lease_nonce.len() < 16 {
+            return Err("临时 WFP 许可的 APP_ID 或会话 nonce 无效".into());
+        }
+        let mut h = Sha256::new();
+        h.update(b"SpiderVPN/WFP-v2/dynamic-permit");
+        h.update((app_id.len() as u64).to_le_bytes());
+        h.update(app_id);
+        h.update(endpoint.to_string().as_bytes());
+        h.update(lease_nonce);
+        let digest = h.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        let key = Guid::from_bytes_le(bytes);
+        if key == Guid::nil() { return Err("动态许可键无效".into()); }
+        Ok(key)
+    }
+
+    // Only exact FWP_E_FILTER_NOT_FOUND is absence. In particular ACCESS_DENIED,
+    // a failed BFE connection, generic not-found and malformed success are not.
+    fn permit_key_absent_status(rc: u32, has_object: bool) -> Result<bool, String> {
+        use windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND;
+        match rc {
+            0 if has_object => Ok(false),
+            n if n == FWP_E_FILTER_NOT_FOUND as u32 && !has_object => Ok(true),
+            _ => Err(format!("旧动态许可读回不可确认 (Win32={rc})")),
+        }
+    }
+
+    pub(crate) fn old_dynamic_permits_absent(keys: &[Guid]) -> Result<bool, String> {
+        use std::collections::HashSet;
+        if keys.is_empty() || keys.len() > super::super::identity::MAX_PROGRAMS
+            || keys.iter().any(|key| *key == Guid::nil())
+            || keys.iter().copied().collect::<HashSet<_>>().len() != keys.len()
+        {
+            return Err("旧动态许可完整键集合无效".into());
+        }
+        // Independent, read-only BFE queries. Never change ACL, delete a rule,
+        // reuse the old session, or infer absence from helper exit.
+        let audit = WfpEngine::open().map_err(|e| e.to_string())?;
+        for key in keys {
+            let native = to_win(*key);
+            let mut out: *mut W::FWPM_FILTER0 = std::ptr::null_mut();
+            let rc = unsafe { W::FwpmFilterGetByKey0(audit.raw(), &native, &mut out) };
+            let result = unsafe { WfpBuf::from_raw(out) };
+            if !permit_key_absent_status(rc, result.as_ref().is_some())? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// 已构造好的 `FWPM_FILTER0`（一条 block 规则）。
     pub struct RawFilter {
         raw: W::FWPM_FILTER0,
@@ -415,7 +505,10 @@ mod imp {
         _blob: Box<W::FWP_BYTE_BLOB>,
         _weight: Box<u64>,
         _provider_key: Box<windows_sys::core::GUID>,
-        _conditions: Box<[W::FWPM_FILTER_CONDITION0; 1]>,
+        _conditions: Box<[W::FWPM_FILTER_CONDITION0]>,
+        // v2 地址条件要求整个 IPv6 数组保持有效；下一跳值则必须有稳定 u64 指针。
+        _scoped_v6: Option<Box<W::FWP_BYTE_ARRAY16>>,
+        _scoped_luid: Option<Box<u64>>,
     }
 
     impl RawFilter {
@@ -434,6 +527,8 @@ mod imp {
                 _blob: Box::new(W::FWP_BYTE_BLOB { size: app_id.len() as u32, data: std::ptr::null_mut() }),
                 _weight: Box::new(FILTER_WEIGHT_BLOCK),
                 _provider_key: Box::new(to_win(PROVIDER_GUID)),
+                _scoped_v6: None,
+                _scoped_luid: None,
                 _conditions: Box::new([W::FWPM_FILTER_CONDITION0 {
                     fieldKey: to_win(CONDITION_ALE_APP_ID),
                     matchType: MATCH_EQUAL,
@@ -483,8 +578,1018 @@ mod imp {
             boxed
         }
 
+        /// 仅构造候选 WFP v2 代理规则（**不调用 BFE，不安装**）。
+        /// 实际持久迁移只能在隔离真实流量与事务回滚均通过后启用。
+        /// TUN 仍被硬拒绝：不允许缺省略过 FWP_EMPTY/重新授权保护。
+        pub fn scoped_v2_proxy(
+            name: &str,
+            app_id: &[u8],
+            spec: &super::super::egress_policy::ScopedBlock,
+        ) -> Result<Box<RawFilter>, String> {
+            use super::super::egress_policy::{scoped_key, DenyTerm, IpFamily};
+            if app_id.is_empty() || app_id.len() % 2 != 0 {
+                return Err("WFP v2 APP_ID 必须是非空 UTF-16LE 字节".to_string());
+            }
+            let layer = match spec.family {
+                IpFamily::V4 => Layer::V4,
+                IpFamily::V6 => Layer::V6,
+            };
+            if spec.filter_key != scoped_key(app_id, spec.family, spec.predicate) {
+                return Err("WFP v2 规则 key 与条件不一致，拒绝安装".to_string());
+            }
+            let mut new_filter = RawFilter::block(name, app_id, layer);
+            // 不改变 v1 现有构造器的内容。仅在独立 v2 候选中重算 key 与谓词条件。
+            new_filter.raw.filterKey = to_win(spec.filter_key);
+            let mut conditions = vec![unsafe { std::ptr::read(&new_filter._conditions[0]) }];
+            let predicate = match spec.predicate {
+                DenyTerm::Any => None,
+                DenyTerm::RemoteAddressNot(ip) => {
+                    let value = match (spec.family, ip) {
+                        (IpFamily::V4, std::net::IpAddr::V4(ip)) => W::FWP_CONDITION_VALUE0 {
+                            r#type: W::FWP_UINT32,
+                            Anonymous: W::FWP_CONDITION_VALUE0_0 {
+                                uint32: u32::from_be_bytes(ip.octets()),
+                            },
+                        },
+                        (IpFamily::V6, std::net::IpAddr::V6(ip)) => {
+                            new_filter._scoped_v6 = Some(Box::new(W::FWP_BYTE_ARRAY16 {
+                                byteArray16: ip.octets(),
+                            }));
+                            let ptr: *mut W::FWP_BYTE_ARRAY16 =
+                                &mut **new_filter._scoped_v6.as_mut().unwrap();
+                            W::FWP_CONDITION_VALUE0 {
+                                r#type: W::FWP_BYTE_ARRAY16_TYPE,
+                                Anonymous: W::FWP_CONDITION_VALUE0_0 { byteArray16: ptr },
+                            }
+                        }
+                        _ => return Err("IPv4/IPv6 地址与过滤层不匹配，拒绝候选规则".to_string()),
+                    };
+                    Some(W::FWPM_FILTER_CONDITION0 {
+                        fieldKey: W::FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                        matchType: W::FWP_MATCH_NOT_EQUAL,
+                        conditionValue: value,
+                    })
+                }
+                DenyTerm::RemotePortNot(port) => Some(W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_REMOTE_PORT,
+                    matchType: W::FWP_MATCH_NOT_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT16,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint16: port },
+                    },
+                }),
+                DenyTerm::ProtocolNotTcp => Some(W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_PROTOCOL,
+                    matchType: W::FWP_MATCH_NOT_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT8,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint8: 6 },
+                    },
+                }),
+                DenyTerm::NextHopNot(_) | DenyTerm::MissingNextHop => {
+                    return Err("真实 TUN 下一跳与 FWP_EMPTY 重新授权未完成，拒绝 v2 持久构造".to_string());
+                }
+            };
+            if let Some(condition) = predicate {
+                conditions.push(condition);
+            }
+            new_filter._conditions = conditions.into_boxed_slice();
+            new_filter.raw.numFilterConditions = new_filter._conditions.len() as u32;
+            new_filter.raw.filterCondition = new_filter._conditions.as_mut_ptr();
+            Ok(new_filter)
+        }
+
+        /// 候选的临时许可：只对精确可信环回 IP+port 的 TCP 新连接放行。
+        /// 不修改任何 WFP 对象；调用者必须通过动态 WFP Session 安装且在
+        /// 引擎寿命终止时关闭该 Session，保证 v1 持久 BLOCK 始终保留。
+        ///
+        /// lease_nonce 必须从一次独立连接会话产生，避免新的许可复用旧 FilterKey。
+        /// 这里并不证明 sing-box 进程身份；必须由调用方先验证 owner PID/exe。
+        fn ephemeral_proxy_permit(
+            name: &str, app_id: &[u8], endpoint: std::net::SocketAddr, lease_nonce: &[u8],
+        ) -> Result<Box<RawFilter>, String> {
+            let permit_key = dynamic_permit_key(app_id, endpoint, lease_nonce)?;
+            let layer = if endpoint.is_ipv4() { Layer::V4 } else { Layer::V6 };
+
+            let mut permit = RawFilter::block(name, app_id, layer);
+            // 不得修改已有持久 v1 BLOCK；必须高于旧 BLOCK 0x1000 的权重。
+            permit.raw.filterKey = to_win(permit_key);
+            permit.raw.flags = 0; // 不持久、不禁用、不清空其它安全产品的 action right
+            // v1 guard 的 snapshot/sync 仅枚举 PROVIDER_GUID 下的持久 BLOCK。
+            // 动态许可不能使用这个 provider，否则会被误判为“多余过滤器”，
+            // 甚至在交易名单同步时遭到删除。许可由动态 WFP 会话拥有，
+            // 必须始终使用 NULL provider + 空 providerData；但继续引用
+            // 相同 sublayer，以保证与 v1 BLOCK 在同一子层内进行权重仲裁。
+            permit.raw.providerKey = std::ptr::null_mut();
+            permit.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
+            permit.raw.action.r#type = W::FWP_ACTION_PERMIT;
+            *permit._weight = super::super::wfp::FILTER_WEIGHT_PERMIT;
+
+            let addr_value = match endpoint.ip() {
+                std::net::IpAddr::V4(ip) => W::FWP_CONDITION_VALUE0 {
+                    r#type: W::FWP_UINT32,
+                    Anonymous: W::FWP_CONDITION_VALUE0_0 {
+                        uint32: u32::from_be_bytes(ip.octets()),
+                    },
+                },
+                std::net::IpAddr::V6(ip) => {
+                    permit._scoped_v6 = Some(Box::new(W::FWP_BYTE_ARRAY16 {
+                        byteArray16: ip.octets(),
+                    }));
+                    let pointer: *mut W::FWP_BYTE_ARRAY16 =
+                        &mut **permit._scoped_v6.as_mut().unwrap();
+                    W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_BYTE_ARRAY16_TYPE,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { byteArray16: pointer },
+                    }
+                }
+            };
+            let conditions = vec![
+                // ALE_APP_ID is the first condition as in the existing v1 BLOCK builder.
+                unsafe { std::ptr::read(&permit._conditions[0]) },
+                W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    matchType: W::FWP_MATCH_EQUAL,
+                    conditionValue: addr_value,
+                },
+                W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_REMOTE_PORT,
+                    matchType: W::FWP_MATCH_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT16,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint16: endpoint.port() },
+                    },
+                },
+                W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_PROTOCOL,
+                    matchType: W::FWP_MATCH_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT8,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint8: 6 },
+                    },
+                },
+            ];
+            permit._conditions = conditions.into_boxed_slice();
+            permit.raw.numFilterConditions = permit._conditions.len() as u32;
+            permit.raw.filterCondition = permit._conditions.as_mut_ptr();
+            Ok(permit)
+        }
+
+        /// TUN 正向临时许可的**内部候选构造器**：
+        ///    APP_ID == 交易软件 && NEXTHOP_INTERFACE == 经验证的 TUN LUID。
+        ///
+        /// 持久的 v1 APP_ID BLOCK 永不移除：字段为 FWP_EMPTY、接口改变、
+        /// 非 TUN 流量时，上述正向许可不匹配，继续由 v1 BLOCK 阻断。
+        /// 因此无需依赖 NOT_EQUAL 在缺失字段上的语义来实现 fail-closed。
+        ///
+        /// 这里只生成原生结构，不安装、不同步、不向 UI 暴露。真实 Wintun 和
+        /// ALE 重新授权尚未通过验证时，不得将它用于生产连接。
+        fn candidate_ephemeral_tun_permit(
+            name: &str,
+            app_id: &[u8],
+            layer: Layer,
+            expected_luid: u64,
+            lease_nonce: &[u8],
+        ) -> Result<Box<RawFilter>, String> {
+            use sha2::{Digest, Sha256};
+            if expected_luid == 0 || app_id.is_empty() || app_id.len() % 2 != 0
+                || lease_nonce.len() < 16
+            {
+                return Err("TUN 临时许可的 LUID、APP_ID 或 nonce 不合法".into());
+            }
+            let mut hash = Sha256::new();
+            hash.update(b"SpiderVPN/WFP-v2/dynamic-tun-permit/");
+            hash.update(match layer { Layer::V4 => b"ipv4", Layer::V6 => b"ipv6" });
+            hash.update((app_id.len() as u64).to_le_bytes());
+            hash.update(app_id);
+            hash.update(expected_luid.to_le_bytes());
+            hash.update(lease_nonce);
+            let digest = hash.finalize();
+            let mut key_bytes = [0u8; 16];
+            key_bytes.copy_from_slice(&digest[..16]);
+
+            let mut permit = RawFilter::block(name, app_id, layer);
+            permit.raw.filterKey = to_win(Guid::from_bytes_le(key_bytes));
+            permit.raw.flags = 0;
+            // 与代理动态许可一致：不归入 v1 持久 BLOCK 的 provider 枚举。
+            permit.raw.providerKey = std::ptr::null_mut();
+            permit.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
+            permit.raw.action.r#type = W::FWP_ACTION_PERMIT;
+            *permit._weight = super::super::wfp::FILTER_WEIGHT_PERMIT;
+            permit._scoped_luid = Some(Box::new(expected_luid));
+            let luid_ptr: *mut u64 = &mut **permit._scoped_luid.as_mut().unwrap();
+            permit._conditions = vec![
+                unsafe { std::ptr::read(&permit._conditions[0]) },
+                W::FWPM_FILTER_CONDITION0 {
+                    fieldKey: W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE,
+                    matchType: W::FWP_MATCH_EQUAL,
+                    conditionValue: W::FWP_CONDITION_VALUE0 {
+                        r#type: W::FWP_UINT64,
+                        Anonymous: W::FWP_CONDITION_VALUE0_0 { uint64: luid_ptr },
+                    },
+                },
+            ].into_boxed_slice();
+            permit.raw.numFilterConditions = permit._conditions.len() as u32;
+            permit.raw.filterCondition = permit._conditions.as_mut_ptr();
+            Ok(permit)
+        }
+
+        /// 在调用端遗漏进程归属检查的情况下也不可能从公共入口生成许可。
+        /// 验证当前 TCP LISTEN 所属 PID 和 EXE，出错即拒绝构造。
+        ///
+        /// 重要：这是当前时刻的身份检查，不构成对后续端口重新绑定的永久担保。
+        /// 未来安装方仍须将动态 WFP 会话寿命绑定到引擎进程，并在安装前再次核验。
+        pub fn trusted_ephemeral_proxy_permit(
+            name: &str,
+            app_id: &[u8],
+            endpoint: std::net::SocketAddr,
+            expected_pid: u32,
+            expected_executable: &Path,
+            lease_nonce: &[u8],
+        ) -> Result<Box<RawFilter>, String> {
+            super::super::proxy_identity::verify_proxy_owner(
+                endpoint, expected_pid, expected_executable,
+            )?;
+            Self::ephemeral_proxy_permit(name, app_id, endpoint, lease_nonce)
+        }
+
+        // Test-only constructor for the joint native pipe/BFE fixture. Reuse
+        // the real permit and block builders, but never touch the product
+        // provider, sublayer, persistent flags, or deterministic rule IDs.
+        #[cfg(test)]
+        pub fn isolated_lifecycle_filter(app_id: &[u8], endpoint: Option<std::net::SocketAddr>,
+            nonce: &[u8]) -> Result<Box<RawFilter>, String>
+        {
+            let mut filter = match endpoint {
+                Some(addr) => Self::ephemeral_proxy_permit("isolated pipe lease test", app_id, addr, nonce)?,
+                None => Self::block("isolated pipe baseline test", app_id, Layer::V4),
+            };
+            // Keep the real deterministic permit key for independent readback.
+            // Only the fixture baseline block uses a fresh BFE-assigned key.
+            if endpoint.is_none() {
+                filter.raw.filterKey = windows_sys::core::GUID::default();
+            }
+            filter.raw.flags = 0;
+            filter.raw.providerKey = std::ptr::null_mut();
+            filter.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
+            filter.raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+            Ok(filter)
+        }
+
         pub fn as_ptr(&self) -> *const W::FWPM_FILTER0 {
             &self.raw
+        }
+    }
+
+    /// 严格核验一条 WFP v2 scoped 规则：必须核对条件真实值，而不能仅凭
+    /// filterKey / provider / “有 2 条条件”就宣称保护已生效。
+    ///
+    /// # Safety
+    /// raw 必须是当前调用期间有效的 FWPM_FILTER0（内存来自 WFP 读回或
+    /// RawFilter::scoped_v2_proxy 拥有的缓冲），且其中引用的指针有效。
+    /// TUN 条件在真正的断线/重授权测试完成前一律不接受。
+    unsafe fn scoped_native_matches(
+        raw: *const W::FWPM_FILTER0,
+        app_id: &[u8],
+        spec: &super::super::egress_policy::ScopedBlock,
+    ) -> bool {
+        use super::super::egress_policy::{scoped_key, DenyTerm, IpFamily};
+        if raw.is_null() || app_id.is_empty()
+            || spec.filter_key != scoped_key(app_id, spec.family, spec.predicate)
+        { return false; }
+        let f = &*raw;
+        let layer = match spec.family { IpFamily::V4 => Layer::V4, IpFamily::V6 => Layer::V6 };
+        if from_win(f.filterKey) != spec.filter_key
+            || f.providerKey.is_null()
+            || from_win(*f.providerKey) != PROVIDER_GUID
+            || from_win(f.subLayerKey) != SUBLAYER_GUID
+            || from_win(f.layerKey) != layer.guid()
+            || f.action.r#type != ACTION_BLOCK
+            || from_win(f.action.Anonymous.filterType) != Guid::nil()
+            || f.flags & FILTER_FLAG_PERSISTENT == 0
+            || f.flags & W::FWPM_FILTER_FLAG_DISABLED != 0
+            || f.flags & !(FILTER_FLAG_PERSISTENT | W::FWPM_FILTER_FLAG_DISABLED
+                           | W::FWPM_FILTER_FLAG_INDEXED) != 0
+            || read_blob(&f.providerData) != OWNER_MARKER
+            // 当 HAS_PROVIDER_CONTEXT 未置位时，这个 union 的有效字段是
+            // rawContext (u64)，不能把它按 16 字节的 providerContextKey 读取。
+            || f.flags & W::FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT != 0
+            || f.Anonymous.rawContext != 0
+            || f.weight.r#type != FWP_TYPE_UINT64
+            || f.weight.Anonymous.uint64.is_null()
+            || *f.weight.Anonymous.uint64 != FILTER_WEIGHT_BLOCK
+        { return false; }
+
+        let expected_count = if spec.predicate == DenyTerm::Any { 1 } else { 2 };
+        if f.numFilterConditions != expected_count || f.filterCondition.is_null() { return false; }
+        let conditions = std::slice::from_raw_parts(f.filterCondition, expected_count as usize);
+        let app = &conditions[0];
+        if from_win(app.fieldKey) != CONDITION_ALE_APP_ID
+            || app.matchType != MATCH_EQUAL
+            || app.conditionValue.r#type != FWP_TYPE_BYTE_BLOB
+            || app.conditionValue.Anonymous.byteBlob.is_null()
+            || read_blob(&*app.conditionValue.Anonymous.byteBlob) != app_id
+        { return false; }
+
+        let Some(extra) = conditions.get(1) else {
+            return spec.predicate == DenyTerm::Any;
+        };
+        if extra.matchType != W::FWP_MATCH_NOT_EQUAL { return false; }
+        match spec.predicate {
+            DenyTerm::Any => false,
+            DenyTerm::RemoteAddressNot(ip) => {
+                if from_win(extra.fieldKey) != from_win(W::FWPM_CONDITION_IP_REMOTE_ADDRESS) {
+                    return false;
+                }
+                match (spec.family, ip) {
+                    (IpFamily::V4, std::net::IpAddr::V4(ip)) =>
+                        extra.conditionValue.r#type == W::FWP_UINT32
+                            && extra.conditionValue.Anonymous.uint32 == u32::from_be_bytes(ip.octets()),
+                    (IpFamily::V6, std::net::IpAddr::V6(ip)) =>
+                        extra.conditionValue.r#type == W::FWP_BYTE_ARRAY16_TYPE
+                            && !extra.conditionValue.Anonymous.byteArray16.is_null()
+                            && (*extra.conditionValue.Anonymous.byteArray16).byteArray16 == ip.octets(),
+                    _ => false,
+                }
+            }
+            DenyTerm::RemotePortNot(port) =>
+                from_win(extra.fieldKey) == from_win(W::FWPM_CONDITION_IP_REMOTE_PORT)
+                    && extra.conditionValue.r#type == W::FWP_UINT16
+                    && extra.conditionValue.Anonymous.uint16 == port,
+            DenyTerm::ProtocolNotTcp =>
+                from_win(extra.fieldKey) == from_win(W::FWPM_CONDITION_IP_PROTOCOL)
+                    && extra.conditionValue.r#type == W::FWP_UINT8
+                    && extra.conditionValue.Anonymous.uint8 == 6,
+            DenyTerm::NextHopNot(_) | DenyTerm::MissingNextHop => false,
+        }
+    }
+
+    /// 仅用于未来显式 v2 迁移的严格读回原语；不修改现有 v1 快照或状态。
+    /// 返回的 id 是 BFE 实际分配的 id，字段不合格则整笔拒绝。
+    pub fn scoped_v2_get_validated(
+        engine: &WfpEngine,
+        app_id: &[u8],
+        spec: &super::super::egress_policy::ScopedBlock,
+    ) -> Result<Option<u64>, WfpError> {
+        let key = to_win(spec.filter_key);
+        let mut raw: *mut W::FWPM_FILTER0 = std::ptr::null_mut();
+        let rc = unsafe { W::FwpmFilterGetByKey0(engine.raw(), &key, &mut raw) };
+        if rc != 0 {
+            let err = classify(rc);
+            return if err.is_absent() { Ok(None) } else { Err(err) };
+        }
+        let owned = unsafe { WfpBuf::from_raw(raw) };
+        let Some(native) = owned.as_ref() else { return Err(WfpError::InvalidState); };
+        let valid = unsafe { scoped_native_matches(native, app_id, spec) };
+        if !valid || native.filterId == 0 {
+            return Err(WfpError::InvalidState);
+        }
+        Ok(Some(native.filterId))
+    }
+
+    #[cfg(test)]
+    mod scoped_v2_tests {
+        use super::*;
+        use super::super::super::egress_policy::{
+            compile_scoped_blocks, scoped_key, DenyTerm, EgressPolicy, IpFamily, ScopedBlock,
+        };
+
+        fn app() -> Vec<u8> {
+            "trader.exe".encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect()
+        }
+
+        #[test]
+        fn dynamic_proxy_permit_is_nonpersistent_precise_and_unique_per_lease() {
+            let app = app();
+            let nonce = [0xA5u8; 16];
+            for endpoint in ["127.0.0.1:17890", "[::1]:17890"] {
+                let endpoint: std::net::SocketAddr = endpoint.parse().unwrap();
+                let p = RawFilter::ephemeral_proxy_permit("Trader", &app, endpoint, &nonce).unwrap();
+                assert_eq!(p.raw.flags, 0);
+                assert!(p.raw.providerKey.is_null(), "动态许可不能进入 v1 持久规则 provider 枚举");
+                assert_eq!(p.raw.providerData.size, 0);
+                assert!(p.raw.providerData.data.is_null());
+                assert_eq!(p.raw.action.r#type, W::FWP_ACTION_PERMIT);
+                assert_eq!(p.raw.numFilterConditions, 4);
+                assert_eq!(*p._weight, super::super::super::wfp::FILTER_WEIGHT_PERMIT);
+                assert_eq!(p.raw.weight.r#type, FWP_TYPE_UINT64);
+                assert_eq!(from_win(p.raw.subLayerKey), SUBLAYER_GUID);
+                for c in p._conditions.iter() {
+                    assert_eq!(c.matchType, W::FWP_MATCH_EQUAL);
+                }
+                assert_eq!(from_win(p._conditions[0].fieldKey), from_win(W::FWPM_CONDITION_ALE_APP_ID));
+                assert_eq!(from_win(p._conditions[1].fieldKey), from_win(W::FWPM_CONDITION_IP_REMOTE_ADDRESS));
+                assert_eq!(from_win(p._conditions[2].fieldKey), from_win(W::FWPM_CONDITION_IP_REMOTE_PORT));
+                assert_eq!(from_win(p._conditions[3].fieldKey), from_win(W::FWPM_CONDITION_IP_PROTOCOL));
+                assert_eq!(unsafe { p._conditions[2].conditionValue.Anonymous.uint16 }, endpoint.port());
+                assert_eq!(unsafe { p._conditions[3].conditionValue.Anonymous.uint8 }, 6);
+                match endpoint.ip() {
+                    std::net::IpAddr::V4(ip) => {
+                        assert_eq!(p._conditions[1].conditionValue.r#type, W::FWP_UINT32);
+                        assert_eq!(unsafe { p._conditions[1].conditionValue.Anonymous.uint32 },
+                            u32::from_be_bytes(ip.octets()));
+                    }
+                    std::net::IpAddr::V6(ip) => {
+                        assert_eq!(p._conditions[1].conditionValue.r#type, W::FWP_BYTE_ARRAY16_TYPE);
+                        assert_eq!(unsafe { (*p._conditions[1].conditionValue.Anonymous.byteArray16).byteArray16 },
+                            ip.octets());
+                    }
+                }
+                let mut alternate = nonce;
+                alternate[0] ^= 1;
+                let other = RawFilter::ephemeral_proxy_permit("Trader", &app, endpoint, &alternate).unwrap();
+                assert_ne!(from_win(p.raw.filterKey), from_win(other.raw.filterKey), "旧会话不能共享新许可 key");
+                assert_ne!(from_win(p.raw.filterKey),
+                    from_win(RawFilter::block("Trader", &app, if endpoint.is_ipv4() { Layer::V4 } else { Layer::V6 }).raw.filterKey),
+                    "动态许可不能覆盖 v1 持久 BLOCK filterKey");
+            }
+        }
+
+        #[test]
+        fn candidate_tun_permit_is_exact_nonpersistent_and_rejects_missing_luid() {
+            let app = app();
+            let nonce = [0x6Au8; 16];
+            for layer in [Layer::V4, Layer::V6] {
+                let permit = RawFilter::candidate_ephemeral_tun_permit(
+                    "Trader", &app, layer, 424242, &nonce).unwrap();
+                assert_eq!(permit.raw.flags, 0);
+                assert!(permit.raw.providerKey.is_null(), "TUN 候选许可不得污染 v1 BLOCK provider");
+                assert_eq!(permit.raw.providerData.size, 0);
+                assert!(permit.raw.providerData.data.is_null());
+                assert_eq!(permit.raw.action.r#type, W::FWP_ACTION_PERMIT);
+                assert_eq!(*permit._weight, super::super::super::wfp::FILTER_WEIGHT_PERMIT);
+                assert_eq!(permit._conditions.len(), 2);
+                assert_eq!(from_win(permit._conditions[0].fieldKey), from_win(W::FWPM_CONDITION_ALE_APP_ID));
+                assert_eq!(from_win(permit._conditions[1].fieldKey), from_win(W::FWPM_CONDITION_IP_NEXTHOP_INTERFACE));
+                assert_eq!(permit._conditions[1].matchType, W::FWP_MATCH_EQUAL);
+                assert_eq!(permit._conditions[1].conditionValue.r#type, W::FWP_UINT64);
+                assert_eq!(unsafe { *permit._conditions[1].conditionValue.Anonymous.uint64 }, 424242);
+                assert_ne!(from_win(permit.raw.filterKey), from_win(RawFilter::block("Trader", &app, layer).raw.filterKey));
+                let mut other = nonce;
+                other[15] ^= 1;
+                let rotated = RawFilter::candidate_ephemeral_tun_permit(
+                    "Trader", &app, layer, 424242, &other).unwrap();
+                assert_ne!(from_win(permit.raw.filterKey), from_win(rotated.raw.filterKey));
+                assert!(RawFilter::candidate_ephemeral_tun_permit(
+                    "Trader", &app, layer, 0, &nonce).is_err());
+                assert!(RawFilter::candidate_ephemeral_tun_permit(
+                    "Trader", &app, layer, 424242, &[]).is_err());
+            }
+        }
+
+        #[test]
+        fn trusted_dynamic_permit_requires_the_real_listener_process() {
+            let app = app();
+            let nonce = [0xD3u8; 16];
+            let exe = std::env::current_exe().unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = listener.local_addr().unwrap();
+            assert!(RawFilter::trusted_ephemeral_proxy_permit(
+                "Trader", &app, endpoint, std::process::id(), &exe, &nonce
+            ).is_ok(), "正确端口、PID、可执行文件才能生成临时许可");
+            assert!(RawFilter::trusted_ephemeral_proxy_permit(
+                "Trader", &app, endpoint, std::process::id() + 1, &exe, &nonce
+            ).is_err(), "错误 PID 不得生成许可");
+            let wrong = std::env::temp_dir().join("not-the-proxy-engine.exe");
+            assert!(RawFilter::trusted_ephemeral_proxy_permit(
+                "Trader", &app, endpoint, std::process::id(), &wrong, &nonce
+            ).is_err(), "错误 EXE 不得生成许可");
+            drop(listener);
+            assert!(RawFilter::trusted_ephemeral_proxy_permit(
+                "Trader", &app, endpoint, std::process::id(), &exe, &nonce
+            ).is_err(), "端口释放后不能复用已失效的可信验证");
+        }
+
+        #[test]
+        fn dynamic_proxy_permit_rejects_unspecified_untrusted_destinations() {
+            let app = app();
+            let nonce = [0xBBu8; 16];
+            for bad in ["0.0.0.0:17890", "127.0.0.2:17890",
+                        "192.168.1.5:17890", "127.0.0.1:0",
+                        "[::ffff:127.0.0.1]:17890"] {
+                let address: std::net::SocketAddr = bad.parse().unwrap();
+                assert!(RawFilter::ephemeral_proxy_permit("Trader", &app, address, &nonce).is_err(), "{bad}");
+            }
+            assert!(RawFilter::ephemeral_proxy_permit("Trader", &app, "127.0.0.1:17890".parse().unwrap(), &[]).is_err());
+            assert!(RawFilter::ephemeral_proxy_permit("Trader", &[], "127.0.0.1:17890".parse().unwrap(), &nonce).is_err());
+        }
+
+        #[test]
+        fn v1_filter_projection_reads_only_the_live_union_member() {
+            let app = app();
+            let raw = RawFilter::block("Trader", &app, Layer::V4);
+            let projected = unsafe { filter_raw_from(raw.as_ptr()) };
+            assert_eq!(projected.provider_context_key, Guid::nil());
+            assert!(super::super::super::wfp::recognize(&projected, &app, Layer::V4).ok(),
+                "修正 v1 union 读取不能破坏旧版规则识别");
+        }
+
+        #[test]
+        fn native_candidate_fields_are_owned_and_match_scoped_v2_ids() {
+            let app = app();
+            let candidates = compile_scoped_blocks(
+                EgressPolicy::local_proxy("127.0.0.1:17890").unwrap(), &app).unwrap();
+            assert_eq!(candidates.len(), 4);
+            for candidate in candidates {
+                let raw = RawFilter::scoped_v2_proxy("Trader", &app, &candidate).unwrap();
+                let projection = unsafe { filter_raw_from(raw.as_ptr()) };
+                assert_eq!(projection.filter_key, candidate.filter_key);
+                assert_eq!(projection.provider_key, PROVIDER_GUID);
+                assert_eq!(projection.flags & FILTER_FLAG_PERSISTENT, FILTER_FLAG_PERSISTENT);
+                let num = if candidate.predicate == DenyTerm::Any { 1 } else { 2 };
+                assert_eq!(projection.num_conditions, num);
+                assert_eq!(projection.conditions[0].field_key, CONDITION_ALE_APP_ID);
+                if num == 2 {
+                    assert_eq!(projection.conditions[1].match_type, W::FWP_MATCH_NOT_EQUAL);
+                }
+            }
+        }
+
+        #[test]
+        fn strict_native_readback_rejects_tampered_conditions_or_flags() {
+            let app = app();
+            for endpoint in ["127.0.0.1:17890", "[::1]:17890"] {
+                let rules = compile_scoped_blocks(EgressPolicy::local_proxy(endpoint).unwrap(), &app).unwrap();
+                for candidate in rules {
+                    let mut raw = RawFilter::scoped_v2_proxy("Trader", &app, &candidate).unwrap();
+                    assert!(unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) },
+                        "v2 预期规则未被严格识别 endpoint={endpoint}, candidate={candidate:?}, actual={:?}",
+                        unsafe { filter_raw_from(raw.as_ptr()) });
+                    // Wrong app identity and stale endpoint can never be certified.
+                    let another_app = "other.exe".encode_utf16().chain(Some(0))
+                        .flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+                    assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &another_app, &candidate) });
+
+                    raw.raw.flags |= W::FWPM_FILTER_FLAG_DISABLED;
+                    assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    raw.raw.flags &= !W::FWPM_FILTER_FLAG_DISABLED;
+                    raw.raw.action.r#type = W::FWP_ACTION_PERMIT;
+                    assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    raw.raw.action.r#type = ACTION_BLOCK;
+                    if candidate.predicate == DenyTerm::Any { continue; }
+                    raw._conditions[1].matchType = W::FWP_MATCH_EQUAL;
+                    assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    raw._conditions[1].matchType = W::FWP_MATCH_NOT_EQUAL;
+                    assert!(unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+
+                    if candidate.predicate == DenyTerm::RemotePortNot(17890) {
+                        raw._conditions[1].conditionValue.Anonymous.uint16 = 17891;
+                        assert!(!unsafe { scoped_native_matches(raw.as_ptr(), &app, &candidate) });
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn invalid_or_tun_predicates_fail_before_any_native_wfp_write() {
+            let app = app();
+            let bad = ScopedBlock {
+                family: IpFamily::V4, predicate: DenyTerm::NextHopNot(42),
+                filter_key: scoped_key(&app, IpFamily::V4, DenyTerm::NextHopNot(42)),
+            };
+            assert!(RawFilter::scoped_v2_proxy("Trader", &app, &bad).is_err());
+            let altered = ScopedBlock { filter_key: Guid::nil(), ..bad };
+            assert!(RawFilter::scoped_v2_proxy("Trader", &app, &altered).is_err());
+        }
+    }
+
+    /// 持有 Windows 内核进程对象 HANDLE，避免仅靠 PID 轮询造成 PID 复用误判。
+    /// 它只负责监听引擎存活，并不赋予任何 WFP 放行权限。
+    struct WatchedEngineProcess(HANDLE);
+
+    impl WatchedEngineProcess {
+        fn open(pid: u32) -> Result<Self, String> {
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            };
+            if pid == 0 { return Err("不能监控 PID=0 的引擎进程".into()); }
+            // SYNCHRONIZE 标准权限位（winnt.h），用于 WaitForSingleObject。
+            const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+            let handle = unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS, 0, pid)
+            };
+            if handle.is_null() {
+                return Err("无法打开受监督引擎进程句柄，拒绝临时放行".into());
+            }
+            let watched = Self(handle);
+            watched.require_alive()?;
+            Ok(watched)
+        }
+
+        fn wait(&self, millis: u32) -> u32 {
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            unsafe { WaitForSingleObject(self.0, millis) }
+        }
+
+        fn require_alive(&self) -> Result<(), String> {
+            use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+            if self.wait(0) != WAIT_TIMEOUT {
+                return Err("可信引擎已经退出或存活状态不可读，拒绝 WFP 临时放行".into());
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for WatchedEngineProcess {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0); }
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// 临时代理许可的 RAII 句柄。**不写持久规则**，Drop 必然关闭动态会话。
+    /// 未来的独立监督进程必须持有它，并在引擎退出或监听身份变化时丢弃。
+    /// 目前不接入任何正式连接入口，不能把它解释为已上线的 Kill Switch。
+    pub struct DynamicProxyLease {
+        engine: WfpEngine,
+        endpoint: std::net::SocketAddr,
+        owner_pid: u32,
+        watched_process: WatchedEngineProcess,
+        // 在独立提权 helper 中同时监控发起连接的主程序；
+        // 如果主程序已退出，不能继续仅凭 sing-box 存活保留 WFP 许可。
+        controller_process: WatchedEngineProcess,
+        permitted_filters: Vec<u64>,
+    }
+
+    /// 动态许可是提权操作：不能信任父进程或请求文件直接提交的 APP_ID。
+    /// 重新走正式交易名单的路径、reparse、WFP AppId 校验，并拒绝重复身份。
+    /// 必须在打开 WFP 动态会话和安装任何 PERMIT 之前完整执行。
+    fn validate_lease_identities(
+        ids: &[super::super::identity::ProgramIdentity],
+    ) -> Result<(), String> {
+        use super::super::identity::{resolve_entry, MAX_PROGRAMS};
+        if ids.is_empty() || ids.len() > MAX_PROGRAMS {
+            return Err(format!("许可名单必须包含 1 至 {MAX_PROGRAMS} 条有效程序身份"));
+        }
+        let env = SystemIdentityEnv::new();
+        let mut seen = std::collections::HashSet::new();
+        for identity in ids {
+            if identity.name.trim().is_empty() {
+                return Err("交易程序名称为空，拒绝创建许可".into());
+            }
+            let path = identity.path.to_str().ok_or_else(|| {
+                "交易程序路径包含无法表达的 Unicode，拒绝创建许可".to_string()
+            })?;
+            let expected = resolve_entry(&identity.name, Some(path), &env)
+                .map_err(|e| format!("交易程序「{}」身份复核失败：{}", identity.name, e.reason()))?;
+            if expected.app_id != identity.app_id
+                || expected.device_path != identity.device_path
+            {
+                return Err(format!(
+                    "交易程序「{}」路径、设备身份与传入 APP_ID 不一致，拒绝动态许可",
+                    identity.name
+                ));
+            }
+            if !seen.insert(expected.app_id) {
+                return Err("交易程序 APP_ID 在许可名单中重复，拒绝生成歧义规则".into());
+            }
+        }
+        Ok(())
+    }
+
+    // A3b-DENY: the production machine-wide history and writer fence do not
+    // exist yet. Even the first controller might follow an older live writer.
+    // No caller-supplied proof, environment, test switch, empty enumeration,
+    // process exit, or acquired mutex can turn this boundary into success.
+    pub(crate) const UNKNOWN_MACHINE_HISTORY_REASON: &str =
+        "全机旧 WFP 许可历史与迟到写入屏障尚无法可信证明，暂不发放实验动态许可";
+
+    fn require_verified_machine_history() -> Result<(), String> {
+        Err(UNKNOWN_MACHINE_HISTORY_REASON.into())
+    }
+
+    impl DynamicProxyLease {
+        /// 唯一允许构造临时代理许可的内部入口，拒绝在持久阻断缺失时开放通道。
+        pub fn acquire(
+            ids: &[super::super::identity::ProgramIdentity],
+            endpoint: std::net::SocketAddr,
+            owner_pid: u32,
+            controller_pid: u32,
+            executable: &Path,
+            lease_nonce: &[u8],
+        ) -> Result<Self, String> {
+            if ids.is_empty() || lease_nonce.len() < 16 {
+                return Err("保护名单为空或许可会话 nonce 不足，拒绝临时放行".into());
+            }
+            validate_lease_identities(ids)?;
+            // 与现有 install/sync/remove 使用完全相同的跨进程互斥，
+            // 保证检查持久 BLOCK → 安装许可之间不会被另一笔 Guard 变更打断。
+            // 仅保护创建时的原子前置检查；lease 运行期间不能长期占有互斥。
+            let lock_name = format!(
+                "{}{}",
+                super::super::GUARD_MUTEX_PREFIX,
+                super::super::wfp::PROVIDER_KEY.replace('-', "").to_uppercase(),
+            );
+            let _guard_lock = NamedMutex::acquire(&lock_name)?;
+            let watched_process = WatchedEngineProcess::open(owner_pid)?;
+            let controller_process = WatchedEngineProcess::open(controller_pid)?;
+            // 活着的 PID 不等于可信主程序：提权侧独立确认它就是当前
+            // SpiderVPN exe，不能用一个任意长寿进程冒充控制者。
+            let controller_exe = std::env::current_exe()
+                .map_err(|e| format!("无法确认 WFP helper 自身程序路径：{e}"))?;
+            unsafe {
+                super::super::proxy_identity::verify_live_process_handle(
+                    controller_process.0, controller_pid, &controller_exe,
+                )?;
+                super::super::proxy_identity::verify_proxy_owner_on_handle(
+                    endpoint, owner_pid, executable, watched_process.0,
+                )?;
+            }
+            watched_process.require_alive()?;
+            controller_process.require_alive()?;
+            // Enforce at the actual elevated acquisition entry, before even
+            // opening the writable dynamic session. Keep the candidate
+            // BLOCK validation, permit builder and supervision below intact
+            // for a separately authorized future trustworthy history gate.
+            require_verified_machine_history()?;
+            let engine = WfpEngine::open_dynamic().map_err(|e| e.to_string())?;
+            let provider = provider_get(&engine, PROVIDER_GUID).map_err(|e| e.to_string())?;
+            let sublayer = sublayer_get(&engine, SUBLAYER_GUID).map_err(|e| e.to_string())?;
+            if !provider.as_ref().is_some_and(ProviderDefinition::is_ours)
+                || !sublayer.as_ref().is_some_and(SubLayerDefinition::is_ours)
+            {
+                return Err("持久 WFP 保护基础设施缺失或身份不可信，不创建任何动态许可".into());
+            }
+            // snapshot 使用相同的 provider 枚举及 recognize 逻辑。额外规则、
+            // 重复条目、禁用的 BLOCK 都必须拒绝，不能“有一个就算安全”。
+            let existing = WindowsWfp::enumerate_ours(&engine).map_err(|e| e.to_string())?;
+            let mut wanted = std::collections::HashSet::new();
+            for id in ids {
+                if id.app_id.is_empty() { return Err("保护名单 APP_ID 为空".into()); }
+                for layer in Layer::ALL {
+                    let key = super::super::wfp::filter_key(&id.app_id, layer, false);
+                    if !wanted.insert(key) {
+                        return Err("交易保护名单含重复 APP_ID，拒绝不确定的持久规则集".into());
+                    }
+                    let matching: Vec<_> = existing.iter().filter(|f| f.filter_key == key).collect();
+                    if matching.len() != 1
+                        || !super::super::wfp::recognize(matching[0], &id.app_id, layer).ok()
+                    {
+                        return Err(format!("{} 的 {:?} 持久 BLOCK 不完整，拒绝动态许可", id.name, layer));
+                    }
+                }
+            }
+            if existing.len() != wanted.len() {
+                return Err("WFP provider 存在未预期或重复过滤器，拒绝临时放行".into());
+            }
+            // owner 检查可能与 BFE 枚举并发；真正写入之前再次核验。
+            unsafe { super::super::proxy_identity::verify_proxy_owner_on_handle(
+                endpoint, owner_pid, executable, watched_process.0,
+            )?; }
+            let mut permits = Vec::with_capacity(ids.len());
+            for id in ids {
+                let raw = RawFilter::trusted_ephemeral_proxy_permit(
+                    &id.name, &id.app_id, endpoint, owner_pid, executable, lease_nonce,
+                )?;
+                // 这里仍然只能写临时许可；RawFilter 内部使用 NULL providerKey，
+                // 不会在后续持久 Guard snapshot/sync 中被当作多余规则。
+                let installed = filter_add(&engine, &raw).map_err(|e| e.to_string())?;
+                if installed == 0 {
+                    return Err("动态 WFP 许可未返回有效 filterId".into());
+                }
+                permits.push(installed);
+            }
+            // 安装过程也可能跨越代理退出或端口重新绑定；失败直接 Drop
+            // 动态 engine，BFE 会移除已经装上的所有 permits。
+            unsafe { super::super::proxy_identity::verify_proxy_owner_on_handle(
+                endpoint, owner_pid, executable, watched_process.0,
+            )?; }
+            watched_process.require_alive()?;
+            controller_process.require_alive()?;
+            Ok(Self {
+                engine, endpoint, owner_pid, watched_process, controller_process,
+                permitted_filters: permits,
+            })
+        }
+
+        /// 每次接到存活检查都必须**消耗**旧 lease。失败时旧会话立即 Drop，
+        /// 防止监控调用方忘记主动撤销。不能代替实时进程退出通知机制。
+        pub fn revalidate(self, executable: &Path) -> Result<Self, String> {
+            self.controller_process.require_alive()?;
+            self.watched_process.require_alive()?;
+            unsafe { super::super::proxy_identity::verify_proxy_owner_on_handle(
+                self.endpoint, self.owner_pid, executable, self.watched_process.0,
+            )?; }
+            self.watched_process.require_alive()?;
+            self.controller_process.require_alive()?;
+            Ok(self)
+        }
+
+        /// 只供未来独立的提升权限 helper 线程调用，不能在 UI/IPC 主线程运行。
+        /// 引擎退出立即关闭动态许可；每 200ms 复查一次代理监听进程身份。
+        /// 临时许可进程本身崩溃时，由 WFP 动态会话的 RPC rundown 兜底。
+        pub fn supervise_until_exit(mut self, executable: &Path) -> Result<(), String> {
+            use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
+            loop {
+                // 不要单靠 PID 查询：已打开的 Windows HANDLE 精确绑定进程对象，
+                // 也不受系统复用 PID 影响。两个对象任何一个退出都撤销会话。
+                let handles = [self.watched_process.0, self.controller_process.0];
+                let result = unsafe {
+                    WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, 200)
+                };
+                match result {
+                    WAIT_OBJECT_0 => {
+                        return self.close().map_err(|e| e.to_string());
+                    }
+                    n if n == WAIT_OBJECT_0 + 1 => {
+                        // 控制程序退出：即使引擎仍活着，也不保留交易许可。
+                        return self.close().map_err(|e| e.to_string());
+                    }
+                    WAIT_TIMEOUT => {
+                        // 端口被接管、控制程序无法确认等任一异常都消费并 Drop 租约。
+                        self = self.revalidate(executable)?;
+                    }
+                    _ => return Err("受监督进程等待状态异常，动态许可已撤销".into()),
+                }
+            }
+        }
+
+        /// 显式关闭，便于未来 helper 在退出前把关闭错误反馈给控制进程。
+        pub fn close(self) -> Result<(), WfpError> {
+            let Self { engine, .. } = self;
+            engine.close_checked()
+        }
+
+        pub fn count(&self) -> usize { self.permitted_filters.len() }
+    }
+
+    #[cfg(test)]
+    mod dynamic_proxy_lease_tests {
+        use super::*;
+
+        #[test]
+        fn actual_acquire_denies_unknown_machine_history_with_live_listener() {
+            use super::super::super::identity::resolve_entry;
+            use std::io::Read;
+            use std::process::{Child, Command, Stdio};
+            const ROLE: &str = "SPIDERVPN_DENY_ACQUIRE_CONTROLLER_FIXTURE";
+            if std::env::var(ROLE).as_deref() == Ok("1") {
+                // Test process synchronization only; no production gate reads it.
+                let mut byte = [0u8; 1];
+                assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
+                return;
+            }
+            struct ChildGuard(Child);
+            impl Drop for ChildGuard {
+                fn drop(&mut self) {
+                    if self.0.try_wait().ok().flatten().is_none() {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+            }
+            let exe = std::env::current_exe().unwrap();
+            let id = resolve_entry("Trader", exe.to_str(), &SystemIdentityEnv::new()).unwrap();
+            let mut controller = ChildGuard(Command::new(&exe)
+                .args(["--exact", "guard::wfp_win::imp::dynamic_proxy_lease_tests::actual_acquire_denies_unknown_machine_history_with_live_listener", "--nocapture"])
+                .env(ROLE, "1").stdin(Stdio::piped()).spawn().unwrap());
+            let owner_pid = std::process::id();
+            let controller_pid = controller.0.id();
+            assert_ne!(owner_pid, controller_pid);
+            let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+            for (index, listener) in [v4, v6].iter().enumerate() {
+                let endpoint = listener.local_addr().unwrap();
+                super::super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, &exe).unwrap();
+                assert!(controller.0.try_wait().unwrap().is_none());
+                let nonce = [index as u8 + 1; 16];
+                let result = DynamicProxyLease::acquire(
+                    &[id.clone()], endpoint, owner_pid, controller_pid, &exe, &nonce,
+                );
+                let reason = match result {
+                    Err(reason) => reason,
+                    Ok(lease) => { let _ = lease.close(); panic!("unknown history granted a real lease"); }
+                };
+                assert_eq!(reason, UNKNOWN_MACHINE_HISTORY_REASON);
+                // Input-negative controls still fail earlier, not by silently
+                // replacing the original identity/nonce validation.
+                let mut forged = id.clone();
+                forged.app_id[0] ^= 1;
+                let err = DynamicProxyLease::acquire(
+                    &[forged], endpoint, owner_pid, controller_pid, &exe, &nonce,
+                ).err().expect("forged APP_ID refused");
+                assert_ne!(err, UNKNOWN_MACHINE_HISTORY_REASON);
+                let err = DynamicProxyLease::acquire(
+                    &[id.clone()], endpoint, owner_pid, 0, &exe, &nonce,
+                ).err().expect("missing controller refused");
+                assert_ne!(err, UNKNOWN_MACHINE_HISTORY_REASON);
+                println!("A3B_DENY_ACQUIRE endpoint={endpoint} owner_pid={owner_pid} controller_pid={controller_pid} live_listener_verified=true history_refused=true earlier_negative_controls=true");
+            }
+            drop(controller.0.stdin.take());
+            assert!(controller.0.wait().unwrap().success());
+        }
+
+        #[test]
+        fn old_permit_absence_requires_exact_native_not_found() {
+            use windows_sys::Win32::Foundation::{FWP_E_FILTER_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_NOT_FOUND};
+            assert_eq!(permit_key_absent_status(FWP_E_FILTER_NOT_FOUND as u32, false), Ok(true));
+            assert_eq!(permit_key_absent_status(0, true), Ok(false));
+            assert!(permit_key_absent_status(0, false).is_err());
+            assert!(permit_key_absent_status(FWP_E_FILTER_NOT_FOUND as u32, true).is_err());
+            assert!(permit_key_absent_status(ERROR_ACCESS_DENIED, false).is_err());
+            assert!(permit_key_absent_status(ERROR_NOT_FOUND, false).is_err());
+            assert!(old_dynamic_permits_absent(&[]).is_err());
+            assert!(old_dynamic_permits_absent(&[Guid::nil()]).is_err());
+            let addr = "127.0.0.1:12345".parse().unwrap();
+            let key = dynamic_permit_key(&[1, 0], addr, &[1; 16]).unwrap();
+            assert_ne!(key, dynamic_permit_key(&[2, 0], addr, &[1; 16]).unwrap());
+            assert_ne!(key, dynamic_permit_key(&[1, 0], "127.0.0.1:12346".parse().unwrap(), &[1; 16]).unwrap());
+            assert_ne!(key, dynamic_permit_key(&[1, 0], addr, &[2; 16]).unwrap());
+            assert!(old_dynamic_permits_absent(&[key, key]).is_err());
+        }
+
+        #[test]
+        fn lease_rejects_forged_appid_and_device_path_before_bfe_writes() {
+            use super::super::super::identity::resolve_entry;
+            let exe = std::env::current_exe().unwrap();
+            let good = resolve_entry("Trader", exe.to_str(), &SystemIdentityEnv::new())
+                .expect("用于测试的可执行文件必须可被 Windows 识别");
+            assert!(validate_lease_identities(&[good.clone()]).is_ok());
+
+            let mut forged_app = good.clone();
+            forged_app.app_id[0] ^= 1;
+            assert!(validate_lease_identities(&[forged_app]).is_err());
+
+            let mut forged_device = good.clone();
+            forged_device.device_path.push_str("-other");
+            assert!(validate_lease_identities(&[forged_device]).is_err());
+
+            assert!(validate_lease_identities(&[good.clone(), good]).is_err(),
+                "重复程序身份不能导致重复许可");
+        }
+
+        #[test]
+        fn lease_rejects_empty_invalid_and_oversized_identities() {
+            use super::super::super::identity::{ProgramIdentity, MAX_PROGRAMS};
+            let exe = std::env::current_exe().unwrap();
+            let identity = ProgramIdentity {
+                name: String::new(),
+                path: exe,
+                app_id: vec![1, 0],
+                device_path: String::new(),
+            };
+            assert!(validate_lease_identities(&[]).is_err());
+            assert!(validate_lease_identities(&[identity.clone()]).is_err());
+            assert!(validate_lease_identities(&vec![identity; MAX_PROGRAMS + 1]).is_err());
+        }
+
+        #[test]
+        fn lease_rejects_missing_controller_pid_before_creating_dynamic_rules() {
+            let exe = std::env::current_exe().unwrap();
+            let id = super::super::super::identity::resolve_entry(
+                "Trader", exe.to_str(), &SystemIdentityEnv::new(),
+            ).expect("test exe identity");
+            assert!(DynamicProxyLease::acquire(
+                &[id], "127.0.0.1:17890".parse().unwrap(),
+                std::process::id(), 0, &exe, &[1u8; 16],
+            ).is_err(), "缺少主程序 PID 不能开启长期动态放行");
+        }
+
+        #[test]
+        fn supervised_process_handle_rejects_invalid_pid_and_accepts_current() {
+            assert!(WatchedEngineProcess::open(0).is_err());
+            let process = WatchedEngineProcess::open(std::process::id()).unwrap();
+            assert!(process.require_alive().is_ok());
+        }
+
+        #[test]
+        fn process_handle_detects_actual_child_exit_without_pid_reuse_guessing() {
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            let mut child = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 1"])
+                .spawn().expect("Windows PowerShell subprocess");
+            let watched = WatchedEngineProcess::open(child.id())
+                .expect("must capture actual child process object before exit");
+            assert!(watched.require_alive().is_ok());
+            let result = child.wait().expect("child must exit");
+            assert!(result.success());
+            assert_eq!(watched.wait(0), WAIT_OBJECT_0);
+            assert!(watched.require_alive().is_err());
+        }
+
+        #[test]
+        fn lease_rejects_missing_ids_without_modifying_bfe() {
+            let exe = std::env::current_exe().unwrap();
+            assert!(DynamicProxyLease::acquire(
+                &[], "127.0.0.1:17890".parse().unwrap(),
+                std::process::id(), std::process::id(), &exe, &[1u8; 16],
+            ).is_err());
+        }
+
+        #[test]
+        fn lease_rejects_short_nonce_before_touching_bfe() {
+            let exe = std::env::current_exe().unwrap();
+            let one = super::super::super::identity::ProgramIdentity {
+                name: "Trader".into(), path: exe.clone(),
+                app_id: vec![1u8, 0], device_path: String::new(),
+            };
+            assert!(DynamicProxyLease::acquire(
+                &[one], "127.0.0.1:17890".parse().unwrap(),
+                std::process::id(), std::process::id(), &exe, &[2u8; 8],
+            ).is_err());
         }
     }
 
@@ -533,7 +1638,14 @@ mod imp {
             num_conditions: f.numFilterConditions,
             conditions,
             weight,
-            provider_context_key: from_win(f.Anonymous.providerContextKey),
+            // FWPM_FILTER0 的匿名 union：无 HAS_PROVIDER_CONTEXT 时只能读
+            // rawContext(u64)，不得无条件按 providerContextKey(GUID/16B) 读取。
+            // 旧规则若 rawContext 非 0，转成非零 Guid 让原识别判据拒绝它。
+            provider_context_key: if f.flags & W::FWPM_FILTER_FLAG_HAS_PROVIDER_CONTEXT != 0 {
+                from_win(f.Anonymous.providerContextKey)
+            } else {
+                Guid::from_u128(f.Anonymous.rawContext as u128)
+            },
         }
     }
 
@@ -759,6 +1871,126 @@ mod imp {
         Ok(out)
     }
 
+    // A3b evidence lab only. Unlike the production provider-limited reader,
+    // enumerate the entire requested ALE layer, including NULL providers and
+    // disabled/boot-time objects. A completed snapshot is NOT a writer fence.
+    #[cfg(test)]
+    #[derive(Clone, Debug)]
+    pub(crate) struct LabFilter {
+        pub raw: FilterRaw,
+        pub null_provider: bool,
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lab_enum_layer(engine: &WfpEngine, layer: Layer, max_pages: usize)
+        -> Result<Vec<LabFilter>, String>
+    {
+        use std::collections::HashSet;
+        const PAGE: u32 = 7; // deliberately exercise pagination
+        let mut template: W::FWPM_FILTER_ENUM_TEMPLATE0 = unsafe { std::mem::zeroed() };
+        template.providerKey = std::ptr::null_mut();
+        template.layerKey = to_win(layer.guid());
+        template.enumType = 0; // FWP_FILTER_ENUM_FULLY_CONTAINED
+        template.flags = 0x8 | 0x10; // INCLUDE_BOOTTIME | INCLUDE_DISABLED
+        template.actionMask = u32::MAX;
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let rc = unsafe { W::FwpmFilterCreateEnumHandle0(engine.raw(), &template, &mut handle) };
+        if rc != 0 || handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(format!("lab enum create incomplete layer={layer:?} rc={rc:#x}"));
+        }
+        let enumerator = unsafe { EnumHandle::new(engine.raw(), handle, W::FwpmFilterDestroyEnumHandle0) };
+        let mut rows = Vec::new();
+        let mut keys = HashSet::new();
+        for page in 0..max_pages {
+            let mut entries: *mut *mut W::FWPM_FILTER0 = std::ptr::null_mut();
+            let mut returned = 0u32;
+            let rc = unsafe { W::FwpmFilterEnum0(engine.raw(), enumerator.raw(), PAGE, &mut entries, &mut returned) };
+            let _buf = unsafe { WfpBuf::from_raw(entries) };
+            if rc != 0 || returned > PAGE || (returned != 0 && entries.is_null()) {
+                return Err(format!("lab enum page incomplete layer={layer:?} page={page} rc={rc:#x} count={returned}"));
+            }
+            if returned == 0 {
+                let nulls = rows.iter().filter(|r: &&LabFilter| r.null_provider).count();
+                let disabled = rows.iter().filter(|r| r.raw.flags & W::FWPM_FILTER_FLAG_DISABLED != 0).count();
+                println!("A3B_ENUM layer={layer:?} rows={} pages={} terminal_zero=true null_provider={nulls} disabled={disabled}", rows.len(), page + 1);
+                return Ok(rows);
+            }
+            for item in unsafe { std::slice::from_raw_parts(entries, returned as usize) } {
+                if item.is_null() {
+                    return Err("lab enum returned a null filter".into());
+                }
+                let raw = unsafe { filter_raw_from(*item) };
+                if raw.layer != layer.guid() || raw.filter_key.is_nil() || !keys.insert(raw.filter_key)
+                    || raw.num_conditions as usize != raw.conditions.len()
+                {
+                    return Err("lab enum malformed, duplicate, or wrong-layer object".into());
+                }
+                rows.push(LabFilter { raw, null_provider: unsafe { (**item).providerKey.is_null() } });
+            }
+        }
+        Err(format!("lab enum incomplete: layer={layer:?} page budget exhausted"))
+    }
+
+    // The fixture uses an isolated random provider only for its BLOCKs and
+    // the existing UNIVERSAL sublayer. BFE prohibits cross-session references
+    // to dynamic sublayers; do not create a persistent fixture sublayer.
+    #[cfg(test)]
+    pub(crate) fn lab_add_provider(engine: &WfpEngine, key: Guid) {
+        assert!(!key.is_nil() && key != PROVIDER_GUID);
+        let mut provider = RawProvider::build();
+        provider._name = wide("SpiderVPN isolated A3b lab provider");
+        provider._description = wide("Disposable dynamic test provider");
+        provider.raw.providerKey = to_win(key);
+        provider.raw.displayData.name = provider._name.as_mut_ptr();
+        provider.raw.displayData.description = provider._description.as_mut_ptr();
+        provider.raw.flags = 0;
+        provider.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
+        provider_add(engine, &provider).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lab_block(app: &[u8], layer: Layer, provider: Option<Guid>, key: Guid)
+        -> Box<RawFilter>
+    {
+        assert!(!app.is_empty() && !key.is_nil());
+        let mut raw = RawFilter::block("isolated A3b lab BLOCK", app, layer);
+        raw.raw.filterKey = to_win(key);
+        raw.raw.flags = 0;
+        raw.raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+        raw.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
+        if let Some(provider) = provider {
+            assert!(!provider.is_nil() && provider != PROVIDER_GUID);
+            *raw._provider_key = to_win(provider);
+            raw.raw.providerKey = &mut *raw._provider_key;
+        } else {
+            raw.raw.providerKey = std::ptr::null_mut();
+        }
+        raw
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lab_try_disabled_block(engine: &WfpEngine, app: &[u8], key: Guid)
+        -> Result<u64, u32>
+    {
+        let mut raw = lab_block(app, Layer::V4, None, key);
+        // The SDK documents that DISABLED is BFE-owned/read-only. Try the
+        // actual API on a disposable BLOCK, never on a product rule.
+        raw.raw.flags = W::FWPM_FILTER_FLAG_DISABLED;
+        let mut id = 0;
+        let rc = unsafe { W::FwpmFilterAdd0(engine.raw(), raw.as_ptr(), std::ptr::null_mut(), &mut id) };
+        if rc == 0 { Ok(id) } else { Err(rc) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lab_native_enum_error(engine: &WfpEngine) -> u32 {
+        let mut entries: *mut *mut W::FWPM_FILTER0 = std::ptr::null_mut();
+        let mut count = 0;
+        // Invalid enumeration handle, valid engine. No writes or ACL change.
+        let rc = unsafe { W::FwpmFilterEnum0(engine.raw(), std::ptr::null_mut(), 7, &mut entries, &mut count) };
+        let _buf = unsafe { WfpBuf::from_raw(entries) };
+        rc
+    }
+
     /// 枚举全部 provider（用于识别 旧版留下的对象 —— 它的 key 我们不知道，
     /// 只能靠 `providerData` 标记扫出来）。
     pub fn provider_enumerate(engine: &WfpEngine) -> Result<Vec<ProviderDefinition>, WfpError> {
@@ -939,6 +2171,134 @@ mod imp {
                     CloseHandle(self.handle);
                 }
                 self.handle = std::ptr::null_mut();
+            }
+        }
+    }
+
+    // Isolated lifecycle-lock experiment only. No product lock name, no
+    // production admission interface, no authority to access installed files.
+    #[cfg(test)]
+    pub(crate) mod lifecycle_lab {
+        use super::wide;
+        use windows_sys::Win32::Foundation::*;
+        use windows_sys::Win32::Security::*;
+        use windows_sys::Win32::Security::Authorization::*;
+        use windows_sys::Win32::System::Threading::*;
+
+        pub const USE_LOCK: u32 = 0x0012_0001; // SYNCHRONIZE | READ_CONTROL | MUTEX_MODIFY_STATE
+        pub const SYNC_ONLY: u32 = 0x0010_0000;
+        pub const DELETE_RIGHT: u32 = 0x0001_0000;
+
+        pub struct TestHandle(HANDLE);
+        impl Drop for TestHandle {
+            fn drop(&mut self) { unsafe { CloseHandle(self.0); } }
+        }
+        struct LocalMemory(*mut core::ffi::c_void);
+        impl Drop for LocalMemory {
+            fn drop(&mut self) { unsafe { LocalFree(self.0); } }
+        }
+        fn test_name(name: &str) -> Vec<u16> {
+            let nonce = name.strip_prefix(r"Global\SpiderVPN-Lifecycle-Lab-")
+                .expect("only isolated lab names allowed");
+            assert!(nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit()));
+            wide(name)
+        }
+        fn descriptor(sddl: &str) -> Result<LocalMemory, u32> {
+            let mut sd = std::ptr::null_mut();
+            let ok = unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide(sddl).as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) };
+            if ok == 0 { return Err(unsafe { GetLastError() }); }
+            assert!(!sd.is_null());
+            Ok(LocalMemory(sd.cast()))
+        }
+        pub fn expected_sddl(sid: &str) -> String {
+            format!("O:{sid}D:P(A;;0x00120001;;;{sid})")
+        }
+        pub fn create(name: &str, sddl: &str) -> Result<(TestHandle, u32), u32> {
+            let name = test_name(name);
+            let desc = descriptor(sddl)?;
+            let attr = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: desc.0,
+                bInheritHandle: 0,
+            };
+            unsafe { SetLastError(0); }
+            let h = unsafe { CreateMutexExW(&attr, name.as_ptr(), 0, USE_LOCK) };
+            let err = unsafe { GetLastError() };
+            if h.is_null() { Err(err) } else { Ok((TestHandle(h), err)) }
+        }
+        pub fn open(name: &str, rights: u32) -> Result<TestHandle, u32> {
+            let h = unsafe { OpenMutexW(rights, 0, test_name(name).as_ptr()) };
+            if h.is_null() { Err(unsafe { GetLastError() }) } else { Ok(TestHandle(h)) }
+        }
+        pub fn wrong_type(name: &str) -> TestHandle {
+            let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, test_name(name).as_ptr()) };
+            assert!(!h.is_null());
+            TestHandle(h)
+        }
+        impl TestHandle {
+            pub fn wait(&self, ms: u32) -> (u32, u32) {
+                unsafe { SetLastError(0); }
+                let rc = unsafe { WaitForSingleObject(self.0, ms) };
+                (rc, unsafe { GetLastError() })
+            }
+            pub fn release(&self) -> Result<(), u32> {
+                if unsafe { ReleaseMutex(self.0) } == 0 { Err(unsafe { GetLastError() }) } else { Ok(()) }
+            }
+            // Read the actual kernel object's owner and DACL through this
+            // exact handle, not a path/name and not the supplied create SDDL.
+            pub fn verify(&self, sid: &str) -> Result<(), String> {
+                let mut owner = std::ptr::null_mut();
+                let mut acl: *mut ACL = std::ptr::null_mut();
+                let mut sd = std::ptr::null_mut();
+                let rc = unsafe { GetSecurityInfo(self.0, SE_KERNEL_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut owner, std::ptr::null_mut(), &mut acl, std::ptr::null_mut(), &mut sd) };
+                let _sd = LocalMemory(sd.cast());
+                if rc != 0 || owner.is_null() || sd.is_null() {
+                    return Err(format!("kernel owner/DACL query failed rc={rc}"));
+                }
+                let mut expected_sid = std::ptr::null_mut();
+                let ok = unsafe { ConvertStringSidToSidW(wide(sid).as_ptr(), &mut expected_sid) };
+                let _expected_sid = LocalMemory(expected_sid.cast());
+                if ok == 0 || expected_sid.is_null() { return Err("expected SID invalid".into()); }
+                let owner_matches = unsafe { EqualSid(owner, expected_sid) } != 0;
+                let mut present = 0;
+                let mut defaulted = 0;
+                let mut returned_acl = std::ptr::null_mut();
+                let mut control = 0u16;
+                let mut revision = 0u32;
+                let ok = unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut returned_acl, &mut defaulted) };
+                let control_ok = unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) };
+                if ok == 0 || control_ok == 0 || present == 0 || acl.is_null() || returned_acl != acl {
+                    return Err("missing or NULL/unreadable kernel DACL".into());
+                }
+                let count = unsafe { (*acl).AceCount };
+                println!("LIFECYCLE_DACL owner_match={owner_matches} present={present} ace_count={count} control={control:#x} read_rc={rc}");
+                if !owner_matches { return Err("kernel object owner mismatch".into()); }
+                if count != 1 { return Err("kernel DACL has unexpected ACE count".into()); }
+                let mut ace = std::ptr::null_mut();
+                if unsafe { GetAce(acl, 0, &mut ace) } == 0 || ace.is_null() {
+                    return Err("kernel DACL ACE read failed".into());
+                }
+                let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+                if header.AceType != 0 || header.AceFlags != 0 ||
+                    (header.AceSize as usize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+                {
+                    return Err("unexpected kernel DACL ACE type/flags/size".into());
+                }
+                let allow = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                let actual_sid = std::ptr::addr_of!(allow.SidStart).cast_mut().cast();
+                if unsafe { IsValidSid(actual_sid) } == 0 { return Err("invalid ACE SID".into()); }
+                let sid_matches = unsafe { EqualSid(actual_sid, expected_sid) } != 0;
+                println!("LIFECYCLE_ACE type={} flags={} mask={:#x} sid_match={sid_matches}",
+                    header.AceType, header.AceFlags, allow.Mask);
+                if !sid_matches || allow.Mask != USE_LOCK {
+                    return Err("kernel DACL trustee/mask not exact".into());
+                }
+                // Named mutexes are not containers. Record protected flag as
+                // actually returned; enforce exact single ACE regardless.
+                Ok(())
             }
         }
     }

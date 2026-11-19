@@ -320,3 +320,122 @@ fn a_gui_that_exits_before_taking_the_lock_is_reported_at_once() {
     shutdown(first);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a3a_real_instance_lock_rejects_mixed_and_preserves_exclusive_cli_contract() {
+    use std::io::Read;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    // The independent test executable retains the real Win32 mutex while each
+    // CLI is a separate production process. No GUI timing or fake lock result.
+    const ENGINE_ROLE: &str = "SPIDERVPN_A3A_TEST_ENGINE";
+    if std::env::var(ENGINE_ROLE).as_deref() == Ok("1") {
+        let mut buf = [0u8; 1];
+        assert_eq!(std::io::stdin().read(&mut buf).unwrap(), 0);
+        return;
+    }
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) { unsafe { CloseHandle(self.0); } }
+    }
+    struct EngineGuard(Child);
+    impl Drop for EngineGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let root = tmp_root("a3a-native-owner");
+    let data = root.join("data");
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in data.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let name = format!(r"Global\SpiderVPN-{hash:016x}");
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let raw = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+    let error = unsafe { GetLastError() };
+    assert!(!raw.is_null(), "real instance mutex creation failed: {error}");
+    let owner = HandleGuard(raw);
+    assert_ne!(error, ERROR_ALREADY_EXISTS, "test must own a fresh mutex");
+
+    let key = proxy_key("a3a-native-owner");
+    stale_site(&root, &key, "127.0.0.1:18993");
+    let mut engine = EngineGuard(Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "a3a_real_instance_lock_rejects_mixed_and_preserves_exclusive_cli_contract"])
+        .env(ENGINE_ROLE, "1").stdin(Stdio::piped())
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let runtime = data.join("runtime.json");
+    let journal = data.join("proxy-journal.json");
+    let config = data.join("config.json");
+    std::fs::write(&runtime, format!(
+        r#"{{"SchemaVersion":1,"SupervisorPid":{},"EnginePid":{},"StartedAt":"2026-01-01T00:00:00Z","State":"Running"}}"#,
+        std::process::id(), engine.0.id())).unwrap();
+    let runtime_before = std::fs::read(&runtime).unwrap();
+    let journal_before = std::fs::read(&journal).unwrap();
+    let proxy_before = key_state(&key);
+
+    // No existing config: shared queries must not generate one or touch the
+    // live engine's records/proxy. In particular headless may probe only: the
+    // held fixture mutex has NO IPC server, so a bind by headless is detectable.
+    for args in [&["--status"][..], &["--headless"][..]] {
+        let (code, out) = run(&root, &key, args);
+        assert_eq!(code, Some(0), "{args:?}: {out}");
+        if args == ["--headless"] {
+            assert!(out.contains("控制接口：不可用"), "non-owner created a control server: {out}");
+            assert!(out.contains("headless：不创建窗口，仅自检"), "{out}");
+        }
+        assert!(!config.exists());
+        assert_eq!(std::fs::read(&runtime).unwrap(), runtime_before);
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+        assert_eq!(key_state(&key), proxy_before);
+        assert_alive(&mut engine.0);
+    }
+
+    // Malformed config bytes must not be migrated/overwritten by rejected
+    // combinations or ordinary conflicting write attempts.
+    let config_before = b"owner-config-sentinel";
+    std::fs::write(&config, config_before).unwrap();
+    let mixed: &[&[&str]] = &[
+        &["--plan", "--disconnect"], &["--disconnect", "--plan"],
+        &["--plan", "--connect"], &["--headless", "--apply"],
+        &["--status", "--guard-remove"], &["--providers", "--restore-apply"],
+    ];
+    let exclusive: &[&[&str]] = &[
+        &["--connect"], &["--disconnect"], &["--connect", "--tun"],
+        &["--restore"], &["--restore-apply"], &["--apply"],
+        &["--import", "missing.json", "--engine", "sing-box.exe", "--port", "17890", "--line-name", "test", "--tun"],
+        &["--split-add-process", "trader.exe", "--to", "trade"],
+        &["--provider-add", "clashverge", "test", "directory", "7890", "a.example.com,b.example.com"],
+        &["--guard-install", "--acknowledge-running"], &["--guard-sync", "--acknowledge-running"],
+        &["--guard-remove"],
+    ];
+    for (cases, expected) in [(mixed, 2), (exclusive, 6)] {
+        for args in cases {
+            let (code, out) = run(&root, &key, args);
+            assert_eq!(code, Some(expected), "{args:?}: {out}");
+            if expected == 6 {
+                assert!(out.contains("已经有一个 SpiderVPN 在运行了"), "{out}");
+            } else {
+                assert!(out.contains("不能混合主命令"), "{out}");
+            }
+            assert_eq!(std::fs::read(&config).unwrap().as_slice(), config_before);
+            assert_eq!(std::fs::read(&runtime).unwrap(), runtime_before);
+            assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+            assert_eq!(key_state(&key), proxy_before);
+            assert_alive(&mut engine.0);
+        }
+    }
+    // Real ordinary process remains running until the fixture explicitly
+    // releases stdin. A failed test also force-cleans only this child.
+    drop(engine.0.stdin.take());
+    assert!(engine.0.wait().unwrap().success());
+    drop(owner);
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let _ = hkcu.delete_subkey_all(&key);
+    let _ = std::fs::remove_dir_all(&root);
+}
