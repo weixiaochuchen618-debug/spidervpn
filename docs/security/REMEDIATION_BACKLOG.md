@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.88 与 [任务分配表](./TASK_ASSIGNMENTS.md) §24 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.89 与 [任务分配表](./TASK_ASSIGNMENTS.md) §25 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -917,3 +917,7 @@ PR/commit/CI: ...
 ## D.88 2026-11-19 §24：D2隔离PASS与集成基线ACTIVE
 - 更新D.87中的D2 FAIL快照：#29 `0944db440867313f93519f3596e61047865a6aaf`，最新MSVC44490493075 attempt2、GNU44490493057、Linux44490493204全success；D独立[7006016296](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29#issuecomment-7006016296)，双ABI16/16、MSVC portable1440/0fail/1原ignored/8原filtered。真实短名fixture核定、同对象删除及拒绝、无可信恢复入口安全停止。历史首次MSVC同SHA lines-e2e.rs293失败保留，重跑21/21，根因未证，集成跟踪。仍非真实卸载或恢复完成。
 - A实际创建[独立集成分支](https://github.com/weixiaochuchen618-debug/spidervpn/tree/integration/security-remediation-20261119)，当前基于上述B冻结SHA，与B identical；C冻结SHA `bde8e360f8aa1d89db130e968e1bc896bc7664ca` 待合流。授权依据 [§24 d49a52361f190b09566e4b137d35793fe7830041](https://github.com/weixiaochuchen618-debug/spidervpn/commit/d49a52361f190b09566e4b137d35793fe7830041)，C唯一写锁、4共享文件/12独有文件，保存双方历史和全部测试，B只读、D独立审查。尚无合流提交、集成PR/CI或生产新逻辑，008-B/D2/D3待基线验收后串行授权；全部实际可信来源、跨SID/UAC/WFP05、Windows/VPS等原DoD不变，main不动、无新增缺陷关闭。
+
+## D.89 2026-11-19 §25：双父集成候选PASS冻结，可信暂存首段ACTIVE
+- #30 Draft `e67316d5a82e6f6c7b8a303be406ca3671c46a58` 双父B0944db44/Cbde8e360，D独立[7007771368](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7007771368)确认完整300叶、四共享语义及四workflow五job实际通过；MSVC44509725420 portable1500/0fail/2原ignored/8原filtered，GNU-B44509725385、GNU-C44509725511、Linux44509725411 success；历史lines-e2e import失败原因未知，本轮未复现。生产16项未新增关闭。
+- [§25正式授权](https://github.com/weixiaochuchen618-debug/spidervpn/commit/e4b17d3d00bb878a2f67b7f2fd1fab0f9808cb84)：C停写、B唯一集成分支写锁，COORD-INT-TRUST-STAGE / R01-008-B1 ACTIVE，真实独立Rust包外验证与新受保护stage，固定12项与独立核定digest/commit，禁止执行包内文件、实际安装卸载及WFP写入，不形成安装授权。尚无B1提交/CI。后续共同门、008-B完整接线、D2/D3及可运行恢复仍排队；外部可信锚、旧writer/跨SID/UAC/WFP05/L2/L3、Windows/VPS仍未验。#3/#29冻结、#30 Draft、main未动。
