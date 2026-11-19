@@ -587,4 +587,437 @@ mod tests {
         assert!(launcher_path_parts(Path::new(r"C:\Users\Public\启动SpiderVPN.cmd")).is_ok());
     }
 
+
+    // D2-LAB only. An isolated filesystem experiment, NOT the production
+    // uninstall implementation or a reusable arbitrary-path delete command.
+    mod d2_lab {
+        use super::super::*;
+        use std::{
+            fs::{self, File, OpenOptions},
+            io::{Seek, SeekFrom, Write},
+            os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+            path::PathBuf,
+        };
+        use windows_sys::Win32::{
+            Foundation::GENERIC_READ,
+            Storage::FileSystem::{
+                GetDriveTypeW, GetFileInformationByHandleEx, SetFileInformationByHandle,
+                BY_HANDLE_FILE_INFORMATION, FILE_DISPOSITION_INFO, FILE_STANDARD_INFO,
+                FileDispositionInfo, FileStandardInfo, DELETE, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE,
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            },
+        };
+
+        const FLAGS: u32 = FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS;
+        const ALL_SHARES: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+        // The only paths the experiment permits disposal of are the two
+        // exact launcher names beneath this freshly created random root.
+        struct Fixture(PathBuf);
+        impl Fixture {
+            fn new() -> Self {
+                use ring::rand::{SecureRandom, SystemRandom};
+                let mut nonce = [0u8; 16];
+                SystemRandom::new().fill(&mut nonce).unwrap();
+                let suffix: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+                let path = std::env::temp_dir().join(format!("spider-d2-lab-{}-{suffix}", std::process::id()));
+                fs::create_dir(&path).expect("fresh exclusively created D2 fixture");
+                let fixture = Self(path);
+                for dir in [fixture.desktop(), fixture.install(), fixture.neighbor(), fixture.install().join("bin")] {
+                    fs::create_dir(dir).unwrap();
+                }
+                fixture
+            }
+            fn desktop(&self) -> PathBuf { self.0.join("desktop") }
+            fn install(&self) -> PathBuf { self.0.join("install") }
+            fn neighbor(&self) -> PathBuf { self.0.join("neighbor") }
+            fn path(&self, which: Launcher) -> PathBuf { self.desktop().join(which.name()) }
+            fn bytes(&self, which: Launcher) -> Vec<u8> {
+                launcher_template(&self.install(), which.name()).unwrap().into_bytes()
+            }
+            fn write_launcher(&self, which: Launcher) {
+                fs::write(self.path(which), self.bytes(which)).unwrap();
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // Test cleanup only, never part of the disposition primitive.
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        #[derive(Clone, Copy)]
+        enum Launcher { Start, Uninstall }
+        impl Launcher {
+            fn name(self) -> &'static str {
+                match self { Self::Start => "启动SpiderVPN.cmd", Self::Uninstall => "卸载SpiderVPN.cmd" }
+            }
+        }
+        fn id(info: &BY_HANDLE_FILE_INFORMATION) -> (u32, u32, u32) {
+            (info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow)
+        }
+        fn unchanged(before: &BY_HANDLE_FILE_INFORMATION, after: &BY_HANDLE_FILE_INFORMATION) -> bool {
+            id(before) == id(after)
+                && before.dwFileAttributes == after.dwFileAttributes
+                && before.nNumberOfLinks == after.nNumberOfLinks
+                && launcher_size(before) == launcher_size(after)
+                && before.ftLastWriteTime.dwHighDateTime == after.ftLastWriteTime.dwHighDateTime
+                && before.ftLastWriteTime.dwLowDateTime == after.ftLastWriteTime.dwLowDateTime
+        }
+        fn open_error(where_: &str, e: std::io::Error) -> String {
+            format!("{where_} win32={:?}: {e}", e.raw_os_error())
+        }
+        type Ancestors = Vec<(PathBuf, File, BY_HANDLE_FILE_INFORMATION)>;
+        fn hold_ancestors(path: &Path) -> Result<Ancestors, String> {
+            let parts = launcher_path_parts(path)?;
+            let drive: Vec<u16> = parts[0].as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe { GetDriveTypeW(drive.as_ptr()) } != 3 {
+                return Err("D2_NOT_FIXED_DISK".into());
+            }
+            let (_, parents) = parts.split_last().ok_or("D2_NO_PARENTS")?;
+            let mut held = Vec::new();
+            for parent in parents {
+                let file = OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ).custom_flags(FLAGS)
+                    .open(parent).map_err(|e| open_error("D2_OPEN_PARENT", e))?;
+                let info = launcher_handle_info(&file, true)
+                    .map_err(|e| format!("D2_PARENT_OBJECT {e}"))?;
+                launcher_handle_path(&file, parent)?;
+                held.push((parent.clone(), file, info));
+            }
+            Ok(held)
+        }
+        fn check_ancestors(held: &Ancestors) -> Result<(), String> {
+            for (path, file, before) in held {
+                let now = launcher_handle_info(file, true)?;
+                if id(before) != id(&now) { return Err("D2_PARENT_ID_CHANGED".into()); }
+                launcher_handle_path(file, path)?;
+            }
+            Ok(())
+        }
+        fn open_delete_read(path: &Path) -> std::io::Result<File> {
+            OpenOptions::new().access_mode(GENERIC_READ | DELETE)
+                .share_mode(FILE_SHARE_READ).custom_flags(FLAGS).open(path)
+        }
+        fn independent_read(path: &Path) -> std::io::Result<File> {
+            OpenOptions::new().read(true).share_mode(ALL_SHARES)
+                .custom_flags(FLAGS).open(path)
+        }
+        fn pending(file: &File) -> std::io::Result<bool> {
+            let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+            // SAFETY: live handle and correctly sized SDK output struct.
+            if unsafe {
+                GetFileInformationByHandleEx(file.as_raw_handle(), FileStandardInfo,
+                    (&mut info as *mut FILE_STANDARD_INFO).cast(),
+                    std::mem::size_of::<FILE_STANDARD_INFO>() as u32)
+            } == 0 { return Err(std::io::Error::last_os_error()); }
+            Ok(info.DeletePending as u8 != 0)
+        }
+        fn set_disposition(file: &File) -> std::io::Result<()> {
+            let info = FILE_DISPOSITION_INFO { DeleteFile: true as _ };
+            // SAFETY: live handle; SDK layout; no pathname or second open.
+            if unsafe {
+                SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfo,
+                    (&info as *const FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32)
+            } == 0 { return Err(std::io::Error::last_os_error()); }
+            Ok(())
+        }
+        struct Verified<'a> {
+            fixture: &'a Fixture,
+            which: Launcher,
+            path: PathBuf,
+            parents: Ancestors,
+            file: File,
+            before: BY_HANDLE_FILE_INFORMATION,
+        }
+        impl<'a> Verified<'a> {
+            fn open(fixture: &'a Fixture, which: Launcher) -> Result<Self, String> {
+                let path = fixture.path(which);
+                let parents = hold_ancestors(&path)?;
+                let file = open_delete_read(&path).map_err(|e| open_error("D2_OPEN_LEAF", e))?;
+                let before = launcher_handle_info(&file, false)
+                    .map_err(|e| format!("D2_LEAF_OBJECT {e}"))?;
+                let mut verified = Self { fixture, which, path, parents, file, before };
+                verified.recheck()?;
+                Ok(verified)
+            }
+            fn recheck(&mut self) -> Result<(), String> {
+                check_ancestors(&self.parents)?;
+                launcher_handle_path(&self.file, &self.path)?;
+                let first = launcher_handle_info(&self.file, false)
+                    .map_err(|e| format!("D2_LEAF_OBJECT {e}"))?;
+                if !unchanged(&self.before, &first) || launcher_size(&first) > MAX_LAUNCHER_BYTES {
+                    return Err("D2_LEAF_CHANGED_OR_OVERSIZE".into());
+                }
+                self.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+                let bytes = read_launcher_bounded(&mut self.file).map_err(|e| e.to_string())?;
+                let last = launcher_handle_info(&self.file, false)?;
+                if bytes.len() as u64 != launcher_size(&last) || !unchanged(&first, &last)
+                    || !owned_launcher_bytes(&bytes, &self.fixture.install(), self.which.name())
+                {
+                    return Err("D2_TEMPLATE_OR_IDENTITY_MISMATCH".into());
+                }
+                launcher_handle_path(&self.file, &self.path)?;
+                check_ancestors(&self.parents)?;
+                if pending(&self.file).map_err(|e| open_error("D2_PENDING_QUERY", e))? {
+                    return Err("D2_ALREADY_PENDING".into());
+                }
+                Ok(())
+            }
+            fn mark(&mut self) -> Result<(), String> {
+                self.recheck()?;
+                set_disposition(&self.file).map_err(|e| open_error("D2_DISPOSITION_FAILED", e))?;
+                // Success of the call alone is not proof of deletion.
+                if !pending(&self.file).map_err(|e| open_error("D2_PENDING_QUERY", e))? {
+                    return Err("D2_DISPOSITION_NOT_READ_BACK".into());
+                }
+                Ok(())
+            }
+            fn close_and_read_back(self) -> Result<(), String> {
+                if !pending(&self.file).map_err(|e| open_error("D2_PENDING_QUERY", e))? {
+                    return Err("D2_NOT_MARKED".into());
+                }
+                let Self { file, path, parents, .. } = self;
+                drop(file);
+                // Keep the original ancestor handles until completion is
+                // checked by a separate open AND enumeration of the parent.
+                check_ancestors(&parents)?;
+                match independent_read(&path) {
+                    Err(e) if e.raw_os_error() == Some(2) => {}
+                    Err(e) => return Err(open_error("D2_ABSENCE_UNKNOWN", e)),
+                    Ok(_) => return Err("D2_NAME_STILL_EXISTS".into()),
+                }
+                let name = path.file_name().ok_or("D2_NO_NAME")?;
+                for entry in fs::read_dir(path.parent().ok_or("D2_NO_PARENT")?)
+                    .map_err(|e| open_error("D2_ENUM_FAILED", e))?
+                {
+                    if entry.map_err(|e| open_error("D2_ENUM_FAILED", e))?.file_name() == name {
+                        return Err("D2_NAME_STILL_ENUMERATED".into());
+                    }
+                }
+                check_ancestors(&parents)?;
+                Ok(())
+            }
+        }
+        fn refusal<T>(result: Result<T, String>, prefix: &str) -> String {
+            match result {
+                Err(e) if e.starts_with(prefix) => e,
+                Err(e) => panic!("expected {prefix}, got {e}"),
+                Ok(_) => panic!("unexpected acceptance: {prefix}"),
+            }
+        }
+        fn win32_refused<T>(result: std::io::Result<T>, label: &str, codes: &[i32]) -> i32 {
+            let err = match result { Ok(_) => panic!("{label}: unexpected success"), Err(e) => e };
+            let code = err.raw_os_error().expect("actual Win32 error");
+            assert!(codes.contains(&code), "{label}: unexpected Win32 error {code}: {err}");
+            code
+        }
+        fn snapshot(path: &Path) -> ((u32, u32, u32), Vec<u8>) {
+            let file = independent_read(path).unwrap();
+            (id(&launcher_handle_info(&file, false).unwrap()), fs::read(path).unwrap())
+        }
+        fn marker(line: &str) {
+            // Direct stdout is not swallowed by libtest's normal capture;
+            // existing filtered GNU and MSVC CI need no workflow changes.
+            writeln!(std::io::stdout().lock(), "{line}").unwrap();
+        }
+
+        #[test]
+        fn d2_same_handle_disposition_pending_then_independent_absence() {
+            let fixture = Fixture::new();
+            let neighbor = fixture.neighbor().join(Launcher::Start.name());
+            fs::write(&neighbor, fixture.bytes(Launcher::Start)).unwrap();
+            let unrelated = fixture.desktop().join("unknown.cmd");
+            fs::write(&unrelated, b"unrelated data").unwrap();
+            let keep = snapshot(&neighbor);
+            let keep_unknown = snapshot(&unrelated);
+            for which in [Launcher::Start, Launcher::Uninstall] {
+                fixture.write_launcher(which);
+                let path = fixture.path(which);
+                let mut verified = Verified::open(&fixture, which).unwrap();
+                let observer = independent_read(&path).unwrap();
+                assert_eq!(id(&verified.before), id(&launcher_handle_info(&observer, false).unwrap()));
+                assert!(!pending(&observer).unwrap());
+                verified.mark().unwrap();
+                assert!(pending(&observer).unwrap(), "independent live handle must observe disposition");
+                let reopen = win32_refused(independent_read(&path), "delete-pending reopen", &[5, 32, 303]);
+                // Last close, not SetFileInformationByHandle alone, proves removal.
+                drop(observer);
+                verified.close_and_read_back().unwrap();
+                assert_eq!(snapshot(&neighbor), keep);
+                assert_eq!(snapshot(&unrelated), keep_unknown);
+                marker(&format!("D2_LAB_DISPOSITION name={} same_id=true pending_readback=true pending_open_win32={reopen} absent_after_close=true neighbor_preserved=true", which.name()));
+            }
+        }
+
+        #[test]
+        fn d2_old_write_and_delete_share_block_before_disposition() {
+            let fixture = Fixture::new();
+            let which = Launcher::Start;
+            fixture.write_launcher(which);
+            let path = fixture.path(which);
+            let original = snapshot(&path);
+            // Independently opened old write handle, even when it shares all
+            // access, conflicts with the candidate's refusal to share writes.
+            let mut writer = OpenOptions::new().write(true).share_mode(ALL_SHARES).open(&path).unwrap();
+            let old_write = refusal(Verified::open(&fixture, which), "D2_OPEN_LEAF win32=Some(32)");
+            writer.seek(SeekFrom::Start(0)).unwrap();
+            writer.write_all(&fixture.bytes(which)).unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+            assert_eq!(snapshot(&path), original);
+            let reader = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&path).unwrap();
+            let no_delete = refusal(Verified::open(&fixture, which), "D2_OPEN_LEAF win32=Some(32)");
+            drop(reader);
+            assert_eq!(snapshot(&path), original);
+            let mut verified = Verified::open(&fixture, which).unwrap();
+            assert_eq!(id(&verified.before), original.0);
+            verified.mark().unwrap();
+            verified.close_and_read_back().unwrap();
+            marker(&format!("D2_LAB_OLD_HANDLES old_write={old_write:?} no_delete_share={no_delete:?} preserved_until_release=true deletion_after_release=true"));
+        }
+
+        #[test]
+        fn d2_verified_object_blocks_rename_replacement_and_ancestor_move() {
+            let fixture = Fixture::new();
+            let which = Launcher::Start;
+            fixture.write_launcher(which);
+            let path = fixture.path(which);
+            let original = snapshot(&path);
+            let replacement = fixture.desktop().join("replacement.cmd");
+            fs::write(&replacement, b"neighbor replacement sentinel").unwrap();
+            let replacement_before = snapshot(&replacement);
+            let mut verified = Verified::open(&fixture, which).unwrap();
+            let write = win32_refused(OpenOptions::new().write(true).share_mode(ALL_SHARES).open(&path), "write reopen", &[32]);
+            let rename = win32_refused(fs::rename(&path, fixture.desktop().join("moved.cmd")), "leaf rename", &[5, 32]);
+            let replace = win32_refused(fs::rename(&replacement, &path), "replacement", &[5, 32]);
+            let parent = win32_refused(fs::rename(fixture.desktop(), fixture.0.join("moved-desktop")), "parent rename", &[5, 32]);
+            let ancestor = win32_refused(fs::rename(&fixture.0, fixture.0.with_extension("moved")), "ancestor rename", &[5, 32]);
+            verified.recheck().unwrap();
+            let mut observer = independent_read(&path).unwrap();
+            let observed = read_launcher_bounded(&mut observer).unwrap();
+            assert_eq!(id(&launcher_handle_info(&observer, false).unwrap()), original.0);
+            assert_eq!(observed, original.1);
+            drop(observer);
+            assert_eq!(snapshot(&replacement), replacement_before);
+            verified.mark().unwrap();
+            verified.close_and_read_back().unwrap();
+            assert_eq!(snapshot(&replacement), replacement_before);
+            marker(&format!("D2_LAB_COMPETITION write={write} rename={rename} replace={replace} parent={parent} ancestor={ancestor} same_id=true replacement_preserved=true"));
+        }
+
+        #[test]
+        fn d2_custom_other_install_hardlink_and_reparse_are_preserved() {
+            let fixture = Fixture::new();
+            let which = Launcher::Start;
+            let path = fixture.path(which);
+            let other = launcher_template(&fixture.neighbor(), which.name()).unwrap();
+            fs::write(&path, other.as_bytes()).unwrap();
+            let before = snapshot(&path);
+            refusal(Verified::open(&fixture, which), "D2_TEMPLATE_OR_IDENTITY_MISMATCH");
+            assert_eq!(snapshot(&path), before);
+            fs::write(&path, b"@echo off\r\nrem custom user script\r\n").unwrap();
+            let before = snapshot(&path);
+            refusal(Verified::open(&fixture, which), "D2_TEMPLATE_OR_IDENTITY_MISMATCH");
+            assert_eq!(snapshot(&path), before);
+            fixture.write_launcher(which);
+            let before = snapshot(&path);
+            let linked = fixture.neighbor().join("linked.cmd");
+            fs::hard_link(&path, &linked).unwrap();
+            refusal(Verified::open(&fixture, which), "D2_LEAF_OBJECT");
+            assert_eq!(fs::read(&path).unwrap(), before.1);
+            assert_eq!(fs::read(&linked).unwrap(), before.1);
+            fs::remove_file(&linked).unwrap();
+            assert_eq!(snapshot(&path), before);
+
+            // Create an actual directory junction to another fixture dir,
+            // not a symlink emulation. Never descend through it for deletion.
+            let real_desktop = fixture.0.join("original-desktop");
+            fs::rename(fixture.desktop(), &real_desktop).unwrap();
+            let target = fixture.neighbor().join(which.name());
+            fs::write(&target, fixture.bytes(which)).unwrap();
+            let target_before = snapshot(&target);
+            let output = std::process::Command::new(PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe"))
+                .args(["/D", "/C", "mklink", "/J"]).arg(fixture.desktop()).arg(fixture.neighbor())
+                .output().unwrap();
+            assert!(output.status.success(), "junction fixture failed: {:?}", output);
+            refusal(Verified::open(&fixture, which), "D2_PARENT_OBJECT");
+            assert_eq!(snapshot(&target), target_before);
+            fs::remove_dir(fixture.desktop()).unwrap();
+            fs::rename(&real_desktop, fixture.desktop()).unwrap();
+            assert_eq!(snapshot(&path), before);
+            // Leaf symlink needs privilege/developer mode. Attempt it and
+            // report actual unsupported privilege, not a fabricated pass.
+            let leaf = fixture.path(Launcher::Uninstall);
+            match std::os::windows::fs::symlink_file(&target, &leaf) {
+                Ok(()) => {
+                    refusal(Verified::open(&fixture, Launcher::Uninstall), "D2_LEAF_OBJECT");
+                    assert_eq!(snapshot(&target), target_before);
+                    assert!(fs::symlink_metadata(&leaf).unwrap().file_type().is_symlink());
+                    fs::remove_file(&leaf).unwrap();
+                    marker("D2_LAB_LEAF_SYMLINK actual=true refused=true target_preserved=true");
+                }
+                Err(e) if matches!(e.raw_os_error(), Some(1314) | Some(5)) => {
+                    marker(&format!("D2_LAB_LEAF_SYMLINK NOT_RUN win32={:?}", e.raw_os_error()));
+                }
+                Err(e) => panic!("unexpected symlink fixture failure: {e}"),
+            }
+            marker("D2_LAB_NONOWNED other_install=true custom=true hardlink=true ancestor_junction=true unchanged=true");
+        }
+
+        // The recovery group is deliberately non-executable fixture data.
+        // Acquire candidates without any disposition: a failed member or
+        // absent independent trusted recovery entry cannot break the group.
+        fn recovery_stop_before_mutation(fixture: &Fixture) -> Result<(), String> {
+            let bin = fixture.install().join("bin");
+            let paths = [bin.join("spidervpn.exe"), bin.join("WebView2Loader.dll")];
+            let parents = hold_ancestors(&paths[0])?;
+            let mut files = Vec::new();
+            for path in &paths {
+                let file = open_delete_read(path).map_err(|e| open_error("D2_RECOVERY_MEMBER_OPEN", e))?;
+                launcher_handle_info(&file, false)?;
+                launcher_handle_path(&file, path)?;
+                files.push(file);
+            }
+            check_ancestors(&parents)?;
+            // There is no production trusted recovery entry in this LAB.
+            // No argument, boolean or test switch can convert this to permission.
+            Err("D2_NO_TRUSTED_RECOVERY_ENTRY".into())
+        }
+
+        #[test]
+        fn d2_real_disposition_error_and_recovery_group_stops_intact() {
+            let fixture = Fixture::new();
+            let which = Launcher::Start;
+            fixture.write_launcher(which);
+            let path = fixture.path(which);
+            let original = snapshot(&path);
+            // Actual kernel rejection, not an injected HRESULT. A read-only
+            // access handle has no DELETE access; this is a prerequisite
+            // negative control, not a failure of the validated DELETE handle.
+            let reader = independent_read(&path).unwrap();
+            assert!(!pending(&reader).unwrap());
+            let error = win32_refused(set_disposition(&reader), "disposition without DELETE access", &[5]);
+            assert!(!pending(&reader).unwrap());
+            drop(reader);
+            assert_eq!(snapshot(&path), original);
+            let bin = fixture.install().join("bin");
+            let exe = bin.join("spidervpn.exe");
+            let dll = bin.join("WebView2Loader.dll");
+            fs::write(&exe, b"LAB only recovery main sentinel, not executable").unwrap();
+            fs::write(&dll, b"LAB only dependency sentinel, not executable").unwrap();
+            let exe_before = snapshot(&exe);
+            let dll_before = snapshot(&dll);
+            let old_writer = OpenOptions::new().write(true).share_mode(ALL_SHARES).open(&dll).unwrap();
+            refusal(recovery_stop_before_mutation(&fixture), "D2_RECOVERY_MEMBER_OPEN win32=Some(32)");
+            drop(old_writer);
+            assert_eq!(snapshot(&exe), exe_before);
+            assert_eq!(snapshot(&dll), dll_before);
+            refusal(recovery_stop_before_mutation(&fixture), "D2_NO_TRUSTED_RECOVERY_ENTRY");
+            assert_eq!(snapshot(&exe), exe_before);
+            assert_eq!(snapshot(&dll), dll_before);
+            marker(&format!("D2_LAB_RECOVERY disposition_without_delete_win32={error} pending=false dependency_open_failed=true group_unchanged=true no_trusted_entry_stopped=true real_recovery_process=false production_recovery_proven=false"));
+        }
+    }
 }
