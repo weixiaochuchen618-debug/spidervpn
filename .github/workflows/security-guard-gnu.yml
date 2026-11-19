@@ -98,3 +98,17 @@ jobs:
             if (($output -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw "Exact engine entry test did not execute once: $test" }
             if (($output -join "`n") -notmatch 'ENGINE_ENTRY_ACTUAL_TOKEN elevated=(true|false)') { throw "Missing actual process token readback: $test" }
           }
+
+      - name: R01-008-B1 actual standalone Rust bootstrap stage (not installation)
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
+          & cargo +stable-x86_64-pc-windows-gnu build --locked --features bootstrap-stage --bin spidervpn-bootstrap
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $output = & cargo +stable-x86_64-pc-windows-gnu test --locked --features bootstrap-stage --test bootstrap-stage-e2e -- --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          if (($output -join [Environment]::NewLine) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'Bootstrap actual EXE test did not run exactly once' }
+          if (($output -join [Environment]::NewLine) -notmatch 'BOOTSTRAP_E2E_COMPLETE real_exe=true files=13') { throw 'Bootstrap actual stage evidence missing' }

@@ -2,6 +2,7 @@
 name = "spidervpn"
 version = "0.1.4"
 edition = "2021"
+default-run = "spidervpn"
 description = "SpiderVPN — Windows 桌面 VPN 客户端：自建服务器部署、线路管理、交易程序直连阻断。"
 license = "MIT"
 repository = "https://github.com/weixiaochuchen618-debug/spidervpn"
@@ -146,3 +147,12 @@ windows = { version = "0.62.2", features = [
 [[bin]]
 name = "spidervpn"
 path = "src/main.rs"
+
+# Independent bootstrap is deliberately not part of the default build/package.
+[features]
+bootstrap-stage = []
+
+[[bin]]
+name = "spidervpn-bootstrap"
+path = "src/bin/spidervpn-bootstrap.rs"
+required-features = ["bootstrap-stage"]

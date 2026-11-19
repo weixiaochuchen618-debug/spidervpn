@@ -127,3 +127,14 @@ jobs:
           --skip tightening_closes_a_file_that_inherited_the_loose_acl
           --skip a_shortcut_is_replaced_by_the_program_it_points_at
 
+      - name: R01-008-B1 actual standalone Rust bootstrap stage (not installation)
+        shell: pwsh
+        run: |
+          & cargo build --locked --features bootstrap-stage --bin spidervpn-bootstrap
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $output = & cargo test --locked --features bootstrap-stage --test bootstrap-stage-e2e -- --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          if (($output -join [Environment]::NewLine) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'Bootstrap actual EXE test did not run exactly once' }
+          if (($output -join [Environment]::NewLine) -notmatch 'BOOTSTRAP_E2E_COMPLETE real_exe=true files=13') { throw 'Bootstrap actual stage evidence missing' }
