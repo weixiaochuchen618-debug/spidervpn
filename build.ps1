@@ -19,9 +19,9 @@
 候选构建（仅 GNU x64；需要可信操作者已核验工具链与离线依赖缓存）：
   build.ps1 -Candidate -Release -SourceSha <完整40位SHA> -CandidateTarget <新ASCII目录>
     -CandidateOutput <另一个新ASCII目录> -ApprovalFile <包外JSON>
-    -ApprovalSha256 <通过独立可信渠道取得的64位摘要> -MingwBin <已审核MinGW bin>
+    -ApprovalSha256 <通过独立可信渠道取得的64位摘要> -MingwBin <已审核MinGW bin> -GitPath <已审核git.exe> -RustupPath <已审核rustup.exe>
 Approval JSON schema 1: repository (固定GitHub URL), sourceSha, rustVersion ("1.100.0"),
-target ("x86_64-pc-windows-gnu"), gcc/dlltool/ld/loader/engine/license objects.
+target ("x86_64-pc-windows-gnu"), git/rustup/gcc/dlltool/ld/loader/engine/license objects.
 每个对象必须由可信操作者核定 source、version、sha256；loader/engine/license
 另须 platform="windows-x64"，license.version=engine.version。
 DLL/引擎/许可证和工具摘要必须来自独立审核，不从待验证目录自采作为信任依据。
@@ -31,7 +31,7 @@ DLL/引擎/许可证和工具摘要必须来自独立审核，不从待验证目
 [CmdletBinding()]
 param([switch]$Release,[switch]$Candidate,[string]$SourceSha,
   [string]$CandidateTarget,[string]$CandidateOutput,[string]$ApprovalFile,
-  [string]$ApprovalSha256,[string]$MingwBin)
+  [string]$ApprovalSha256,[string]$MingwBin,[string]$GitPath,[string]$RustupPath)
 
 $ErrorActionPreference='Stop'
 $here=Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -52,6 +52,7 @@ function Assert-LocalPath([string]$Path, [switch]$Directory) {
         throw "Noncanonical local path: $Path"
     }
     if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($Path)).DriveType -ne [IO.DriveType]::Fixed) { throw 'Fixed local disk required' }
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Missing local object: $Path" }
     $item = Get-Item -LiteralPath $Path -Force
     if ([bool]$item.PSIsContainer -ne [bool]$Directory) { throw "Unexpected object kind: $Path" }
     $cursor = $item
@@ -79,19 +80,53 @@ function Assert-Separate([string]$First, [string]$Second) {
         throw 'Candidate paths overlap'
     }
 }
-function Invoke-CheckedNative([string]$Exe,[string[]]$Arguments) {
-    $prior = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try { $lines = @(& $Exe @Arguments 2>&1); $code = $LASTEXITCODE }
-    finally { $ErrorActionPreference = $prior }
-    if ($code -ne 0) { throw "Native command failed ($code): $Exe $Arguments" }
-    @($lines | ForEach-Object { $_.ToString() })
+# Do not collapse multiple Application matches into a single string.
+# Production always supplies a separately approved absolute path.
+function Resolve-CandidateApplication([string]$Name,[string]$Selected) {
+    if (-not $Selected) {
+        $matches=@(Get-Command $Name -CommandType Application -All -ErrorAction SilentlyContinue | ForEach-Object {$_.Source} | Sort-Object -Unique)
+        if ($matches.Count -ne 1) { throw "Native application missing or ambiguous: $Name ($($matches.Count))" }
+        throw "Explicit audited application path required: $Name"
+    }
+    if ([IO.Path]::GetFileName($Selected) -ine $Name) { throw "Wrong application name: $Name" }
+    if (-not (Test-Path -LiteralPath $Selected -PathType Leaf)) { throw "Native application missing: $Selected" }
+    $null=Assert-LocalPath $Selected
+    $commands=@(Get-Command -Name $Selected -CommandType Application -ErrorAction Stop)
+    if ($commands.Count -ne 1 -or $commands[0].Source -ine $Selected) { throw "Native application resolution mismatch: $Selected" }
+    $Selected
 }
-function Assert-CandidateSource([string]$Root,[string]$Sha) {
+function Invoke-CheckedNative([string]$Exe,[string[]]$Arguments) {
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "Native application missing: $Exe" }
+    $null=Assert-LocalPath $Exe
+    # Windows PowerShell 5.1 can wrap stderr as ErrorRecords even on
+    # success. Capture both streams; reject errors other than native stderr.
+    # A sentinel prevents stale successful LASTEXITCODE from authorizing
+    # a failed start. No shell, command string, or PATH lookup.
+    $prior=$ErrorActionPreference
+    $ErrorActionPreference='Continue'
+    $LASTEXITCODE=$null
+    try {
+        try { $lines=@(& $Exe @Arguments 2>&1); $code=$LASTEXITCODE }
+        catch { throw "Native application launch failed: $Exe" }
+        if ($null -eq $code -or @($lines | Where-Object {
+            $_ -is [Management.Automation.ErrorRecord] -and $_.FullyQualifiedErrorId -notin @('NativeCommandError','NativeCommandErrorMessage')
+        }).Count -ne 0) { throw "Native application launch failed: $Exe" }
+        if ($code -ne 0) { throw "Native command failed ($code): $Exe" }
+        @($lines | ForEach-Object {$_.ToString()})
+    } finally { $ErrorActionPreference=$prior }
+}
+function Read-AuditedApplication([string]$Name,[string]$Path,$Approval) {
+    $file=Resolve-CandidateApplication $Name $Path
+    Assert-FileDigest $file $Approval.sha256
+    $version=(Invoke-CheckedNative $file @('--version')) -join [Environment]::NewLine
+    if (-not $version.Contains([string]$Approval.version)) { throw "Wrong audited tool version: $Name" }
+    @{path=$file;sha256=(Candidate-Hash $file);version=$version;source=$Approval.source}
+}
+function Assert-CandidateSource([string]$Root,[string]$Sha,[string]$Git) {
     if ($Sha -cnotmatch '^[a-f0-9]{40}$') { throw 'Exact lowercase source SHA required' }
     $null = Assert-LocalPath $Root -Directory
     if ($Root -notmatch '^[A-Za-z]:\\[ -~]+$') { throw 'ASCII source directory required' }
-    $git = (Get-Command git.exe -CommandType Application).Source
+    $git = Resolve-CandidateApplication 'git.exe' $Git
     if (((Invoke-CheckedNative $git @('-C',$Root,'remote','get-url','origin')) -join '') -cnotmatch '^https://github\.com/weixiaochuchen618-debug/spidervpn(?:\.git)?$') { throw 'Unexpected repository' }
     if (((Invoke-CheckedNative $git @('-C',$Root,'rev-parse','HEAD')) -join '') -cne $Sha) { throw 'Source SHA mismatch' }
     $top = (Invoke-CheckedNative $git @('-C',$Root,'rev-parse','--show-toplevel')) -join ''
@@ -115,7 +150,7 @@ function Read-CandidateApproval([string]$Path,[string]$Digest,[string]$Sha) {
     if ($a.schema -ne 1 -or $a.sourceSha -cne $Sha -or
         $a.repository -cne 'https://github.com/weixiaochuchen618-debug/spidervpn' -or
         $a.rustVersion -cne '1.100.0' -or $a.target -cne 'x86_64-pc-windows-gnu') { throw 'Approval scope mismatch' }
-    foreach ($key in @('gcc','dlltool','ld','loader','engine','license')) {
+    foreach ($key in @('git','rustup','gcc','dlltool','ld','loader','engine','license')) {
         $entry = $a.$key
         if ($null -eq $entry -or [string]::IsNullOrWhiteSpace($entry.source) -or [string]::IsNullOrWhiteSpace($entry.version)) { throw "Audited external source/version required: $key" }
         Assert-Digest $entry.sha256
@@ -158,10 +193,12 @@ function Candidate-CargoArguments([string]$Root,[string]$Target) {
 }
 function Invoke-CandidateBuild {
     if (-not $Release -or -not $SourceSha -or -not $CandidateTarget -or -not $CandidateOutput -or
-        -not $ApprovalFile -or -not $ApprovalSha256 -or -not $MingwBin) { throw 'Candidate requires Release, SHA, new target/output, external approval and explicit MinGW bin' }
+        -not $ApprovalFile -or -not $ApprovalSha256 -or -not $MingwBin -or -not $GitPath -or -not $RustupPath) { throw 'Candidate requires Release, SHA, new target/output, external approval and explicit tools' }
     $root=$here
-    $lock=Assert-CandidateSource $root $SourceSha
     $a=Read-CandidateApproval $ApprovalFile $ApprovalSha256 $SourceSha
+    $gitEvidence=Read-AuditedApplication 'git.exe' $GitPath $a.git
+    $rustupEvidence=Read-AuditedApplication 'rustup.exe' $RustupPath $a.rustup
+    $lock=Assert-CandidateSource $root $SourceSha $gitEvidence.path
     Assert-Separate $root $ApprovalFile
     Assert-NewDirectory $CandidateTarget
     Assert-NewDirectory $CandidateOutput
@@ -179,7 +216,7 @@ function Invoke-CandidateBuild {
         if (Test-Path -LiteralPath (Join-Path $cargoHome $name)) { throw 'Implicit Cargo home config refused' }
     }
     $null=Assert-LocalPath $MingwBin -Directory
-    $tools=@{}
+    $tools=@{git=$gitEvidence;rustup=$rustupEvidence}
     $names=@{gcc='x86_64-w64-mingw32-gcc.exe';dlltool='dlltool.exe';ld='ld.exe'}
     foreach ($key in @('gcc','dlltool','ld')) {
         $tool=Join-Path $MingwBin $names[$key]
@@ -188,7 +225,7 @@ function Invoke-CandidateBuild {
         if (-not $version.Contains([string]$a.$key.version)) { throw "Wrong audited tool version: $key" }
         $tools[$key]=@{path=$tool;sha256=(Candidate-Hash $tool);version=$version;source=$a.$key.source}
     }
-    $rustup=(Get-Command rustup.exe -CommandType Application).Source
+    $rustup=$rustupEvidence.path
     $tc='1.100.0-x86_64-pc-windows-gnu'
     $rust=(Invoke-CheckedNative $rustup @('run',$tc,'rustc','-Vv')) -join [Environment]::NewLine
     $cargo=(Invoke-CheckedNative $rustup @('run',$tc,'cargo','-V')) -join [Environment]::NewLine
@@ -210,9 +247,9 @@ function Invoke-CandidateBuild {
         Remove-Item Env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER -ErrorAction SilentlyContinue
         Pop-Location
     }
-    if ((Assert-CandidateSource $root $SourceSha) -cne $lock) { throw 'Source changed during build' }
+    if ((Assert-CandidateSource $root $SourceSha $gitEvidence.path) -cne $lock) { throw 'Source changed during build' }
     Assert-FileDigest $ApprovalFile $ApprovalSha256
-    foreach ($key in @('gcc','dlltool','ld')) { Assert-FileDigest $tools[$key].path $a.$key.sha256 }
+    foreach ($key in @('git','rustup','gcc','dlltool','ld')) { Assert-FileDigest $tools[$key].path $a.$key.sha256 }
     $exe=Join-Path $CandidateTarget 'x86_64-pc-windows-gnu\release\spidervpn.exe'
     Assert-X64Pe $exe
     $loader=Select-CandidateLoader $CandidateTarget $a.loader.sha256
@@ -238,7 +275,7 @@ function Invoke-CandidateBuild {
 
 if ($MyInvocation.InvocationName -eq '.') { return }
 if ($Candidate) { Invoke-CandidateBuild; return }
-if ($SourceSha -or $CandidateTarget -or $CandidateOutput -or $ApprovalFile -or $ApprovalSha256 -or $MingwBin) { throw 'Candidate inputs require -Candidate' }
+if ($SourceSha -or $CandidateTarget -or $CandidateOutput -or $ApprovalFile -or $ApprovalSha256 -or $MingwBin -or $GitPath -or $RustupPath) { throw 'Candidate inputs require -Candidate' }
 $targetDir='C:\tc-rs-build'
 
 # 1. 找到完整 MinGW-w64（WinLibs）。查找顺序：PATH → 便携目录 → WinGet 包。

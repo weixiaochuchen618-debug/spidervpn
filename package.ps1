@@ -4,16 +4,16 @@
 # package.ps1 -Version <version> -SourceSha <full SHA> -BuildDir <candidate output>
 #   -BuildEvidenceSha256 <independently retained reviewed build record hash>
 #   -ApprovalFile <external approved input JSON> -ApprovalSha256 <external hash>
-#   -EnginePath <approved engine> -LicensePath <approved license> -OutputDir <new ASCII directory>
+#   -EnginePath <approved engine> -LicensePath <approved license> -OutputDir <new ASCII directory> -GitPath <audited git.exe>
 # The resulting ZIP and manifest hashes require independent review. Never
 # run the package's own scripts to establish initial trust. 008-B is pending.
 [CmdletBinding()]
 param([string]$Version,[string]$SourceSha,[string]$BuildDir,[string]$BuildEvidenceSha256,
-    [string]$ApprovalFile,[string]$ApprovalSha256,[string]$EnginePath,[string]$LicensePath,[string]$OutputDir)
+    [string]$ApprovalFile,[string]$ApprovalSha256,[string]$EnginePath,[string]$LicensePath,[string]$OutputDir,[string]$GitPath)
 $ErrorActionPreference='Stop'
 $here=$PSScriptRoot
 # Forward shared names because dot-source imports functions in this scope.
-. (Join-Path $here 'build.ps1') -SourceSha $SourceSha -ApprovalFile $ApprovalFile -ApprovalSha256 $ApprovalSha256
+. (Join-Path $here 'build.ps1') -SourceSha $SourceSha -ApprovalFile $ApprovalFile -ApprovalSha256 $ApprovalSha256 -GitPath $GitPath
 
 function Read-CandidateBuild([string]$Dir,[string]$Digest,[string]$Root,[string]$Sha,[string]$ApprovalDigest,$Approval,[string]$Lock) {
     if ($Dir -ieq 'C:\tc-rs-build\release') { throw 'Shared legacy output refused' }
@@ -41,7 +41,8 @@ function Read-CandidateBuild([string]$Dir,[string]$Digest,[string]$Root,[string]
     }
     Assert-Separate $Root $e.targetDir
     Assert-Separate $Dir $e.targetDir
-    foreach ($key in @('gcc','dlltool','ld')) {
+    if ($got[0] -cne $e.tools.rustup.path) { throw 'Build executable path mismatch' }
+    foreach ($key in @('git','rustup','gcc','dlltool','ld')) {
         if ($e.tools.$key.sha256 -ine $Approval.$key.sha256 -or $e.tools.$key.source -cne $Approval.$key.source -or
             -not ([string]$e.tools.$key.version).Contains([string]$Approval.$key.version)) { throw 'Tool evidence mismatch' }
     }
@@ -160,11 +161,12 @@ function Assert-CandidateZip([string]$Zip,$Entries,[string]$ManifestHash,[long]$
 # package command has no fixture bypass and requires approved input digests.
 if ($MyInvocation.InvocationName -eq '.') { return }
 if ($Version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$' -or -not $SourceSha -or -not $BuildDir -or
-    -not $BuildEvidenceSha256 -or -not $ApprovalFile -or -not $ApprovalSha256 -or -not $EnginePath -or -not $LicensePath -or -not $OutputDir) {
+    -not $BuildEvidenceSha256 -or -not $ApprovalFile -or -not $ApprovalSha256 -or -not $EnginePath -or -not $LicensePath -or -not $OutputDir -or -not $GitPath) {
     throw 'Explicit version, SHA, build evidence, external approval, engine/license and new output required'
 }
-$lock=Assert-CandidateSource $here $SourceSha
 $a=Read-CandidateApproval $ApprovalFile $ApprovalSha256 $SourceSha
+$gitEvidence=Read-AuditedApplication 'git.exe' $GitPath $a.git
+$lock=Assert-CandidateSource $here $SourceSha $gitEvidence.path
 Assert-Separate $here $ApprovalFile
 Assert-Separate $here $BuildDir
 $e=Read-CandidateBuild $BuildDir $BuildEvidenceSha256 $here $SourceSha $ApprovalSha256 $a $lock
@@ -262,7 +264,7 @@ SpiderVPN（Windows x64）候选包 — 未批准发布或安装
   交易保护装不上      → 需要管理员权限；未提权时连接照常，只是不阻断直连。
 '@
 Set-Content -LiteralPath (Join-Path $stage 'INSTALL.txt') -Value $install -Encoding UTF8
-if ((Assert-CandidateSource $here $SourceSha) -cne $lock) { throw 'Source changed during packaging' }
+if ((Assert-CandidateSource $here $SourceSha $gitEvidence.path) -cne $lock) { throw 'Source changed during packaging' }
 Assert-FileDigest $ApprovalFile $ApprovalSha256
 Assert-FileDigest (Join-Path $BuildDir 'build-evidence.json') $BuildEvidenceSha256
 $entries=@(New-CandidateManifest $stage)
