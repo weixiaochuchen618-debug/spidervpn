@@ -4944,7 +4944,8 @@ fn engine_reply(result: Result<(String, String), String>) -> String {
 /// 那会一直不退出——直接用 `output()` 会把界面线程卡死。
 pub(crate) fn probe_engine_binary(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
-    let mut child = std::process::Command::new(path)
+    let program = crate::engine::checked_engine_program(path)?;
+    let mut child = std::process::Command::new(&program)
         .arg("version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -10984,8 +10985,36 @@ mod tests {
     /// 真探测：自己的测试二进制不是 sing-box，必须被拒（这条跑的是真实 `version` 路径）。
     #[test]
     fn the_real_probe_rejects_a_program_that_is_not_sing_box() {
+        if crate::engine::tests::isolated_engine_entry(
+            "ipc::tests::the_real_probe_rejects_a_program_that_is_not_sing_box",
+            r"C:\Windows\System32\whoami.exe",
+        ) { return; }
+        let elevated = crate::engine::actual_process_elevation().expect("actual process token");
+        assert_eq!(std::env::var("SPIDERVPN_FORCE_NONADMIN").as_deref(), Ok("1"));
         let exe = std::env::current_exe().expect("测试进程自己的路径");
-        let error = probe_engine_binary(&exe).expect_err("测试二进制不可能是 sing-box");
+        let root = exe.parent().unwrap();
+        let bundled = root.join("sing-box.exe");
+        let external = root.join("external");
+        std::fs::create_dir(&external).unwrap();
+        let foreign = external.join("sing-box.exe");
+        std::fs::copy(&bundled, &foreign).unwrap();
+        // A real, harmless external same-name executable must be rejected
+        // at the entry gate, not merely after it ran its version command.
+        for path in [&exe, &foreign] {
+            let error = probe_engine_binary(path).expect_err("测试二进制不可能是 sing-box");
+            if elevated {
+                assert!(error.contains("同目录"), "{error}");
+            }
+            assert!(error.contains("sing-box") || error.contains("version"), "{error}");
+        }
+        // The trusted-directory policy positively permits this controlled
+        // image to execute; its *actual version protocol* is not sing-box.
+        // Retain the old real-exec negative rather than replacing it with
+        // only a path-policy failure.
+        let error = probe_engine_binary(&bundled).expect_err("测试二进制不可能是 sing-box");
+        assert!(error.contains("version"), "must reach real version handling: {error}");
+        assert!(!error.contains("同目录"), "{error}");
+        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={elevated} legacy_force_nonadmin=1 actual_probe=true");
         assert!(
             error.contains("sing-box") || error.contains("version"),
             "拒绝理由要说清为什么不是引擎：{error}"
