@@ -2480,6 +2480,58 @@ mod tests {
         std::fs::write(dir.join(marker), b"fixture").unwrap();
     }
 
+    // Test-only rendezvous format. The previous failing fixture wrote the
+    // two characters '\' and 'n' instead of an actual LF between addresses.
+    #[cfg(windows)]
+    fn a3b_deny_encode_endpoints(endpoints: [std::net::SocketAddr; 2]) -> String {
+        format!("{}\n{}", endpoints[0], endpoints[1])
+    }
+
+    #[cfg(windows)]
+    fn a3b_deny_decode_endpoints(encoded: &str) -> Result<[std::net::SocketAddr; 2], String> {
+        let lines: Vec<&str> = encoded.lines().collect();
+        if lines.len() != 2 {
+            return Err(format!("expected exactly two endpoint lines, got {}", lines.len()));
+        }
+        let v4: std::net::SocketAddr = lines[0].parse()
+            .map_err(|e| format!("invalid IPv4 socket address {:?}: {e}", lines[0]))?;
+        let v6: std::net::SocketAddr = lines[1].parse()
+            .map_err(|e| format!("invalid IPv6 socket address {:?}: {e}", lines[1]))?;
+        if v4.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) || v4.port() == 0 {
+            return Err(format!("first endpoint must be IPv4 loopback with nonzero port: {v4}"));
+        }
+        if v6.ip() != std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST) || v6.port() == 0 {
+            return Err(format!("second endpoint must be IPv6 loopback with nonzero port: {v6}"));
+        }
+        Ok([v4, v6])
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a3b_deny_endpoint_fixture_uses_real_lf_and_rejects_wrong_shape() {
+        let expected = ["127.0.0.1:12345", "[::1]:23456"].map(|s| s.parse().unwrap());
+        let encoded = a3b_deny_encode_endpoints(expected);
+        assert_eq!(encoded.as_bytes(), b"127.0.0.1:12345\n[::1]:23456");
+        assert_eq!(a3b_deny_decode_endpoints(&encoded).unwrap(), expected);
+        for (invalid, reason) in [
+            (r"127.0.0.1:12345\n[::1]:23456", "expected exactly two endpoint lines"),
+            ("127.0.0.1:12345", "expected exactly two endpoint lines"),
+            ("127.0.0.1:12345\n[::1]:23456\n[::1]:34567", "expected exactly two endpoint lines"),
+            ("not-an-address\n[::1]:23456", "invalid IPv4 socket address"),
+            ("127.0.0.1:12345\nnot-an-address", "invalid IPv6 socket address"),
+            ("[::1]:23456\n127.0.0.1:12345", "first endpoint must be IPv4 loopback"),
+            ("127.0.0.1:12345\n127.0.0.1:23456", "second endpoint must be IPv6 loopback"),
+            ("0.0.0.0:12345\n[::1]:23456", "first endpoint must be IPv4 loopback"),
+            ("127.0.0.1:12345\n[::]:23456", "second endpoint must be IPv6 loopback"),
+            ("127.0.0.1:0\n[::1]:23456", "first endpoint must be IPv4 loopback"),
+            ("127.0.0.1:12345\n[::1]:0", "second endpoint must be IPv6 loopback"),
+        ] {
+            let err = a3b_deny_decode_endpoints(invalid).expect_err("invalid fixture must fail");
+            assert!(err.contains(reason), "input={invalid:?}, actual={err:?}, expected={reason:?}");
+        }
+        println!("A3B_DENY_ENDPOINT_FORMAT_PASS two_addresses=true real_lf=true literal_backslash_n_rejected=true wrong_shape_rejected=true");
+    }
+
     #[cfg(windows)]
     fn a3b_lab_worker(role: &str) {
         use super::super::wfp_win::{WfpEngine, RawFilter, Txn, app_id_from_path,
@@ -2504,8 +2556,14 @@ mod tests {
             use std::io::Read;
             let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
-            std::fs::write(dir.join("deny-endpoints"),
-                format!("{}\\n{}", v4.local_addr().unwrap(), v6.local_addr().unwrap())).unwrap();
+            let endpoints = [v4.local_addr().unwrap(), v6.local_addr().unwrap()];
+            let encoded = a3b_deny_encode_endpoints(endpoints);
+            std::fs::write(dir.join("deny-endpoints"), encoded.as_bytes())
+                .expect("write DENY fixture IPv4/IPv6 addresses");
+            let readback = std::fs::read_to_string(dir.join("deny-endpoints"))
+                .expect("read back DENY fixture IPv4/IPv6 addresses");
+            assert_eq!(a3b_deny_decode_endpoints(&readback)
+                .expect("DENY fixture endpoint roundtrip"), endpoints);
             a3b_lab_mark(&dir, "deny-engine-ready");
             let mut byte = [0u8; 1];
             assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
@@ -3102,10 +3160,13 @@ mod tests {
         let mut engine = ChildGuard(cmd(&exe).env("SPIDERVPN_A3B_ROLE", "deny-engine")
             .env("SPIDERVPN_A3B_DIR", &dir).stdin(Stdio::piped()).spawn().unwrap());
         a3b_lab_wait(&dir, "deny-engine-ready");
-        let endpoints: Vec<SocketAddr> = std::fs::read_to_string(dir.join("deny-endpoints")).unwrap()
-            .lines().map(|s| s.parse().unwrap()).collect();
+        let encoded = std::fs::read_to_string(dir.join("deny-endpoints"))
+            .expect("read DENY engine fixture endpoint file");
+        let endpoints = a3b_deny_decode_endpoints(&encoded)
+            .unwrap_or_else(|reason| panic!("invalid DENY engine fixture endpoint file: {reason}; payload={encoded:?}"));
         assert_eq!(endpoints.len(), 2);
         assert!(endpoints[0].is_ipv4() && endpoints[1].is_ipv6());
+        println!("A3B_DENY_ENDPOINTS v4={} v6={} two_families=true", endpoints[0], endpoints[1]);
         let engine_pid = engine.0.id();
         assert_ne!(engine_pid, controller_pid);
         let verify_old_and_base = |before: &[super::super::wfp::FilterRaw], key: Guid| {
