@@ -175,6 +175,157 @@ fn owned_launcher_bytes(contents: &[u8], root: &Path, name: &str) -> bool {
     contents.eq_ignore_ascii_case(template.as_bytes())
 }
 
+// D1 only: a bounded read of one named local disk object. This is NOT a
+// capability to delete it later by pathname. The caller still needs a
+// separate same-object removal and uninstall-lifecycle gate.
+const MAX_LAUNCHER_BYTES: u64 = 8192;
+
+fn launcher_path_parts(path: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    // Reject namespace/relative paths, ADS, lexical aliases, empty segments
+    // and Win32 trailing-dot/space normalization before opening anything.
+    let text = path.to_str().ok_or("快捷方式路径不是有效文本")?.replace('/', "\\");
+    let bytes = text.as_bytes();
+    if bytes.len() < 4 || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':' || bytes[2] != b'\\'
+    {
+        return Err("快捷方式必须是本机磁盘绝对路径".into());
+    }
+    let mut current = std::path::PathBuf::from(&text[..3]);
+    let mut parts = vec![current.clone()];
+    for part in text[3..].split('\\') {
+        if part.is_empty() || part.ends_with(['.', ' '])
+            || part.chars().any(|c| c.is_control() || ":*?\"<>|".contains(c))
+        {
+            return Err("快捷方式路径包含不安全的名称或别名".into());
+        }
+        current.push(part);
+        parts.push(current.clone());
+    }
+    Ok(parts)
+}
+
+fn launcher_handle_info(file: &std::fs::File, directory: bool)
+    -> Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION, String>
+{
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, GetFileType, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_DEVICE, FILE_TYPE_DISK,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: live borrowed file handle, correctly sized initialized output.
+    if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK
+        || unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0
+    {
+        return Err("无法核验快捷方式磁盘文件对象".into());
+    }
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE) != 0
+        || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
+        || (!directory && (info.nNumberOfLinks != 1
+            || (info.nFileIndexHigh == 0 && info.nFileIndexLow == 0)))
+    {
+        return Err("快捷方式对象为链接、设备、非普通文件或身份未知".into());
+    }
+    Ok(info)
+}
+
+fn launcher_handle_path(file: &std::fs::File, expected: &Path) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS = 0. Reject aliases, including
+    // short names or redirected volumes that do not resolve to this name.
+    let mut buffer = vec![0u16; 32768];
+    let n = unsafe {
+        GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(),
+            buffer.len() as u32, 0)
+    } as usize;
+    if n == 0 || n >= buffer.len() {
+        return Err("无法读取快捷方式对象的规范路径".into());
+    }
+    let actual = String::from_utf16(&buffer[..n]).map_err(|_| "快捷方式对象路径无效")?;
+    let actual = actual.strip_prefix(r"\\?\").ok_or("快捷方式对象不是本地 DOS 路径")?;
+    let expected = expected.to_str().ok_or("快捷方式路径无效")?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err("快捷方式路径与打开的对象不一致".into());
+    }
+    Ok(())
+}
+
+fn launcher_size(info: &windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION) -> u64 {
+    (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow)
+}
+
+fn read_launcher_bounded(reader: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    // Do not trust the initial metadata length to bound allocation or I/O.
+    let mut bytes = Vec::with_capacity((MAX_LAUNCHER_BYTES + 1) as usize);
+    reader.take(MAX_LAUNCHER_BYTES + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_launcher_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let parts = launcher_path_parts(path)?;
+    let drive: Vec<u16> = parts[0].as_os_str().encode_wide().chain(Some(0)).collect();
+    // GetDriveTypeW: DRIVE_FIXED = 3. No mapped network/removable or unknown
+    // volume is accepted as a safe local desktop launcher.
+    if unsafe { GetDriveTypeW(drive.as_ptr()) } != 3 {
+        return Err("快捷方式不在固定本机磁盘上".into());
+    }
+    let (leaf, parents) = parts.split_last().ok_or("快捷方式路径为空")?;
+    let mut dirs = Vec::with_capacity(parents.len());
+    // Open root-to-leaf and keep all ancestor handles live for the whole
+    // observation. No delete/write sharing; reject reparse points at every
+    // level, not just a separate symlink_metadata check of the leaf.
+    for parent in parents {
+        let dir = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(parent).map_err(|e| format!("无法打开快捷方式祖先目录 {}：{e}", parent.display()))?;
+        launcher_handle_info(&dir, true)?;
+        launcher_handle_path(&dir, parent)?;
+        dirs.push(dir);
+    }
+    let mut file = std::fs::OpenOptions::new().read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(leaf).map_err(|e| format!("读取快捷方式 {} 失败：{e}", path.display()))?;
+    let before = launcher_handle_info(&file, false)?;
+    launcher_handle_path(&file, leaf)?;
+    if launcher_size(&before) > MAX_LAUNCHER_BYTES {
+        return Ok(None);
+    }
+    let bytes = read_launcher_bounded(&mut file)
+        .map_err(|e| format!("读取快捷方式 {} 失败：{e}", path.display()))?;
+    if bytes.len() as u64 > MAX_LAUNCHER_BYTES {
+        return Ok(None);
+    }
+    let after = launcher_handle_info(&file, false)?;
+    launcher_handle_path(&file, leaf)?;
+    if launcher_size(&before) != bytes.len() as u64
+        || launcher_size(&after) != bytes.len() as u64
+        || before.dwVolumeSerialNumber != after.dwVolumeSerialNumber
+        || before.nFileIndexHigh != after.nFileIndexHigh
+        || before.nFileIndexLow != after.nFileIndexLow
+        || before.dwFileAttributes != after.dwFileAttributes
+        || before.ftLastWriteTime.dwHighDateTime != after.ftLastWriteTime.dwHighDateTime
+        || before.ftLastWriteTime.dwLowDateTime != after.ftLastWriteTime.dwLowDateTime
+    {
+        return Err("快捷方式对象在读取期间变化，拒绝确认归属".into());
+    }
+    for (dir, parent) in dirs.iter().zip(parents) {
+        launcher_handle_info(dir, true)?;
+        launcher_handle_path(dir, parent)?;
+    }
+    Ok(Some(bytes))
+}
+
 /// This only reports ownership for known desktop/start-menu launchers.
 /// No deletion, no filesystem mutation and no WFP access.
 pub fn owns_launcher(path: &Path, root: &Path) -> Result<bool, String> {
@@ -182,9 +333,7 @@ pub fn owns_launcher(path: &Path, root: &Path) -> Result<bool, String> {
     let name = path.file_name().and_then(|s| s.to_str())
         .ok_or_else(|| "快捷方式文件名不是有效文本".to_string())?;
     let Some(_) = launcher_template(root, name) else { return Ok(false); };
-    let content = std::fs::read(path)
-        .map_err(|e| format!("读取快捷方式 {} 失败：{e}", path.display()))?;
-    if content.len() > 8192 { return Ok(false); }
+    let Some(content) = read_launcher_file(path)? else { return Ok(false); };
     Ok(owned_launcher_bytes(&content, root, name))
 }
 
@@ -390,4 +539,41 @@ mod tests {
         assert!(code_file_manifest().contains(&"spidervpn.exe"));
         assert!(code_file_manifest().iter().all(|n| !n.contains('*') && !n.contains('\\')));
     }
+
+    #[test]
+    fn launcher_bounded_reader_stops_at_8193_even_after_real_file_growth() {
+        use std::io::{Seek, Write};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let p = root("bounded-growth");
+        let path = p.join("grow.cmd");
+        std::fs::write(&path, b"small").unwrap();
+        // Deliberately allow a writer in this helper-level fault injection.
+        // The real identity gate denies write sharing instead.
+        let mut read = std::fs::OpenOptions::new().read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&path).unwrap();
+        assert_eq!(read.metadata().unwrap().len(), 5);
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(&vec![b'x'; 32000]).unwrap();
+        writer.flush().unwrap();
+        let got = read_launcher_bounded(&mut read).unwrap();
+        assert_eq!(got.len(), 8193);
+        assert_eq!(read.stream_position().unwrap(), 8193);
+        drop(writer);
+        drop(read);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn launcher_path_rejects_namespace_and_normalization_aliases() {
+        for name in [r"C:relative\启动SpiderVPN.cmd", r"\\server\share\启动SpiderVPN.cmd",
+            r"\\?\C:\folder\启动SpiderVPN.cmd", r"C:\a\..\启动SpiderVPN.cmd",
+            r"C:\a\.\启动SpiderVPN.cmd", r"C:\a.\启动SpiderVPN.cmd",
+            r"C:\a \启动SpiderVPN.cmd", r"C:\a:stream\启动SpiderVPN.cmd",
+            r"C:\a\\启动SpiderVPN.cmd"] {
+            assert!(launcher_path_parts(Path::new(name)).is_err(), "{name}");
+        }
+        assert!(launcher_path_parts(Path::new(r"C:\Users\Public\启动SpiderVPN.cmd")).is_ok());
+    }
+
 }
