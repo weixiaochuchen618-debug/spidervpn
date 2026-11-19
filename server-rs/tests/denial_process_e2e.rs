@@ -5,10 +5,14 @@
 #![cfg(target_os = "linux")]
 
 use spidervpn_pairing_authority::tls_identity::legacy_leaf_der_sha256;
-use std::fs::{self, DirBuilder};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -56,11 +60,18 @@ struct ChildGuard {
 }
 impl ChildGuard {
     fn start(args: &[&str]) -> Self {
-        let mut child = Command::new(BIN).args(args)
+        Self::start_configured(args, |_| {})
+    }
+
+    fn start_configured(args: &[&str], configure: impl FnOnce(&mut Command)) -> Self {
+        let mut command = Command::new(BIN);
+        command.args(args)
             // Deliberately set hostile path/port overrides; neither is used.
             .env("TC_PAIR_ROOT", "/tmp/attacker")
             .env("SPIDERVPN_PAIR_PORT", "443")
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        configure(&mut command);
+        let mut child = command.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = mpsc::channel();
         thread::spawn(move || {
@@ -105,6 +116,90 @@ fn assert_denied(args: &[&str], message: &str) {
         "failed startup emitted a ready or success message");
 }
 
+// pre_exec runs after Command's normal stdio remapping. The supplied
+// parent FDs remain live through spawn and are not leaked by the parent.
+fn override_fd(command: &mut Command, target: RawFd, source: Option<RawFd>) {
+    unsafe {
+        command.pre_exec(move || {
+            let result = match source {
+                Some(fd) => libc::dup2(fd, target),
+                None => libc::close(target),
+            };
+            if result < 0 { return Err(std::io::Error::last_os_error()); }
+            Ok(())
+        });
+    }
+}
+
+fn fixture_pipe() -> (OwnedFd, OwnedFd) {
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: successful pipe2 returned two distinct owned descriptors.
+    unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+}
+
+fn assert_silent_fd_refusal(pin: &str, mode: &str, target: RawFd, source: Option<RawFd>) {
+    let mut child = ChildGuard::start_configured(&["serve-denial-lab", pin],
+        |command| override_fd(command, target, source));
+    assert_eq!(child.wait().code(), Some(2), "{mode}: invalid stdio must refuse startup");
+    assert!(child.stderr().is_empty(), "{mode}: diagnostic escaped");
+    assert!(child.lines.recv_timeout(Duration::from_secs(1)).is_err(),
+        "{mode}: stdout escaped");
+    println!("FD_REFUSAL {mode} silent=true");
+}
+
+fn unsafe_inherited_stdio(pin: &str) {
+    let path = Path::new(LAB).join("fd-sentinel");
+    let sentinel = b"disposable nonsecret protected fixture\n";
+    fs::write(&path, sentinel).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let input = File::open(&path).unwrap();
+    assert_silent_fd_refusal(pin, "protected-stdin-file", 0, Some(input.as_raw_fd()));
+    let writable = OpenOptions::new().write(true).open(&path).unwrap();
+    assert_silent_fd_refusal(pin, "protected-stdout-file", 1, Some(writable.as_raw_fd()));
+    assert_silent_fd_refusal(pin, "protected-stderr-file", 2, Some(writable.as_raw_fd()));
+    assert_eq!(fs::read(&path).unwrap(), sentinel);
+
+    for fd in [0, 1, 2] {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        assert_silent_fd_refusal(pin, &format!("socket-{fd}"), fd, Some(socket.as_raw_fd()));
+        drop(socket);
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0, "socket received bytes");
+    }
+
+    let (read_end, write_end) = fixture_pipe();
+    assert_silent_fd_refusal(pin, "wrong-input-direction", 0, Some(write_end.as_raw_fd()));
+    for fd in [1, 2] {
+        assert_silent_fd_refusal(pin, &format!("wrong-output-direction-{fd}"),
+            fd, Some(read_end.as_raw_fd()));
+    }
+    let fifo_path = Path::new(LAB).join("named-fifo");
+    let name = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    // Keep a reader present so opening the writer cannot block.
+    let _keeper = OpenOptions::new().read(true).write(true).open(&fifo_path).unwrap();
+    let fifo = OpenOptions::new().write(true).open(&fifo_path).unwrap();
+    assert_silent_fd_refusal(pin, "named-fifo-output", 1, Some(fifo.as_raw_fd()));
+
+    let path_only = OpenOptions::new().read(true).custom_flags(libc::O_PATH)
+        .open(&path).unwrap();
+    assert_silent_fd_refusal(pin, "path-only-input", 0, Some(path_only.as_raw_fd()));
+    let zero = File::open("/dev/zero").unwrap();
+    assert_silent_fd_refusal(pin, "unexpected-input-device", 0, Some(zero.as_raw_fd()));
+    let null_output = OpenOptions::new().write(true).open("/dev/null").unwrap();
+    assert_silent_fd_refusal(pin, "unexpected-output-device", 2, Some(null_output.as_raw_fd()));
+
+    // Rust's Unix runtime may repair a closed stdio FD with O_RDWR
+    // /dev/null before main. That is also rejected by the strict policy.
+    for fd in [0, 1, 2] {
+        assert_silent_fd_refusal(pin, &format!("closed-{fd}"), fd, None);
+    }
+    assert_eq!(fs::read(&path).unwrap(), sentinel);
+    println!("FD_REFUSAL_COMPLETE modes=16 sentinel_unchanged=true");
+}
+
 fn status_field<'a>(status: &'a str, field: &str) -> &'a str {
     status.lines().find_map(|line| line.strip_prefix(field)).unwrap().trim()
 }
@@ -143,12 +238,36 @@ fn real_tls_denial(addr: SocketAddr) {
 }
 
 fn run_and_signal(pin: &str, signal: libc::c_int) {
-    let mut child = ChildGuard::start(&["serve-denial-lab", pin]);
+    let path = Path::new(LAB).join("fd-sentinel");
+    let protected = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let original = fs::read(&path).unwrap();
+    let (input, writer) = fixture_pipe();
+    let mut writer = File::from(writer);
+    let (extra_socket, mut peer) = UnixStream::pair().unwrap();
+    let mut child = ChildGuard::start_configured(&["serve-denial-lab", pin], |command| {
+        override_fd(command, 0, Some(input.as_raw_fd()));
+        override_fd(command, 198, Some(protected.as_raw_fd()));
+        override_fd(command, 199, Some(extra_socket.as_raw_fd()));
+    });
+    drop(input);
+    drop(extra_socket);
     let ready = child.lines.recv_timeout(Duration::from_secs(5)).unwrap();
     let address: SocketAddr = ready.strip_prefix("READY_DENIAL_ONLY ").unwrap().parse().unwrap();
     assert!(address.ip().is_loopback());
     assert!(address.port() >= 1024);
     readback_dropped_credentials(child.child.id());
+    // The original pipe's read end must be gone, not simply unused.
+    assert_eq!(writer.write_all(b"test input").unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe);
+    // Kernel enumeration of descriptor numbers (no need to follow the
+    // dumpable=0 process's protected proc symlinks) and independent EOF.
+    let fd_dir = format!("/proc/{}/fd", child.child.id());
+    let fds: Vec<_> = fs::read_dir(fd_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(!fds.iter().any(|name| name == "198" || name == "199"));
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    println!("FD_ISOLATION_READBACK signal={signal} stdin_replaced=true extra_file_closed=true extra_socket_closed=true");
     real_tls_denial(address);
 
     // Hold a real incomplete handshake until the process exits. Observe
@@ -183,6 +302,7 @@ fn run_and_signal(pin: &str, signal: libc::c_int) {
     assert!(child.stderr().is_empty());
     assert_eq!(TcpStream::connect(address).unwrap_err().kind(),
         std::io::ErrorKind::ConnectionRefused);
+    assert_eq!(fs::read(&path).unwrap(), original);
 }
 
 #[test]
@@ -204,6 +324,7 @@ fn real_root_startup_refuses_unsafe_identity_and_term_int_drain_after_privilege_
     assert_denied(&["serve-denial-lab", &pin], "identity or pin refused");
     fs::remove_file(&key).unwrap();
     fs::rename(&moved, &key).unwrap();
+    unsafe_inherited_stdio(&pin);
     run_and_signal(&pin, libc::SIGTERM);
     run_and_signal(&pin, libc::SIGINT);
 }

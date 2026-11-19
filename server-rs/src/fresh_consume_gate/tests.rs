@@ -1,0 +1,715 @@
+use super::*;
+use crate::http_one_request::read_one_request;
+use crate::ledger_disk::bootstrap_for_test;
+use crate::{AddressPool, Peer};
+use serde_json::json;
+use std::fs::{self, DirBuilder};
+use std::io::{Cursor, Write};
+use std::net::Ipv4Addr;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+const INV: &str = "11111111-1111-4111-8111-111111111111";
+const DEV: &str = "22222222-2222-4222-8222-222222222222";
+const REQ: &str = "33333333-3333-4333-8333-333333333333";
+const OTHER_INV: &str = "44444444-4444-4444-8444-444444444444";
+const NOW: &str = "2026-11-18T07:00:00Z";
+const EXP: &str = "2026-11-18T08:00:00Z";
+const RETRY: &str = "2026-11-18T08:02:00Z";
+const HOST: &str = "pair.example.test";
+const PORT: u16 = 18443;
+
+fn encode(raw: &[u8]) -> String {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    let (mut acc,mut bits) = (0u32,0);
+    for x in raw {
+        acc = (acc<<8) | u32::from(*x);
+        bits+=8;
+        while bits>=6 {
+            bits-=6;
+            out.push(char::from(alphabet[((acc>>bits)&63) as usize]));
+        }
+        acc&=(1<<bits)-1;
+    }
+    if bits>0 {out.push(char::from(alphabet[((acc<<(6-bits))&63) as usize]));}
+    out
+}
+fn wg(byte: u8) -> String { encode(&[byte;32]).replace('-',"+").replace('_',"/")+"=" }
+
+struct Directory(PathBuf);
+impl Directory {
+    fn new() -> Self {
+        static ID:AtomicUsize=AtomicUsize::new(0);
+        let path=std::env::temp_dir().join(format!("spider-fresh-gate-{}-{}",
+            std::process::id(),ID.fetch_add(1,Ordering::Relaxed)));
+        DirBuilder::new().mode(0o700).create(&path).unwrap();
+        Self(path)
+    }
+}
+impl Drop for Directory {
+    fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
+}
+
+struct TestKey { path:PathBuf, jwk:Value }
+impl TestKey {
+    fn generate(dir:&Path,name:&str)->Self {
+        let path=dir.join(name);
+        let status=Command::new("openssl").args(["genpkey","-algorithm","RSA",
+            "-pkeyopt","rsa_keygen_bits:2048","-out"]).arg(&path)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        assert!(status.success());
+        let modulus=Command::new("openssl").args(["rsa","-in"]).arg(&path)
+            .args(["-modulus","-noout"]).output().unwrap();
+        assert!(modulus.status.success());
+        let hex=String::from_utf8(modulus.stdout).unwrap();
+        let hex=hex.trim().strip_prefix("Modulus=").unwrap();
+        let bytes:Vec<u8>=(0..hex.len()).step_by(2)
+            .map(|i|u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect();
+        Self{path,jwk:json!({"kty":"RSA","e":"AQAB","n":encode(&bytes)})}
+    }
+    fn sign_raw(&self,header:&[u8],body:&[u8])->String {
+        let input=format!("{}.{}",encode(header),encode(body));
+        let mut child=Command::new("openssl").args(["dgst","-sha256","-sign"])
+            .arg(&self.path).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let output=child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        format!("{input}.{}",encode(&output.stdout))
+    }
+    fn sign(&self,body:&Value)->String {
+        self.sign_raw(br#"{"alg":"RS256","typ":"JWT"}"#,
+            &serde_json::to_vec(body).unwrap())
+    }
+}
+
+struct Fixture {
+    store:LedgerStore,
+    management:TestKey,
+    recipient:TestKey,
+    binding:Value,
+    token:String,
+    pin:String,
+    fingerprint:String,
+    body:Value,
+    invite:Value,
+    descriptor:Value,
+    signed_descriptor:String,
+    _dir:Directory,
+}
+impl Fixture {
+    fn new()->Self {
+        Self::with_times(NOW,EXP,RETRY,"2026-11-18T07:00:00.123456Z")
+    }
+    fn with_times(issued:&str,expires:&str,retry:&str,created:&str)->Self {
+        let dir=Directory::new();
+        bootstrap_for_test(&dir.0).unwrap();
+        let mut store=LedgerStore::open_existing(&dir.0,Duration::from_secs(1)).unwrap();
+        store.update(|l|l.insert_open(INV,utc_seconds(expires).unwrap())).unwrap();
+        let management=TestKey::generate(&dir.0,"management.pem");
+        let recipient=TestKey::generate(&dir.0,"recipient.pem");
+        let binding=json!({"RemoteOwnerId":"55555555-5555-4555-8555-555555555555",
+            "NodeId":"66666666-6666-4666-8666-666666666666","ServerPublicKey":wg(2)});
+        let token=encode(&[77;32]);
+        let pin="a".repeat(64);
+        let fingerprint=management_fingerprint(&management.jwk).unwrap();
+        let invite=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairInvite","InviteId":INV,
+            "RemoteOwnerId":binding["RemoteOwnerId"],"NodeId":binding["NodeId"],
+            "ServerPublicKey":binding["ServerPublicKey"],"ServerBinding":binding,
+            "ManagementSigningPublicKey":management.jwk,"IssuedAtUtc":issued,"ExpiresAtUtc":expires,
+            "PublicEndpoint":format!("{HOST}:{PORT}"),"DeviceName":"交易电脑",
+            "Capabilities":{"PairingVersion":1,"ManagementApiVersion":2,"Transport":"udp"}});
+        let descriptor=json!({"SchemaVersion":1,"Kind":"TradeChannel.OnlineInvite",
+            "InviteId":INV,"Invite":management.sign(&invite),"PublicHost":HOST,"Port":PORT,
+            "TlsSha256":pin,"ManagementFingerprint":fingerprint,
+            "ManagementSigningPublicKey":management.jwk,"ExpiresAtUtc":expires,"RetryUntilUtc":retry});
+        let signed_descriptor=management.sign(&descriptor);
+        let inner=json!({"SchemaVersion":1,"Kind":"TradeChannel.ClientRequest",
+            "RequestId":REQ,"DeviceId":DEV,"CreatedAtUtc":created,
+            "ClientPublicKey":wg(1),"AddressFamilies":["IPv4"]});
+        let body=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairRequest","InviteId":INV,
+            "ServerBinding":binding,"ClientRequest":inner,"DeviceName":"交易电脑",
+            "RecipientJwk":recipient.jwk,"RequestDigest":client_digest(&inner).unwrap(),
+            "RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":issued});
+        Self{store,management,recipient,binding,token,pin,fingerprint,body,invite,descriptor,
+            signed_descriptor,_dir:dir}
+    }
+    fn scope(&self)->TrustedOpenInvite<'_> {
+        TrustedOpenInvite{invite_id:INV,token:&self.token,signed_descriptor:&self.signed_descriptor,
+            management_jwk:&self.management.jwk,management_fingerprint:&self.fingerprint,
+            server_binding:&self.binding,public_host:HOST,port:PORT,tls_der_pin:&self.pin,wg_interface:"wg0"}
+    }
+    fn request(&self,compact:&str)->ParsedRequest {
+        let body=serde_json::to_vec(&json!({"PairRequest":compact})).unwrap();
+        let header=format!("POST /v1/invitations/{INV}/consume HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",self.token,body.len());
+        let mut wire=header.into_bytes();
+        wire.extend(body);
+        read_one_request(&mut Cursor::new(wire)).unwrap()
+    }
+    fn get(&self)->ParsedRequest {
+        read_one_request(&mut Cursor::new(format!("GET /v1/invitations/{INV} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nAuthorization: Bearer {}\r\n\r\n",self.token))).unwrap()
+    }
+    fn post(&self)->ParsedRequest {self.request(&self.recipient.sign(&self.body))}
+    fn error(&self,req:&ParsedRequest)->Option<GateError> {
+        fixture_fresh(&self.store,&self.scope(),req,utc_seconds(NOW).unwrap()).err()
+    }
+}
+
+#[test]
+fn signed_get_and_fresh_post_match_legacy_protocol_without_writing_ledger() {
+    let f=Fixture::new();
+    let generation=f.store.generation().unwrap();
+    let descriptor=fixture_get(&f.store,&f.scope(),&f.get(),utc_seconds(NOW).unwrap()).unwrap();
+    assert_eq!(descriptor.legacy_data(),json!({"Status":"InvitationReady","SignedDescriptor":f.signed_descriptor}));
+    let prepared=fixture_fresh(&f.store,&f.scope(),&f.post(),utc_seconds(NOW).unwrap()).unwrap();
+    assert_eq!(prepared.claims().request_id,REQ);
+    assert_eq!(prepared.claims().device_id,DEV);
+    assert_eq!(prepared.claims().public_key,wg(1));
+    assert_eq!(prepared.claims().request_digest,f.body["RequestDigest"].as_str().unwrap());
+    assert_eq!(prepared.recipient_jwk(),&f.recipient.jwk);
+    assert_eq!(f.store.generation().unwrap(),generation);
+    assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Open));
+}
+
+#[test]
+fn wrong_token_host_route_expiry_and_unknown_invitation_fail_closed() {
+    let f=Fixture::new();
+    let mut req=f.post();
+    req.authorization=Some(format!("Bearer {}",encode(&[78;32])));
+    assert_eq!(f.error(&req),Some(GateError::Forbidden));
+    req.authorization=None;
+    assert_eq!(f.error(&req),Some(GateError::Forbidden));
+    req=f.post();
+    req.host="foreign.example.test:18443".into();
+    assert_eq!(f.error(&req),Some(GateError::InviteMismatch));
+    req=f.post();
+    req.target.push_str("?extra=1");
+    assert_eq!(f.error(&req),Some(GateError::NotFound));
+    assert_eq!(fixture_fresh(&f.store,&f.scope(),&f.post(),utc_seconds(EXP).unwrap()).err(),Some(GateError::InviteExpired));
+    let mut other=f.scope();
+    other.invite_id=OTHER_INV;
+    req=f.post();
+    req.target=format!("/v1/invitations/{OTHER_INV}/consume");
+    assert_eq!(fixture_fresh(&f.store,&other,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InviteNotFound));
+}
+
+#[test]
+fn actual_signed_descriptor_and_nested_invite_must_bind_to_independent_scope() {
+    let f=Fixture::new();
+    let req=f.post();
+    let mut scope=f.scope();
+    let mut foreign=f.descriptor.clone();
+    foreign["TlsSha256"]=json!("b".repeat(64));
+    let signed=f.management.sign(&foreign);
+    scope.signed_descriptor=&signed;
+    assert_eq!(fixture_fresh(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InvalidState));
+    let mut inner=f.invite.clone();
+    inner["ServerBinding"]["NodeId"]=json!(OTHER_INV);
+    foreign=f.descriptor.clone();
+    foreign["Invite"]=json!(f.management.sign(&inner));
+    let signed=f.management.sign(&foreign);
+    scope.signed_descriptor=&signed;
+    assert_eq!(fixture_fresh(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InvalidState));
+    scope=f.scope();
+    scope.management_jwk=&f.recipient.jwk;
+    assert_eq!(fixture_fresh(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::InvalidState));
+}
+
+#[test]
+fn signed_request_requires_correct_proof_digest_identity_and_time() {
+    let f=Fixture::new();
+    let wrong_signer=f.management.sign(&f.body);
+    assert_eq!(f.error(&f.request(&wrong_signer)),Some(GateError::InvalidPairRequest));
+    let mut body=f.body.clone();
+    body["RequestDigest"]=json!("f".repeat(64));
+    assert_eq!(f.error(&f.request(&f.recipient.sign(&body))),Some(GateError::PairingMismatch));
+    body=f.body.clone();
+    body["ServerBinding"]["NodeId"]=json!(OTHER_INV);
+    assert_eq!(f.error(&f.request(&f.recipient.sign(&body))),Some(GateError::InviteMismatch));
+    body=f.body.clone();
+    body["CreatedAtUtc"]=json!("2026-11-18T07:05:01Z");
+    assert_eq!(f.error(&f.request(&f.recipient.sign(&body))),Some(GateError::InvalidPairRequest));
+    body=f.body.clone();
+    body["ClientRequest"]["ClientPublicKey"]=json!(wg(0));
+    body["RequestDigest"]=json!(client_digest(&body["ClientRequest"]).unwrap());
+    assert_eq!(f.error(&f.request(&f.recipient.sign(&body))),Some(GateError::InvalidPairRequest));
+}
+
+#[test]
+fn duplicate_json_keys_rejected_even_with_valid_signature() {
+    let f=Fixture::new();
+    let raw=serde_json::to_string(&f.body).unwrap();
+    let ambiguous=format!("{{\"Kind\":\"Other\",{}", &raw[1..]);
+    let jws=f.recipient.sign_raw(br#"{"alg":"RS256","typ":"JWT"}"#,ambiguous.as_bytes());
+    assert_eq!(f.error(&f.request(&jws)),Some(GateError::InvalidPairRequest));
+    let mut req=f.post();
+    req.body=format!("{{\"PairRequest\":\"x\",\"PairRequest\":\"{}\"}}",f.recipient.sign(&f.body)).into_bytes();
+    assert_eq!(f.error(&req),Some(GateError::InvalidRequest));
+    assert!(unique_json(br#"{"a":{"b":1,"b":2}}"#).is_none());
+}
+
+#[test]
+fn consumed_pending_revocation_and_other_invite_tombstones_cannot_reenroll() {
+    let mut f=Fixture::new();
+    let claims=fixture_fresh(&f.store,&f.scope(),&f.post(),utc_seconds(NOW).unwrap())
+        .unwrap().claims().clone();
+    let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
+    let grant=f.store.update(|l|l.reserve(claims.clone(),utc_seconds(NOW).unwrap(),pool,Some(&[]))).unwrap();
+    assert_eq!(f.error(&f.post()),Some(GateError::InvalidState));
+    let peer=Peer{public_key:claims.public_key.clone(),address:grant.address};
+    f.store.update(|l|l.confirm_consumed(INV,Some(&[peer]))).unwrap();
+    assert_eq!(f.error(&f.post()),Some(GateError::InviteConsumed));
+    f.store.update(|l|l.begin_revocation(INV)).unwrap();
+    assert_eq!(f.error(&f.post()),Some(GateError::Revoked));
+    f.store.update(|l|l.confirm_revocation(INV,Some(&[]))).unwrap();
+    assert_eq!(f.error(&f.post()),Some(GateError::Revoked));
+    // Separate invitation with a correctly signed new request and token
+    // cannot revive the same revoked device or public key.
+    f.store.update(|l|l.insert_open(OTHER_INV,utc_seconds(EXP).unwrap())).unwrap();
+    let mut invite=f.invite.clone();
+    invite["InviteId"]=json!(OTHER_INV);
+    let mut descriptor=f.descriptor.clone();
+    descriptor["InviteId"]=json!(OTHER_INV);
+    descriptor["Invite"]=json!(f.management.sign(&invite));
+    let signed=f.management.sign(&descriptor);
+    let mut scope=f.scope();
+    scope.invite_id=OTHER_INV;
+    scope.signed_descriptor=&signed;
+    let mut body=f.body.clone();
+    body["InviteId"]=json!(OTHER_INV);
+    body["ClientRequest"]["ClientPublicKey"]=json!(wg(3));
+    body["RequestDigest"]=json!(client_digest(&body["ClientRequest"]).unwrap());
+    let mut req=f.request(&f.recipient.sign(&body));
+    req.target=format!("/v1/invitations/{OTHER_INV}/consume");
+    assert_eq!(fixture_fresh(&f.store,&scope,&req,utc_seconds(NOW).unwrap()).err(),Some(GateError::Revoked));
+    assert_eq!(f.store.view().unwrap().state(OTHER_INV),Some(&InviteState::Open));
+}
+
+#[test]
+fn utc_clock_validates_calendar_and_preserves_fractional_digest_bytes() {
+    assert_eq!(utc_seconds("1970-01-01T00:00:00Z"),Some(0));
+    assert_eq!(utc_seconds("2000-02-29T00:00:00.123456Z"),Some(951782400));
+    assert_eq!(utc_seconds("2100-02-29T00:00:00Z"),None);
+    for invalid in ["2026-11-18T24:00:00Z","2026-11-18T00:60:00Z",
+        "2026-11-18T00:00:60Z","2026-11-18T00:00:00.Z","2026-11-18T00:00:00.1234567Z",
+        "2026-11-18T00:00:00+00:00","2026-11-18T00:00:00中"] {
+        assert_eq!(utc_seconds(invalid),None);
+    }
+}
+
+#[test]
+fn legacy_golden_original_request_digest_and_recipient_proof_still_agree() {
+    let fixture:Value=serde_json::from_str(include_str!("../../tests/fixtures/legacy_request_proof.json")).unwrap();
+    let compact=fixture["originalSignedPairRequest"].as_str().unwrap();
+    let unsigned=jws_payload(compact).unwrap();
+    let verified=verify_unique_jws(compact,&unsigned["RecipientJwk"]).unwrap();
+    assert_eq!(client_digest(&verified["ClientRequest"]).unwrap(),verified["RequestDigest"].as_str().unwrap());
+    assert_eq!(recipient_digest(&verified["RecipientJwk"]).unwrap(),
+        fixture["independentlyPinnedRecipientDigest"].as_str().unwrap());
+}
+
+#[test]
+fn authenticated_consumed_retry_is_bounded_exact_and_read_only() {
+    let mut f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let exp=utc_seconds(EXP).unwrap();
+    let req=f.post();
+    let claims=fixture_fresh(&f.store,&f.scope(),&req,now).unwrap().claims().clone();
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(&[])).err(),Some(GateError::InvalidState));
+    let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
+    let grant=f.store.update(|l|l.reserve(claims.clone(),now,pool,Some(&[]))).unwrap();
+    let peer=Peer{public_key:claims.public_key.clone(),address:grant.address};
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(std::slice::from_ref(&peer))).err(),Some(GateError::InvalidState));
+    f.store.update(|l|l.confirm_consumed(INV,Some(std::slice::from_ref(&peer)))).unwrap();
+    let gen=f.store.generation().unwrap();
+    let live=std::slice::from_ref(&peer);
+    for instant in [now,exp,exp+119] {
+        let retry=fixture_retry(&f.store,&f.scope(),&req,instant,Some(live)).unwrap();
+        assert_eq!(retry.claims(),&claims);
+    }
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,exp+120,Some(live)).err(),Some(GateError::InviteExpired));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,None).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(&[])).err(),Some(GateError::InvalidState));
+    let wrong=Peer{public_key:wg(3),address:peer.address};
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(&[wrong])).err(),Some(GateError::InvalidState));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(&[peer.clone(),peer.clone()])).err(),Some(GateError::InvalidState));
+    let mut body=f.body.clone();
+    body["ClientRequest"]["RequestId"]=json!(OTHER_INV);
+    body["RequestDigest"]=json!(client_digest(&body["ClientRequest"]).unwrap());
+    let changed=f.request(&f.recipient.sign(&body));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&changed,now,Some(live)).err(),Some(GateError::PairingMismatch));
+    let mut wrong_token=f.post();
+    wrong_token.authorization=Some(format!("Bearer {}",encode(&[78;32])));
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&wrong_token,now,Some(live)).err(),Some(GateError::Forbidden));
+    assert_eq!(f.store.generation().unwrap(),gen);
+    assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Consumed(grant)));
+    f.store.update(|l|l.begin_revocation(INV)).unwrap();
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(live)).err(),Some(GateError::Revoked));
+    f.store.update(|l|l.confirm_revocation(INV,Some(&[]))).unwrap();
+    assert_eq!(fixture_retry(&f.store,&f.scope(),&req,now,Some(live)).err(),Some(GateError::Revoked));
+}
+
+#[test]
+fn noncanonical_historical_revoking_key_cannot_evade_fresh_gate() {
+    let mut f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let mut claims=fixture_fresh(&f.store,&f.scope(),&f.post(),now).unwrap().claims().clone();
+    // Change only unused base64 pad bits: old wg_key shape accepts it.
+    let mut alias=wg(1);
+    assert_eq!(&alias[42..43],"E");
+    alias.replace_range(42..43,"F");
+    assert!(wg_key(&alias));
+    assert!(!canonical_wg_key(&alias));
+    claims.invite_id=OTHER_INV.into();
+    claims.device_id=OTHER_INV.into();
+    claims.public_key=alias;
+    let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
+    f.store.update(|l|l.insert_open(OTHER_INV,utc_seconds(EXP).unwrap())).unwrap();
+    f.store.update(|l|l.reserve(claims,now,pool,Some(&[]))).unwrap();
+    f.store.update(|l|l.begin_revocation(OTHER_INV)).unwrap();
+    let gen=f.store.generation().unwrap();
+    assert_eq!(f.error(&f.post()),Some(GateError::InvalidState));
+    assert_eq!(f.store.generation().unwrap(),gen);
+}
+
+#[test]
+fn independent_metadata_pin_binds_bearer_descriptor_and_scope() {
+    let f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let tag=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,f.token.as_bytes()),METADATA_BEARER_DOMAIN);
+    let tag_hex:String=tag.as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    let record=json!({"SchemaVersion":1,"Kind":"SpiderVPN.InviteMetadata",
+        "InviteId":INV,"BearerHmacSha256":tag_hex,"SignedDescriptor":f.signed_descriptor,
+        "ManagementSigningPublicKey":f.management.jwk,"ManagementFingerprint":f.fingerprint,
+        "ServerBinding":f.binding,"PublicHost":HOST,"Port":PORT,"TlsSha256":f.pin,"WgInterface":"wg0"});
+    let pin_for=|raw:&[u8]| -> String {
+        digest::digest(&digest::SHA256,raw).as_ref().iter().map(|b|format!("{b:02x}")).collect()
+    };
+    let raw=serde_json::to_vec(&record).unwrap();
+    let pin=pin_for(&raw);
+    let authenticated=verify_pinned_invite_metadata(&raw,&pin,&f.token).unwrap();
+    let scope=authenticated.scope().unwrap();
+    assert!(fixture_get(&f.store,&scope,&f.get(),now).is_ok());
+    assert!(fixture_fresh(&f.store,&scope,&f.post(),now).is_ok());
+    assert_eq!(check_retry_interface(&scope,"wg0"),Ok(()));
+    for wrong in ["wg1","wg00","WG0","all",""] {
+        assert_eq!(check_retry_interface(&scope,wrong),Err(GateError::InvalidState));
+    }
+    let other=encode(&[78;32]);
+    assert_eq!(verify_pinned_invite_metadata(&raw,&pin,&other).err(),Some(GateError::Forbidden));
+    assert_eq!(verify_pinned_invite_metadata(&raw,&"f".repeat(64),&f.token).err(),Some(GateError::InvalidState));
+    for field in ["BearerHmacSha256","SignedDescriptor","InviteId","PublicHost","TlsSha256","ServerBinding"] {
+        let mut altered=record.clone();
+        altered[field]=json!("attacker controlled");
+        assert_eq!(verify_pinned_invite_metadata(&serde_json::to_vec(&altered).unwrap(),&pin,&f.token).err(),Some(GateError::InvalidState));
+    }
+    // A valid but different interface name must not survive the original pin.
+    let mut changed=record.clone();
+    changed["WgInterface"]=json!("wg1");
+    assert_eq!(verify_pinned_invite_metadata(&serde_json::to_vec(&changed).unwrap(),&pin,&f.token).err(),Some(GateError::InvalidState));
+    // No implicit default or selector fallback; even an independently
+    // pinned malformed record must be refused.
+    let mut missing=record.clone();
+    missing.as_object_mut().unwrap().remove("WgInterface");
+    let bytes=serde_json::to_vec(&missing).unwrap();
+    assert_eq!(verify_pinned_invite_metadata(&bytes,&pin_for(&bytes),&f.token).err(),Some(GateError::InvalidState));
+    for name in ["all","interfaces","../wg0","wg0;id","WG 0",""] {
+        let mut bad=record.clone();
+        bad["WgInterface"]=json!(name);
+        let bytes=serde_json::to_vec(&bad).unwrap();
+        assert_eq!(verify_pinned_invite_metadata(&bytes,&pin_for(&bytes),&f.token).err(),Some(GateError::InvalidState));
+    }
+    // Even if independently pinned, ambiguous JSON must never become a scope.
+    let body=String::from_utf8(raw.clone()).unwrap();
+    let duplicate=format!("{{\"InviteId\":\"other\",{}",&body[1..]);
+    assert_eq!(verify_pinned_invite_metadata(duplicate.as_bytes(),&pin_for(duplicate.as_bytes()),&f.token).err(),Some(GateError::InvalidState));
+    assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Open));
+}
+
+fn fixture_retry<'a>(store: &'a LedgerStore,scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest,now: i64,peers: Option<&[Peer]>)
+    -> Result<VerifiedConsumedRetry<'a>,GateError>
+{
+    prepare_retry_with_observation(store,scope,request,||Ok(now),
+        ||peers.map(<[Peer]>::to_vec).ok_or(GateError::InvalidState))
+}
+
+#[test]
+fn retry_observes_under_current_lock_and_rechecks_clock_after_readback() {
+    let mut f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let exp=utc_seconds(EXP).unwrap();
+    let req=f.post();
+    let claims=fixture_fresh(&f.store,&f.scope(),&req,now).unwrap().claims().clone();
+    let pool=AddressPool{network:Ipv4Addr::new(10,44,0,0),prefix:24};
+    let grant=f.store.update(|l|l.reserve(claims.clone(),now,pool,Some(&[]))).unwrap();
+    let peer=Peer{public_key:claims.public_key.clone(),address:grant.address};
+    f.store.update(|l|l.confirm_consumed(INV,Some(std::slice::from_ref(&peer)))).unwrap();
+    let generation=f.store.generation().unwrap();
+    let scope=f.scope();
+    let mut times=[exp+119,exp+120].into_iter();
+    assert_eq!(prepare_retry_with_observation(&f.store,&scope,&req,
+        ||Ok(times.next().unwrap()),||{
+            assert!(LedgerStore::open_existing(&f._dir.0,Duration::from_millis(25)).is_err());
+            Ok(vec![peer.clone()])
+        }).err(),Some(GateError::InviteExpired));
+    let mut times=[now,now-1].into_iter();
+    assert_eq!(prepare_retry_with_observation(&f.store,&scope,&req,
+        ||Ok(times.next().unwrap()),||Ok(vec![peer.clone()])).err(),Some(GateError::InvalidState));
+    let mut bad=f.post();
+    bad.authorization=Some(format!("Bearer {}",encode(&[78;32])));
+    assert_eq!(prepare_retry_with_observation(&f.store,&scope,&bad,||Ok(now),
+        ||panic!("unauthenticated request must not read privileged inventory")).err(),Some(GateError::Forbidden));
+    let unrelated=Peer{public_key:wg(3),address:Ipv4Addr::new(10,44,0,9)};
+    assert_eq!(fixture_retry(&f.store,&scope,&req,now,Some(&[peer.clone(),unrelated.clone(),unrelated])).err(),
+        Some(GateError::InvalidState));
+    let proof=prepare_retry_with_observation(&f.store,&scope,&req,||Ok(now),||{
+        assert!(LedgerStore::open_existing(&f._dir.0,Duration::from_millis(25)).is_err());
+        Ok(vec![peer.clone()])
+    }).unwrap();
+    assert_eq!(proof.claims(),&claims);
+    // The external entry point rejects arbitrary selectors even before IO.
+    assert_eq!(prepare_consumed_retry(&f.store,&scope,&req,"all").err(),Some(GateError::InvalidState));
+    // A syntactically valid but differently named interface is also rejected
+    // before privileged IO, even if it happens to contain identical peers.
+    assert_eq!(prepare_consumed_retry(&f.store,&scope,&req,"wg1").err(),Some(GateError::InvalidState));
+    assert_eq!(f.store.generation().unwrap(),generation);
+    assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Consumed(grant)));
+}
+
+fn fixture_get<'a>(store: &'a LedgerStore,scope: &TrustedOpenInvite<'a>,
+    request: &ParsedRequest,now: i64) -> Result<OpenDescriptor<'a>,GateError>
+{
+    read_open_with_clock(store,scope,request,||Ok(now))
+}
+
+fn fixture_fresh<'a>(store: &'a LedgerStore,scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest,now: i64) -> Result<VerifiedFreshConsume<'a>,GateError>
+{
+    prepare_fresh_with_clock(store,scope,request,||Ok(now))
+}
+
+#[test]
+fn open_gates_recheck_expiry_and_generation_and_refuse_cancelled_replay() {
+    let mut f=Fixture::new();
+    let now=utc_seconds(NOW).unwrap();
+    let exp=utc_seconds(EXP).unwrap();
+    let get=f.get();
+    let post=f.post();
+    let generation=f.store.generation().unwrap();
+    {
+        let scope=f.scope();
+        let mut times=[exp-1,exp].into_iter();
+        assert_eq!(read_open_with_clock(&f.store,&scope,&get,
+            ||Ok(times.next().unwrap())).err(),Some(GateError::InviteExpired));
+        let mut times=[exp-1,exp].into_iter();
+        assert_eq!(prepare_fresh_with_clock(&f.store,&scope,&post,
+            ||Ok(times.next().unwrap())).err(),Some(GateError::InviteExpired));
+        let mut times=[now,now-1].into_iter();
+        assert_eq!(read_open_with_clock(&f.store,&scope,&get,
+            ||Ok(times.next().unwrap())).err(),Some(GateError::InvalidState));
+        let mut times=[now,now-1].into_iter();
+        assert_eq!(prepare_fresh_with_clock(&f.store,&scope,&post,
+            ||Ok(times.next().unwrap())).err(),Some(GateError::InvalidState));
+        assert!(fixture_get(&f.store,&scope,&get,now).is_ok());
+        assert!(fixture_fresh(&f.store,&scope,&post,now).is_ok());
+    }
+    assert_eq!(f.store.generation().unwrap(),generation);
+    f.store.update(|l|l.insert_open(OTHER_INV,exp)).unwrap();
+    let advanced=f.store.generation().unwrap();
+    assert!(advanced>generation);
+    // An old captured generation cannot validate even while the invite
+    // remains Open. This is an actual persisted generation change.
+    assert_eq!(check_open_completion(&f.store,INV,generation,now,now),
+        Err(GateError::InvalidState));
+    assert_eq!(check_open_completion(&f.store,INV,advanced,now,now),Ok(()));
+    f.store.update(|l|l.cancel_open(INV)).unwrap();
+    let cancelled_generation=f.store.generation().unwrap();
+    assert!(cancelled_generation>advanced);
+    let scope=f.scope();
+    assert_eq!(fixture_get(&f.store,&scope,&get,now).err(),Some(GateError::InviteCancelled));
+    assert_eq!(fixture_fresh(&f.store,&scope,&post,now).err(),Some(GateError::InviteCancelled));
+    // The real public system-clock paths must refuse as well.
+    assert_eq!(read_open_descriptor(&f.store,&scope,&get).err(),Some(GateError::InviteCancelled));
+    assert_eq!(prepare_fresh_consume(&f.store,&scope,&post).err(),Some(GateError::InviteCancelled));
+    assert_eq!(f.store.generation().unwrap(),cancelled_generation);
+}
+
+// GNU date is used only by this Linux test to independently construct the
+// signed UTC strings from the real wall clock, not by gate implementation.
+fn test_utc_at(seconds:i64)->String {
+    let output=Command::new("date").args(["-u","-d",&format!("@{seconds}"),
+        "+%Y-%m-%dT%H:%M:%SZ"]).output().unwrap();
+    assert!(output.status.success());
+    let timestamp=String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    assert_eq!(utc_seconds(&timestamp),Some(seconds));
+    timestamp
+}
+
+fn public_metadata_bytes(f:&Fixture)->(Vec<u8>,String) {
+    let tag=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,f.token.as_bytes()),METADATA_BEARER_DOMAIN);
+    let tag_hex:String=tag.as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    let raw=serde_json::to_vec(&json!({"SchemaVersion":1,"Kind":"SpiderVPN.InviteMetadata",
+        "InviteId":INV,"BearerHmacSha256":tag_hex,"SignedDescriptor":f.signed_descriptor,
+        "ManagementSigningPublicKey":f.management.jwk,"ManagementFingerprint":f.fingerprint,
+        "ServerBinding":f.binding,"PublicHost":HOST,"Port":PORT,"TlsSha256":f.pin,
+        "WgInterface":"wg0"})).unwrap();
+    let pin=digest::digest(&digest::SHA256,&raw).as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    (raw,pin)
+}
+
+#[test]
+fn public_system_clock_gates_accept_authenticated_current_scope_and_refuse_expiry() {
+    let now=system_utc_seconds().unwrap();
+    let issued=test_utc_at(now-60);
+    let exp=test_utc_at(now+3600);
+    let retry=test_utc_at(now+3720);
+    let mut f=Fixture::with_times(&issued,&exp,&retry,&issued);
+    let generation=f.store.generation().unwrap();
+    let (raw,pin)=public_metadata_bytes(&f);
+    let metadata=verify_pinned_invite_metadata(&raw,&pin,&f.token).unwrap();
+    let scope=metadata.scope().unwrap();
+    let get=f.get();
+    let post=f.post();
+    {
+        let d=read_open_descriptor(&f.store,&scope,&get).unwrap();
+        assert_eq!(d.legacy_data(),json!({"Status":"InvitationReady","SignedDescriptor":f.signed_descriptor}));
+        let p=prepare_fresh_consume(&f.store,&scope,&post).unwrap();
+        assert_eq!(p.claims().request_id,REQ);
+        assert_eq!(p.claims().public_key,wg(1));
+        assert_eq!(p.recipient_jwk(),&f.recipient.jwk);
+        assert!(LedgerStore::open_existing(&f._dir.0,Duration::from_millis(25)).is_err());
+    }
+    assert_eq!(f.store.generation().unwrap(),generation);
+    assert_eq!(f.store.view().unwrap().state(INV),Some(&InviteState::Open));
+
+    // A different current ledger with the same invitation ID but a
+    // different durable expiration must not accept the original scope.
+    let other=Fixture::with_times(&issued,&test_utc_at(now+7200),
+        &test_utc_at(now+7320),&issued);
+    assert_eq!(read_open_descriptor(&other.store,&scope,&get).err(),Some(GateError::InvalidState));
+    assert_eq!(prepare_fresh_consume(&other.store,&scope,&post).err(),Some(GateError::InvalidState));
+
+    // Valid signatures and metadata do not revive a genuinely expired
+    // invitation. No fake public timestamp is provided.
+    let expired_issued=test_utc_at(now-3600);
+    let expired=Fixture::with_times(&expired_issued,&test_utc_at(now-240),
+        &test_utc_at(now-120),&expired_issued);
+    let (raw,pin)=public_metadata_bytes(&expired);
+    let authenticated=verify_pinned_invite_metadata(&raw,&pin,&expired.token).unwrap();
+    let expired_scope=authenticated.scope().unwrap();
+    let expired_generation=expired.store.generation().unwrap();
+    assert_eq!(read_open_descriptor(&expired.store,&expired_scope,&expired.get()).err(),
+        Some(GateError::InviteExpired));
+    assert_eq!(prepare_fresh_consume(&expired.store,&expired_scope,&expired.post()).err(),
+        Some(GateError::InviteExpired));
+    assert_eq!(expired.store.generation().unwrap(),expired_generation);
+    assert_eq!(expired.store.view().unwrap().state(INV),Some(&InviteState::Open));
+
+    // Use the same already authenticated scope after a durable cancellation.
+    f.store.update(|l|l.cancel_open(INV)).unwrap();
+    let cancelled=f.store.generation().unwrap();
+    assert!(cancelled>generation);
+    assert_eq!(read_open_descriptor(&f.store,&scope,&get).err(),Some(GateError::InviteCancelled));
+    assert_eq!(prepare_fresh_consume(&f.store,&scope,&post).err(),Some(GateError::InviteCancelled));
+    assert_eq!(f.store.generation().unwrap(),cancelled);
+}
+
+fn l1_digest(bytes: &[u8]) -> [u8;32] {
+    digest::digest(&digest::SHA256, bytes).as_ref().try_into().unwrap()
+}
+
+#[test]
+fn l1_metadata_exact_ledger_binding_is_not_current_history() {
+    use crate::ledger_disk::ReadOnlyLedgerEvidence;
+    let f = Fixture::new();
+    // An independently generated same-ID/same-expiry metadata record.
+    let other = Fixture::new();
+    let (raw, pin) = public_metadata_bytes(&f);
+    let (foreign_raw, foreign_pin) = public_metadata_bytes(&other);
+    assert_ne!(pin, foreign_pin);
+    let req = f.post();
+    let foreign_req = other.post();
+    // Both records are individually valid. Only the selected fixture pin
+    // can match the record in this comparison; no trusted registry exists.
+    assert!(verify_pinned_invite_metadata(&foreign_raw, &foreign_pin, &other.token).is_ok());
+    let now = utc_seconds(NOW).unwrap();
+    let root = f._dir.0.clone();
+    let path = root.join("authority-ledger.json");
+    let generation = f.store.generation().unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let sha = l1_digest(&bytes);
+    let token = f.token.clone();
+    drop(f.store);
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    let result = compare_local_evidence(&e, (generation, &sha), &raw, &pin, &token, &req, now).unwrap();
+    assert_eq!(result.require_current_history(), Err(GateError::InvalidState));
+    assert!(compare_local_evidence(&e, (generation, &sha), &foreign_raw, &pin,
+        &other.token, &foreign_req, now).is_err());
+    assert!(compare_local_evidence(&e, (generation + 1, &sha), &raw, &pin, &token, &req, now).is_err());
+    assert!(LedgerStore::open_existing(&root, Duration::ZERO).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    drop(e);
+    // A legitimate byte-only change at the same generation is not the
+    // original evidence. Neither observation proves a current history.
+    let mut changed = bytes.clone();
+    changed.push(b' ');
+    fs::write(&path, &changed).unwrap();
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    assert!(compare_local_evidence(&e, (generation, &sha), &raw, &pin, &token, &req, now).is_err());
+    assert_eq!(compare_local_evidence(&e, (generation, &l1_digest(&changed)), &raw, &pin,
+        &token, &req, now).unwrap().require_current_history(), Err(GateError::InvalidState));
+}
+
+#[test]
+fn l1_revoking_revoked_and_rolled_back_metadata_never_elevate() {
+    use crate::ledger_disk::ReadOnlyLedgerEvidence;
+    let mut f = Fixture::new();
+    let (raw, pin) = public_metadata_bytes(&f);
+    let now = utc_seconds(NOW).unwrap();
+    let req = f.post();
+    let claims = fixture_fresh(&f.store, &f.scope(), &req, now).unwrap().claims().clone();
+    let root = f._dir.0.clone();
+    let path = root.join("authority-ledger.json");
+    let old = fs::read(&path).unwrap();
+    let old_generation = f.store.generation().unwrap();
+    let old_sha = l1_digest(&old);
+    let pool = AddressPool { network: Ipv4Addr::new(10,44,0,0), prefix: 24 };
+    let grant = f.store.update(|l| l.reserve(claims.clone(), now, pool, Some(&[]))).unwrap();
+    f.store.update(|l| l.confirm_consumed(INV, Some(&[Peer {
+        public_key: claims.public_key.clone(), address: grant.address,
+    }]))).unwrap();
+    f.store.update(|l| l.begin_revocation(INV)).unwrap();
+    let revoking_generation = f.store.generation().unwrap();
+    let token = f.token.clone();
+    drop(f.store);
+    let revoking = fs::read(&path).unwrap();
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    assert_eq!(compare_local_evidence(&e, (revoking_generation, &l1_digest(&revoking)),
+        &raw, &pin, &token, &req, now).err(), Some(GateError::Revoked));
+    assert!(compare_local_evidence(&e, (old_generation, &old_sha),
+        &raw, &pin, &token, &req, now).is_err());
+    drop(e);
+    let mut writer = LedgerStore::open_existing(&root, Duration::ZERO).unwrap();
+    writer.update(|l| l.confirm_revocation(INV, Some(&[]))).unwrap();
+    let revoked_generation = writer.generation().unwrap();
+    drop(writer);
+    let revoked = fs::read(&path).unwrap();
+    let revoked_sha = l1_digest(&revoked);
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    assert_eq!(compare_local_evidence(&e, (revoked_generation, &revoked_sha),
+        &raw, &pin, &token, &req, now).err(), Some(GateError::Revoked));
+    drop(e);
+    // Simulate a full local rollback after the lock is released. Old bytes
+    // plus old metadata really can match L1 again, but never acquire L2.
+    fs::write(&path, &old).unwrap();
+    let e = ReadOnlyLedgerEvidence::open(&root, Duration::ZERO).unwrap();
+    assert!(compare_local_evidence(&e, (revoked_generation, &revoked_sha),
+        &raw, &pin, &token, &req, now).is_err());
+    assert_eq!(compare_local_evidence(&e, (old_generation, &old_sha),
+        &raw, &pin, &token, &req, now).unwrap().require_current_history(), Err(GateError::InvalidState));
+    assert_eq!(fs::read(&path).unwrap(), old);
+}

@@ -1,89 +1,226 @@
 ﻿#requires -Version 5.1
-<#
-.SYNOPSIS
-把 release 产物打成可分发的 zip（含依赖 DLL、安装说明、用户速查），并生成 SHA256。
-
-.DESCRIPTION
-只打包真正要分发的东西：
-- spidervpn.exe（release）
-- WebView2Loader.dll（必须与 exe 同级，否则启动即 0xC0000135）
-- 一键安装.cmd / 一键卸载.cmd / 直接运行（免安装）.cmd（素材在 package-files\）
-- install\install.ps1 / uninstall.ps1 / expected.sha256（安装时核对哈希）
-- INSTALL.txt（安装、卸载、数据位置、常用命令、排错）
-- 用户速查（一页纸）
-
-数据目录固定在 C:\SpiderVPN\data（代码里的常量），与 exe 放哪无关——
-所以这个包解压到任意目录都能用，不会污染或迁移用户数据。
-
-用法：powershell -NoProfile -File package.ps1 [-Version 0.1.0]
-#>
+# Candidate packaging only; never fall back to shared legacy build output.
+# Invoke from the same reviewed clean source worktree:
+# package.ps1 -Version <version> -SourceSha <full SHA> -BuildDir <candidate output>
+#   -BuildEvidenceSha256 <independently retained reviewed build record hash>
+#   -ApprovalFile <external approved input JSON> -ApprovalSha256 <external hash>
+#   -EnginePath <approved engine> -LicensePath <approved license> -OutputDir <new ASCII directory> -GitPath <audited git.exe>
+# The resulting ZIP and manifest hashes require independent review. Never
+# run the package's own scripts to establish initial trust. 008-B is pending.
 [CmdletBinding()]
-param([string]$Version = '0.1.0')
+param([string]$Version,[string]$SourceSha,[string]$BuildDir,[string]$BuildEvidenceSha256,
+    [string]$ApprovalFile,[string]$ApprovalSha256,[string]$EnginePath,[string]$LicensePath,[string]$OutputDir,[string]$GitPath)
+$ErrorActionPreference='Stop'
+$here=$PSScriptRoot
+# Forward shared names because dot-source imports functions in this scope.
+. (Join-Path $here 'build.ps1') -SourceSha $SourceSha -ApprovalFile $ApprovalFile -ApprovalSha256 $ApprovalSha256 -GitPath $GitPath
 
-$ErrorActionPreference = 'Stop'
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$src  = 'C:\tc-rs-build\release'
-# 输出到仓库自己的 dist\（与源码同级，便于 .gitignore 一把排除）。
-$dist = Join-Path $here 'dist'
-
-$exe = Join-Path $src 'spidervpn.exe'
-$dll = Join-Path $src 'WebView2Loader.dll'
-foreach ($f in @($exe, $dll)) { if (-not (Test-Path $f)) { throw "缺产物：$f（先 cargo build --release）" } }
-
-$name = "SpiderVPN-$Version-windows-x64"
-$stage = Join-Path $dist $name
-$zip = Join-Path $dist "$name.zip"
-if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-if (Test-Path $zip) { Remove-Item $zip -Force }
-$null = New-Item -ItemType Directory -Path $stage -Force
-$null = New-Item -ItemType Directory -Path $dist -Force
-
-Copy-Item $exe (Join-Path $stage 'spidervpn.exe')
-Copy-Item $dll (Join-Path $stage 'WebView2Loader.dll')
-
-# 引擎随包分发，装到 bin\ 与程序同级：不带引擎的包落到一台全新机器上，
-# 用户连第一次连接都做不了。
-# 许可：sing-box 是 GPL-3.0，声明必须跟着二进制一起走。
-$vendorEngine = Join-Path $here 'vendor\sing-box.exe'
-$vendorLicense = Join-Path $here 'vendor\sing-box.LICENSE.txt'
-if (-not (Test-Path $vendorEngine)) {
-    throw "缺引擎：$vendorEngine（把 sing-box.exe 放到 vendor\ 下再打包）"
+function Read-CandidateBuild([string]$Dir,[string]$Digest,[string]$Root,[string]$Sha,[string]$ApprovalDigest,$Approval,[string]$Lock) {
+    if ($Dir -ieq 'C:\tc-rs-build\release') { throw 'Shared legacy output refused' }
+    $null=Assert-LocalPath $Dir -Directory
+    $allowed=@('spidervpn.exe','WebView2Loader.dll','build.log','build-evidence.json')
+    $items=@(Get-ChildItem -LiteralPath $Dir -Force)
+    if ($items.Count -ne $allowed.Count) { throw 'Unexpected build output set' }
+    foreach ($item in $items) {
+        if ($item.PSIsContainer -or $item.Name -cnotin $allowed) { throw 'Unknown build output' }
+        $null=Assert-LocalPath $item.FullName
+    }
+    $record=Join-Path $Dir 'build-evidence.json'
+    Assert-FileDigest $record $Digest
+    $e=Get-Content -LiteralPath $record -Raw | ConvertFrom-Json
+    if ($e.schema -ne 1 -or $e.kind -cne 'client-candidate-build' -or $e.sourceSha -cne $Sha -or
+        $e.repository -cne $Approval.repository -or $e.sourceRoot -cne $Root -or $e.outputDir -cne $Dir -or
+        $e.cargoLockSha256 -cne $Lock -or $e.approvalSha256 -ine $ApprovalDigest -or $e.target -cne $Approval.target -or
+        $e.toolchain -cne '1.100.0-x86_64-pc-windows-gnu' -or $e.exitCode -ne 0) { throw 'Build evidence scope mismatch' }
+    Assert-RustVersion $e.rustc $e.cargo
+    $expected=@(Candidate-CargoArguments $Root $e.targetDir)
+    $got=@($e.command)
+    if ($got.Count -ne $expected.Count+1) { throw 'Build command mismatch' }
+    for ($n=0;$n -lt $expected.Count;$n++) {
+        if ($got[$n+1] -cne $expected[$n]) { throw 'Build command or locked dependency mismatch' }
+    }
+    Assert-Separate $Root $e.targetDir
+    Assert-Separate $Dir $e.targetDir
+    if ($got[0] -cne $e.tools.rustup.path) { throw 'Build executable path mismatch' }
+    foreach ($key in @('git','rustup','gcc','dlltool','ld')) {
+        if ($e.tools.$key.sha256 -ine $Approval.$key.sha256 -or $e.tools.$key.source -cne $Approval.$key.source -or
+            -not ([string]$e.tools.$key.version).Contains([string]$Approval.$key.version)) { throw 'Tool evidence mismatch' }
+    }
+    Assert-FileDigest (Join-Path $Dir 'spidervpn.exe') $e.exeSha256
+    Assert-FileDigest (Join-Path $Dir 'WebView2Loader.dll') $e.loaderSha256
+    Assert-FileDigest (Join-Path $Dir 'WebView2Loader.dll') $Approval.loader.sha256
+    Assert-FileDigest (Join-Path $Dir 'build.log') $e.buildLogSha256
+    Assert-X64Pe (Join-Path $Dir 'spidervpn.exe')
+    Assert-X64Pe (Join-Path $Dir 'WebView2Loader.dll') -Dll
+    $e
 }
-Copy-Item $vendorEngine (Join-Path $stage 'sing-box.exe')
-if (Test-Path $vendorLicense) { Copy-Item $vendorLicense (Join-Path $stage 'sing-box.LICENSE.txt') }
-
-# 一键安装 / 一键卸载 / 免安装直接运行：交给别人的包必须双击就能用，
-# 不能要求对方「打开终端敲命令」。脚本源在 package-files\（都是 UTF-8 BOM / GBK+CRLF 的成品）。
-$files = Join-Path $here 'package-files'
-foreach ($f in @('install-once.cmd', 'uninstall-once.cmd', 'run-portable.cmd', 'install.ps1', 'uninstall.ps1')) {
-    if (-not (Test-Path (Join-Path $files $f))) { throw "缺打包素材：$f" }
+function Candidate-Names {
+    @('spidervpn.exe','WebView2Loader.dll','sing-box.exe','sing-box.LICENSE.txt',
+      '一键安装.cmd','一键卸载.cmd','直接运行（免安装）.cmd','install/install.ps1','install/uninstall.ps1',
+      'install/expected.sha256','INSTALL.txt','用户速查.md')
 }
-$stageInstall = Join-Path $stage 'install'
-$null = New-Item -ItemType Directory -Path $stageInstall -Force
-Copy-Item (Join-Path $files 'install-once.cmd')   (Join-Path $stage '一键安装.cmd')
-Copy-Item (Join-Path $files 'uninstall-once.cmd') (Join-Path $stage '一键卸载.cmd')
-Copy-Item (Join-Path $files 'run-portable.cmd')   (Join-Path $stage '直接运行（免安装）.cmd')
-Copy-Item (Join-Path $files 'install.ps1')        (Join-Path $stageInstall 'install.ps1')
-Copy-Item (Join-Path $files 'uninstall.ps1')      (Join-Path $stageInstall 'uninstall.ps1')
+function Assert-FileSet([string]$Stage,[string[]]$Names) {
+    $null=Assert-LocalPath $Stage -Directory
+    # Do not recurse into arbitrary directories or reparse points.
+    $dirs=@(Get-ChildItem -LiteralPath $Stage -Directory -Force)
+    if ($dirs.Count -ne 1 -or $dirs[0].Name -cne 'install') { throw 'Unexpected package directory' }
+    $null=Assert-LocalPath $dirs[0].FullName -Directory
+    $top=@(Get-ChildItem -LiteralPath $Stage -File -Force)
+    $inside=@(Get-ChildItem -LiteralPath $dirs[0].FullName -Force)
+    if (@($inside | Where-Object {$_.PSIsContainer}).Count -ne 0) { throw 'Unknown nested directory' }
+    $items=$top+$inside
+    if ($items.Count -ne $Names.Count) { throw 'Incomplete or extra file set' }
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in $items) {
+        $name=$item.FullName.Substring($Stage.Length+1).Replace('\','/')
+        if ($name -cnotin $Names -or -not $seen.Add($name)) { throw "Unknown or duplicate file: $name" }
+        $null=Assert-LocalPath $item.FullName
+    }
+}
+function New-CandidateManifest([string]$Stage) {
+    $names=@(Candidate-Names)
+    Assert-FileSet $Stage $names
+    foreach ($name in $names) {
+        $file=Join-Path $Stage $name.Replace('/','\')
+        [pscustomobject]@{path=$name;size=(Get-Item -LiteralPath $file).Length;sha256=(Candidate-Hash $file)}
+    }
+}
+function Assert-CandidateManifest($Entries) {
+    $names=@(Candidate-Names)
+    if (@($Entries).Count -ne $names.Count) { throw 'Manifest count mismatch' }
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $Entries) {
+        if ($entry.path -cnotin $names -or -not $seen.Add([string]$entry.path) -or
+            $entry.size -isnot [ValueType] -or $entry.size -lt 0 -or [decimal]$entry.size -ne [long]$entry.size) {
+            throw 'Invalid, duplicate or unknown manifest entry'
+        }
+        Assert-Digest $entry.sha256
+    }
+}
+function Assert-StageManifest([string]$Stage,$Entries,[string]$ManifestHash) {
+    Assert-CandidateManifest $Entries
+    Assert-FileSet $Stage (@(Candidate-Names)+@('manifest.json'))
+    Assert-FileDigest (Join-Path $Stage 'manifest.json') $ManifestHash
+    foreach ($entry in $Entries) {
+        $file=Join-Path $Stage $entry.path.Replace('/','\')
+        if ((Get-Item -LiteralPath $file).Length -ne $entry.size) { throw 'Manifest size mismatch' }
+        Assert-FileDigest $file $entry.sha256
+    }
+}
+function Write-CandidateZip([string]$Stage,[string]$Zip,$Entries,[string]$ManifestHash) {
+    Assert-StageManifest $Stage $Entries $ManifestHash
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $stream=[IO.File]::Open($Zip,[IO.FileMode]::CreateNew)
+    try {
+        $archive=[IO.Compression.ZipArchive]::new($stream,[IO.Compression.ZipArchiveMode]::Create,$false,[Text.Encoding]::UTF8)
+        try {
+            foreach ($name in (@(Candidate-Names)+@('manifest.json'))) {
+                $entry=$archive.CreateEntry($name,[IO.Compression.CompressionLevel]::Optimal)
+                $out=$entry.Open()
+                try {
+                    $in=[IO.File]::OpenRead((Join-Path $Stage $name.Replace('/','\')))
+                    try { $in.CopyTo($out) } finally { $in.Dispose() }
+                } finally { $out.Dispose() }
+            }
+        } finally { $archive.Dispose() }
+    } finally { $stream.Dispose() }
+}
+function Assert-CandidateZip([string]$Zip,$Entries,[string]$ManifestHash,[long]$ManifestSize) {
+    Assert-CandidateManifest $Entries
+    Assert-Digest $ManifestHash
+    $null=Assert-LocalPath $Zip
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $expected=@{}
+    foreach ($entry in $Entries) { $expected[$entry.path]=$entry }
+    $expected['manifest.json']=@{size=$ManifestSize;sha256=$ManifestHash}
+    $names=@(Candidate-Names)+@('manifest.json')
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $stream=[IO.File]::OpenRead($Zip)
+    try {
+        $archive=[IO.Compression.ZipArchive]::new($stream,[IO.Compression.ZipArchiveMode]::Read,$false,[Text.Encoding]::UTF8)
+        try {
+            if ($archive.Entries.Count -ne $names.Count) { throw 'ZIP count mismatch' }
+            foreach ($entry in $archive.Entries) {
+                $name=$entry.FullName
+                if ($name -cnotin $names -or -not $seen.Add($name)) { throw "ZIP unknown/duplicate/path escape: $name" }
+                if ((($entry.ExternalAttributes -shr 16) -band 0xf000) -eq 0xa000 -or ($entry.ExternalAttributes -band 0x400) -ne 0) { throw 'ZIP link entry' }
+                $want=$expected[$name]
+                if ($entry.Length -ne $want.size) { throw "ZIP size mismatch: $name" }
+                $in=$entry.Open()
+                try {
+                    if ((Get-FileHash -InputStream $in -Algorithm SHA256).Hash -ine $want.sha256) { throw "ZIP hash mismatch: $name" }
+                } finally { $in.Dispose() }
+            }
+        } finally { $archive.Dispose() }
+    } finally { $stream.Dispose() }
+}
 
-# 包内哈希清单：安装时核对，防「复制不完整 / 被杀软改写」
-$exeHashInPack = (Get-FileHash (Join-Path $stage 'spidervpn.exe') -Algorithm SHA256).Hash
-$engineHashInPack = (Get-FileHash (Join-Path $stage 'sing-box.exe') -Algorithm SHA256).Hash
-Set-Content -Path (Join-Path $stageInstall 'expected.sha256') -Encoding ASCII -Value @(
-    ("{0}  spidervpn.exe" -f $exeHashInPack),
-    ("{0}  sing-box.exe" -f $engineHashInPack)
+# Functions may be used by isolated TEST-ONLY integrity checks; the actual
+# package command has no fixture bypass and requires approved input digests.
+if ($MyInvocation.InvocationName -eq '.') { return }
+if ($Version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$' -or -not $SourceSha -or -not $BuildDir -or
+    -not $BuildEvidenceSha256 -or -not $ApprovalFile -or -not $ApprovalSha256 -or -not $EnginePath -or -not $LicensePath -or -not $OutputDir -or -not $GitPath) {
+    throw 'Explicit version, SHA, build evidence, external approval, engine/license and new output required'
+}
+$a=Read-CandidateApproval $ApprovalFile $ApprovalSha256 $SourceSha
+$gitEvidence=Read-AuditedApplication 'git.exe' $GitPath $a.git
+$lock=Assert-CandidateSource $here $SourceSha $gitEvidence.path
+Assert-Separate $here $ApprovalFile
+Assert-Separate $here $BuildDir
+$e=Read-CandidateBuild $BuildDir $BuildEvidenceSha256 $here $SourceSha $ApprovalSha256 $a $lock
+Assert-FileDigest $EnginePath $a.engine.sha256
+Assert-FileDigest $LicensePath $a.license.sha256
+Assert-X64Pe $EnginePath
+Assert-NewDirectory $OutputDir
+foreach ($path in @($here,$BuildDir,$e.targetDir,$ApprovalFile,$EnginePath,$LicensePath)) { Assert-Separate $OutputDir $path }
+$name="SpiderVPN-$Version-$($SourceSha.Substring(0,12))-windows-x64-CANDIDATE-NOT-APPROVED"
+$null=New-Item -ItemType Directory -Path $OutputDir
+$stage=Join-Path $OutputDir $name
+$null=New-Item -ItemType Directory -Path $stage
+$stageInstall=Join-Path $stage 'install'
+$null=New-Item -ItemType Directory -Path $stageInstall
+$copies=@(
+    ,@((Join-Path $BuildDir 'spidervpn.exe'),'spidervpn.exe',$e.exeSha256)
+    ,@((Join-Path $BuildDir 'WebView2Loader.dll'),'WebView2Loader.dll',$a.loader.sha256)
+    ,@($EnginePath,'sing-box.exe',$a.engine.sha256)
+    ,@($LicensePath,'sing-box.LICENSE.txt',$a.license.sha256)
+)
+$sourceFiles=[ordered]@{
+    'package-files\install-once.cmd'='一键安装.cmd'
+    'package-files\uninstall-once.cmd'='一键卸载.cmd'
+    'package-files\run-portable.cmd'='直接运行（免安装）.cmd'
+    'package-files\install.ps1'='install\install.ps1'
+    'package-files\uninstall.ps1'='install\uninstall.ps1'
+    'docs\用户速查.md'='用户速查.md'
+}
+foreach ($file in $sourceFiles.Keys) {
+    $src=Assert-LocalPath (Join-Path $here $file)
+    $copies+=,@($src,$sourceFiles[$file],(Candidate-Hash $src))
+}
+foreach ($copy in $copies) {
+    Assert-FileDigest $copy[0] $copy[2]
+    $dest=Join-Path $stage $copy[1]
+    Copy-Item -LiteralPath $copy[0] -Destination $dest
+    Assert-FileDigest $dest $copy[2]
+}
+# Compatibility only; covered by full inventory, no source authentication.
+Set-Content -LiteralPath (Join-Path $stageInstall 'expected.sha256') -Encoding ASCII -Value @(
+    ("{0}  spidervpn.exe" -f $e.exeSha256),("{0}  sing-box.exe" -f $a.engine.sha256)
 )
 
 $install = @'
-SpiderVPN 0.1.4（Windows x64）
+SpiderVPN（Windows x64）候选包 — 未批准发布或安装
 
 一、怎么装（推荐，一次就好）
+  先通过独立可信渠道核验 ZIP 与完整清单。008-B尚未验收，当前不得安装。
+  以下仅保留正式获准后的原使用说明。
   1. 把整个文件夹解压到任意位置（桌面、D 盘都行）。
   2. 双击「一键安装.cmd」。
      它会：复制程序到 C:\SpiderVPN\bin、在桌面和开始菜单建启动入口、
-     校验文件哈希。普通权限即可，不需要管理员。
-     如果 Windows 弹出「已保护你的电脑」（程序没有代码签名，第一次运行常见），
-     点「更多信息」→「仍要运行」即可；杀软误报同理，加信任即可。
+     校验文件哈希。安装需要管理员权限。
+     遇到 Windows 或安全软件警告请停止并核实来源，不要绕过保护。
   3. 双击桌面「启动SpiderVPN.cmd」→ 添加线路 → 点连接。
      要接管不读系统代理的程序（TUN 模式）：用「以管理员身份启动SpiderVPN.cmd」。
      引擎（sing-box）随包装在 bin\sing-box.exe，装完就能连，不用先去别处找程序。
@@ -126,46 +263,30 @@ SpiderVPN 0.1.4（Windows x64）
   标准连接自检不通    → 照结论后的提示执行 --set-transport tcp。
   交易保护装不上      → 需要管理员权限；未提权时连接照常，只是不阻断直连。
 '@
-Set-Content -Path (Join-Path $stage 'INSTALL.txt') -Value $install -Encoding UTF8
-
-$guide = Join-Path $here 'docs\用户速查.md'
-if (Test-Path $guide) { Copy-Item $guide (Join-Path $stage '用户速查.md') }
-
-# 自己写条目而不是 Compress-Archive / ZipFile.CreateFromDirectory：
-# .NET Framework 那两个在 Windows 上会把条目名写成反斜杠（`a\b.txt`），
-# 标准 unzip 与部分解压工具会判成非法条目。ZIP 规范要求正斜杠。
-Add-Type -AssemblyName System.IO.Compression
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$stageFull = (Resolve-Path -LiteralPath $stage).Path
-$zipStream = [System.IO.File]::Open($zip, [System.IO.FileMode]::Create)
-try {
-    # 第 4 个参数传 UTF8：.NET 才会给条目置「UTF-8 名称」标志位。
-    # 不传的话中文文件名（一键安装.cmd 等）在非 Windows 的解压工具里会变乱码。
-    $archive = New-Object System.IO.Compression.ZipArchive(
-        $zipStream, [System.IO.Compression.ZipArchiveMode]::Create, $false,
-        [System.Text.Encoding]::UTF8)
-    try {
-        Get-ChildItem -LiteralPath $stageFull -Recurse -File | ForEach-Object {
-            $rel = $_.FullName.Substring($stageFull.Length).TrimStart('\', '/').Replace('\', '/')
-            $entry = $archive.CreateEntry($rel, [System.IO.Compression.CompressionLevel]::Optimal)
-            $out = $entry.Open()
-            try {
-                $in = [System.IO.File]::OpenRead($_.FullName)
-                try { $in.CopyTo($out) } finally { $in.Dispose() }
-            } finally { $out.Dispose() }
-        }
-    } finally { $archive.Dispose() }
-} finally { $zipStream.Dispose() }
-
-$hash = (Get-FileHash $zip -Algorithm SHA256).Hash
-Set-Content -Path "$zip.sha256" -Value ("{0}  {1}" -f $hash, (Split-Path -Leaf $zip)) -Encoding ASCII
-$exeHash = (Get-FileHash (Join-Path $stage 'spidervpn.exe') -Algorithm SHA256).Hash
-
-[pscustomobject]@{
-    Name = $name
-    Zip = $zip
-    ZipBytes = (Get-Item $zip).Length
-    ZipSha256 = $hash
-    ExeSha256 = $exeHash
-    ExeBytes = (Get-Item (Join-Path $stage 'spidervpn.exe')).Length
-} | Format-List
+Set-Content -LiteralPath (Join-Path $stage 'INSTALL.txt') -Value $install -Encoding UTF8
+if ((Assert-CandidateSource $here $SourceSha $gitEvidence.path) -cne $lock) { throw 'Source changed during packaging' }
+Assert-FileDigest $ApprovalFile $ApprovalSha256
+Assert-FileDigest (Join-Path $BuildDir 'build-evidence.json') $BuildEvidenceSha256
+$entries=@(New-CandidateManifest $stage)
+$manifest=Join-Path $stage 'manifest.json'
+[ordered]@{schema=1;kind='unapproved-client-candidate';sourceSha=$SourceSha;files=$entries} |
+    ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifest -Encoding UTF8
+$mh=Candidate-Hash $manifest
+$partial=Join-Path $OutputDir "$name.zip.partial"
+Write-CandidateZip $stage $partial $entries $mh
+Assert-CandidateZip $partial $entries $mh (Get-Item -LiteralPath $manifest).Length
+Assert-StageManifest $stage $entries $mh
+$zip=Join-Path $OutputDir "$name.zip"
+Move-Item -LiteralPath $partial -Destination $zip
+$hash=Candidate-Hash $zip
+[ordered]@{
+    schema=1;kind='unapproved-client-candidate';sourceSha=$SourceSha;repository=$a.repository
+    buildEvidenceSha256=$BuildEvidenceSha256.ToLowerInvariant();approvalSha256=$ApprovalSha256.ToLowerInvariant()
+    cargoLockSha256=$lock;target=$e.target;toolchain=$e.toolchain;zip=(Split-Path -Leaf $zip)
+    zipSha256=$hash;manifestSha256=$mh;engineSource=$a.engine.source;engineVersion=$a.engine.version
+    engineSha256=$a.engine.sha256;loaderSource=$a.loader.source;loaderSha256=$a.loader.sha256
+    licenseSource=$a.license.source;licenseSha256=$a.license.sha256
+    status='AWAIT INDEPENDENT APPROVAL; no publisher authentication or installation approval'
+} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputDir 'candidate-evidence.json') -Encoding UTF8
+Set-Content -LiteralPath "$zip.sha256" -Value ("{0}  {1}" -f $hash,(Split-Path -Leaf $zip)) -Encoding ASCII
+[pscustomobject]@{Zip=$zip;ZipSha256=$hash;ManifestSha256=$mh;SourceSha=$SourceSha;Status='NOT APPROVED FOR INSTALLATION'}

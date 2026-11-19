@@ -163,6 +163,12 @@ unsafe extern "C" {
 }
 
 fn secure_read(root: &Path) -> Result<Document, StoreError> {
+    read_validated_document(root).map(|(doc, _)| doc)
+}
+
+// One open and one bounded read for both the parsed document and the exact
+// bytes that passed all existing validations. No reserialization or reopen.
+fn read_validated_document(root: &Path) -> Result<(Document, Vec<u8>), StoreError> {
     let path = root.join(LEDGER_NAME);
     let file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(&path)
         .map_err(|e| if e.kind() == io::ErrorKind::NotFound {
@@ -182,7 +188,41 @@ fn secure_read(root: &Path) -> Result<Document, StoreError> {
         return Err(StoreError::Invalid("unknown ledger schema or impossible generation"));
     }
     validate(&doc.ledger)?;
-    Ok(doc)
+    Ok((doc, bytes))
+}
+
+/// L1 isolated experiment ONLY: an observation of validated local bytes,
+/// NOT an independently current checkpoint or permission. Own the same
+/// exclusive lock as LedgerStore, but expose no mutation, conversion to a
+/// writable store, detached digest/ledger, or serialization interface.
+/// Noncooperating writers, whole-machine rollback and external revocation
+/// are outside this local evidence boundary. Compiled only for tests.
+#[cfg(test)]
+pub(crate) struct ReadOnlyLedgerEvidence {
+    doc: Document,
+    sha256: ring::digest::Digest,
+    _guard: AuthorityLock,
+}
+
+#[cfg(test)]
+impl ReadOnlyLedgerEvidence {
+    pub(crate) fn open(root: &Path, timeout: Duration) -> Result<Self, StoreError> {
+        let guard = lock::acquire_for(root, timeout)?;
+        let (doc, bytes) = read_validated_document(root)?;
+        let sha256 = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        Ok(Self { doc, sha256, _guard: guard })
+    }
+
+    /// The expected tuple is only comparison input, not trusted history.
+    /// Borrow the parsed value from this exact still-locked observation.
+    pub(crate) fn compare(&self, generation: u64, sha256: &[u8; 32])
+        -> Result<&Ledger, StoreError>
+    {
+        if self.doc.generation != generation || self.sha256.as_ref() != sha256 {
+            return Err(StoreError::Invalid("local ledger evidence mismatch"));
+        }
+        Ok(&self.doc.ledger)
+    }
 }
 
 fn temporary_path(root: &Path) -> Result<PathBuf, StoreError> {
@@ -513,6 +553,112 @@ mod tests {
             Err(StoreError::Io(ref err)) if err.kind() == io::ErrorKind::TimedOut));
         drop(owner);
         LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
+        fs::remove_dir_all(p).unwrap();
+    }
+
+    fn exact_digest(bytes: &[u8]) -> [u8; 32] {
+        ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().try_into().unwrap()
+    }
+
+    #[test]
+    fn l1_exact_original_bytes_generation_and_exclusive_lock() {
+        let p = dir("l1-exact");
+        bootstrap_for_test(&p).unwrap();
+        let path = p.join(LEDGER_NAME);
+        let mut writer = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
+        writer.update(|l| l.insert_open(INV, 600)).unwrap();
+        let generation = writer.generation().unwrap();
+        drop(writer);
+        let canonical = fs::read(&path).unwrap();
+        let mut raw = canonical.clone();
+        raw.extend_from_slice(b" \n\t");
+        fs::write(&path, &raw).unwrap();
+        let exact = exact_digest(&raw);
+        let evidence = ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).unwrap();
+        let ledger = evidence.compare(generation, &exact).unwrap();
+        assert!(matches!(ledger.state(INV), Some(InviteState::Open)));
+        assert!(evidence.compare(generation, &exact_digest(&canonical)).is_err());
+        assert!(evidence.compare(generation + 1, &exact).is_err());
+        assert!(matches!(LedgerStore::open_existing(&p, Duration::from_millis(40)),
+            Err(StoreError::Io(ref err)) if err.kind() == io::ErrorKind::TimedOut));
+        assert!(ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).is_err());
+        assert_eq!(fs::read(&path).unwrap(), raw);
+        drop(evidence);
+        let mut writer = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
+        writer.update(|l| l.cancel_open(INV)).unwrap();
+        let next_generation = writer.generation().unwrap();
+        drop(writer);
+        let next = fs::read(&path).unwrap();
+        let evidence = ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).unwrap();
+        assert!(evidence.compare(generation, &exact).is_err());
+        assert!(evidence.compare(next_generation, &exact).is_err());
+        assert!(matches!(evidence.compare(next_generation, &exact_digest(&next))
+            .unwrap().state(INV), Some(InviteState::Cancelled)));
+        drop(evidence);
+        fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn l1_same_generation_other_valid_ledger_and_unsafe_bytes_are_rejected() {
+        let p = dir("l1-foreign");
+        let q = dir("l1-other");
+        for (root, id) in [(&p, INV), (&q, INV2)] {
+            bootstrap_for_test(root).unwrap();
+            let mut writer = LedgerStore::open_existing(root, Duration::ZERO).unwrap();
+            writer.update(|l| l.insert_open(id, 600)).unwrap();
+        }
+        let path = p.join(LEDGER_NAME);
+        let raw = fs::read(&path).unwrap();
+        let other = fs::read(q.join(LEDGER_NAME)).unwrap();
+        let expected = exact_digest(&raw);
+        let e = ReadOnlyLedgerEvidence::open(&q, Duration::ZERO).unwrap();
+        assert!(e.compare(2, &expected).is_err());
+        assert!(e.compare(2, &exact_digest(&other)).unwrap().state(INV2).is_some());
+        drop(e);
+        // Same generation and valid schema, different parsed ledger.
+        fs::write(&path, &other).unwrap();
+        let e = ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).unwrap();
+        assert!(e.compare(2, &expected).is_err());
+        drop(e);
+        fs::write(&path, b"{malformed").unwrap();
+        assert!(ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).is_err());
+        fs::write(&path, &raw).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let moved = p.join("copy");
+        fs::rename(&path, &moved).unwrap();
+        assert!(matches!(ReadOnlyLedgerEvidence::open(&p, Duration::ZERO), Err(StoreError::Missing)));
+        symlink(&moved, &path).unwrap();
+        assert!(ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&moved, &path).unwrap();
+        assert!(ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).is_err());
+        fs::remove_dir_all(p).unwrap();
+        fs::remove_dir_all(q).unwrap();
+    }
+
+    #[test]
+    fn l1_cannot_share_poisoned_writer_or_reuse_its_old_evidence() {
+        let p = dir("l1-poison");
+        bootstrap_for_test(&p).unwrap();
+        let mut writer = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
+        writer.update(|l| l.insert_open(INV, 600)).unwrap();
+        let old_generation = writer.generation().unwrap();
+        let old = exact_digest(&fs::read(p.join(LEDGER_NAME)).unwrap());
+        FAIL_AFTER_RENAME.with(|cell| cell.set(true));
+        let failed = writer.update(|l| l.cancel_open(INV));
+        FAIL_AFTER_RENAME.with(|cell| cell.set(false));
+        assert!(failed.is_err());
+        assert!(matches!(writer.view(), Err(StoreError::Poisoned)));
+        assert!(ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).is_err());
+        drop(writer);
+        let e = ReadOnlyLedgerEvidence::open(&p, Duration::ZERO).unwrap();
+        assert!(e.compare(old_generation, &old).is_err());
+        let new = exact_digest(&fs::read(p.join(LEDGER_NAME)).unwrap());
+        assert!(matches!(e.compare(old_generation + 1, &new).unwrap().state(INV),
+            Some(InviteState::Cancelled)));
+        drop(e);
         fs::remove_dir_all(p).unwrap();
     }
 }

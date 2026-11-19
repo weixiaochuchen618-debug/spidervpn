@@ -32,6 +32,12 @@ jobs:
             throw "SEC-09 uninstall wrapper has PowerShell syntax errors"
           }
 
+      - name: SEC-03 isolated candidate packaging integrity tests (not a release)
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tests/package-candidate-e2e.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build with Rust
         run: cargo build --locked
 
@@ -44,6 +50,15 @@ jobs:
             Write-Host "Running MSVC Rust security tests: $filter"
             & cargo test --locked --bin spidervpn $filter -- --test-threads=1
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          foreach ($test in @('engine::tests::start_reports_pid_and_process_is_alive', 'engine::tests::actual_token_query_failure_is_not_nonadmin', 'ipc::tests::the_real_probe_rejects_a_program_that_is_not_sing_box')) {
+            Write-Host "Running exact MSVC engine entry test: $test"
+            $output = & cargo test --locked --bin spidervpn $test -- --exact --nocapture --test-threads=1 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) { exit $code }
+            if (($output -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw "Exact engine entry test did not execute once: $test" }
+            if (($output -join "`n") -notmatch 'ENGINE_ENTRY_ACTUAL_TOKEN elevated=(true|false)') { throw "Missing actual process token readback: $test" }
           }
 
       - name: SEC-01 legacy Python SSH writer retirement gate (MSVC)

@@ -71,6 +71,76 @@ pub fn validate_privileged_engine(
     Ok(())
 }
 
+/// Query the *primary process token*, not registry writability, a caller
+/// supplied bool, the current thread's impersonation token or the legacy
+/// SPIDERVPN_FORCE_NONADMIN test hook. CreateProcess runs with the primary
+/// token. An error or incomplete/unknown reply must never mean non-admin.
+#[cfg(windows)]
+pub(crate) fn actual_process_elevation() -> Result<bool, String> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: valid pseudo-handle to this process, writable out pointer.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0
+        || raw.is_null()
+    {
+        return Err(format!("无法核验管理员 引擎执行权限（进程 Token）：{}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: OpenProcessToken returned an owned token handle.
+    let _token = unsafe { OwnedHandle::from_raw_handle(raw) };
+    read_token_elevation(raw)
+}
+
+#[cfg(windows)]
+fn read_token_elevation(raw: windows_sys::Win32::Foundation::HANDLE) -> Result<bool, String> {
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION};
+    let mut value = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
+    let mut returned = 0u32;
+    // SAFETY: token remains owned, output is correctly sized and aligned.
+    if unsafe { GetTokenInformation(raw, TokenElevation,
+        (&mut value as *mut TOKEN_ELEVATION).cast(), size, &mut returned) } == 0
+    {
+        return Err(format!("无法核验管理员 引擎执行权限（TokenElevation）：{}", std::io::Error::last_os_error()));
+    }
+    if returned != size {
+        return Err("无法核验管理员 引擎执行权限（TokenElevation 长度未知）".into());
+    }
+    match value.TokenIsElevated {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err("无法核验管理员 引擎执行权限（TokenElevation 值未知）".into()),
+    }
+}
+
+/// One actual execution gate shared by start and the version subprocess.
+/// This only enforces the existing bundled-path/reparse policy, not a
+/// signature, trusted ACL, or same-file-object CreateProcess guarantee.
+pub(crate) fn checked_engine_program(requested: &std::path::Path)
+    -> Result<std::path::PathBuf, String>
+{
+    #[cfg(windows)]
+    {
+        if !actual_process_elevation()? {
+            // Preserve the real standard user's configured path verbatim.
+            return Ok(requested.to_path_buf());
+        }
+        let frontend = std::env::current_exe()
+            .map_err(|e| format!("无法确认 SpiderVPN 主程序身份：{e}"))?;
+        validate_privileged_engine(requested, &frontend)?;
+        // Never hand a separate caller-controlled alias/relative executable
+        // path back to Command after the privileged policy check.
+        Ok(frontend.parent().ok_or("无法确认 SpiderVPN 主程序目录")?.join("sing-box.exe"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = requested;
+        Err("无法在此平台核验管理员 引擎执行权限".into())
+    }
+}
+
 /// 拉起引擎。失败信息里带上程序路径——只说「启动失败」没法排查。
 pub fn start(cfg: &EngineConfig, log_dir: &std::path::Path) -> Result<EngineHandle, String> {
     if cfg.binary.trim().is_empty() {
@@ -79,6 +149,7 @@ pub fn start(cfg: &EngineConfig, log_dir: &std::path::Path) -> Result<EngineHand
     if !std::path::Path::new(&cfg.binary).exists() {
         return Err(format!("引擎程序不存在：{}", cfg.binary));
     }
+    let program = checked_engine_program(std::path::Path::new(&cfg.binary))?;
     let _ = std::fs::create_dir_all(log_dir);
 
     // 引擎自己的 stdout/stderr 必须落盘（`logs\engine.log`）。
@@ -96,7 +167,7 @@ pub fn start(cfg: &EngineConfig, log_dir: &std::path::Path) -> Result<EngineHand
         .append(true)
         .open(&log_path)
         .ok();
-    let mut cmd = Command::new(&cfg.binary);
+    let mut cmd = Command::new(&program);
     cmd.args(&cfg.args).stdin(Stdio::null());
     match &log_file {
         Some(file) => {
@@ -256,8 +327,105 @@ pub fn resolve_for(root: &std::path::Path, configured: &str) -> Option<(std::pat
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+
+    // Run the original and new real-process assertions from a disposable
+    // frontend directory, not beside the actual installed executable or a
+    // different cargo test binary. Child selection is test-harness only;
+    // neither it nor FORCE_NONADMIN is consulted by the execution policy.
+    #[cfg(windows)]
+    pub(crate) fn isolated_engine_entry(test_name: &str, harmless_engine: &str) -> bool {
+        let exe = std::env::current_exe().unwrap();
+        const FRONTEND: &str = "spidervpn-engine-entry-fixture.exe";
+        if exe.file_name().and_then(|n| n.to_str()) == Some(FRONTEND) {
+            return false;
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = test_name.rsplit("::").next().unwrap();
+        assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        // Never reuse or erase a pre-existing directory. Each original
+        // test gets its own frontend, engine, logs and data, even when
+        // multiple tests execute in one cargo invocation.
+        let root = loop {
+            let dir = std::env::temp_dir().join(format!("tcrs-entry-{name}-{}-{}",
+                std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => break dir,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!("create isolated frontend directory: {err}"),
+            }
+        };
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let child = root.join(FRONTEND);
+        std::fs::copy(&exe, &child).unwrap();
+        std::fs::copy(harmless_engine, root.join("sing-box.exe")).unwrap();
+        assert_eq!(std::fs::read(root.join("sing-box.exe")).unwrap(),
+            std::fs::read(harmless_engine).unwrap(), "exact harmless fixture image");
+        let dll = exe.parent().unwrap().join("WebView2Loader.dll");
+        if dll.is_file() {
+            std::fs::copy(dll, root.join("WebView2Loader.dll")).unwrap();
+        }
+        let mut command = Command::new(&child);
+        command.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .current_dir(&root);
+        // Only the explicit entry-gate tests challenge the legacy hook.
+        // The three real connection regressions must run with no forced
+        // nonadmin flag; all tests keep the inherited primary token.
+        if test_name == "engine::tests::start_reports_pid_and_process_is_alive"
+            || test_name == "ipc::tests::the_real_probe_rejects_a_program_that_is_not_sing_box"
+        {
+            command.env("SPIDERVPN_FORCE_NONADMIN", "1");
+        } else {
+            command.env_remove("SPIDERVPN_FORCE_NONADMIN");
+        }
+        let output = command.output().expect("run isolated real-token test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && stdout.contains("1 passed")
+            && stdout.contains("ENGINE_ENTRY_ACTUAL_TOKEN"),
+            "isolated test did not execute successfully: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr));
+        print!("{stdout}");
+        true
+    }
+
+
+    #[cfg(windows)]
+    pub(crate) fn with_engine_junction(target: &std::path::Path, check: impl FnOnce(&std::path::Path)) {
+        // Junction lives outside the target, so there is no recursive cycle.
+        let dir = tmp_dirs("entry-junction");
+        let link = dir.join("linked");
+        struct Cleanup(std::path::PathBuf, std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                std::fs::remove_dir(&self.0).unwrap();
+                std::fs::remove_dir(&self.1).unwrap();
+            }
+        }
+        let output = Command::new(r"C:\Windows\System32\cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"]).arg(&link).arg(target)
+            .output().unwrap();
+        assert!(output.status.success(), "create isolated junction: {}",
+            String::from_utf8_lossy(&output.stderr));
+        let _cleanup = Cleanup(link.clone(), dir);
+        check(&link.join("sing-box.exe"));
+    }
+
+    #[test]
+    fn actual_token_query_failure_is_not_nonadmin() {
+        // Actual Win32 failure; do not create a fake token/elevation bool.
+        // Production query takes only the owned current-process handle.
+        assert!(read_token_elevation(std::ptr::null_mut()).is_err());
+        assert!(actual_process_elevation().is_ok(), "real current process token must be queryable");
+        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={} null_token_query_refused=true",
+            actual_process_elevation().unwrap());
+    }
 
     /// 用系统自带的 ping 当「假引擎」：它是个会活一会儿的普通进程，
     /// 不监听端口、不改任何系统设置，用来验证拉起与停止的正反路径。
@@ -270,8 +438,51 @@ mod tests {
 
     #[test]
     fn start_reports_pid_and_process_is_alive() {
-        let dir = std::env::temp_dir();
-        let h = start(&sleeper(), &dir).expect("应当能启动");
+        if isolated_engine_entry(
+            "engine::tests::start_reports_pid_and_process_is_alive",
+            r"C:\Windows\System32\PING.EXE",
+        ) { return; }
+        assert_eq!(std::env::var("SPIDERVPN_FORCE_NONADMIN").as_deref(), Ok("1"));
+        let elevated = actual_process_elevation().expect("actual primary token");
+        let frontend = std::env::current_exe().unwrap();
+        let root = frontend.parent().unwrap();
+        let dir = root.join("logs");
+        let mut cfg = sleeper();
+        let custom = root.join("external");
+        std::fs::create_dir(&custom).unwrap();
+        let external_same_name = custom.join("sing-box.exe");
+        std::fs::copy(&cfg.binary, &external_same_name).unwrap();
+        if elevated {
+            for rejected in [cfg.binary.clone(), external_same_name.to_string_lossy().into_owned()] {
+                let bad = EngineConfig { binary: rejected, args: cfg.args.clone() };
+                match start(&bad, &dir) {
+                    Err(error) => assert!(error.contains("同目录"), "{error}"),
+                    Ok(handle) => {
+                        stop(handle.pid, 100).unwrap();
+                        panic!("real elevated start admitted external image");
+                    }
+                }
+                assert!(!dir.exists(), "rejected engine must not create logs or spawn");
+            }
+            with_engine_junction(root, |linked| {
+                let bad = EngineConfig { binary: linked.to_string_lossy().into_owned(),
+                    args: cfg.args.clone() };
+                match start(&bad, &dir) {
+                    Err(error) => assert!(error.contains("重解析"), "{error}"),
+                    Ok(handle) => {
+                        stop(handle.pid, 100).unwrap();
+                        panic!("real elevated start followed a junction");
+                    }
+                }
+                assert!(!dir.exists());
+            });
+            cfg.binary = root.join("sing-box.exe").to_string_lossy().into_owned();
+        } else {
+            // Exercise a genuine non-elevated custom same-name engine.
+            cfg.binary = external_same_name.to_string_lossy().into_owned();
+        }
+        let h = start(&cfg, &dir).expect("应当能启动");
+        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={elevated} legacy_force_nonadmin=1 actual_start=true external_rejected={elevated} junction_rejected={elevated} standard_custom_started={}", !elevated);
         assert!(h.pid > 0);
         assert!(crate::probe::SystemProbe::default().process_alive(h.pid));
         assert!(h.alive());

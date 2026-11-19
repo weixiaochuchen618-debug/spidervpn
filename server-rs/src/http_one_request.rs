@@ -25,6 +25,7 @@ pub enum Method { Get, Post }
 pub struct ParsedRequest {
     pub method: Method,
     pub target: String,
+    pub host: String,
     pub body: Vec<u8>,
     pub authorization: Option<String>,
 }
@@ -121,7 +122,7 @@ pub fn read_one_request<R: Read>(io: &mut R) -> io::Result<ParsedRequest> {
     let (method, target) = request_line(&crlf_line(io, MAX_REQUEST_LINE)?)?;
     let mut bytes = 0usize;
     let mut fields = 0usize;
-    let mut host = false;
+    let mut host = None;
     let mut length = None;
     let mut authorization = None;
     loop {
@@ -134,10 +135,11 @@ pub fn read_one_request<R: Read>(io: &mut R) -> io::Result<ParsedRequest> {
         if fields > MAX_HEADER_FIELDS { return Err(invalid("SEC-02 too many headers")); }
         let (name, value) = header(&line)?;
         if name.eq_ignore_ascii_case(b"host") {
-            if host || value.is_empty() || !value.iter().all(u8::is_ascii_graphic) {
+            if host.is_some() || value.is_empty() || !value.iter().all(u8::is_ascii_graphic) {
                 return Err(invalid("SEC-02 duplicate/bad Host"));
             }
-            host = true;
+            host = Some(std::str::from_utf8(value)
+                .map_err(|_| invalid("SEC-02 invalid Host"))?.to_owned());
         } else if name.eq_ignore_ascii_case(b"content-length") {
             if length.is_some() { return Err(invalid("SEC-02 duplicate Content-Length")); }
             length = Some(parse_length(value)?);
@@ -154,7 +156,7 @@ pub fn read_one_request<R: Read>(io: &mut R) -> io::Result<ParsedRequest> {
                 .map_err(|_| invalid("SEC-02 invalid Authorization"))?.to_owned());
         }
     }
-    if !host { return Err(invalid("SEC-02 missing Host")); }
+    let host = host.ok_or_else(|| invalid("SEC-02 missing Host"))?;
     let count = match method {
         Method::Get => {
             if length.unwrap_or(0) != 0 {
@@ -169,7 +171,7 @@ pub fn read_one_request<R: Read>(io: &mut R) -> io::Result<ParsedRequest> {
     };
     let mut body = vec![0u8; count];
     io.read_exact(&mut body)?;
-    Ok(ParsedRequest { method, target, body, authorization })
+    Ok(ParsedRequest { method, target, host, body, authorization })
 }
 
 #[cfg(test)]

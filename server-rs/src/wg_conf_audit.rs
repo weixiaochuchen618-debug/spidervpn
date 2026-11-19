@@ -4,9 +4,10 @@
 //! future wg-quick configuration. Failing to compare both views can lead to
 //! duplicate address allocation or resurrection after interface restart.
 //!
-//! This module NEVER writes wg.conf or invokes wg/shell. It only parses the
+//! This module NEVER writes wg.conf or invokes a shell. It parses the
 //! [Interface] and [Peer] sections required by the SpiderVPN /32 model,
 //! and demands exact equality with the separately verified live inventory.
+//! Identity-bound audit derives only the public key with the pinned wg tool.
 //! Interface PrivateKey/PresharedKey contents are never returned/logged.
 //!
 //! It is a migration candidate, NOT a deployed authorization adapter.
@@ -19,7 +20,20 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::Peer;
-use crate::wg_readonly::{parse_allowed_ips, valid_interface, LiveWgReader, ReadError};
+#[cfg(feature = "linux-fresh-consume-gate")]
+use crate::ledger_disk::LedgerStore;
+#[cfg(feature = "linux-fresh-consume-gate")]
+use crate::wg_readonly::derive_public_key;
+#[cfg(feature = "linux-fresh-consume-gate")]
+use zeroize::Zeroizing;
+use crate::wg_readonly::{canonical_key, parse_allowed_ips, valid_interface, LiveWgReader, ReadError};
+
+// The opt-in identity path always zeroizes the protected file buffer.
+// Without that feature, retain the original inventory-only reader.
+#[cfg(feature = "linux-fresh-consume-gate")]
+type ProtectedConfigBytes = Zeroizing<Vec<u8>>;
+#[cfg(not(feature = "linux-fresh-consume-gate"))]
+type ProtectedConfigBytes = Vec<u8>;
 
 const ROOT: &str = "/etc/wireguard";
 const MAX_CONF_BYTES: usize = 1024 * 1024;
@@ -39,6 +53,8 @@ pub enum ConfigError {
     UnsupportedField,
     InvalidPeers(ReadError),
     SnapshotMismatch,
+    IdentityMismatch,
+    InvalidAuthority,
 }
 
 #[derive(Default)]
@@ -66,10 +82,19 @@ fn flush_peer(pending: &mut PendingPeer, lines: &mut String)
 /// pairing service. If metadata/format is ambiguous, reject rather than
 /// skipping that peer and falsely claiming the identity is absent.
 pub fn parse_wg_quick_conf(bytes: &[u8]) -> Result<Vec<Peer>, ConfigError> {
+    parse_conf(bytes, false).map(|(peers, _)| peers)
+}
+
+// Only this private parser can borrow the key from a zeroizing protected
+// file buffer. The legacy inventory-only audit retains its prior semantics.
+fn parse_conf(bytes: &[u8], require_identity: bool)
+    -> Result<(Vec<Peer>, Option<&str>), ConfigError>
+{
     if bytes.len() > MAX_CONF_BYTES { return Err(ConfigError::TooLarge); }
     let text = std::str::from_utf8(bytes).map_err(|_| ConfigError::Utf8)?;
     let mut section = Section::None;
     let mut saw_interface = false;
+    let mut private_key = None;
     let mut pending = PendingPeer::default();
     let mut public_lines = String::new();
 
@@ -104,6 +129,11 @@ pub fn parse_wg_quick_conf(bytes: &[u8]) -> Result<Vec<Peer>, ConfigError> {
                 // private key. Never return these strings in diagnostics.
                 // Do not execute PreUp/PostUp or any other script field.
                 match name {
+                    "PrivateKey" if require_identity => {
+                        if !canonical_key(value) || private_key.replace(value).is_some() {
+                            return Err(ConfigError::IdentityMismatch);
+                        }
+                    }
                     "PrivateKey" | "Address" | "ListenPort" | "MTU" |
                     "DNS" | "Table" | "SaveConfig" | "FwMark" |
                     "PreUp" | "PostUp" | "PreDown" | "PostDown" =>
@@ -134,7 +164,11 @@ pub fn parse_wg_quick_conf(bytes: &[u8]) -> Result<Vec<Peer>, ConfigError> {
     if section == Section::Peer {
         flush_peer(&mut pending, &mut public_lines)?;
     }
-    parse_allowed_ips(public_lines.as_bytes()).map_err(ConfigError::InvalidPeers)
+    if require_identity && private_key.is_none() {
+        return Err(ConfigError::IdentityMismatch);
+    }
+    let peers = parse_allowed_ips(public_lines.as_bytes()).map_err(ConfigError::InvalidPeers)?;
+    Ok((peers, private_key))
 }
 
 /// Every live and durable peer must have the same key and assigned address.
@@ -188,6 +222,11 @@ fn validate_root() -> Result<(), ConfigError> {
 /// request-supplied path. A malicious symlink/hardlink or permissions drift
 /// is an ERROR, not evidence of an absent peer.
 pub fn read_pinned_conf(interface: &str) -> Result<Vec<Peer>, ConfigError> {
+    let bytes = read_pinned_conf_bytes(interface)?;
+    parse_wg_quick_conf(&bytes)
+}
+
+fn read_pinned_conf_bytes(interface: &str) -> Result<ProtectedConfigBytes, ConfigError> {
     if !valid_interface(interface) { return Err(ConfigError::InvalidInterface); }
     validate_root()?;
     let path: PathBuf = Path::new(ROOT).join(format!("{interface}.conf"));
@@ -200,7 +239,10 @@ pub fn read_pinned_conf(interface: &str) -> Result<Vec<Peer>, ConfigError> {
         return Err(ConfigError::InvalidPermissions);
     }
     if before.len() > MAX_CONF_BYTES as u64 { return Err(ConfigError::TooLarge); }
-    let mut data = Vec::new();
+    #[cfg(feature = "linux-fresh-consume-gate")]
+    let mut data = Zeroizing::new(Vec::with_capacity(MAX_CONF_BYTES + 1));
+    #[cfg(not(feature = "linux-fresh-consume-gate"))]
+    let mut data = Vec::with_capacity(MAX_CONF_BYTES + 1);
     file.take((MAX_CONF_BYTES + 1) as u64)
         .read_to_end(&mut data).map_err(|_| ConfigError::Io)?;
     if data.len() > MAX_CONF_BYTES { return Err(ConfigError::TooLarge); }
@@ -219,7 +261,7 @@ pub fn read_pinned_conf(interface: &str) -> Result<Vec<Peer>, ConfigError> {
     {
         return Err(ConfigError::Io);
     }
-    parse_wg_quick_conf(&data)
+    Ok(data)
 }
 
 /// Separate snapshots are not an atomic joint read. The caller must hold the
@@ -245,7 +287,7 @@ fn require_stable_views(
     Ok(after.to_vec())
 }
 
-/// The strongest available pre-integration read-only API. It does not
+/// Inventory-only pre-integration API (not server identity evidence). It does not
 /// perform any WG mutations, and is deliberately not PeerControl.
 pub fn read_verified_snapshot(interface: &str) -> Result<Vec<Peer>, ConfigError> {
     if !valid_interface(interface) { return Err(ConfigError::InvalidInterface); }
@@ -256,6 +298,46 @@ pub fn read_verified_snapshot(interface: &str) -> Result<Vec<Peer>, ConfigError>
     require_stable_views(&before, &durable, &after)
 }
 
+/// Same locked authority, independently pinned interface name and server
+/// public key. Repeated key/peer observations are NOT atomic against a
+/// noncooperating privileged writer or ABA; production writer exclusion is
+/// still required. No private key, cached peer rows or grant returned.
+#[cfg(feature = "linux-fresh-consume-gate")]
+pub fn read_verified_identity_snapshot(store: &LedgerStore, interface: &str,
+    expected_public_key: &str) -> Result<Vec<Peer>, ConfigError>
+{
+    if !canonical_key(expected_public_key) { return Err(ConfigError::IdentityMismatch); }
+    let generation = store.generation().map_err(|_| ConfigError::InvalidAuthority)?;
+    let reader = LiveWgReader::new(interface).map_err(ConfigError::InvalidPeers)?;
+    let check_key = || {
+        if reader.server_public_key().map_err(ConfigError::InvalidPeers)? != expected_public_key {
+            return Err(ConfigError::IdentityMismatch);
+        }
+        Ok(())
+    };
+    check_key()?;
+    let before = reader.snapshot().map_err(ConfigError::InvalidPeers)?;
+    check_key()?;
+    let bytes = read_pinned_conf_bytes(interface)?;
+    let (durable, private_key) = parse_conf(&bytes, true)?;
+    let derived = derive_public_key(private_key.ok_or(ConfigError::IdentityMismatch)?)
+        .map_err(ConfigError::InvalidPeers)?;
+    if derived != expected_public_key { return Err(ConfigError::IdentityMismatch); }
+    drop(bytes);
+    check_key()?;
+    let after = reader.snapshot().map_err(ConfigError::InvalidPeers)?;
+    check_key()?;
+    let result = require_stable_views(&before, &durable, &after)?;
+    if result.iter().any(|p| !canonical_key(&p.public_key)
+        || p.public_key == expected_public_key) {
+        return Err(ConfigError::IdentityMismatch);
+    }
+    if store.generation().map_err(|_| ConfigError::InvalidAuthority)? != generation {
+        return Err(ConfigError::InvalidAuthority);
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +345,20 @@ mod tests {
     fn key(c: char) -> String { format!("{}=", c.to_string().repeat(43)) }
     fn conf(peers: &str) -> String {
         format!("# server setup\n[Interface]\nPrivateKey = VERY_SECRET_NEVER_LOG\nAddress = 10.66.0.1/24\nListenPort = 51820\nPostUp = echo safe\n{peers}")
+    }
+
+    #[test]
+    fn identity_parser_requires_exactly_one_canonical_private_key() {
+        let key = format!("{}E=", "A".repeat(42));
+        let body = format!("[Interface]\nPrivateKey = {key}\n");
+        let (peers, private_key) = parse_conf(body.as_bytes(), true).unwrap();
+        assert!(peers.is_empty());
+        assert!(private_key == Some(key.as_str()));
+        for bad in ["[Interface]\n".to_owned(), format!("{body}PrivateKey = {key}\n"),
+            "[Interface]\nPrivateKey = (none)\n".to_owned(),
+            format!("[Interface]\nPrivateKey = {}F=\n","A".repeat(42))] {
+            assert!(parse_conf(bad.as_bytes(), true).is_err());
+        }
     }
 
     #[test]

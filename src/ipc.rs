@@ -4944,7 +4944,8 @@ fn engine_reply(result: Result<(String, String), String>) -> String {
 /// 那会一直不退出——直接用 `output()` 会把界面线程卡死。
 pub(crate) fn probe_engine_binary(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
-    let mut child = std::process::Command::new(path)
+    let program = crate::engine::checked_engine_program(path)?;
+    let mut child = std::process::Command::new(&program)
         .arg("version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -10984,8 +10985,44 @@ mod tests {
     /// 真探测：自己的测试二进制不是 sing-box，必须被拒（这条跑的是真实 `version` 路径）。
     #[test]
     fn the_real_probe_rejects_a_program_that_is_not_sing_box() {
+        if crate::engine::tests::isolated_engine_entry(
+            "ipc::tests::the_real_probe_rejects_a_program_that_is_not_sing_box",
+            r"C:\Windows\System32\whoami.exe",
+        ) { return; }
+        let elevated = crate::engine::actual_process_elevation().expect("actual process token");
+        assert_eq!(std::env::var("SPIDERVPN_FORCE_NONADMIN").as_deref(), Ok("1"));
         let exe = std::env::current_exe().expect("测试进程自己的路径");
-        let error = probe_engine_binary(&exe).expect_err("测试二进制不可能是 sing-box");
+        let root = exe.parent().unwrap();
+        let bundled = root.join("sing-box.exe");
+        let external = root.join("external");
+        std::fs::create_dir(&external).unwrap();
+        let foreign = external.join("sing-box.exe");
+        std::fs::copy(&bundled, &foreign).unwrap();
+        // A real, harmless external same-name executable must be rejected
+        // at the entry gate, not merely after it ran its version command.
+        for path in [&exe, &foreign] {
+            let error = probe_engine_binary(path).expect_err("测试二进制不可能是 sing-box");
+            if elevated {
+                assert!(error.contains("同目录"), "{error}");
+            }
+            assert!(error.contains("sing-box") || error.contains("version"), "{error}");
+        }
+        if elevated {
+            crate::engine::tests::with_engine_junction(root, |linked| {
+                let error = probe_engine_binary(linked).expect_err("junction must be refused before spawn");
+                assert!(error.contains("重解析"), "{error}");
+            });
+            let error = probe_engine_binary(&root.join("missing.exe")).unwrap_err();
+            assert!(error.contains("存在"), "{error}");
+        }
+        // The trusted-directory policy positively permits this controlled
+        // image to execute; its *actual version protocol* is not sing-box.
+        // Retain the old real-exec negative rather than replacing it with
+        // only a path-policy failure.
+        let error = probe_engine_binary(&bundled).expect_err("测试二进制不可能是 sing-box");
+        assert!(error.contains("version"), "must reach real version handling: {error}");
+        assert!(!error.contains("同目录"), "{error}");
+        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={elevated} legacy_force_nonadmin=1 actual_probe=true external_rejected={elevated} junction_rejected={elevated} missing_rejected={elevated} non_sing_box_protocol_refused=true");
         assert!(
             error.contains("sing-box") || error.contains("version"),
             "拒绝理由要说清为什么不是引擎：{error}"
@@ -14657,13 +14694,65 @@ mod tests {
         }
     }
 
+    // Only used by these three original real IPC tests. The parent makes a
+    // separate executable directory; confirm the actual running frontend
+    // and its bundled copy before driving the real product path.
+    fn isolated_ipc_engine() -> (PathBuf, PathBuf) {
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(exe.file_name().and_then(|n| n.to_str()),
+            Some("spidervpn-engine-entry-fixture.exe"));
+        assert!(std::env::var_os("SPIDERVPN_FORCE_NONADMIN").is_none());
+        let bin = exe.parent().unwrap();
+        let engine = bin.join("sing-box.exe");
+        assert_eq!(std::fs::read(&engine).unwrap(),
+            std::fs::read(r"C:\Windows\System32\PING.EXE").unwrap());
+        crate::engine::validate_privileged_engine(&engine, &exe).unwrap();
+        let root = bin.join("data");
+        std::fs::create_dir(&root).unwrap();
+        (root, engine)
+    }
+
+    // Read back the actual process image, not just a PID or the configured
+    // filename. Cleanup also restricts termination to this fixture image.
+    fn ipc_engine_image(pid: i64) -> Option<PathBuf> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let pid = u32::try_from(pid).ok()?;
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if raw.is_null() { return None; }
+        let _handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut buffer = vec![0u16; 32768];
+        let mut size = buffer.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(raw, 0, buffer.as_mut_ptr(), &mut size) } == 0
+            || size == 0 || size as usize >= buffer.len()
+        {
+            return None;
+        }
+        use std::os::windows::ffi::OsStringExt;
+        let name = std::ffi::OsString::from_wide(&buffer[..size as usize]);
+        std::fs::canonicalize(PathBuf::from(name)).ok()
+    }
+
+    fn assert_ipc_fixture_image(pid: i64, engine: &std::path::Path) {
+        assert_eq!(ipc_engine_image(pid), Some(std::fs::canonicalize(engine).unwrap()),
+            "real engine PID {pid} must run the isolated same-directory image");
+    }
+
     #[test]
     fn ipc_connect_keeps_runtime_engine_config_until_disconnect() {
+        if crate::engine::tests::isolated_engine_entry(
+            "ipc::tests::ipc_connect_keeps_runtime_engine_config_until_disconnect", r"C:\Windows\System32\PING.EXE",
+        ) { return; }
+        let elevated = crate::engine::actual_process_elevation().expect("actual primary token");
+        let (root, fixture_engine) = isolated_ipc_engine();
         // 与 CLI 同一个不变量、同一个场景：坏成员（引擎活着、没有东西监听线路端口）→
         // 连接在跑 → runtime-engine.json 必须在；断开才删。收尾走 settle_runtime_engine，
         // 与 main.rs 是同一个函数。
-        let root = tmp_root("ipc-runtime-engine");
         let key = format!(r"Software\SpiderVPN\tests\ipc-re-{}", std::process::id());
+        let mut cleanup = RealEngineCleanup { root: root.clone(), key: key.clone(),
+            pids: Vec::new(), engine: fixture_engine.canonicalize().unwrap() };
         // 代理键必须可读：读不到系统代理时连接会被拒绝（那是另一条用例的现场）。
         let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
         {
@@ -14690,7 +14779,7 @@ mod tests {
                 "selected": "L1",
                 "mode": "proxy",
                 "lines": [{ "id": "L1", "name": "坏成员", "proxy_endpoint": format!("127.0.0.1:{port}") }],
-                "engine": { "binary": r"C:\Windows\System32\PING.EXE" }
+                "engine": { "binary": fixture_engine.to_str().unwrap() }
             })
             .to_string(),
         )
@@ -14731,13 +14820,19 @@ mod tests {
             "引擎必须还活着"
         );
 
+        let pid = rec.engine_pid.expect("running engine PID");
+        cleanup.pids.push(pid);
+        assert_ipc_fixture_image(pid, &fixture_engine);
         let d = call(r#"{"cmd":"disconnect"}"#, &ctx);
         assert_eq!(d["ok"], true, "{d}");
         assert!(!runtime_engine.exists(), "断开后运行时配置必须删除");
+        assert!(!crate::probe::pid_alive(pid), "disconnect must stop the actual engine");
+        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={elevated} ipc_runtime_engine_complete=true real_pid={pid}");
 
         drop(env);
         let _ = hkcu.delete_subkey_all(&key);
         let _ = std::fs::remove_dir_all(&root);
+        drop(cleanup);
     }
 
     /// 失败也要收掉本次真实拉起的假引擎，并删除临时注册表键；不能靠断言全部通过才清理。
@@ -14745,17 +14840,22 @@ mod tests {
         root: PathBuf,
         key: String,
         pids: Vec<i64>,
+        engine: PathBuf,
     }
 
     impl Drop for RealEngineCleanup {
         fn drop(&mut self) {
             if let Ok(Some(rec)) = crate::model::load_runtime(&self.root.join("runtime.json")) {
                 if let Some(pid) = rec.engine_pid {
-                    let _ = crate::engine::stop(pid, 100);
+                    if ipc_engine_image(pid).as_ref() == Some(&self.engine) {
+                        let _ = crate::engine::stop(pid, 100);
+                    }
                 }
             }
             for pid in self.pids.drain(..) {
-                let _ = crate::engine::stop(pid, 100);
+                if ipc_engine_image(pid).as_ref() == Some(&self.engine) {
+                    let _ = crate::engine::stop(pid, 100);
+                }
             }
             let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
             let _ = hkcu.delete_subkey_all(&self.key);
@@ -14765,9 +14865,15 @@ mod tests {
 
     #[test]
     fn t14_compatible_action_really_restarts_the_engine_and_restores_temporary_proxy() {
+        if crate::engine::tests::isolated_engine_entry(
+            "ipc::tests::t14_compatible_action_really_restarts_the_engine_and_restores_temporary_proxy", r"C:\Windows\System32\PING.EXE",
+        ) { return; }
+        let elevated = crate::engine::actual_process_elevation().expect("actual primary token");
+        let (root, fixture_engine) = isolated_ipc_engine();
         let _env_serial = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let root = tmp_root("t14-real-reconnect");
         let key = format!(r"Software\SpiderVPN\tests\ipc-t14-reconnect-{}", std::process::id());
+        let mut cleanup = RealEngineCleanup { root: root.clone(), key: key.clone(),
+            pids: Vec::new(), engine: fixture_engine.canonicalize().unwrap() };
         let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
         {
             let (k, _) = hkcu.create_subkey(&key).unwrap();
@@ -14779,7 +14885,6 @@ mod tests {
             ("SPIDERVPN_PROXY_KEY", key.clone()),
             ("SPIDERVPN_ENGINE_ARGS", "-n 300 127.0.0.1".to_string()),
         ]);
-        let mut cleanup = RealEngineCleanup { root: root.clone(), key: key.clone(), pids: Vec::new() };
         let store = crate::proxy::ProxyStore { key_path: key.clone() };
         let original_proxy = store.read();
         assert!(original_proxy.readable, "临时代理键必须可读：{original_proxy:?}");
@@ -14796,7 +14901,7 @@ mod tests {
         let mut cfg = write_cfg(&root, "L1");
         cfg.lines.truncate(1);
         cfg.lines[0].proxy_endpoint = endpoint.clone();
-        cfg.engine = Some(crate::config::EngineSettings { binary: r"C:\Windows\System32\PING.EXE".to_string() });
+        cfg.engine = Some(crate::config::EngineSettings { binary: fixture_engine.to_str().unwrap().to_string() });
         crate::config::save(&root.join(crate::config::DEFAULT_PATH), &cfg).unwrap();
         write_line_file(&root, "L1", true);
         let ctx = ctx_with(None, &root);
@@ -14806,6 +14911,7 @@ mod tests {
         let before = crate::model::load_runtime(&root.join("runtime.json")).unwrap().unwrap();
         let old_pid = before.engine_pid.expect("标准连接必须记录真实引擎 PID");
         cleanup.pids.push(old_pid);
+        assert_ipc_fixture_image(old_pid, &fixture_engine);
         assert!(crate::probe::pid_alive(old_pid), "旧引擎必须真实存活");
         assert_eq!(
             crate::engine_config::actual_transport(&root.join("runtime-engine.json")),
@@ -14829,6 +14935,7 @@ mod tests {
         let after = crate::model::load_runtime(&root.join("runtime.json")).unwrap().unwrap();
         let new_pid = after.engine_pid.expect("重连后必须记录新引擎 PID");
         cleanup.pids.push(new_pid);
+        assert_ipc_fixture_image(new_pid, &fixture_engine);
         assert_ne!(new_pid, old_pid, "重连不能沿用旧引擎 PID");
         assert!(!crate::probe::pid_alive(old_pid), "旧引擎 PID={old_pid} 必须已经停止");
         assert!(crate::probe::pid_alive(new_pid), "新引擎 PID={new_pid} 必须真实存活");
@@ -14852,15 +14959,22 @@ mod tests {
         assert_eq!(store.read(), original_proxy, "最终必须还原临时键里的原始代理值");
         assert!(!root.join("runtime.json").exists());
         assert!(!root.join("runtime-engine.json").exists());
+        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={elevated} ipc_reconnect_complete=true old_pid={old_pid} new_pid={new_pid} proxy_restored=true");
         drop(env);
         drop(cleanup);
     }
 
     #[test]
     fn t14_verify_failure_is_reported_after_a_real_reconnect_without_rollback() {
+        if crate::engine::tests::isolated_engine_entry(
+            "ipc::tests::t14_verify_failure_is_reported_after_a_real_reconnect_without_rollback", r"C:\Windows\System32\PING.EXE",
+        ) { return; }
+        let elevated = crate::engine::actual_process_elevation().expect("actual primary token");
+        let (root, fixture_engine) = isolated_ipc_engine();
         let _env_serial = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let root = tmp_root("t14-real-verify-failure");
         let key = format!(r"Software\SpiderVPN\tests\ipc-t14-verify-{}", std::process::id());
+        let mut cleanup = RealEngineCleanup { root: root.clone(), key: key.clone(),
+            pids: Vec::new(), engine: fixture_engine.canonicalize().unwrap() };
         let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
         {
             let (k, _) = hkcu.create_subkey(&key).unwrap();
@@ -14872,7 +14986,6 @@ mod tests {
             ("SPIDERVPN_PROXY_KEY", key.clone()),
             ("SPIDERVPN_ENGINE_ARGS", "-n 300 127.0.0.1".to_string()),
         ]);
-        let mut cleanup = RealEngineCleanup { root: root.clone(), key: key.clone(), pids: Vec::new() };
         let store = crate::proxy::ProxyStore { key_path: key.clone() };
         let original_proxy = store.read();
         let port = loop {
@@ -14886,7 +14999,7 @@ mod tests {
         cfg.lines.truncate(1);
         cfg.lines[0].proxy_endpoint = endpoint.clone();
         cfg.engine = Some(crate::config::EngineSettings {
-            binary: r"C:\Windows\System32\PING.EXE".to_string(),
+            binary: fixture_engine.to_str().unwrap().to_string(),
         });
         crate::config::save(&root.join(crate::config::DEFAULT_PATH), &cfg).unwrap();
         write_line_file(&root, "L1", true);
@@ -14896,6 +15009,7 @@ mod tests {
         let before = crate::model::load_runtime(&root.join("runtime.json")).unwrap().unwrap();
         let old_pid = before.engine_pid.expect("旧引擎 PID");
         cleanup.pids.push(old_pid);
+        assert_ipc_fixture_image(old_pid, &fixture_engine);
         let failed = crate::selfcheck::load(&root).expect("真实自检结论");
         assert!(!failed.ok && failed.skipped.is_none(), "资格必须来自真实自检未通过：{failed:?}");
         assert_eq!(call(r#"{"cmd":"status"}"#, &ctx)["compatibleAction"], true);
@@ -14922,6 +15036,7 @@ mod tests {
         let after = crate::model::load_runtime(&root.join("runtime.json")).unwrap().unwrap();
         let new_pid = after.engine_pid.expect("重连后的新引擎 PID");
         cleanup.pids.push(new_pid);
+        assert_ipc_fixture_image(new_pid, &fixture_engine);
         assert_ne!(new_pid, old_pid);
         assert!(!crate::probe::pid_alive(old_pid), "即使核验失败，旧引擎也确实已停止");
         assert!(crate::probe::pid_alive(new_pid), "reconnected=true 必须有真实存活的新引擎");
@@ -14942,6 +15057,7 @@ mod tests {
         assert_eq!(store.read(), original_proxy);
         assert!(!root.join("runtime.json").exists());
         assert!(!root.join("runtime-engine.json").exists());
+        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={elevated} ipc_verify_failure_no_rollback_complete=true old_pid={old_pid} new_pid={new_pid} proxy_restored=true");
         drop(env);
         drop(cleanup);
     }

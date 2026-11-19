@@ -18,7 +18,7 @@ ring = "=0.17.14"
 # Same version and crypto backend as the Windows client, explicitly OFF by
 # default. Real Linux TLS1.2 encrypted loopback lab, NOT deployed receiver.
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
-# Zeroize in-memory PEM key buffers on every return path. Same existing
+# Zeroize in-memory PEM and protected WG key buffers. Same existing
 # vetted version/checksum as the pinned Windows client lock.
 zeroize = { version = "=1.9.1", optional = true }
 # Existing pinned transitive libc; expose only for the opted-in Linux process lab.
@@ -52,6 +52,8 @@ linux-bounded-accept-lab = ["linux-http-deny-response-lab"]
 linux-persistent-listener-lab = ["linux-bounded-accept-lab"]
 # Explicit disposable process lab, NOT installed or deployed.
 linux-denial-process-lab = ["linux-persistent-listener-lab", "dep:libc"]
+# Default-off request authentication against an independently trusted invite.
+linux-fresh-consume-gate = ["linux-handshake-admission", "dep:zeroize"]
 
 [[test]]
 name = "wg_namespace_e2e"
