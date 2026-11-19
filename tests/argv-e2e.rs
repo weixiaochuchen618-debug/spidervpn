@@ -160,3 +160,50 @@ fn no_arguments_still_opens_the_gui() {
     assert!(alive, "不带参数时应当进入界面（进程存活），而不是直接退出");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a3a_invalid_command_combinations_fail_before_creating_data_root() {
+    let root = tmp_root("a3a-early");
+    std::fs::remove_dir_all(&root).unwrap();
+    let cases: &[&[&str]] = &[
+        &["--plan", "--disconnect"],
+        &["--disconnect", "--plan"],
+        &["--plan", "--connect"],
+        &["--headless", "--apply"],
+        &["--status", "--guard-remove"],
+        &["--status", "--status"],
+        &["--connect", "--disconnect"],
+        &["--status", "--tun"],
+        &["--help", "--disconnect"],
+        &["--engine", "sing-box.exe"],
+        &["--tun"],
+        &["stray"],
+        &["--use", "line", "stray"],
+        &["--provider-add", "kind", "name", "dir", "7890", "a.example", "extra"],
+        &["--import", "profile.json", "--engine", "a.exe", "--engine", "b.exe"],
+    ];
+    for args in cases {
+        let (code, out, took) = run_timed(&root, args);
+        assert_eq!(code, Some(2), "{args:?}: {out}");
+        assert!(took < Duration::from_secs(2), "{args:?}: {took:?}");
+        assert!(!root.exists(), "{args:?}: invalid arguments reached directory initialization");
+    }
+}
+
+#[test]
+fn a3a_documented_server_modifiers_reach_original_validation() {
+    let root = tmp_root("a3a-server-modifiers");
+    // Malformed targets stop at the existing target parser before any SSH.
+    // A generic argument-combination rejection is not sufficient evidence.
+    for args in [
+        &["--server-inspect", "invalid-target", "--fingerprint", "SHA256:abc"][..],
+        &["--server-trust", "invalid-target", "--fingerprint", "SHA256:abc"][..],
+        &["--server-setup", "invalid-target", "--fingerprint", "SHA256:abc"][..],
+    ] {
+        let (code, out, took) = run_timed(&root, args);
+        assert_eq!(code, Some(2), "{args:?}: {out}");
+        assert!(out.contains("用户名@主机"), "must reach existing target validation: {out}");
+        assert!(took < Duration::from_secs(2), "{args:?}: {took:?}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
