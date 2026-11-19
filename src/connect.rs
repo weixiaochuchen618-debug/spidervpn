@@ -230,12 +230,75 @@ pub fn connect_with_origin(
     out
 }
 
+/// 隔离实机验证入口：默认关闭，不改变原有连接 / UAC / UI 交互。
+///
+/// 只允许在明确设置 SPIDERVPN_WFP_LEASE_EXPERIMENT=1 且现有持久
+/// v1 Guard 已经保护交易名单时，测试长期动态代理租约。
+/// 生产启用前仍必须完成 Wintun/TUN 故障注入、真实进程生命周期和证据集成。
+#[cfg(windows)]
+fn try_start_experimental_proxy_lease(
+    cfg: &AppConfig,
+    engine: &EngineConfig,
+    endpoint: &str,
+    engine_pid: i64,
+    blocked: bool,
+    tun: bool,
+    intent: crate::guard::lease_helper::LocalLeaseIntent<'static>,
+) -> Result<usize, String> {
+    if tun {
+        return Err("TUN 的下一跳/重新授权防泄漏尚未验收，不允许试验许可".into());
+    }
+    if !blocked {
+        return Err("持久交易程序 BLOCK 未成功核验，不允许动态放行".into());
+    }
+    // Consume the intent captured before the connection transaction. A late
+    // continuation cannot mint a new intent after a completed disconnect.
+    let pid: u32 = engine_pid.try_into()
+        .map_err(|_| "引擎 PID 超出 Windows 进程标识范围".to_string())?;
+    let registration = crate::guard::lease_helper::register_experimental_lease(
+        intent, pid, std::path::Path::new(&engine.binary),
+    )?;
+    let resolved = crate::guard::trade_identities(cfg);
+    if resolved.programs.is_empty() || !resolved.all_participated() {
+        return Err("交易程序名单不完整，不允许授予部分程序的临时许可".into());
+    }
+    let target = endpoint.parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("代理入口必须是精确的本地 IP:port：{e}"))?;
+    let request = crate::guard::lease_helper::LeaseRequest {
+        schema: 1,
+        // The registered lease owns its unique random 128-bit nonce.
+        nonce: String::new(),
+        endpoint: target,
+        engine_pid: pid,
+        controller_pid: std::process::id(),
+        engine_executable: std::path::PathBuf::from(&engine.binary),
+        programs: resolved.programs,
+    };
+    let child = crate::guard::lease_helper::launch_elevated(&request, registration)?;
+    if !child.running() {
+        return Err("动态 WFP 辅助进程在握手后意外退出".into());
+    }
+    // The unique pipe-owning worker retains this registration after startup;
+    // disconnect_inner cancels it independently of engine termination.
+    let count = request.programs.len();
+    drop(child);
+    Ok(count)
+}
+
 fn connect_inner(
     cfg: &AppConfig,
     engine: &EngineConfig,
     deps: &Deps,
     legacy_running: bool,
 ) -> Result<Outcome, String> {
+    // Snapshot only the opt-in experimental intent at entry. Failure never
+    // interrupts the existing connection transaction or its error paths.
+    #[cfg(windows)]
+    let experimental_intent = if std::env::var("SPIDERVPN_WFP_LEASE_EXPERIMENT").as_deref() == Ok("1") {
+        Some(crate::guard::lease_helper::capture_experimental_intent())
+    } else {
+        None
+    };
     // 没有线路就没有连接可言：这里必须拒绝，而不是拿一个空端点去改系统代理。
     let Some(line) = cfg.current_line() else {
         return Err("未配置线路：请先导入线路或用 --set-line 写入一条".to_string());
@@ -378,6 +441,23 @@ fn connect_inner(
     }
     did.push("写入运行时记录".to_string());
 
+    // 试验开关默认关闭：不会改变现有 UI 或连接顺序，也不会无故增加 UAC。
+    // 此位置要求引擎已真正活着、运行时记录已原子提交，并且 0.7 步
+    // WFP 持久阻断结果明确。失败绝不删除已有 BLOCK 或误报已放行。
+    #[cfg(windows)]
+    if let Some(intent) = experimental_intent {
+        match intent.and_then(|intent| try_start_experimental_proxy_lease(
+            cfg, engine, &endpoint, pid, trading_blocked, tun, intent,
+        )) {
+            Ok(count) => did.push(format!(
+                "WFP 临时代理租约已在隔离试验模式启动（{count} 个交易程序）"
+            )),
+            Err(err) => did.push(format!(
+                "WFP 临时代理试验未启用（{err}）；持久直连阻断不受影响"
+            )),
+        }
+    }
+
     Ok(Outcome::Done(did))
 }
 
@@ -460,6 +540,12 @@ pub fn disconnect_with_origin(
 
 fn disconnect_inner(cfg: Option<&AppConfig>, deps: &Deps) -> Result<Outcome, String> {
     let mut did = Vec::new();
+
+    // Experiment only: cancel the current locally owned lease even if runtime
+    // is absent/corrupt or the following engine stop returns Err. No lease is
+    // a no-op; never infer another process's ownership from runtime.json.
+    #[cfg(windows)]
+    let _lease_disconnect = crate::guard::lease_helper::begin_experimental_disconnect();
 
     // 1) 先停引擎：否则还原代理之后，引擎仍在跑，流量会绕过代理直连。
     //    这里必须按 EnginePid 停——守护就是我们自己，照着 SupervisorPid 去 kill 等于自杀。
@@ -1517,6 +1603,97 @@ mod tests {
         let after = f.store.read();
         assert_eq!(after.enable, before.enable);
         assert_eq!(after.server, before.server);
+    }
+
+    // Exercise the real shared experimental start/stop entries without UAC
+    // or BFE writes. connect_inner passes its captured intent to this exact
+    // entry; this fixture does not claim to run the full connection transaction.
+    #[cfg(windows)]
+    #[test]
+    fn a2_old_experimental_intent_is_rejected_after_disconnect_returns() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        const ROLE: &str = "SPIDERVPN_A2_CONNECT_INTENT_FIXTURE";
+        const TEST: &str = "connect::tests::a2_old_experimental_intent_is_rejected_after_disconnect_returns";
+        let exe = std::env::current_exe().unwrap();
+        match std::env::var(ROLE).as_deref() {
+            Ok("engine") => {
+                let mut byte = [0u8; 1];
+                assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
+                return;
+            }
+            Ok("controller") => {}
+            _ => {
+                // Do not share the test process's global experimental slot
+                // with unrelated connection tests running in parallel.
+                let status = Command::new(&exe).args(["--exact", TEST, "--nocapture"])
+                    .env(ROLE, "controller").status().unwrap();
+                assert!(status.success());
+                return;
+            }
+        }
+        struct EngineCleanup(std::process::Child);
+        impl Drop for EngineCleanup {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let mut child = EngineCleanup(Command::new(&exe)
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ROLE, "engine").stdin(Stdio::piped()).spawn().unwrap());
+        let pid = i64::from(child.0.id());
+        let engine = EngineConfig { binary: exe.to_str().unwrap().into(), args: vec![] };
+        let cfg = cfg();
+        let endpoint = "127.0.0.1:12345";
+        assert!(crate::guard::trade_identities(&cfg).programs.is_empty());
+        for mode in ["normal", "kill-error", "missing-runtime", "corrupt-runtime"] {
+            let f = fixture(&format!("a2-intent-{mode}"));
+            let _ = std::fs::remove_file(&f.runtime);
+            let _ = std::fs::remove_file(&f.journal);
+            if mode == "corrupt-runtime" {
+                std::fs::write(&f.runtime, b"not-json").unwrap();
+            } else if mode != "missing-runtime" {
+                write_runtime(&f.runtime, pid, 1_700_000_000.0, "Running", true).unwrap();
+            }
+            let old = crate::guard::lease_helper::capture_experimental_intent().unwrap();
+            let calls = std::cell::Cell::new(0);
+            let spawn = |_: &EngineConfig| panic!("disconnect must not spawn");
+            let kill = |seen: i64| {
+                assert_eq!(seen, pid);
+                calls.set(calls.get() + 1);
+                // Simulated stop failure; actual child deliberately stays live.
+                if mode == "kill-error" { Err("A2 injected stop error".into()) } else { Ok(()) }
+            };
+            let d = deps(&f, &spawn, &kill);
+            let result = disconnect(None, &d);
+            match mode {
+                "kill-error" => {
+                    assert_eq!(result.unwrap_err(), "A2 injected stop error");
+                    assert!(f.runtime.exists());
+                }
+                "missing-runtime" | "corrupt-runtime" =>
+                    assert_eq!(result.unwrap(), Outcome::AlreadyDone),
+                _ => assert!(matches!(result.unwrap(), Outcome::Done(_))),
+            }
+            assert_eq!(calls.get(), if matches!(mode, "normal" | "kill-error") { 1 } else { 0 });
+            assert!(!child.0.try_wait().unwrap().is_some());
+            let error = try_start_experimental_proxy_lease(&cfg, &engine, endpoint,
+                pid, true, false, old).unwrap_err();
+            assert_eq!(error, "旧连接实验租约意图已失效");
+            // A genuinely new intent may register. Empty list then deliberately
+            // stops before UAC, proving the original list refusal is preserved.
+            let fresh = crate::guard::lease_helper::capture_experimental_intent().unwrap();
+            let error = try_start_experimental_proxy_lease(&cfg, &engine, endpoint,
+                pid, true, false, fresh).unwrap_err();
+            assert_eq!(error, "交易程序名单不完整，不允许授予部分程序的临时许可");
+            println!("A2_INTENT_PASS mode={mode} stale_rejected=true fresh_registered=true original_result_preserved=true");
+            let _ = std::fs::remove_dir_all(f.runtime.parent().unwrap());
+        }
+        drop(child.0.stdin.take());
+        assert!(child.0.wait().unwrap().success());
     }
 
     #[test]

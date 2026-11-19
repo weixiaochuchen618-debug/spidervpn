@@ -79,6 +79,18 @@ jobs:
           & cargo test --locked --bin spidervpn pairing::http::tests::sec02_legacy_rsa_ -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Ephemeral WFP IPv4 proxy canary (actual BFE classification)
+        shell: pwsh
+        env:
+          SPIDERVPN_WFP_CANARY: "1"
+        run: |
+          # Only a dynamic session targeting this test executable; never touch
+          # SpiderVPN's persistent WFP provider or the user's firewall.
+          & cargo test --locked --test wfp_proxy_canary -- --ignored --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo test --locked --bin spidervpn guard::lease_helper::tests::real_process_channel_faults_with_bfe -- --ignored --exact --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Rust integration tests (each integration target, no duplicate binary unit tests)
         shell: pwsh
         run: |
