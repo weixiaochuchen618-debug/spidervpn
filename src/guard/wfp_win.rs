@@ -1249,6 +1249,17 @@ mod imp {
         Ok(())
     }
 
+    // A3b-DENY: the production machine-wide history and writer fence do not
+    // exist yet. Even the first controller might follow an older live writer.
+    // No caller-supplied proof, environment, test switch, empty enumeration,
+    // process exit, or acquired mutex can turn this boundary into success.
+    pub(crate) const UNKNOWN_MACHINE_HISTORY_REASON: &str =
+        "全机旧 WFP 许可历史与迟到写入屏障尚无法可信证明，暂不发放实验动态许可";
+
+    fn require_verified_machine_history() -> Result<(), String> {
+        Err(UNKNOWN_MACHINE_HISTORY_REASON.into())
+    }
+
     impl DynamicProxyLease {
         /// 唯一允许构造临时代理许可的内部入口，拒绝在持久阻断缺失时开放通道。
         pub fn acquire(
@@ -1288,6 +1299,11 @@ mod imp {
             }
             watched_process.require_alive()?;
             controller_process.require_alive()?;
+            // Enforce at the actual elevated acquisition entry, before even
+            // opening the writable dynamic session. Keep the candidate
+            // BLOCK validation, permit builder and supervision below intact
+            // for a separately authorized future trustworthy history gate.
+            require_verified_machine_history()?;
             let engine = WfpEngine::open_dynamic().map_err(|e| e.to_string())?;
             let provider = provider_get(&engine, PROVIDER_GUID).map_err(|e| e.to_string())?;
             let sublayer = sublayer_get(&engine, SUBLAYER_GUID).map_err(|e| e.to_string())?;
@@ -1403,6 +1419,68 @@ mod imp {
     #[cfg(test)]
     mod dynamic_proxy_lease_tests {
         use super::*;
+
+        #[test]
+        fn actual_acquire_denies_unknown_machine_history_with_live_listener() {
+            use super::super::super::identity::resolve_entry;
+            use std::io::Read;
+            use std::process::{Child, Command, Stdio};
+            const ROLE: &str = "SPIDERVPN_DENY_ACQUIRE_CONTROLLER_FIXTURE";
+            if std::env::var(ROLE).as_deref() == Ok("1") {
+                // Test process synchronization only; no production gate reads it.
+                let mut byte = [0u8; 1];
+                assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
+                return;
+            }
+            struct ChildGuard(Child);
+            impl Drop for ChildGuard {
+                fn drop(&mut self) {
+                    if self.0.try_wait().ok().flatten().is_none() {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+            }
+            let exe = std::env::current_exe().unwrap();
+            let id = resolve_entry("Trader", exe.to_str(), &SystemIdentityEnv::new()).unwrap();
+            let mut controller = ChildGuard(Command::new(&exe)
+                .args(["--exact", "guard::wfp_win::imp::dynamic_proxy_lease_tests::actual_acquire_denies_unknown_machine_history_with_live_listener", "--nocapture"])
+                .env(ROLE, "1").stdin(Stdio::piped()).spawn().unwrap());
+            let owner_pid = std::process::id();
+            let controller_pid = controller.0.id();
+            assert_ne!(owner_pid, controller_pid);
+            let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+            for (index, listener) in [v4, v6].iter().enumerate() {
+                let endpoint = listener.local_addr().unwrap();
+                super::super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, &exe).unwrap();
+                assert!(controller.0.try_wait().unwrap().is_none());
+                let nonce = [index as u8 + 1; 16];
+                let result = DynamicProxyLease::acquire(
+                    &[id.clone()], endpoint, owner_pid, controller_pid, &exe, &nonce,
+                );
+                let reason = match result {
+                    Err(reason) => reason,
+                    Ok(lease) => { let _ = lease.close(); panic!("unknown history granted a real lease"); }
+                };
+                assert_eq!(reason, UNKNOWN_MACHINE_HISTORY_REASON);
+                // Input-negative controls still fail earlier, not by silently
+                // replacing the original identity/nonce validation.
+                let mut forged = id.clone();
+                forged.app_id[0] ^= 1;
+                let err = DynamicProxyLease::acquire(
+                    &[forged], endpoint, owner_pid, controller_pid, &exe, &nonce,
+                ).err().expect("forged APP_ID refused");
+                assert_ne!(err, UNKNOWN_MACHINE_HISTORY_REASON);
+                let err = DynamicProxyLease::acquire(
+                    &[id.clone()], endpoint, owner_pid, 0, &exe, &nonce,
+                ).err().expect("missing controller refused");
+                assert_ne!(err, UNKNOWN_MACHINE_HISTORY_REASON);
+                println!("A3B_DENY_ACQUIRE endpoint={endpoint} owner_pid={owner_pid} controller_pid={controller_pid} live_listener_verified=true history_refused=true earlier_negative_controls=true");
+            }
+            drop(controller.0.stdin.take());
+            assert!(controller.0.wait().unwrap().success());
+        }
 
         #[test]
         fn old_permit_absence_requires_exact_native_not_found() {
