@@ -1274,6 +1274,10 @@ mod imp {
                 return Err("保护名单为空或许可会话 nonce 不足，拒绝临时放行".into());
             }
             validate_lease_identities(ids)?;
+            // Final privileged executor: lifecycle -> existing short Guard
+            // mutex -> BFE. Neither gate survives this acquisition call.
+            // The machine history gate below still denies every permit.
+            let _lifecycle = super::super::lifecycle_gate::LifecycleGate::acquire()?;
             // 与现有 install/sync/remove 使用完全相同的跨进程互斥，
             // 保证检查持久 BLOCK → 安装许可之间不会被另一笔 Guard 变更打断。
             // 仅保护创建时的原子前置检查；lease 运行期间不能长期占有互斥。
@@ -1456,6 +1460,17 @@ mod imp {
                 super::super::super::proxy_identity::verify_proxy_owner(endpoint, owner_pid, &exe).unwrap();
                 assert!(controller.0.try_wait().unwrap().is_none());
                 let nonce = [index as u8 + 1; 16];
+                // Refuse the real acquire even for a valid request while
+                // the fixed production object already exists. The normal
+                // history denial below must still run after release.
+                {
+                    let _held = super::super::super::lifecycle_gate::LifecycleGate::acquire().unwrap();
+                    let denied = DynamicProxyLease::acquire(
+                        &[id.clone()], endpoint, owner_pid, controller_pid, &exe, &nonce,
+                    ).err().expect("existing G1 object must reject dynamic acquire");
+                    assert_eq!(denied, "G1_GATE_EXISTING win32=183");
+                    println!("G1_DYNAMIC_CONTENTION endpoint={endpoint} existing_rc=183 no_acquire=true");
+                }
                 let result = DynamicProxyLease::acquire(
                     &[id.clone()], endpoint, owner_pid, controller_pid, &exe, &nonce,
                 );

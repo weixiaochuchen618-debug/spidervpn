@@ -60,3 +60,26 @@ jobs:
             & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn $filter -- --test-threads=1
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+
+      - name: R01-009 G1 actual lifecycle and final Guard executor (GNU)
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
+          & cargo +stable-x86_64-pc-windows-gnu build --locked --bin spidervpn
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metadata = & cargo +stable-x86_64-pc-windows-gnu metadata --locked --format-version 1 --no-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:SPIDERVPN_G1_PRODUCT_EXE = Join-Path (($metadata | ConvertFrom-Json).target_directory) 'debug/spidervpn.exe'
+          if (-not (Test-Path -LiteralPath $env:SPIDERVPN_G1_PRODUCT_EXE -PathType Leaf)) { throw 'Missing actual G1 debug product executable' }
+          foreach ($case in @(
+            @{ Test = 'guard::lifecycle_gate::imp::tests::production_gate_kernel_contract'; Marker = 'G1_GATE_KERNEL_COMPLETE' },
+            @{ Test = 'guard::elevate::tests::g1_final_executor_transaction'; Marker = 'G1_EXECUTOR_COMPLETE' }
+          )) {
+            $output = & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn $case.Test -- --ignored --exact --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) { exit $code }
+            if (($output -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G1 exact test did not execute' }
+            if (($output -join "`n") -notmatch $case.Marker) { throw "G1 missing real execution marker $($case.Marker)" }
+          }

@@ -3300,6 +3300,17 @@ mod tests {
         use std::io::Read;
         let name = std::env::var("SPIDERVPN_LIFECYCLE_LAB_NAME").unwrap();
         let own = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        if role == "g1-hold" {
+            // This worker takes the actual fixed production gate, not the
+            // random-name lab gate. Only used by the explicit BFE runner.
+            let _gate = super::super::lifecycle_gate::LifecycleGate::acquire().unwrap();
+            let dir = std::path::PathBuf::from(std::env::var_os("SPIDERVPN_LIFECYCLE_LAB_DIR").unwrap());
+            a3b_lab_mark(&dir, "g1-held");
+            println!("G1_CANCEL_HOLDER pid={} elevated={} session={} actual_production_gate=true",
+                std::process::id(), own.elevated, own.session);
+            assert_eq!(std::io::stdin().read(&mut [0u8; 1]).unwrap(), 0);
+            return;
+        }
         if role == "precreate-exact" || role == "precreate-broad" {
             let sddl = if role == "precreate-exact" {
                 lock::expected_sddl(&own.sid)
@@ -3553,6 +3564,16 @@ mod tests {
         let mut holder = spawn("hold", &name);
         wait_marker(&dir, "lock-held");
         wait_rc(&gate, 0, WAIT_TIMEOUT, "outer-gate-held");
+        // Keep the old independent lab gate and all of its assertions.
+        // In addition a distinct process holds the new production gate
+        // during the same real authenticated cancellation fixture.
+        let mut g1_holder = spawn("g1-hold", &name);
+        wait_marker(&dir, "g1-held");
+        let check_g1 = || {
+            assert_eq!(super::super::lifecycle_gate::LifecycleGate::acquire().err().unwrap(),
+                "G1_GATE_EXISTING win32=183");
+        };
+        check_g1();
         let app = app_id_from_path(&exe).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let witness = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3649,6 +3670,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
         }
         wait_rc(&gate, 0, WAIT_TIMEOUT, "outer-held-before-cancel");
+        check_g1();
+        assert!(g1_holder.0.try_wait().unwrap().is_none());
         let started = Instant::now();
         // Reuse real cancellation/teardown entry exercised by old tests.
         // No outer gate acquisition added to the existing path.
@@ -3658,6 +3681,8 @@ mod tests {
         assert!(helper.0.try_wait().unwrap().is_none());
         assert!(holder.0.try_wait().unwrap().is_none());
         wait_rc(&gate, 0, WAIT_TIMEOUT, "outer-held-after-native-close");
+        check_g1();
+        assert!(g1_holder.0.try_wait().unwrap().is_none());
         assert!(old_dynamic_permits_absent(&[key]).unwrap());
         assert!(filter_get_by_id(&audit, permit_id).unwrap().is_none());
         assert_eq!(filter_get_by_id(&audit, bid).unwrap().unwrap(), block);
@@ -3670,6 +3695,14 @@ mod tests {
         await_child(&mut helper.0, Instant::now() + Duration::from_secs(5));
         LOCAL_LEASE.reap_verified().unwrap();
         wait_rc(&gate, 0, WAIT_TIMEOUT, "outer-held-after-helper-exit");
+        check_g1();
+        assert!(g1_holder.0.try_wait().unwrap().is_none());
+        println!("G1_CANCEL_CLOSE actual_gate_held=true helper_exited=true bfe_permit_absent=true baseline_unchanged=true");
+        drop(g1_holder.0.stdin.take());
+        await_child(&mut g1_holder.0, Instant::now() + Duration::from_secs(5));
+        {
+            let _new = super::super::lifecycle_gate::LifecycleGate::acquire().unwrap();
+        }
         drop(holder.0.stdin.take());
         await_child(&mut holder.0, Instant::now() + Duration::from_secs(5));
         wait_rc(&gate, 0, WAIT_OBJECT_0, "outer-released");
@@ -3679,6 +3712,7 @@ mod tests {
         flow(&listener, true);
         flow(&witness, true);
         println!("LIFECYCLE_LAB_COMPLETE actual_kernel_lock=true owner_dacl_readback=true same_sid_processes=true reentry=true precreate_rejected=true abandoned_rejected=true cancel_close_while_held=true tcp_restored=true cross_sid_not_run=true production_gate_proven=false");
+        println!("G1_CANCEL_COMPLETE actual_production_gate=true fixture_bfe=true cancel_independent=true tcp_restored=true history_proven=false");
     }
 
     // The real connect.rs disconnect entry, with a disposable runtime directory.
