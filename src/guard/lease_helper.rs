@@ -3300,6 +3300,25 @@ mod tests {
         use std::io::Read;
         let name = std::env::var("SPIDERVPN_LIFECYCLE_LAB_NAME").unwrap();
         let own = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        if role == "precreate-exact" || role == "precreate-broad" {
+            let sddl = if role == "precreate-exact" {
+                lock::expected_sddl(&own.sid)
+            } else {
+                format!("O:{}D:P(A;;0x00120001;;;{})(A;;0x00120001;;;WD)", own.sid, own.sid)
+            };
+            let (created, rc) = lock::create(&name, &sddl).unwrap();
+            assert_eq!(rc, 0);
+            if role == "precreate-exact" { created.verify(&own.sid).unwrap(); }
+            else { assert!(created.verify(&own.sid).unwrap_err().contains("ACE count")); }
+            println!("LIFECYCLE_PRECREATOR role={role} pid={} create_last_error={rc} elevated={} session={}",
+                std::process::id(), own.elevated, own.session);
+            let dir = std::path::PathBuf::from(std::env::var_os("SPIDERVPN_LIFECYCLE_LAB_DIR").unwrap());
+            a3b_lab_mark(&dir, "precreated");
+            let mut byte = [0u8; 1];
+            assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
+            drop(created);
+            return;
+        }
         let h = lock::open(&name, lock::USE_LOCK).expect("open same kernel mutex");
         h.verify(&own.sid).unwrap();
         println!("LIFECYCLE_WORKER role={role} pid={} elevated={} session={} actual_token_verified=true",
@@ -3448,24 +3467,26 @@ mod tests {
 
         // Creation cannot authenticate existing names: even an exact DACL
         // can be pre-created by a process with the same real SID.
-        let (duplicate, rc) = lock::create(&name, &sddl).unwrap();
-        assert_eq!(rc, ERROR_ALREADY_EXISTS);
-        duplicate.verify(&own.sid).unwrap();
-        println!("LIFECYCLE_PRECREATE mode=matching_acl existing_rc={rc} rejected=true");
-        drop(duplicate);
-        let bad_name = fresh_name();
-        let broad_sddl = format!("O:{}D:P(A;;0x00120001;;;{})(A;;0x00120001;;;WD)", own.sid, own.sid);
-        let (broad, rc) = lock::create(&bad_name, &broad_sddl).unwrap();
-        assert_eq!(rc, 0);
-        // It is a real broad DACL; the expected descriptor supplied on a
-        // second CreateMutexEx cannot replace it.
-        let (bad_open, existing) = lock::create(&bad_name, &sddl).unwrap();
-        assert_eq!(existing, ERROR_ALREADY_EXISTS);
-        let acl_error = bad_open.verify(&own.sid).unwrap_err();
-        assert!(acl_error.contains("ACE count"));
-        println!("LIFECYCLE_PRECREATE mode=broad_acl existing_rc={existing} reason={acl_error:?} rejected=true");
-        drop(bad_open);
-        drop(broad);
+        for (role, mode) in [("precreate-exact", "matching_acl"), ("precreate-broad", "broad_acl")] {
+            let pre_name = fresh_name();
+            let mut precreator = spawn(role, &pre_name);
+            wait_marker(&dir, "precreated");
+            assert!(precreator.0.try_wait().unwrap().is_none());
+            let (duplicate, rc) = lock::create(&pre_name, &sddl).unwrap();
+            assert_eq!(rc, ERROR_ALREADY_EXISTS);
+            // Even a correct descriptor is not an authenticated creation.
+            // On the broad object the new SDDL cannot replace the existing ACL.
+            let verification = duplicate.verify(&own.sid);
+            if role == "precreate-exact" { assert!(verification.is_ok()); }
+            else { assert!(verification.as_ref().unwrap_err().contains("ACE count")); }
+            println!("LIFECYCLE_PRECREATE mode={mode} existing_rc={rc} creator_pid={} creator_alive=true acl_check={verification:?} rejected=true",
+                precreator.0.id());
+            drop(duplicate);
+            drop(precreator.0.stdin.take());
+            await_child(&mut precreator.0, Instant::now() + Duration::from_secs(5));
+            std::fs::remove_file(dir.join("precreated")).unwrap();
+            assert_eq!(lock::open(&pre_name, lock::USE_LOCK).err(), Some(ERROR_FILE_NOT_FOUND));
+        }
         let wide_mask_name = fresh_name();
         let wide_mask = format!("O:{}D:P(A;;0x001f0001;;;{})", own.sid, own.sid);
         let (wide_acl, rc) = lock::create(&wide_mask_name, &wide_mask).unwrap();
@@ -3486,6 +3507,18 @@ mod tests {
         let wrong_owner = gate.verify(other_sid).unwrap_err();
         assert!(wrong_owner.contains("owner mismatch"));
         println!("LIFECYCLE_OWNER_NEGATIVE actual_owner_read=true expected_sid_mismatch=true cross_sid_process_test=false");
+        // Null DACL is permissive and cannot pass even with our actual owner.
+        let null_name = fresh_name();
+        let null_sddl = format!("O:{}D:NO_ACCESS_CONTROL", own.sid);
+        match lock::create(&null_name, &null_sddl) {
+            Ok((null_acl, rc)) => {
+                assert_eq!(rc, 0);
+                let reason = null_acl.verify(&own.sid).unwrap_err();
+                assert!(reason.contains("NULL") || reason.contains("ACE count"));
+                println!("LIFECYCLE_PRECREATE mode=null_dacl actual_create=true reason={reason:?} rejected=true");
+            }
+            Err(rc) => println!("LIFECYCLE_PRECREATE mode=null_dacl actual_create=false native_rc={rc} not_run=true"),
+        }
         // Retain gate handle so the named object survives the owner crash.
         let mut abandoned = spawn("hold", &name);
         wait_marker(&dir, "lock-held");
