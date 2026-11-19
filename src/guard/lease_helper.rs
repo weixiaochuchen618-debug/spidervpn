@@ -3430,22 +3430,37 @@ mod tests {
             child
         };
 
-        // Opening with reduced rights does not manufacture modify access.
+        // DACL access checks and thread ownership are distinct. The first
+        // MSVC run (44484932642) observed ReleaseMutex succeeding through a
+        // SYNCHRONIZE-only handle when the calling thread owned the mutex.
+        // Do not infer a release authorization boundary from the ACE mask.
         let limited = lock::open(&name, lock::SYNC_ONLY).unwrap();
         let deny = lock::open(&name, lock::DELETE_RIGHT).err()
             .expect("DELETE access must be rejected by actual DACL");
         assert_eq!(deny, ERROR_ACCESS_DENIED);
-        assert!(limited.verify(&own.sid).is_err(), "SYNCHRONIZE alone cannot read owner/DACL");
+        let read_error = limited.verify(&own.sid).unwrap_err();
+        assert!(read_error.contains("kernel owner/DACL query failed rc=5"),
+            "SYNCHRONIZE alone cannot read owner/DACL: {read_error}");
         wait_rc(&gate, 0, WAIT_OBJECT_0, "parent-first");
         wait_rc(&gate, 0, WAIT_OBJECT_0, "same-thread-recursion");
-        let release_error = limited.release().unwrap_err();
-        assert_eq!(release_error, ERROR_ACCESS_DENIED);
-        println!("LIFECYCLE_ACCESS delete_open_rc={deny} sync_only_release_rc={release_error} sync_only_read_refused=true");
+        limited.release().expect("observed owning-thread release via SYNCHRONIZE-only handle");
+        println!("LIFECYCLE_ACCESS delete_open_rc={deny} sync_only_read_refused=true sync_only_owner_release_succeeded=true release_mask_is_not_authority=true");
+        // The limited-handle release consumed one of two recursion counts.
+        // Reacquire it so the original two independent child timeouts and
+        // final successful acquisition still verify exact count accounting.
+        wait_rc(&gate, 0, WAIT_OBJECT_0, "recursion-after-limited-release");
         let thread_name = name.clone();
         let thread_sid = own.sid.clone();
         assert!(std::thread::spawn(move || {
             let h = lock::open(&thread_name, lock::USE_LOCK).unwrap();
             h.verify(&thread_sid).unwrap();
+            let limited = lock::open(&thread_name, lock::SYNC_ONLY).unwrap();
+            let full_error = h.release().expect_err("non-owner must not release with full lock rights");
+            assert_eq!(full_error, ERROR_NOT_OWNER);
+            let limited_error = limited.release().expect_err("non-owner must not release with SYNCHRONIZE only");
+            assert!(matches!(limited_error, ERROR_NOT_OWNER | ERROR_ACCESS_DENIED),
+                "unexpected non-owner limited release error: {limited_error}");
+            println!("LIFECYCLE_NONOWNER_RELEASE full_rc={full_error} sync_only_rc={limited_error} both_refused=true");
             wait_rc(&h, 150, WAIT_TIMEOUT, "other-thread");
             true
         }).join().unwrap());
