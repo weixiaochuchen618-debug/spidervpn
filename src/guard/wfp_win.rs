@@ -1793,6 +1793,126 @@ mod imp {
         Ok(out)
     }
 
+    // A3b evidence lab only. Unlike the production provider-limited reader,
+    // enumerate the entire requested ALE layer, including NULL providers and
+    // disabled/boot-time objects. A completed snapshot is NOT a writer fence.
+    #[cfg(test)]
+    #[derive(Clone, Debug)]
+    pub(crate) struct LabFilter {
+        pub raw: FilterRaw,
+        pub null_provider: bool,
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lab_enum_layer(engine: &WfpEngine, layer: Layer, max_pages: usize)
+        -> Result<Vec<LabFilter>, String>
+    {
+        use std::collections::HashSet;
+        const PAGE: u32 = 7; // deliberately exercise pagination
+        let mut template: W::FWPM_FILTER_ENUM_TEMPLATE0 = unsafe { std::mem::zeroed() };
+        template.providerKey = std::ptr::null_mut();
+        template.layerKey = to_win(layer.guid());
+        template.enumType = 0; // FWP_FILTER_ENUM_FULLY_CONTAINED
+        template.flags = 0x8 | 0x10; // INCLUDE_BOOTTIME | INCLUDE_DISABLED
+        template.actionMask = u32::MAX;
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let rc = unsafe { W::FwpmFilterCreateEnumHandle0(engine.raw(), &template, &mut handle) };
+        if rc != 0 || handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(format!("lab enum create incomplete layer={layer:?} rc={rc:#x}"));
+        }
+        let enumerator = unsafe { EnumHandle::new(engine.raw(), handle, W::FwpmFilterDestroyEnumHandle0) };
+        let mut rows = Vec::new();
+        let mut keys = HashSet::new();
+        for page in 0..max_pages {
+            let mut entries: *mut *mut W::FWPM_FILTER0 = std::ptr::null_mut();
+            let mut returned = 0u32;
+            let rc = unsafe { W::FwpmFilterEnum0(engine.raw(), enumerator.raw(), PAGE, &mut entries, &mut returned) };
+            let _buf = unsafe { WfpBuf::from_raw(entries) };
+            if rc != 0 || returned > PAGE || (returned != 0 && entries.is_null()) {
+                return Err(format!("lab enum page incomplete layer={layer:?} page={page} rc={rc:#x} count={returned}"));
+            }
+            if returned == 0 {
+                let nulls = rows.iter().filter(|r: &&LabFilter| r.null_provider).count();
+                let disabled = rows.iter().filter(|r| r.raw.flags & W::FWPM_FILTER_FLAG_DISABLED != 0).count();
+                println!("A3B_ENUM layer={layer:?} rows={} pages={} terminal_zero=true null_provider={nulls} disabled={disabled}", rows.len(), page + 1);
+                return Ok(rows);
+            }
+            for item in unsafe { std::slice::from_raw_parts(entries, returned as usize) } {
+                if item.is_null() {
+                    return Err("lab enum returned a null filter".into());
+                }
+                let raw = unsafe { filter_raw_from(*item) };
+                if raw.layer != layer.guid() || raw.filter_key.is_nil() || !keys.insert(raw.filter_key)
+                    || raw.num_conditions as usize != raw.conditions.len()
+                {
+                    return Err("lab enum malformed, duplicate, or wrong-layer object".into());
+                }
+                rows.push(LabFilter { raw, null_provider: unsafe { (**item).providerKey.is_null() } });
+            }
+        }
+        Err(format!("lab enum incomplete: layer={layer:?} page budget exhausted"))
+    }
+
+    // The fixture uses an isolated random provider only for its BLOCKs and
+    // the existing UNIVERSAL sublayer. BFE prohibits cross-session references
+    // to dynamic sublayers; do not create a persistent fixture sublayer.
+    #[cfg(test)]
+    pub(crate) fn lab_add_provider(engine: &WfpEngine, key: Guid) {
+        assert!(!key.is_nil() && key != PROVIDER_GUID);
+        let mut provider = RawProvider::build();
+        provider._name = wide("SpiderVPN isolated A3b lab provider");
+        provider._description = wide("Disposable dynamic test provider");
+        provider.raw.providerKey = to_win(key);
+        provider.raw.displayData.name = provider._name.as_mut_ptr();
+        provider.raw.displayData.description = provider._description.as_mut_ptr();
+        provider.raw.flags = 0;
+        provider.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
+        provider_add(engine, &provider).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lab_block(app: &[u8], layer: Layer, provider: Option<Guid>, key: Guid)
+        -> Box<RawFilter>
+    {
+        assert!(!app.is_empty() && !key.is_nil());
+        let mut raw = RawFilter::block("isolated A3b lab BLOCK", app, layer);
+        raw.raw.filterKey = to_win(key);
+        raw.raw.flags = 0;
+        raw.raw.subLayerKey = W::FWPM_SUBLAYER_UNIVERSAL;
+        raw.raw.providerData = W::FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() };
+        if let Some(provider) = provider {
+            assert!(!provider.is_nil() && provider != PROVIDER_GUID);
+            *raw._provider_key = to_win(provider);
+            raw.raw.providerKey = &mut *raw._provider_key;
+        } else {
+            raw.raw.providerKey = std::ptr::null_mut();
+        }
+        raw
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lab_try_disabled_block(engine: &WfpEngine, app: &[u8], key: Guid)
+        -> Result<u64, u32>
+    {
+        let mut raw = lab_block(app, Layer::V4, None, key);
+        // The SDK documents that DISABLED is BFE-owned/read-only. Try the
+        // actual API on a disposable BLOCK, never on a product rule.
+        raw.raw.flags = W::FWPM_FILTER_FLAG_DISABLED;
+        let mut id = 0;
+        let rc = unsafe { W::FwpmFilterAdd0(engine.raw(), raw.as_ptr(), std::ptr::null_mut(), &mut id) };
+        if rc == 0 { Ok(id) } else { Err(rc) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lab_native_enum_error(engine: &WfpEngine) -> u32 {
+        let mut entries: *mut *mut W::FWPM_FILTER0 = std::ptr::null_mut();
+        let mut count = 0;
+        // Invalid enumeration handle, valid engine. No writes or ACL change.
+        let rc = unsafe { W::FwpmFilterEnum0(engine.raw(), std::ptr::null_mut(), 7, &mut entries, &mut count) };
+        let _buf = unsafe { WfpBuf::from_raw(entries) };
+        rc
+    }
+
     /// 枚举全部 provider（用于识别 旧版留下的对象 —— 它的 key 我们不知道，
     /// 只能靠 `providerData` 标记扫出来）。
     pub fn provider_enumerate(engine: &WfpEngine) -> Result<Vec<ProviderDefinition>, WfpError> {
