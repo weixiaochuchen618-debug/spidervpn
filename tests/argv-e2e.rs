@@ -195,14 +195,15 @@ fn a3a_documented_server_modifiers_reach_original_validation() {
     let root = tmp_root("a3a-server-modifiers");
     // Malformed targets stop at the existing target parser before any SSH.
     // A generic argument-combination rejection is not sufficient evidence.
-    for args in [
-        &["--server-inspect", "invalid-target", "--fingerprint", "SHA256:abc"][..],
-        &["--server-trust", "invalid-target", "--fingerprint", "SHA256:abc"][..],
-        &["--server-setup", "invalid-target", "--fingerprint", "SHA256:abc"][..],
+    for (args, expected) in [
+        (&["--server-inspect", "invalid-target", "--fingerprint", "SHA256:abc"][..], "用户名@主机"),
+        (&["--server-trust", "invalid-target", "--fingerprint", "SHA256:abc"][..], "用户名@主机"),
+        // The setup branch asks for stdin credentials before target parsing.
+        (&["--server-setup", "invalid-target", "--fingerprint", "SHA256:abc"][..], "需要从标准输入提供密码"),
     ] {
         let (code, out, took) = run_timed(&root, args);
         assert_eq!(code, Some(2), "{args:?}: {out}");
-        assert!(out.contains("用户名@主机"), "must reach existing target validation: {out}");
+        assert!(out.contains(expected), "must reach existing handler validation: {out}");
         assert!(took < Duration::from_secs(2), "{args:?}: {took:?}");
     }
     let _ = std::fs::remove_dir_all(&root);
