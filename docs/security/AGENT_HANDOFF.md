@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §88、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §27 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.91；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §89、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §28 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.92；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -719,3 +719,7 @@
 ## 88. 2026-11-19 §27最新恢复入口：B1已执行范围冻结，C独占实际生命周期门G1
 - [§27](https://github.com/weixiaochuchen618-debug/spidervpn/commit/a182e3a8ff17657ef0b89a2ad05815689a2bd16d) 和 [Backlog D.91](./REMEDIATION_BACKLOG.md) 生效；#30 Draft HEAD `dcca33733828c07fc2af16e65472f0e03ae052b8`，B停写7009961168与D最终PASS7010034438均已核实，B1只冻结已执行范围，R2按§26继续独立BLOCKED_REAL_ACCEPTANCE，禁止宣称完整生产PASS。
 - C唯一写锁接管 integration/security-remediation-20261119，以该SHA执行实际COORD-INT-LIFECYCLE-GATE/R01-009-G1，保留所有原行为与回归；新固定机器域短门拒绝已有对象不证明全机历史，真实Guard执行端生命周期→短Guard→BFE/证据，父不持锁等UAC，动态许可unknown拒绝保持，取消/close独立。仅§27授权路径，G2启动占用登记及安装卸载维护接线不提前实施。B只读，D独立审新SHA，A唯一调度。尚无G1新源码/CI，不能消费B1/开启维护写入；真实R2故障、包外锚、跨SID/UAC/WFP05/L2/L3/Windows/VPS/可运行恢复未验，main及原分支不变。总控[7010636270](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7010636270)。
+
+## 89. 2026-11-20 §28最新恢复入口：G1验收待补真实父链
+- [§28](https://github.com/weixiaochuchen618-debug/spidervpn/commit/dc5bb38666cd6dbf180670964c8a0999f5dcc650)、[Backlog D.92](./REMEDIATION_BACKLOG.md) 生效，#30 Draft `4196a63286378c2e965b9c17875d76756d16b70f` 四workflow通过，C停写7012370022、D独立7012498815；不冻结G1，接受真实父函数同步等子运行缺口，首版E0505及旧lines-e2e未知根因保留。
+- C恢复唯一限量test-only写权，基于上述HEAD按§28 G1-PARENT-CHAIN补证；mod/elevate cfg(test)及MSVC/GNU-C追加真实专项，五父入口实际request/nonce、独立子/holder、双门观察、正确父状态、有界成功/两类竞争失败，四CI+D后再次停写。禁止改生产门或原断言、不进G2/安装卸载；B/D只读，R2、外部锚、真实跨SID/UAC、旧writer/生产BLOCK/Windows/VPS未验。总控[7025205277](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7025205277)。
