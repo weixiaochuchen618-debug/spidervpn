@@ -2175,6 +2175,134 @@ mod imp {
         }
     }
 
+    // Isolated lifecycle-lock experiment only. No product lock name, no
+    // production admission interface, no authority to access installed files.
+    #[cfg(test)]
+    pub(crate) mod lifecycle_lab {
+        use super::wide;
+        use windows_sys::Win32::Foundation::*;
+        use windows_sys::Win32::Security::*;
+        use windows_sys::Win32::Security::Authorization::*;
+        use windows_sys::Win32::System::Threading::*;
+
+        pub const USE_LOCK: u32 = 0x0012_0001; // SYNCHRONIZE | READ_CONTROL | MUTEX_MODIFY_STATE
+        pub const SYNC_ONLY: u32 = 0x0010_0000;
+        pub const DELETE_RIGHT: u32 = 0x0001_0000;
+
+        pub struct TestHandle(HANDLE);
+        impl Drop for TestHandle {
+            fn drop(&mut self) { unsafe { CloseHandle(self.0); } }
+        }
+        struct LocalMemory(*mut core::ffi::c_void);
+        impl Drop for LocalMemory {
+            fn drop(&mut self) { unsafe { LocalFree(self.0); } }
+        }
+        fn test_name(name: &str) -> Vec<u16> {
+            let nonce = name.strip_prefix(r"Global\SpiderVPN-Lifecycle-Lab-")
+                .expect("only isolated lab names allowed");
+            assert!(nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit()));
+            wide(name)
+        }
+        fn descriptor(sddl: &str) -> Result<LocalMemory, u32> {
+            let mut sd = std::ptr::null_mut();
+            let ok = unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide(sddl).as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) };
+            if ok == 0 { return Err(unsafe { GetLastError() }); }
+            assert!(!sd.is_null());
+            Ok(LocalMemory(sd.cast()))
+        }
+        pub fn expected_sddl(sid: &str) -> String {
+            format!("O:{sid}D:P(A;;0x00120001;;;{sid})")
+        }
+        pub fn create(name: &str, sddl: &str) -> Result<(TestHandle, u32), u32> {
+            let name = test_name(name);
+            let desc = descriptor(sddl)?;
+            let attr = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: desc.0,
+                bInheritHandle: 0,
+            };
+            unsafe { SetLastError(0); }
+            let h = unsafe { CreateMutexExW(&attr, name.as_ptr(), 0, USE_LOCK) };
+            let err = unsafe { GetLastError() };
+            if h.is_null() { Err(err) } else { Ok((TestHandle(h), err)) }
+        }
+        pub fn open(name: &str, rights: u32) -> Result<TestHandle, u32> {
+            let h = unsafe { OpenMutexW(rights, 0, test_name(name).as_ptr()) };
+            if h.is_null() { Err(unsafe { GetLastError() }) } else { Ok(TestHandle(h)) }
+        }
+        pub fn wrong_type(name: &str) -> TestHandle {
+            let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, test_name(name).as_ptr()) };
+            assert!(!h.is_null());
+            TestHandle(h)
+        }
+        impl TestHandle {
+            pub fn wait(&self, ms: u32) -> (u32, u32) {
+                unsafe { SetLastError(0); }
+                let rc = unsafe { WaitForSingleObject(self.0, ms) };
+                (rc, unsafe { GetLastError() })
+            }
+            pub fn release(&self) -> Result<(), u32> {
+                if unsafe { ReleaseMutex(self.0) } == 0 { Err(unsafe { GetLastError() }) } else { Ok(()) }
+            }
+            // Read the actual kernel object's owner and DACL through this
+            // exact handle, not a path/name and not the supplied create SDDL.
+            pub fn verify(&self, sid: &str) -> Result<(), String> {
+                let mut owner = std::ptr::null_mut();
+                let mut acl: *mut ACL = std::ptr::null_mut();
+                let mut sd = std::ptr::null_mut();
+                let rc = unsafe { GetSecurityInfo(self.0, SE_KERNEL_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut owner, std::ptr::null_mut(), &mut acl, std::ptr::null_mut(), &mut sd) };
+                let _sd = LocalMemory(sd.cast());
+                if rc != 0 || owner.is_null() || sd.is_null() {
+                    return Err(format!("kernel owner/DACL query failed rc={rc}"));
+                }
+                let mut expected_sid = std::ptr::null_mut();
+                let ok = unsafe { ConvertStringSidToSidW(wide(sid).as_ptr(), &mut expected_sid) };
+                let _expected_sid = LocalMemory(expected_sid.cast());
+                if ok == 0 || expected_sid.is_null() { return Err("expected SID invalid".into()); }
+                let owner_matches = unsafe { EqualSid(owner, expected_sid) } != 0;
+                let mut present = 0;
+                let mut defaulted = 0;
+                let mut returned_acl = std::ptr::null_mut();
+                let mut control = 0u16;
+                let mut revision = 0u32;
+                let ok = unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut returned_acl, &mut defaulted) };
+                let control_ok = unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) };
+                if ok == 0 || control_ok == 0 || present == 0 || acl.is_null() || returned_acl != acl {
+                    return Err("missing or NULL/unreadable kernel DACL".into());
+                }
+                let count = unsafe { (*acl).AceCount };
+                println!("LIFECYCLE_DACL owner_match={owner_matches} present={present} ace_count={count} control={control:#x} read_rc={rc}");
+                if !owner_matches { return Err("kernel object owner mismatch".into()); }
+                if count != 1 { return Err("kernel DACL has unexpected ACE count".into()); }
+                let mut ace = std::ptr::null_mut();
+                if unsafe { GetAce(acl, 0, &mut ace) } == 0 || ace.is_null() {
+                    return Err("kernel DACL ACE read failed".into());
+                }
+                let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+                if header.AceType != 0 || header.AceFlags != 0 ||
+                    (header.AceSize as usize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+                {
+                    return Err("unexpected kernel DACL ACE type/flags/size".into());
+                }
+                let allow = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                let actual_sid = std::ptr::addr_of!(allow.SidStart).cast_mut().cast();
+                if unsafe { IsValidSid(actual_sid) } == 0 { return Err("invalid ACE SID".into()); }
+                let sid_matches = unsafe { EqualSid(actual_sid, expected_sid) } != 0;
+                println!("LIFECYCLE_ACE type={} flags={} mask={:#x} sid_match={sid_matches}",
+                    header.AceType, header.AceFlags, allow.Mask);
+                if !sid_matches || allow.Mask != USE_LOCK {
+                    return Err("kernel DACL trustee/mask not exact".into());
+                }
+                // Named mutexes are not containers. Record protected flag as
+                // actually returned; enforce exact single ACE regardless.
+                Ok(())
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // 运行中的交易程序（P0-13 前置提示；非提权）
     // -----------------------------------------------------------------------
