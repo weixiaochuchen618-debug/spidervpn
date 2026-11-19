@@ -711,7 +711,13 @@ mod tests {
         fn fixture_base() -> Result<(PathBuf, Ancestors), String> {
             let raw = std::env::temp_dir();
             marker(&format!("D2_LAB_TEMP_RAW path={raw:?}"));
-            let original = launcher_path_parts(&raw)?;
+            // GetTempPath may include a trailing separator. Build a
+            // non-opened synthetic child exactly as the original fixture
+            // joined its child, then discard that component. The strict
+            // parser still rejects interior aliases/empty segments.
+            let mut original = launcher_path_parts(&raw.join("spider-d2-base-component-probe"))?;
+            original.pop().ok_or("D2_TEMP_EMPTY")?;
+            if original.len() < 2 { return Err("D2_TEMP_DRIVE_ROOT".into()); }
             fixed_drive(&original)?;
             // No canonicalize()/follow-reparse shortcut: inspect each
             // lexical component with OPEN_REPARSE_POINT, retaining handles.
