@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §86、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §25 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.89；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §87、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §26 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.90；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -711,3 +711,7 @@
 ## 86. 2026-11-19 §25最新恢复入口：集成基线冻结，B执行可信暂存
 - [§25](https://github.com/weixiaochuchen618-debug/spidervpn/commit/e4b17d3d00bb878a2f67b7f2fd1fab0f9808cb84)，#30 Draft双父精确候选 `e67316d5a82e6f6c7b8a303be406ca3671c46a58` 正式PASS冻结，D独立[7007771368](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7007771368)，详[Backlog D.89](./REMEDIATION_BACKLOG.md)。四workflow五job完整成功，历史lines-e2e失败根因未证，保留风险。
 - C已停写，撤销集成源码写权；B独占integration/security-remediation-20261119，基准上述SHA，实际COORD-INT-TRUST-STAGE / R01-008-B1实施，唯一范围、真实EXE测试与四workflow按§25，B GNU准确路径security-guard-gnu.yml。包外独立核定来源为外部前置条件，仅受保护stage，不执行包内程序或产生安装授权票据，不接线真实安装卸载/WFP。当前仅授权，尚无新B1提交或CI。D独立审查新精确SHA，C只读等待后续串行门实施；原#3/#29冻结、main不变，无实际供应链锚/跨SID/UAC/WFP05/L2/L3/Windows/VPS验收，不发布合并。总控[7007933446](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7007933446)。
+
+## 87. 2026-11-19 §26最新恢复入口：B1已执行范围待终审，R2真实I/O故障独立阻塞
+- [§26](https://github.com/weixiaochuchen618-debug/spidervpn/commit/ee2b5ac842d581b8eeb3a46af76e616227f51060) 与 [Backlog D.90](./REMEDIATION_BACKLOG.md) 已生效。#30 Draft `dcca33733828c07fc2af16e65472f0e03ae052b8` 四workflow全success，双ABI实际源竞争/ACL/ADS及原回归通过，A实读新MSVC/GNU-B日志；D新MSVC独立终态和B停写声明尚未出现，B唯一写锁、C只读，B1 CI_PASS/ACCEPTANCE_PENDING。D只复核新准确SHA最终结果，不重做已验收旧LAB。待D已执行范围PASS/B停写/A核定后才移交C共同门。
+- R2真实复制写入与刷盘故障均NOT RUN，独立BLOCKED_REAL_ACCEPTANCE，实机准入依据§26安全隔离故障矩阵，不能用创建80、模拟Err或源码传播替代；目标目录ADS注入/真实跨SID等另保留。不在真实系统填盘、改OS ACL、强制故障或降低判据。不消费B1结果、不开放实际安装卸载或WFP许可、不发布。真实外部锚、L2/L3/UAC/WFP05、本地Windows/VPS仍未验；总控[7009901989](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7009901989)。
