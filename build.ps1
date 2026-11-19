@@ -15,6 +15,18 @@
    0xC0000135（找不到 DLL）。
 
 用法：powershell -NoProfile -File build.ps1 [-Release]
+
+候选构建（仅 GNU x64；需要可信操作者已核验工具链与离线依赖缓存）：
+  build.ps1 -Candidate -Release -SourceSha <完整40位SHA> -CandidateTarget <新ASCII目录>
+    -CandidateOutput <另一个新ASCII目录> -ApprovalFile <包外JSON>
+    -ApprovalSha256 <通过独立可信渠道取得的64位摘要> -MingwBin <已审核MinGW bin>
+Approval JSON schema 1: repository (固定GitHub URL), sourceSha, rustVersion ("1.100.0"),
+target ("x86_64-pc-windows-gnu"), gcc/dlltool/ld/loader/engine/license objects.
+每个对象必须由可信操作者核定 source、version、sha256；loader/engine/license
+另须 platform="windows-x64"，license.version=engine.version。
+DLL/引擎/许可证和工具摘要必须来自独立审核，不从待验证目录自采作为信任依据。
+先审阅 build-evidence.json，再独立保管其摘要；package.ps1 要求该摘要与同一审批记录。
+此模式不安装工具、下载未知引擎、不签名、不批准发布。
 #>
 [CmdletBinding()]
 param([switch]$Release,[switch]$Candidate,[string]$SourceSha,
@@ -183,6 +195,8 @@ function Invoke-CandidateBuild {
     Assert-RustVersion $rust $cargo
     $null=New-Item -ItemType Directory -Path $CandidateTarget
     $null=New-Item -ItemType Directory -Path $CandidateOutput
+    $null=Assert-LocalPath $CandidateTarget -Directory
+    $null=Assert-LocalPath $CandidateOutput -Directory
     $buildArgs=@(Candidate-CargoArguments $root $CandidateTarget)
     $oldPath=$env:Path
     Push-Location $root
@@ -197,6 +211,8 @@ function Invoke-CandidateBuild {
         Pop-Location
     }
     if ((Assert-CandidateSource $root $SourceSha) -cne $lock) { throw 'Source changed during build' }
+    Assert-FileDigest $ApprovalFile $ApprovalSha256
+    foreach ($key in @('gcc','dlltool','ld')) { Assert-FileDigest $tools[$key].path $a.$key.sha256 }
     $exe=Join-Path $CandidateTarget 'x86_64-pc-windows-gnu\release\spidervpn.exe'
     Assert-X64Pe $exe
     $loader=Select-CandidateLoader $CandidateTarget $a.loader.sha256

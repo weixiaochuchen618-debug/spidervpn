@@ -1,5 +1,12 @@
 ﻿#requires -Version 5.1
 # Candidate packaging only; never fall back to shared legacy build output.
+# Invoke from the same reviewed clean source worktree:
+# package.ps1 -Version <version> -SourceSha <full SHA> -BuildDir <candidate output>
+#   -BuildEvidenceSha256 <independently retained reviewed build record hash>
+#   -ApprovalFile <external approved input JSON> -ApprovalSha256 <external hash>
+#   -EnginePath <approved engine> -LicensePath <approved license> -OutputDir <new ASCII directory>
+# The resulting ZIP and manifest hashes require independent review. Never
+# run the package's own scripts to establish initial trust. 008-B is pending.
 [CmdletBinding()]
 param([string]$Version,[string]$SourceSha,[string]$BuildDir,[string]$BuildEvidenceSha256,
     [string]$ApprovalFile,[string]$ApprovalSha256,[string]$EnginePath,[string]$LicensePath,[string]$OutputDir)
@@ -198,7 +205,7 @@ foreach ($copy in $copies) {
 }
 # Compatibility only; covered by full inventory, no source authentication.
 Set-Content -LiteralPath (Join-Path $stageInstall 'expected.sha256') -Encoding ASCII -Value @(
-    ("{0}  spidervpn.exe" -f $e.exeSha256),(" {0}  sing-box.exe" -f $a.engine.sha256).TrimStart()
+    ("{0}  spidervpn.exe" -f $e.exeSha256),("{0}  sing-box.exe" -f $a.engine.sha256)
 )
 
 $install = @'

@@ -54,7 +54,31 @@ try {
     if ($buildArgs -cnotcontains '--locked' -or $buildArgs -cnotcontains '--offline' -or
         $buildArgs -cnotcontains '1.100.0-x86_64-pc-windows-gnu') { throw 'Missing fixed locked build command' }
     Refuse 'wrong-toolchain' { Assert-RustVersion ('rustc 1.99.0'+[Environment]::NewLine+'host: x86_64-pc-windows-gnu') 'cargo 1.99.0' }
-    Refuse 'wrong-source-sha' { Assert-CandidateSource $repo ('0'*40) }
+    # Genuine local disposable git tree; not a SpiderVPN release or an
+    # external source proof. Verify correct HEAD then wrong HEAD/dirty
+    # tracked/ignored inputs separately so a universal refusal cannot pass.
+    $fixtureRepo=Join-Path $temp 'source-TEST-ONLY'
+    $null=New-Item -ItemType Directory -Path $fixtureRepo
+    $git=(Get-Command git.exe -CommandType Application).Source
+    $null=Invoke-CheckedNative $git @('-C',$fixtureRepo,'init','-q')
+    $null=Invoke-CheckedNative $git @('-C',$fixtureRepo,'remote','add','origin','https://github.com/weixiaochuchen618-debug/spidervpn')
+    Set-Content -LiteralPath (Join-Path $fixtureRepo 'Cargo.lock') -Value 'TEST ONLY lock bytes'
+    Set-Content -LiteralPath (Join-Path $fixtureRepo '.gitignore') -Value 'ignored.txt'
+    $null=Invoke-CheckedNative $git @('-C',$fixtureRepo,'add','--','Cargo.lock','.gitignore')
+    $null=Invoke-CheckedNative $git @('-C',$fixtureRepo,'-c','user.name=Test Only','-c','user.email=test-only@example.invalid','-c','commit.gpgsign=false','commit','-qm','disposable fixture')
+    $fixtureSha=(Invoke-CheckedNative $git @('-C',$fixtureRepo,'rev-parse','HEAD')) -join ''
+    if ((Assert-CandidateSource $fixtureRepo $fixtureSha) -cne (Candidate-Hash (Join-Path $fixtureRepo 'Cargo.lock'))) { throw 'Clean source positive failed' }
+    Refuse 'wrong-source-sha' { Assert-CandidateSource $fixtureRepo ('0'*40) }
+    Add-Content -LiteralPath (Join-Path $fixtureRepo 'Cargo.lock') -Value 'dirty'
+    Refuse 'dirty-tracked' { Assert-CandidateSource $fixtureRepo $fixtureSha }
+    $null=Invoke-CheckedNative $git @('-C',$fixtureRepo,'restore','Cargo.lock')
+    Set-Content -LiteralPath (Join-Path $fixtureRepo 'ignored.txt') -Value 'unknown ignored build input'
+    Refuse 'ignored-untracked' { Assert-CandidateSource $fixtureRepo $fixtureSha }
+    Remove-Item -LiteralPath (Join-Path $fixtureRepo 'ignored.txt')
+    $null=Assert-CandidateSource $fixtureRepo $fixtureSha
+    Refuse 'actual-build-entry-no-approval' { & (Join-Path $repo 'build.ps1') -Candidate -Release }
+    Refuse 'actual-package-entry-no-input' { & (Join-Path $repo 'package.ps1') }
+
     Refuse 'legacy-output' { Read-CandidateBuild 'C:\tc-rs-build\release' ('0'*64) $repo ('0'*40) ('0'*64) @{} ('0'*64) }
     Refuse 'missing-approval' { Read-CandidateApproval (Join-Path $temp 'absent.json') ('0'*64) ('0'*40) }
     $approval=Join-Path $temp 'TEST-ONLY-approval.json'
@@ -68,6 +92,11 @@ try {
     $record.engine.sha256=$hash; $record.Remove('license')
     $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $approval -Encoding UTF8
     Refuse 'missing-license-approval' { Read-CandidateApproval $approval (Candidate-Hash $approval) ('a'*40) }
+    $record.license=@{source='TEST ONLY';version='fixture';platform='windows-x64';sha256=$hash}
+    $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $approval -Encoding UTF8
+    $null=Read-CandidateApproval $approval (Candidate-Hash $approval) ('a'*40)
+    Refuse 'external-approval-hash-mismatch' { Read-CandidateApproval $approval ('0'*64) ('a'*40) }
+
     $license=Join-Path $stage 'sing-box.LICENSE.txt'
     $saved=[IO.File]::ReadAllBytes($license)
     Remove-Item -LiteralPath $license
