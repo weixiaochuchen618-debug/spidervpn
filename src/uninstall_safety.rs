@@ -180,6 +180,15 @@ fn owned_launcher_bytes(contents: &[u8], root: &Path, name: &str) -> bool {
 // separate same-object removal and uninstall-lifecycle gate.
 const MAX_LAUNCHER_BYTES: u64 = 8192;
 
+fn launcher_reserved_device(part: &str) -> bool {
+    // Win32 also recognizes these DOS devices with a suffix/extension,
+    // including superscript digits 1–3 for COM/LPT. Refuse before any open.
+    let stem = part.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$")
+        || stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+}
+
 fn launcher_path_parts(path: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     // Reject namespace/relative paths, ADS, lexical aliases, empty segments
     // and Win32 trailing-dot/space normalization before opening anything.
@@ -193,7 +202,7 @@ fn launcher_path_parts(path: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     let mut current = std::path::PathBuf::from(&text[..3]);
     let mut parts = vec![current.clone()];
     for part in text[3..].split('\\') {
-        if part.is_empty() || part.ends_with(['.', ' '])
+        if part.is_empty() || part.ends_with(['.', ' ']) || launcher_reserved_device(part)
             || part.chars().any(|c| c.is_control() || ":*?\"<>|".contains(c))
         {
             return Err("快捷方式路径包含不安全的名称或别名".into());
@@ -570,7 +579,9 @@ mod tests {
             r"\\?\C:\folder\启动SpiderVPN.cmd", r"C:\a\..\启动SpiderVPN.cmd",
             r"C:\a\.\启动SpiderVPN.cmd", r"C:\a.\启动SpiderVPN.cmd",
             r"C:\a \启动SpiderVPN.cmd", r"C:\a:stream\启动SpiderVPN.cmd",
-            r"C:\a\\启动SpiderVPN.cmd"] {
+            r"C:\a\\启动SpiderVPN.cmd", r"C:\NUL.txt\启动SpiderVPN.cmd",
+            r"C:\COM1\启动SpiderVPN.cmd", r"C:\LPT²\启动SpiderVPN.cmd",
+            r"C:\CONIN$\启动SpiderVPN.cmd"] {
             assert!(launcher_path_parts(Path::new(name)).is_err(), "{name}");
         }
         assert!(launcher_path_parts(Path::new(r"C:\Users\Public\启动SpiderVPN.cmd")).is_ok());
