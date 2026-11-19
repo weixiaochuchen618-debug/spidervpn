@@ -65,31 +65,51 @@ try {
     # tracked/ignored inputs separately so a universal refusal cannot pass.
     $fixtureRepo=Join-Path $temp 'source-TEST-ONLY'
     $null=New-Item -ItemType Directory -Path $fixtureRepo
-    # For this disposable fixture only, use the runner's actual PATH
-    # precedence explicitly. This is not a production approval.
-    $matches=@(Get-Command git.exe -CommandType Application -All)
-    if ($matches.Count -eq 0) { throw 'Git fixture tool missing' }
-    $git=Resolve-CandidateApplication 'git.exe' $matches[0].Source
+    # Explicit Git path from this runner's installed Git, never discovery
+    # order. This is a TEST ONLY selection, not a production approval.
+    $git=Resolve-CandidateApplication 'git.exe' (Join-Path $env:ProgramFiles 'Git\bin\git.exe')
     $gitVersion=(Invoke-CheckedNative $git @('--version')) -join ''
     if ($gitVersion -notmatch '^git version ') { throw 'Git fixture version missing' }
+    $gitProof=@{sha256=(Candidate-Hash $git);version=$gitVersion;source='TEST ONLY runner Git'}
+    $null=Read-AuditedApplication 'git.exe' $git $gitProof
+    Refuse 'git-wrong-audited-digest' 'External digest mismatch:' { Read-AuditedApplication 'git.exe' $git @{sha256=('0'*64);version=$gitVersion;source='TEST ONLY'} }
+    $rustup=Resolve-CandidateApplication 'rustup.exe' (Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe')
+    $rustupVersion=(Invoke-CheckedNative $rustup @('--version')) -join [Environment]::NewLine
+    if ($rustupVersion -notmatch 'rustup ') { throw 'Rustup fixture version missing' }
+    $rustupProof=@{sha256=(Candidate-Hash $rustup);version=($rustupVersion -split '\r?\n')[0];source='TEST ONLY runner rustup'}
+    $null=Read-AuditedApplication 'rustup.exe' $rustup $rustupProof
+    Refuse 'wrong-application-name' 'Wrong application name: git.exe' { Resolve-CandidateApplication 'git.exe' $exe }
     $toolA=Join-Path $temp 'toolA'; $toolB=Join-Path $temp 'toolB'
     $null=New-Item -ItemType Directory -Path $toolA,$toolB
     # Only discover these harmless copies; do not execute them as git.
-    Copy-Item -LiteralPath $exe -Destination (Join-Path $toolA 'git.exe')
-    Copy-Item -LiteralPath $exe -Destination (Join-Path $toolB 'git.exe')
+    foreach ($name in @('git.exe','rustup.exe')) {
+        Copy-Item -LiteralPath $exe -Destination (Join-Path $toolA $name)
+        Copy-Item -LiteralPath $exe -Destination (Join-Path $toolB $name)
+    }
     $oldPath=$env:Path
     try {
         $env:Path="$toolA;$toolB;$oldPath"
         Refuse 'multiple-git-paths' 'Native application missing or ambiguous: git.exe' { Resolve-CandidateApplication 'git.exe' '' }
+        Refuse 'multiple-rustup-paths' 'Native application missing or ambiguous: rustup.exe' { Resolve-CandidateApplication 'rustup.exe' '' }
         if ((Resolve-CandidateApplication 'git.exe' $git) -cne $git) { throw 'Explicit git selection failed' }
+        if ((Resolve-CandidateApplication 'rustup.exe' $rustup) -cne $rustup) { throw 'Explicit rustup selection failed' }
     } finally { $env:Path=$oldPath }
-    $LASTEXITCODE=0
+    $global:LASTEXITCODE=0
     Refuse 'native-missing-stale-zero' 'Native application missing:' { Invoke-CheckedNative (Join-Path $temp 'missing.exe') @() }
     $notExe=Join-Path $temp 'not-an-image.exe'
     Set-Content -LiteralPath $notExe -Value 'TEST ONLY not executable'
-    $LASTEXITCODE=0
+    $global:LASTEXITCODE=0
     Refuse 'native-launch-stale-zero' 'Native application launch failed:' { Invoke-CheckedNative $notExe @() }
     Refuse 'native-nonzero' 'Native command failed (' { Invoke-CheckedNative $git @('--not-a-real-git-option') }
+    # Actual positive stdout/stderr and exact nonzero controls with known
+    # system cmd.exe; no untrusted package program is executed.
+    $cmd=Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $global:LASTEXITCODE=0
+    $native=@(Invoke-CheckedNative $cmd @('/D','/C','echo STDOUT_OK & echo STDERR_OK 1>&2 & exit /b 0'))
+    if (($native -join ' ') -notmatch 'STDOUT_OK' -or ($native -join ' ') -notmatch 'STDERR_OK') { throw 'Native output boundary failed' }
+    Refuse 'native-exact-exit' 'Native command failed (23):' { Invoke-CheckedNative $cmd @('/D','/C','exit /b 23') }
+    if ($global:LASTEXITCODE -ne 0) { throw 'Native wrapper did not restore caller exit state' }
+    Write-Host 'CANDIDATE_NATIVE_COMPLETE explicit_git=true explicit_rustup=true real_ambiguity=true stale_zero_rejected=true stdout_stderr=true'
 
     $null=Invoke-CheckedNative $git @('-C',$fixtureRepo,'init','-q')
     $null=Invoke-CheckedNative $git @('-C',$fixtureRepo,'remote','add','origin','https://github.com/weixiaochuchen618-debug/spidervpn')

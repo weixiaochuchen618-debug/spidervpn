@@ -103,17 +103,22 @@ function Invoke-CheckedNative([string]$Exe,[string[]]$Arguments) {
     # A sentinel prevents stale successful LASTEXITCODE from authorizing
     # a failed start. No shell, command string, or PATH lookup.
     $prior=$ErrorActionPreference
+    $savedExit=$global:LASTEXITCODE
+    $PSNativeCommandUseErrorActionPreference=$false
     $ErrorActionPreference='Continue'
-    $LASTEXITCODE=$null
+    $global:LASTEXITCODE=$null
     try {
-        try { $lines=@(& $Exe @Arguments 2>&1); $code=$LASTEXITCODE }
+        try { $lines=@(& $Exe @Arguments 2>&1); $code=$global:LASTEXITCODE }
         catch { throw "Native application launch failed: $Exe" }
         if ($null -eq $code -or @($lines | Where-Object {
             $_ -is [Management.Automation.ErrorRecord] -and $_.FullyQualifiedErrorId -notin @('NativeCommandError','NativeCommandErrorMessage')
         }).Count -ne 0) { throw "Native application launch failed: $Exe" }
         if ($code -ne 0) { throw "Native command failed ($code): $Exe" }
         @($lines | ForEach-Object {$_.ToString()})
-    } finally { $ErrorActionPreference=$prior }
+    } finally {
+        $ErrorActionPreference=$prior
+        $global:LASTEXITCODE=$savedExit
+    }
 }
 function Read-AuditedApplication([string]$Name,[string]$Path,$Approval) {
     $file=Resolve-CandidateApplication $Name $Path
