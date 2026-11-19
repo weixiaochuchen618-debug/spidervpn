@@ -1777,6 +1777,11 @@ mod tests {
 
     #[cfg(windows)]
     fn a2_actual_process_app_id(handle: windows_sys::Win32::Foundation::HANDLE) -> Vec<u8> {
+        lab_actual_process_app_id(handle, "A2_IMAGE")
+    }
+
+    #[cfg(windows)]
+    fn lab_actual_process_app_id(handle: windows_sys::Win32::Foundation::HANDLE, marker: &str) -> Vec<u8> {
         use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
         use super::super::identity::device_path_from_app_id;
         use super::super::wfp_win::app_id_from_path;
@@ -1792,7 +1797,7 @@ mod tests {
         let native = image(1); // PROCESS_NAME_NATIVE
         let app = app_id_from_path(Path::new(&win32)).unwrap();
         let wfp = device_path_from_app_id(&app);
-        println!("A2_IMAGE win32={win32:?} native={native:?} wfp_app_id={wfp:?}");
+        println!("{marker} win32={win32:?} native={native:?} wfp_app_id={wfp:?}");
         assert!(native.eq_ignore_ascii_case(&wfp),
             "actual native image and independently resolved WFP APP_ID differ");
         app
@@ -2453,7 +2458,7 @@ mod tests {
 
     #[cfg(windows)]
     fn a3b_lab_wait(dir: &Path, marker: &str) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(45);
         while !dir.join(marker).is_file() {
             assert!(Instant::now() < deadline, "A3b lab missing marker {marker}");
             std::thread::sleep(Duration::from_millis(15));
@@ -2475,7 +2480,7 @@ mod tests {
         if role == "probe" {
             let addr: SocketAddr = std::env::var("SPIDERVPN_A3B_ENDPOINT").unwrap().parse().unwrap();
             let allowed = std::env::var("SPIDERVPN_A3B_ALLOW").as_deref() == Ok("1");
-            let app = a2_actual_process_app_id(unsafe { GetCurrentProcess() });
+            let app = lab_actual_process_app_id(unsafe { GetCurrentProcess() }, "A3B_IMAGE");
             assert_eq!(device_path_from_app_id(&app), std::env::var("SPIDERVPN_A3B_APP").unwrap());
             let result = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
             println!("A3B_TCP pid={} endpoint={addr} expected={allowed} actual={} error={:?}",
@@ -2485,8 +2490,30 @@ mod tests {
             if !allowed { assert_eq!(result.unwrap_err().raw_os_error(), Some(10013)); }
             return;
         }
-        assert_eq!(role, "old-writer");
         let dir = std::path::PathBuf::from(std::env::var_os("SPIDERVPN_A3B_DIR").unwrap());
+        if role == "transaction-reader" {
+            use super::super::wfp_win::lab_enum_layer;
+            use super::super::wfp::{Guid, Layer};
+            let keys = ["SPIDERVPN_A3B_KEY4", "SPIDERVPN_A3B_KEY6"].map(|name|
+                Guid::parse(&std::env::var(name).unwrap()).unwrap());
+            let observe = || -> Result<usize, String> {
+                let audit = WfpEngine::open().map_err(|e| e.to_string())?;
+                let mut rows = lab_enum_layer(&audit, Layer::V4, 4096)?;
+                rows.extend(lab_enum_layer(&audit, Layer::V6, 4096)?);
+                Ok(rows.iter().filter(|row| keys.contains(&row.raw.filter_key)).count())
+            };
+            a3b_lab_mark(&dir, "reader-entered");
+            let result = observe();
+            let body = match result {
+                Ok(n) => format!("count={n}"),
+                Err(reason) => format!("error={reason}"),
+            };
+            println!("A3B_TXN_READER pid={} result={body}", std::process::id());
+            std::fs::write(dir.join("reader-result"), body).unwrap();
+            a3b_lab_mark(&dir, "reader-complete");
+            return;
+        }
+        assert_eq!(role, "old-writer");
         let owner_pid: u32 = std::env::var("SPIDERVPN_A3B_OWNER_PID").unwrap().parse().unwrap();
         let stamp: u64 = std::env::var("SPIDERVPN_A3B_OWNER_STAMP").unwrap().parse().unwrap();
         let owner = open_controller(owner_pid, stamp).unwrap();
@@ -2580,7 +2607,7 @@ mod tests {
             cmd
         }
         fn fresh_key() -> Guid {
-            Guid::from_bytes_le(decode_nonce(&random_nonce()).unwrap().try_into().unwrap())
+            Guid::from_bytes_le(decode_nonce(&random_nonce()).unwrap())
         }
         fn scan() -> Result<Vec<LabFilter>, String> {
             let audit = WfpEngine::open().map_err(|e| e.to_string())?;
@@ -2708,6 +2735,17 @@ mod tests {
         assert!(only_baseline(Ok(observed), &apps, provider, &baseline).is_err());
         println!("A3B_REJECT mode=unknown-null-provider-block id={extra_id}");
         filter_delete_by_id(&other_session, extra_id).unwrap();
+        let foreign_provider = fresh_key();
+        lab_add_provider(&other_session, foreign_provider);
+        let foreign_key = fresh_key();
+        let foreign_id = filter_add(&other_session,
+            &lab_block(&apps[2], Layer::V4, Some(foreign_provider), foreign_key)).unwrap();
+        let observed = scan().unwrap();
+        let foreign = observed.iter().find(|r| r.raw.filter_key == foreign_key).unwrap();
+        assert!(!foreign.null_provider && foreign.raw.provider_key == foreign_provider);
+        assert!(only_baseline(Ok(observed), &apps, provider, &baseline).is_err());
+        println!("A3B_REJECT mode=foreign-provider-block id={foreign_id}");
+        filter_delete_by_id(&other_session, foreign_id).unwrap();
         let disabled_key = fresh_key();
         match lab_try_disabled_block(&other_session, &apps[2], disabled_key) {
             Ok(id) => {
@@ -2723,6 +2761,7 @@ mod tests {
             }
         }
         other_session.close_checked().unwrap();
+        assert!(provider_get(&audit, foreign_provider).unwrap().is_none());
         let mut injected = baseline.clone();
         injected[0].raw.flags |= FILTER_FLAG_DISABLED;
         assert!(only_baseline(Ok(injected), &apps, provider, &baseline).is_err());
@@ -2779,11 +2818,38 @@ mod tests {
         // No admission here: a paused old writer can invalidate this result.
         a3b_lab_mark(&dir, "late-add");
         a3b_lab_wait(&dir, "staged");
-        // Do not synchronously query BFE from the parent while a separate
-        // writer holds an open transaction; the native reader may block.
-        // The committed-state observations bracket this actual transaction.
+        // Independently attempt enumeration while the old writer is inside
+        // a native write transaction. The read may block: never make the
+        // writer's commit depend on read completion.
+        let mut reader = LabChild(lab_cmd(&exe)
+            .env("SPIDERVPN_A3B_ROLE", "transaction-reader")
+            .env("SPIDERVPN_A3B_DIR", &dir)
+            .env("SPIDERVPN_A3B_KEY4", old_keys[0].to_string())
+            .env("SPIDERVPN_A3B_KEY6", old_keys[1].to_string())
+            .spawn().unwrap());
+        a3b_lab_wait(&dir, "reader-entered");
+        let sample_until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < sample_until && !dir.join("reader-complete").is_file() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before_commit = dir.join("reader-complete").is_file();
+        let before_result = if before_commit {
+            let result = std::fs::read_to_string(dir.join("reader-result")).unwrap();
+            assert!(result == "count=0" || result.starts_with("error="),
+                "uncommitted permits unexpectedly visible to independent reader: {result}");
+            Some(result)
+        } else { None };
+        println!("A3B_TXN_IN_FLIGHT reader_pid={} completed_before_commit={before_commit} observation={before_result:?}", reader.0.id());
         a3b_lab_mark(&dir, "commit-add");
         a3b_lab_wait(&dir, "add-committed");
+        a3b_lab_wait(&dir, "reader-complete");
+        assert!(reader.0.wait().unwrap().success());
+        let result = std::fs::read_to_string(dir.join("reader-result")).unwrap();
+        // Two layer reads are not a single transactional snapshot. If the
+        // commit raced the read, 0/1/2 (or a native error) is evidence only.
+        assert!(matches!(result.as_str(), "count=0" | "count=1" | "count=2")
+            || result.starts_with("error="));
+        println!("A3B_TXN_IN_FLIGHT_RESULT before_commit={before_commit} result={result}");
         let committed = scan().unwrap();
         let old_rules: Vec<_> = old_keys.iter().map(|key|
             committed.iter().find(|r| r.raw.filter_key == *key).unwrap()).collect();
