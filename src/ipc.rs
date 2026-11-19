@@ -11007,6 +11007,14 @@ mod tests {
             }
             assert!(error.contains("sing-box") || error.contains("version"), "{error}");
         }
+        if elevated {
+            crate::engine::tests::with_engine_junction(root, |linked| {
+                let error = probe_engine_binary(linked).expect_err("junction must be refused before spawn");
+                assert!(error.contains("重解析"), "{error}");
+            });
+            let error = probe_engine_binary(&root.join("missing.exe")).unwrap_err();
+            assert!(error.contains("存在"), "{error}");
+        }
         // The trusted-directory policy positively permits this controlled
         // image to execute; its *actual version protocol* is not sing-box.
         // Retain the old real-exec negative rather than replacing it with

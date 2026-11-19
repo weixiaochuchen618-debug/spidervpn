@@ -78,9 +78,7 @@ pub fn validate_privileged_engine(
 #[cfg(windows)]
 pub(crate) fn actual_process_elevation() -> Result<bool, String> {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-    };
+    use windows_sys::Win32::Security::TOKEN_QUERY;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut raw = std::ptr::null_mut();
@@ -92,6 +90,12 @@ pub(crate) fn actual_process_elevation() -> Result<bool, String> {
     }
     // SAFETY: OpenProcessToken returned an owned token handle.
     let _token = unsafe { OwnedHandle::from_raw_handle(raw) };
+    read_token_elevation(raw)
+}
+
+#[cfg(windows)]
+fn read_token_elevation(raw: windows_sys::Win32::Foundation::HANDLE) -> Result<bool, String> {
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION};
     let mut value = TOKEN_ELEVATION { TokenIsElevated: 0 };
     let size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
     let mut returned = 0u32;
@@ -370,6 +374,36 @@ pub(crate) mod tests {
         true
     }
 
+
+    #[cfg(windows)]
+    pub(crate) fn with_engine_junction(target: &std::path::Path, check: impl FnOnce(&std::path::Path)) {
+        // Junction lives outside the target, so there is no recursive cycle.
+        let dir = tmp_dirs("entry-junction");
+        let link = dir.join("linked");
+        struct Cleanup(std::path::PathBuf, std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                std::fs::remove_dir(&self.0).unwrap();
+                std::fs::remove_dir(&self.1).unwrap();
+            }
+        }
+        let output = Command::new(r"C:\Windows\System32\cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"]).arg(&link).arg(target)
+            .output().unwrap();
+        assert!(output.status.success(), "create isolated junction: {}",
+            String::from_utf8_lossy(&output.stderr));
+        let _cleanup = Cleanup(link.clone(), dir);
+        check(&link.join("sing-box.exe"));
+    }
+
+    #[test]
+    fn actual_token_query_failure_is_not_nonadmin() {
+        // Actual Win32 failure; do not create a fake token/elevation bool.
+        // Production query takes only the owned current-process handle.
+        assert!(read_token_elevation(std::ptr::null_mut()).is_err());
+        assert!(actual_process_elevation().is_ok(), "real current process token must be queryable");
+    }
+
     /// 用系统自带的 ping 当「假引擎」：它是个会活一会儿的普通进程，
     /// 不监听端口、不改任何系统设置，用来验证拉起与停止的正反路径。
     fn sleeper() -> EngineConfig {
@@ -407,6 +441,18 @@ pub(crate) mod tests {
                 }
                 assert!(!dir.exists(), "rejected engine must not create logs or spawn");
             }
+            with_engine_junction(root, |linked| {
+                let bad = EngineConfig { binary: linked.to_string_lossy().into_owned(),
+                    args: cfg.args.clone() };
+                match start(&bad, &dir) {
+                    Err(error) => assert!(error.contains("重解析"), "{error}"),
+                    Ok(handle) => {
+                        stop(handle.pid, 100).unwrap();
+                        panic!("real elevated start followed a junction");
+                    }
+                }
+                assert!(!dir.exists());
+            });
             cfg.binary = root.join("sing-box.exe").to_string_lossy().into_owned();
         } else {
             // Exercise a genuine non-elevated custom same-name engine.
