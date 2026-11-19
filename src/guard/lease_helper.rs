@@ -3005,13 +3005,16 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(15));
             }
         }
-        fn flow(exe: &Path, app: &[u8], listener: &TcpListener, expected: bool) {
+        fn probe(exe: &Path, app: &[u8], endpoint: SocketAddr, expected: bool) {
             let mut child = ChildGuard(cmd(exe).env("SPIDERVPN_A3B_ROLE", "probe")
-                .env("SPIDERVPN_A3B_ENDPOINT", listener.local_addr().unwrap().to_string())
+                .env("SPIDERVPN_A3B_ENDPOINT", endpoint.to_string())
                 .env("SPIDERVPN_A3B_ALLOW", if expected { "1" } else { "0" })
                 .env("SPIDERVPN_A3B_APP", device_path_from_app_id(app))
                 .spawn().unwrap());
             await_child(&mut child.0, Instant::now() + Duration::from_secs(5));
+        }
+        fn flow(exe: &Path, app: &[u8], listener: &TcpListener, expected: bool) {
+            probe(exe, app, listener.local_addr().unwrap(), expected);
             if expected {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
@@ -3147,6 +3150,7 @@ mod tests {
             };
             assert_eq!(reason, UNKNOWN_MACHINE_HISTORY_REASON);
             verify_old_and_base(&before, key);
+            probe(&trader, app, endpoint, false);
             println!("A3B_DENY_DIRECT family={} residual={} verified_listener=true exact_absent=true baseline_unchanged=true",
                 if endpoint.is_ipv4() { "v4" } else { "v6" }, index);
 
@@ -3193,6 +3197,7 @@ mod tests {
             // session rundown could conceal an erroneous transient permit.
             check().unwrap();
             verify_old_and_base(&before, key);
+            probe(&trader, app, endpoint, false);
             check().unwrap();
             println!("A3B_DENY_REPLY family={} residual={} pid={helper_pid} actual_state=Rejected filters=0 helper_alive=true no_new_permit=true baseline_unchanged=true",
                 if endpoint.is_ipv4() { "v4" } else { "v6" }, index);
