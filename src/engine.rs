@@ -342,11 +342,22 @@ pub(crate) mod tests {
         if exe.file_name().and_then(|n| n.to_str()) == Some(FRONTEND) {
             return false;
         }
-        let root = tmp_dirs(if harmless_engine.ends_with("PING.EXE") {
-            "entry-start-child"
-        } else {
-            "entry-probe-child"
-        });
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = test_name.rsplit("::").next().unwrap();
+        assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        // Never reuse or erase a pre-existing directory. Each original
+        // test gets its own frontend, engine, logs and data, even when
+        // multiple tests execute in one cargo invocation.
+        let root = loop {
+            let dir = std::env::temp_dir().join(format!("tcrs-entry-{name}-{}-{}",
+                std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => break dir,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!("create isolated frontend directory: {err}"),
+            }
+        };
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
@@ -355,16 +366,26 @@ pub(crate) mod tests {
         let child = root.join(FRONTEND);
         std::fs::copy(&exe, &child).unwrap();
         std::fs::copy(harmless_engine, root.join("sing-box.exe")).unwrap();
+        assert_eq!(std::fs::read(root.join("sing-box.exe")).unwrap(),
+            std::fs::read(harmless_engine).unwrap(), "exact harmless fixture image");
         let dll = exe.parent().unwrap().join("WebView2Loader.dll");
         if dll.is_file() {
             std::fs::copy(dll, root.join("WebView2Loader.dll")).unwrap();
         }
-        let output = Command::new(&child)
-            .args(["--exact", test_name, "--nocapture"])
-            // Only the child has the legacy hook set. Actual process token
-            // is unchanged/inherited; never mutate other tests' environment.
-            .env("SPIDERVPN_FORCE_NONADMIN", "1")
-            .output().expect("run isolated real-token test");
+        let mut command = Command::new(&child);
+        command.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .current_dir(&root);
+        // Only the explicit entry-gate tests challenge the legacy hook.
+        // The three real connection regressions must run with no forced
+        // nonadmin flag; all tests keep the inherited primary token.
+        if test_name == "engine::tests::start_reports_pid_and_process_is_alive"
+            || test_name == "ipc::tests::the_real_probe_rejects_a_program_that_is_not_sing_box"
+        {
+            command.env("SPIDERVPN_FORCE_NONADMIN", "1");
+        } else {
+            command.env_remove("SPIDERVPN_FORCE_NONADMIN");
+        }
+        let output = command.output().expect("run isolated real-token test");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && stdout.contains("1 passed")
             && stdout.contains("ENGINE_ENTRY_ACTUAL_TOKEN"),
@@ -402,6 +423,8 @@ pub(crate) mod tests {
         // Production query takes only the owned current-process handle.
         assert!(read_token_elevation(std::ptr::null_mut()).is_err());
         assert!(actual_process_elevation().is_ok(), "real current process token must be queryable");
+        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={} null_token_query_refused=true",
+            actual_process_elevation().unwrap());
     }
 
     /// 用系统自带的 ping 当「假引擎」：它是个会活一会儿的普通进程，
@@ -459,7 +482,7 @@ pub(crate) mod tests {
             cfg.binary = external_same_name.to_string_lossy().into_owned();
         }
         let h = start(&cfg, &dir).expect("应当能启动");
-        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={elevated} legacy_force_nonadmin=1 actual_start=true");
+        println!("ENGINE_ENTRY_ACTUAL_TOKEN elevated={elevated} legacy_force_nonadmin=1 actual_start=true external_rejected={elevated} junction_rejected={elevated} standard_custom_started={}", !elevated);
         assert!(h.pid > 0);
         assert!(crate::probe::SystemProbe::default().process_alive(h.pid));
         assert!(h.alive());
