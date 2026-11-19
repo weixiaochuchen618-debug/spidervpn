@@ -323,7 +323,7 @@ mod imp {
             assert_ne!(unsafe { ReleaseMutex(observer.0) }, 0);
             existing(); // still exists even though currently unowned
             drop(observer);
-            std::fs::remove_file(ready).unwrap();
+            std::fs::remove_file(&ready).unwrap();
             let mut peer = spawn("fresh"); wait(&mut peer.0, true);
             println!("G1_GATE_KERNEL_COMPLETE same_sid=true nonowner_refused=true existing_refused=true abandoned_rc=128 fresh_after_close=true cross_sid_not_run=true history_proven=false");
         }
