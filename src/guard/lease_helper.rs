@@ -1828,6 +1828,14 @@ mod tests {
             }
         }
 
+        // A3b workers are deliberately separate from the production lease
+        // protocol and the existing nine + seven + A2 fixtures.
+        if let Ok(role) = std::env::var("SPIDERVPN_A3B_ROLE") {
+            assert!(native_bfe);
+            a3b_lab_worker(&role);
+            return;
+        }
+
         // A copied disposable test executable exercises a distinct real APP_ID.
         // No production trader executable, provider or system firewall is modified.
         if let Ok(target) = std::env::var("SPIDERVPN_A2_TCP_TARGET") {
@@ -2204,6 +2212,7 @@ mod tests {
         }
         if let Some(engine) = engine.as_mut() {
             generation_barrier_bfe(engine.0.id());
+            a3b_cross_process_bfe_lab();
             assert!(engine.0.try_wait().unwrap().is_none());
             drop(engine.0.stdin.take());
             wait_for(Instant::now() + Duration::from_secs(5), || engine.0.try_wait().unwrap().is_some(),
@@ -2440,6 +2449,421 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).unwrap();
         println!("A2_BFE_COMPLETE old_keys=2 new_keys=1 residual_rejected=true unknown_rejected=true verified_new_generation=true baseline_removed=true tcp_restored=true");
+    }
+
+    #[cfg(windows)]
+    fn a3b_lab_wait(dir: &Path, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !dir.join(marker).is_file() {
+            assert!(Instant::now() < deadline, "A3b lab missing marker {marker}");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    #[cfg(windows)]
+    fn a3b_lab_mark(dir: &Path, marker: &str) {
+        // TEST synchronization only; never a production recovery ticket.
+        std::fs::write(dir.join(marker), b"fixture").unwrap();
+    }
+
+    #[cfg(windows)]
+    fn a3b_lab_worker(role: &str) {
+        use super::super::wfp_win::{WfpEngine, RawFilter, Txn, app_id_from_path,
+            filter_add, filter_delete_by_id};
+        use super::super::identity::device_path_from_app_id;
+        use std::net::{SocketAddr, TcpStream};
+        if role == "probe" {
+            let addr: SocketAddr = std::env::var("SPIDERVPN_A3B_ENDPOINT").unwrap().parse().unwrap();
+            let allowed = std::env::var("SPIDERVPN_A3B_ALLOW").as_deref() == Ok("1");
+            let app = a2_actual_process_app_id(unsafe { GetCurrentProcess() });
+            assert_eq!(device_path_from_app_id(&app), std::env::var("SPIDERVPN_A3B_APP").unwrap());
+            let result = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+            println!("A3B_TCP pid={} endpoint={addr} expected={allowed} actual={} error={:?}",
+                std::process::id(), result.is_ok(), result.as_ref().err());
+            assert_eq!(result.is_ok(), allowed);
+            // A mere timeout is not evidence of WFP classification.
+            if !allowed { assert_eq!(result.unwrap_err().raw_os_error(), Some(10013)); }
+            return;
+        }
+        assert_eq!(role, "old-writer");
+        let dir = std::path::PathBuf::from(std::env::var_os("SPIDERVPN_A3B_DIR").unwrap());
+        let owner_pid: u32 = std::env::var("SPIDERVPN_A3B_OWNER_PID").unwrap().parse().unwrap();
+        let stamp: u64 = std::env::var("SPIDERVPN_A3B_OWNER_STAMP").unwrap().parse().unwrap();
+        let owner = open_controller(owner_pid, stamp).unwrap();
+        let nonce = decode_nonce(&std::env::var("SPIDERVPN_A3B_NONCE").unwrap()).unwrap();
+        let apps = ["trader-a.exe", "trader-b.exe"].map(|name| app_id_from_path(&dir.join(name)).unwrap());
+        let endpoints = ["SPIDERVPN_A3B_OLD4", "SPIDERVPN_A3B_OLD6"].map(|name|
+            std::env::var(name).unwrap().parse::<SocketAddr>().unwrap());
+        let session = WfpEngine::open_dynamic().unwrap();
+        let add = || -> Vec<u64> {
+            apps.iter().zip(endpoints).map(|(app, endpoint)| {
+                filter_add(&session, &RawFilter::isolated_lifecycle_filter(app, Some(endpoint), &nonce).unwrap()).unwrap()
+            }).collect()
+        };
+        println!("A3B_WRITER_READY writer_pid={} controller_pid={owner_pid} dynamic_session=true", std::process::id());
+        a3b_lab_mark(&dir, "writer-ready");
+        a3b_lab_wait(&dir, "abort-add");
+        require_live(owner.0).unwrap();
+        {
+            let txn = Txn::begin(&session).unwrap();
+            let ids = add();
+            txn.abort().unwrap();
+            println!("A3B_TXN phase=add-abort ids={ids:?}");
+        }
+        a3b_lab_mark(&dir, "add-aborted");
+
+        // A deliberately UNsupervised fixture writer can still issue a late
+        // transaction after its original control process has really exited.
+        // This does not substitute for or modify production serve_pipe.
+        a3b_lab_wait(&dir, "late-add");
+        assert!(require_live(owner.0).is_err(), "old controller actually exited");
+        let txn = Txn::begin(&session).unwrap();
+        let ids = add();
+        a3b_lab_mark(&dir, "staged");
+        a3b_lab_wait(&dir, "commit-add");
+        txn.commit().unwrap();
+        println!("A3B_TXN phase=late-add-commit ids={ids:?} controller_exited=true");
+        a3b_lab_mark(&dir, "add-committed");
+
+        a3b_lab_wait(&dir, "abort-delete");
+        {
+            let txn = Txn::begin(&session).unwrap();
+            for id in &ids { filter_delete_by_id(&session, *id).unwrap(); }
+            txn.abort().unwrap();
+            println!("A3B_TXN phase=delete-abort ids={ids:?}");
+        }
+        a3b_lab_mark(&dir, "delete-aborted");
+        a3b_lab_wait(&dir, "commit-delete");
+        {
+            let txn = Txn::begin(&session).unwrap();
+            filter_delete_by_id(&session, ids[0]).unwrap();
+            txn.commit().unwrap();
+            println!("A3B_TXN phase=partial-delete-commit removed={} retained={}", ids[0], ids[1]);
+        }
+        a3b_lab_mark(&dir, "delete-committed");
+        // Parent deliberately terminates only this disposable writer with the
+        // second committed object still installed, exercising native RPC
+        // rundown rather than calling close_checked in this path.
+        a3b_lab_wait(&dir, "unexpected-writer-release");
+        panic!("A3b writer should be terminated during the rundown experiment");
+    }
+
+    #[cfg(windows)]
+    fn a3b_cross_process_bfe_lab() {
+        use super::super::wfp_win::{WfpEngine, RawFilter, Txn, LabFilter, app_id_from_path,
+            lab_enum_layer, lab_add_provider, lab_block, lab_try_disabled_block, lab_native_enum_error,
+            filter_add, filter_get_by_id, filter_enumerate, filter_delete_by_id, dynamic_permit_key,
+            old_dynamic_permits_absent, provider_get};
+        use super::super::wfp::{Guid, Layer, ACTION_BLOCK, ACTION_PERMIT, CONDITION_ALE_APP_ID,
+            MATCH_EQUAL, FWP_TYPE_BYTE_BLOB, FILTER_FLAG_DISABLED, FILTER_WEIGHT_BLOCK};
+        use super::super::identity::device_path_from_app_id;
+        use std::net::TcpListener;
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Child, Command, Stdio};
+
+        struct LabChild(Child);
+        impl Drop for LabChild {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        struct LabDir(std::path::PathBuf);
+        impl Drop for LabDir {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        fn lab_cmd(exe: &Path) -> Command {
+            let mut cmd = Command::new(exe);
+            cmd.args(["--ignored", "--exact", "guard::lease_helper::tests::real_process_channel_faults_with_bfe", "--nocapture"]);
+            cmd
+        }
+        fn fresh_key() -> Guid {
+            Guid::from_bytes_le(decode_nonce(&random_nonce()).unwrap().try_into().unwrap())
+        }
+        fn scan() -> Result<Vec<LabFilter>, String> {
+            let audit = WfpEngine::open().map_err(|e| e.to_string())?;
+            let mut rows = lab_enum_layer(&audit, Layer::V4, 4096)?;
+            rows.extend(lab_enum_layer(&audit, Layer::V6, 4096)?);
+            Ok(rows)
+        }
+        fn rows_for_lab(rows: &[LabFilter], apps: &[Vec<u8>], provider: Guid) -> Vec<LabFilter> {
+            // UNIVERSAL contains unrelated system objects. Select our unique
+            // fixture APP_IDs or test provider AFTER enumerating both layers.
+            // This predicate is not a complete production sublayer classifier.
+            rows.iter().filter(|r| r.raw.provider_key == provider || r.raw.conditions.iter()
+                .any(|c| c.field_key == CONDITION_ALE_APP_ID && c.blob.as_ref().is_some_and(|b| apps.contains(b))))
+                .cloned().collect()
+        }
+        fn only_baseline(rows: Result<Vec<LabFilter>, String>, apps: &[Vec<u8>], provider: Guid,
+            baseline: &[LabFilter]) -> Result<(), String>
+        {
+            let rows = rows_for_lab(&rows?, apps, provider);
+            if rows.len() != baseline.len() || !baseline.iter().all(|expected| rows.iter().any(|r|
+                r.raw == expected.raw && r.null_provider == expected.null_provider
+                && r.raw.flags & FILTER_FLAG_DISABLED == 0 && r.raw.action_type == ACTION_BLOCK))
+            {
+                return Err("lab snapshot includes missing/changed BLOCK or unknown object".into());
+            }
+            Ok(())
+        }
+        fn flow(exe: &Path, app: &[u8], listener: &TcpListener, allowed: bool) {
+            let mut child = LabChild(lab_cmd(exe)
+                .env("SPIDERVPN_A3B_ROLE", "probe")
+                .env("SPIDERVPN_A3B_ENDPOINT", listener.local_addr().unwrap().to_string())
+                .env("SPIDERVPN_A3B_ALLOW", if allowed { "1" } else { "0" })
+                .env("SPIDERVPN_A3B_APP", device_path_from_app_id(app))
+                .spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "A3b TCP child failed");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "A3b TCP child timed out");
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            if allowed {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match listener.accept() {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "A3b expected accepted TCP");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("A3b listener error: {e}"),
+                    }
+                }
+            }
+        }
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap().join(format!("spidervpn-a3b-{}", random_nonce()));
+        std::fs::create_dir(&dir).unwrap();
+        let _dir = LabDir(dir.clone());
+        let paths = ["trader-a.exe", "trader-b.exe", "trader-c.exe"].map(|name| dir.join(name));
+        for path in &paths { std::fs::copy(&exe, path).unwrap(); }
+        let apps: Vec<_> = paths.iter().map(|path| app_id_from_path(path).unwrap()).collect();
+        assert_ne!(apps[0], apps[1]);
+        assert_ne!(apps[0], apps[2]);
+        assert_ne!(apps[1], apps[2]);
+        let endpoints = ["127.0.0.1:0", "[::1]:0", "127.0.0.1:0", "[::1]:0"]
+            .map(|addr| TcpListener::bind(addr).unwrap());
+        for listener in &endpoints { listener.set_nonblocking(true).unwrap(); }
+        assert_ne!(endpoints[0].local_addr().unwrap(), endpoints[2].local_addr().unwrap());
+        assert_ne!(endpoints[1].local_addr().unwrap(), endpoints[3].local_addr().unwrap());
+        // Verify all copied images can really connect on both IPv4/IPv6.
+        let matrix = |allowed: &[(usize, usize)]| {
+            for i in 0..paths.len() {
+                for j in 0..endpoints.len() {
+                    flow(&paths[i], &apps[i], &endpoints[j], allowed.contains(&(i,j)));
+                }
+            }
+        };
+        let all: Vec<_> = (0..3).flat_map(|i| (0..4).map(move |j| (i,j))).collect();
+        matrix(&all);
+
+        let baseline_session = WfpEngine::open_dynamic().unwrap();
+        let audit = WfpEngine::open().unwrap();
+        let provider = fresh_key();
+        lab_add_provider(&baseline_session, provider);
+        let mut base_keys = Vec::new();
+        for app in &apps {
+            for layer in Layer::ALL {
+                let key = fresh_key();
+                let id = filter_add(&baseline_session, &lab_block(app, layer, Some(provider), key)).unwrap();
+                let raw = filter_get_by_id(&audit, id).unwrap().unwrap();
+                assert_eq!(raw.filter_key, key);
+                assert_eq!(raw.provider_key, provider);
+                assert_eq!(raw.layer, layer.guid());
+                assert_eq!(raw.action_type, ACTION_BLOCK);
+                assert_eq!(raw.flags & FILTER_FLAG_DISABLED, 0);
+                assert_eq!(raw.weight, Some(FILTER_WEIGHT_BLOCK));
+                assert_eq!(raw.num_conditions, 1);
+                assert_eq!(raw.conditions.len(), 1);
+                let c = &raw.conditions[0];
+                assert_eq!(c.field_key, CONDITION_ALE_APP_ID);
+                assert_eq!(c.match_type, MATCH_EQUAL);
+                assert_eq!(c.value_type, FWP_TYPE_BYTE_BLOB);
+                assert_eq!(c.blob.as_deref(), Some(app.as_slice()));
+                base_keys.push(key);
+            }
+        }
+        let baseline = rows_for_lab(&scan().unwrap(), &apps, provider);
+        assert_eq!(baseline.len(), 6);
+        assert!(baseline.iter().all(|r| base_keys.contains(&r.raw.filter_key) && !r.null_provider));
+        only_baseline(scan(), &apps, provider, &baseline).unwrap();
+        matrix(&[]);
+        println!("A3B_LAB_BEGIN baseline=6 distinct_apps=3 old_endpoints=2 new_endpoints=2 layers=2");
+
+        // Other attribution and anomalous/disabled objects must never be
+        // silently whitelisted. All actual mutations are fixture-only.
+        let other_session = WfpEngine::open_dynamic().unwrap();
+        let extra_key = fresh_key();
+        let extra_id = filter_add(&other_session, &lab_block(&apps[2], Layer::V6, None, extra_key)).unwrap();
+        let observed = scan().unwrap();
+        let extra = observed.iter().find(|r| r.raw.filter_key == extra_key).unwrap();
+        assert!(extra.null_provider);
+        assert!(only_baseline(Ok(observed), &apps, provider, &baseline).is_err());
+        println!("A3B_REJECT mode=unknown-null-provider-block id={extra_id}");
+        filter_delete_by_id(&other_session, extra_id).unwrap();
+        let disabled_key = fresh_key();
+        match lab_try_disabled_block(&other_session, &apps[2], disabled_key) {
+            Ok(id) => {
+                let observed = scan().unwrap();
+                let got = observed.iter().find(|r| r.raw.filter_key == disabled_key).unwrap();
+                println!("A3B_DISABLED_ADD returned_flags={:#x} id={id}", got.raw.flags);
+                assert!(only_baseline(Ok(observed), &apps, provider, &baseline).is_err());
+                filter_delete_by_id(&other_session, id).unwrap();
+            }
+            Err(rc) => {
+                assert!(old_dynamic_permits_absent(&[disabled_key]).unwrap());
+                println!("A3B_DISABLED_ADD rejected_native_rc={rc:#x}; actual disabled fixture not created");
+            }
+        }
+        other_session.close_checked().unwrap();
+        let mut injected = baseline.clone();
+        injected[0].raw.flags |= FILTER_FLAG_DISABLED;
+        assert!(only_baseline(Ok(injected), &apps, provider, &baseline).is_err());
+        let rc = lab_native_enum_error(&audit);
+        assert_ne!(rc, 0);
+        assert!(only_baseline(Err(format!("native read error {rc:#x}")), &apps, provider, &baseline).is_err());
+        let partial = lab_enum_layer(&audit, Layer::V4, 1);
+        assert!(partial.is_err(), "one page is not complete without terminal zero");
+        assert!(only_baseline(partial, &apps, provider, &baseline).is_err());
+        assert!(only_baseline(Err("injected ACCESS_DENIED".into()), &apps, provider, &baseline).is_err());
+        println!("A3B_REJECT mode=disabled-injected,invalid-native-enum,partial-page,access-denied-injected rc={rc:#x}");
+
+        let mut old_controller = LabChild(lab_cmd(&exe)
+            .env("SPIDERVPN_LEASE_CANCEL_ENGINE_FIXTURE", "1")
+            .stdin(Stdio::piped()).spawn().unwrap());
+        let old_pid = old_controller.0.id();
+        let owner_stamp = creation_stamp(old_controller.0.as_raw_handle()).unwrap();
+        let nonce = random_nonce();
+        let nonce_bytes = decode_nonce(&nonce).unwrap();
+        let old_keys = [
+            dynamic_permit_key(&apps[0], endpoints[0].local_addr().unwrap(), &nonce_bytes).unwrap(),
+            dynamic_permit_key(&apps[1], endpoints[1].local_addr().unwrap(), &nonce_bytes).unwrap(),
+        ];
+        let next_nonce = decode_nonce(&random_nonce()).unwrap();
+        let new_keys = [
+            dynamic_permit_key(&apps[1], endpoints[2].local_addr().unwrap(), &next_nonce).unwrap(),
+            dynamic_permit_key(&apps[2], endpoints[3].local_addr().unwrap(), &next_nonce).unwrap(),
+        ];
+        assert!(old_keys.iter().all(|k| !new_keys.contains(k)));
+        let mut writer = LabChild(lab_cmd(&exe).env("SPIDERVPN_A3B_ROLE", "old-writer")
+            .env("SPIDERVPN_A3B_DIR", &dir)
+            .env("SPIDERVPN_A3B_OWNER_PID", old_pid.to_string())
+            .env("SPIDERVPN_A3B_OWNER_STAMP", owner_stamp.to_string())
+            .env("SPIDERVPN_A3B_NONCE", &nonce)
+            .env("SPIDERVPN_A3B_OLD4", endpoints[0].local_addr().unwrap().to_string())
+            .env("SPIDERVPN_A3B_OLD6", endpoints[1].local_addr().unwrap().to_string())
+            .spawn().unwrap());
+        assert_ne!(writer.0.id(), old_pid);
+        assert_ne!(writer.0.id(), std::process::id());
+        a3b_lab_wait(&dir, "writer-ready");
+        a3b_lab_mark(&dir, "abort-add");
+        a3b_lab_wait(&dir, "add-aborted");
+        assert!(old_dynamic_permits_absent(&old_keys).unwrap());
+        only_baseline(scan(), &apps, provider, &baseline).unwrap();
+        // Old controller really exits; its independent writer remains live.
+        drop(old_controller.0.stdin.take());
+        assert!(old_controller.0.wait().unwrap().success());
+        assert!(writer.0.try_wait().unwrap().is_none());
+        let empty_snapshot = scan().unwrap();
+        only_baseline(Ok(empty_snapshot.clone()), &apps, provider, &baseline).unwrap();
+        assert!(old_dynamic_permits_absent(&old_keys).unwrap());
+        assert!(old_dynamic_permits_absent(&new_keys).unwrap());
+        println!("A3B_EMPTY_SNAPSHOT controller_exited=true writer_alive=true old_absent=true new_absent=true");
+        // No admission here: a paused old writer can invalidate this result.
+        a3b_lab_mark(&dir, "late-add");
+        a3b_lab_wait(&dir, "staged");
+        // Do not synchronously query BFE from the parent while a separate
+        // writer holds an open transaction; the native reader may block.
+        // The committed-state observations bracket this actual transaction.
+        a3b_lab_mark(&dir, "commit-add");
+        a3b_lab_wait(&dir, "add-committed");
+        let committed = scan().unwrap();
+        let old_rules: Vec<_> = old_keys.iter().map(|key|
+            committed.iter().find(|r| r.raw.filter_key == *key).unwrap()).collect();
+        for (i, row) in old_rules.iter().enumerate() {
+            assert!(row.null_provider && row.raw.provider_key.is_nil());
+            assert_eq!(row.raw.action_type, ACTION_PERMIT);
+            assert_eq!(row.raw.layer, Layer::ALL[i].guid());
+            assert_eq!(filter_get_by_id(&audit, row.raw.filter_id).unwrap().unwrap(), row.raw);
+        }
+        // The old provider-restricted reader completely misses both permits.
+        for layer in Layer::ALL {
+            let limited = filter_enumerate(&audit, provider, layer).unwrap();
+            assert_eq!(limited.len(), 3);
+            assert!(limited.iter().all(|r| base_keys.contains(&r.filter_key)));
+        }
+        assert!(only_baseline(Ok(committed.clone()), &apps, provider, &baseline).is_err());
+        assert!(only_baseline(Ok(empty_snapshot), &apps, provider, &baseline).is_ok());
+        assert!(old_dynamic_permits_absent(&new_keys).unwrap());
+        assert!(!old_dynamic_permits_absent(&old_keys).unwrap());
+        println!("A3B_LATE_WRITE controller_exited=true old_v4_v6_present=true provider_limited_missed=2 prior_empty_invalidated=true");
+        matrix(&[(0,0),(1,1)]);
+
+        a3b_lab_mark(&dir, "abort-delete");
+        a3b_lab_wait(&dir, "delete-aborted");
+        let after_abort = scan().unwrap();
+        for key in old_keys { assert!(after_abort.iter().any(|r| r.raw.filter_key == key)); }
+        matrix(&[(0,0),(1,1)]);
+        a3b_lab_mark(&dir, "commit-delete");
+        a3b_lab_wait(&dir, "delete-committed");
+        let partial = scan().unwrap();
+        assert!(!partial.iter().any(|r| r.raw.filter_key == old_keys[0]));
+        assert!(partial.iter().any(|r| r.raw.filter_key == old_keys[1]));
+        assert!(only_baseline(Ok(partial), &apps, provider, &baseline).is_err());
+        assert!(old_dynamic_permits_absent(&old_keys[..1]).unwrap());
+        assert!(!old_dynamic_permits_absent(&old_keys).unwrap());
+        matrix(&[(1,1)]);
+        assert!(writer.0.try_wait().unwrap().is_none());
+        // Actual unexpected process termination; do not infer absence from exit.
+        let started = Instant::now();
+        writer.0.kill().unwrap();
+        let status = writer.0.wait().unwrap();
+        assert!(!status.success());
+        let immediate = old_dynamic_permits_absent(&old_keys);
+        println!("A3B_RUNDOWN writer_pid={} exited=true first_read={immediate:?}", writer.0.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if old_dynamic_permits_absent(&old_keys).unwrap_or(false) &&
+                only_baseline(scan(), &apps, provider, &baseline).is_ok() { break; }
+            assert!(Instant::now() < deadline, "native rundown never proved old keys absent");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        println!("A3B_RUNDOWN_COMPLETE observed_ms={} keys_absent=true baseline_complete=true", started.elapsed().as_millis());
+        matrix(&[]);
+
+        // Positive fixture control, NOT authorization for production. The
+        // known experimental writer is now unable to issue any later call.
+        let new_session = WfpEngine::open_dynamic().unwrap();
+        let txn = Txn::begin(&new_session).unwrap();
+        for (app, endpoint) in [(1,2),(2,3)] {
+            filter_add(&new_session, &RawFilter::isolated_lifecycle_filter(&apps[app],
+                Some(endpoints[endpoint].local_addr().unwrap()), &next_nonce).unwrap()).unwrap();
+        }
+        txn.commit().unwrap();
+        let new_rows = scan().unwrap();
+        for key in new_keys {
+            let row = new_rows.iter().find(|r| r.raw.filter_key == key).unwrap();
+            assert!(row.null_provider && row.raw.action_type == ACTION_PERMIT);
+        }
+        assert!(old_dynamic_permits_absent(&old_keys).unwrap());
+        matrix(&[(1,2),(2,3)]);
+        new_session.close_checked().unwrap();
+        assert!(old_dynamic_permits_absent(&new_keys).unwrap());
+        only_baseline(scan(), &apps, provider, &baseline).unwrap();
+        matrix(&[]);
+        baseline_session.close_checked().unwrap();
+        assert!(provider_get(&audit, provider).unwrap().is_none());
+        assert!(old_dynamic_permits_absent(&base_keys).unwrap());
+        assert!(rows_for_lab(&scan().unwrap(), &apps, provider).is_empty());
+        matrix(&all);
+        println!("A3B_LAB_COMPLETE old_keys=2 new_keys=2 layers=2 old_writer_exited=true late_write_observed=true provider_limited_missed=true commit_abort=true baseline_removed=true tcp_restored=true production_barrier_proven=false");
     }
 
     // The real connect.rs disconnect entry, with a disposable runtime directory.
