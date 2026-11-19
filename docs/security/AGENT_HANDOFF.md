@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：2026-11-17，Asia/Singapore。  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §84、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §23 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.87；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -695,3 +695,11 @@
 
 - [Backlog D.86](./REMEDIATION_BACKLOG.md)：[Draft PR #29](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29) HEAD `81b2f57ea8a3779aff3aebb4216e16e12dda0e89`；[Linux #44258780843](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780843) 完整 Completed/Success，2/2 Jobs，实际 fresh_consume_gate 专项8/8，旧 parser9/9、HTTP14/14、core121/121、root/actual process/WG netns 继续通过；无新 skip，严格编译。同 SHA [GNU #44258780885](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780885)、[MSVC #44258780872](https://github.com/weixiaochuchen618-debug/spidervpn/actions/runs/44258780872) in_progress 待核实。
 - 下一 Agent：先核对 Windows 完整结果；优先设计并完成可持久校验的可信 invitation metadata/bearer provenance、历史撤销门槛、有限只读 retry 及安全成功事务/签名加密回包，而非继续扩展否决监听器。#29 只实现真实 fresh 预认证和库内 GET 数据，明确不是生产授予网络访问，不可信旧数据不得自证；SEC-01/02/08/07 OPEN、#5 OPEN，main 固定、UI/连接/WFP 不变，DoD 未完成禁止合并。
+
+
+## 84. COORD-01 当前恢复入口（2026-11-19）：§23 已生效，D2失败整改仍在执行
+- 固定四窗口 A=COORD-01、B=DEV-01、C=DEV-02、D=REVIEW-01；接续窗口继承原身份，不增加Agent。先读 [AGENT_COLLABORATION.md](./AGENT_COLLABORATION.md)、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) 最新节，再核对PR HEAD、精确CI、实际原日志及最新Issue/PR评论；旧窗口停止由用户确认、共享账号无法技术证明其停写；未知HEAD移动停写上报，不抢占/改其他分支。总控授权 [3992eba87e297eaa98ab53341775db3fbb602633](https://github.com/weixiaochuchen618-debug/spidervpn/commit/3992eba87e297eaa98ab53341775db3fbb602633)，当前全局缺陷状态见 [Backlog D.87](./REMEDIATION_BACKLOG.md)，补充提交 [e1b60b6a1dfd2826c5ea40e8a7dcc7ca57b344f4](https://github.com/weixiaochuchen618-debug/spidervpn/commit/e1b60b6a1dfd2826c5ea40e8a7dcc7ca57b344f4)。
+- B目前唯一ACTIVE：COORD-D01-D2-LAB / R01-009 FAIL，#29 `fix/sec01-verified-fresh-consume-gate-20261118` HEAD `f3b92e920a52f7689f159e9599abb8c1401d8b05`。MSVC44486609014/GNU44486609016各11通过5失败，Linux44486608927 success；后续Windows全量未运行。原日志与 [D 7003940517](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29#issuecomment-7003940517)；B按 [A 7004129376](https://github.com/weixiaochuchen618-debug/spidervpn/pull/29#issuecomment-7004129376) 仅原test-only范围定位真实路径不一致，维持D1严格判据、同handle证据与全部测试，完成新SHA三平台全CI和D独立复核。不允许A代写B或放宽判据。
+- C生命周期隔离PASS冻结，#3 `fix/wfp-trade-egress-p0-20261116` HEAD `bde8e360f8aa1d89db130e968e1bc896bc7664ca`，MSVC44486688478/GNU44486688576 success；D独立 [7004080316](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3#issuecomment-7004080316)，总控 [7004130171](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3#issuecomment-7004130171) 正式冻结。仅同SID隔离实验及真实fixture取消，非生产门/跨SID/UAC/实际WFP05。C停止本阶段源码写入，不复做已冻结阶段，不开启unknown history许可。D只读审查B新SHA、不重复C。
+- 共同门方案 [7003665885](https://github.com/weixiaochuchen618-debug/spidervpn/issues/5#issuecomment-7003665885) 已核定接线清单，不再循环重设计；B隔离验收后A一次性核定生产范围及串行写锁，覆盖可信对象来源、实际写端生命周期→短Guard→BFE、退出取消不依赖外锁、独立可信bootstrap及恢复入口；008-B/D2/D3生产实现仍QUEUED，尚无集成候选。
+- §14本地Agent及独立电脑/服务器资源为用户计划，非已运行。真实外部供应链材料、独立恢复域L2/L3、实际生产UAC/跨SID/WFP05/安装卸载/VPS验收仍阻塞；没有授权部署或合并，不要求用户提供密码。实机准入前按原DoD与完整集成候选确认基准、回滚与测试指令。main `857ea7593941ce79f6507db5b1ced076c3a077ba`、#3/#29 Draft、#6/#28依赖不动。当前仅总控同步全局文档，没有新增代码、CI/实机测试或安全关闭。两次HEAD复核一致，无新的D2整改提交，不重复验收旧SHA。
