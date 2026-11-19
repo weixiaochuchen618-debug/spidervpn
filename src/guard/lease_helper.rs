@@ -1079,7 +1079,15 @@ fn serve_pipe(nonce: &str, pid: u32, stamp: u64) -> Result<(), String> {
         Ok(lease) => lease,
         Err(reason) => {
             if let Ok(body) = serde_json::to_vec(&reply(nonce, LeaseState::Rejected, reason.clone(), 0)) {
-                let _ = pipe.send(&body, deadline, &check);
+                if pipe.send(&body, deadline, &check).is_ok() {
+                    // Give the authenticated controller a bounded chance to
+                    // consume the negative reply before closing the pipe.
+                    // This is only error delivery, NEVER proof of revocation
+                    // or a condition for allowing an experimental lease.
+                    while Instant::now() < deadline && check().is_ok() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
             }
             return Err(reason);
         }
@@ -2218,6 +2226,7 @@ mod tests {
         if let Some(engine) = engine.as_mut() {
             generation_barrier_bfe(engine.0.id());
             a3b_cross_process_bfe_lab();
+            a3b_actual_acquire_denial_bfe();
             assert!(engine.0.try_wait().unwrap().is_none());
             drop(engine.0.stdin.take());
             wait_for(Instant::now() + Duration::from_secs(5), || engine.0.try_wait().unwrap().is_some(),
@@ -2491,6 +2500,30 @@ mod tests {
             return;
         }
         let dir = std::path::PathBuf::from(std::env::var_os("SPIDERVPN_A3B_DIR").unwrap());
+        if role == "deny-engine" {
+            use std::io::Read;
+            let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+            std::fs::write(dir.join("deny-endpoints"),
+                format!("{}\\n{}", v4.local_addr().unwrap(), v6.local_addr().unwrap())).unwrap();
+            a3b_lab_mark(&dir, "deny-engine-ready");
+            let mut byte = [0u8; 1];
+            assert_eq!(std::io::stdin().read(&mut byte).unwrap(), 0);
+            return;
+        }
+        if role == "deny-helper" {
+            // Real authenticated helper entry, not a fake Rejected transport.
+            // Already-elevated CI child; this is NOT a cross-account UAC test.
+            let nonce = std::env::var("SPIDERVPN_A3B_NONCE").unwrap();
+            let controller = std::env::var("SPIDERVPN_A3B_CONTROLLER").unwrap();
+            let own = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+            assert!(own.elevated, "real elevated helper token required");
+            let code = serve(Path::new(&nonce), Path::new(&controller));
+            assert_eq!(code, 6, "actual helper must fail");
+            println!("A3B_DENY_HELPER_EXIT pid={} elevated=true serve_exit={code}",
+                std::process::id());
+            return;
+        }
         if role == "transaction-reader" {
             use super::super::wfp_win::lab_enum_layer;
             use super::super::wfp::{Guid, Layer};
@@ -2930,6 +2963,261 @@ mod tests {
         assert!(rows_for_lab(&scan().unwrap(), &apps, provider).is_empty());
         matrix(&all);
         println!("A3B_LAB_COMPLETE old_keys=2 new_keys=2 layers=2 old_writer_exited=true late_write_observed=true provider_limited_missed=true commit_abort=true baseline_removed=true tcp_restored=true production_barrier_proven=false");
+    }
+
+    #[cfg(windows)]
+    fn a3b_actual_acquire_denial_bfe() {
+        use super::super::wfp_win::{WfpEngine, DynamicProxyLease, SystemIdentityEnv, RawFilter,
+            lab_enum_layer, lab_block, filter_add, filter_get_by_id, dynamic_permit_key,
+            old_dynamic_permits_absent, provider_get, sublayer_get, UNKNOWN_MACHINE_HISTORY_REASON};
+        use super::super::wfp::{Guid, Layer, ACTION_BLOCK, ACTION_PERMIT, CONDITION_ALE_APP_ID,
+            PROVIDER_GUID, SUBLAYER_GUID};
+        use super::super::identity::{resolve_entry, device_path_from_app_id};
+        use std::net::{SocketAddr, TcpListener};
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Child, Command, Stdio};
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        struct RemoveDir(std::path::PathBuf);
+        impl Drop for RemoveDir {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        fn cmd(exe: &Path) -> Command {
+            let mut c = Command::new(exe);
+            c.args(["--ignored", "--exact", "guard::lease_helper::tests::real_process_channel_faults_with_bfe", "--nocapture"]);
+            c
+        }
+        fn await_child(child: &mut Child, deadline: Instant) {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "DENY test child failed: {status}");
+                    return;
+                }
+                assert!(Instant::now() < deadline, "DENY test child timed out");
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        fn flow(exe: &Path, app: &[u8], listener: &TcpListener, expected: bool) {
+            let mut child = ChildGuard(cmd(exe).env("SPIDERVPN_A3B_ROLE", "probe")
+                .env("SPIDERVPN_A3B_ENDPOINT", listener.local_addr().unwrap().to_string())
+                .env("SPIDERVPN_A3B_ALLOW", if expected { "1" } else { "0" })
+                .env("SPIDERVPN_A3B_APP", device_path_from_app_id(app))
+                .spawn().unwrap());
+            await_child(&mut child.0, Instant::now() + Duration::from_secs(5));
+            if expected {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match listener.accept() {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("DENY listener: {e}"),
+                    }
+                }
+            }
+        }
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap().join(format!("spidervpn-a3b-deny-{}", random_nonce()));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = RemoveDir(dir.clone());
+        let trader = dir.join("trader-deny.exe");
+        std::fs::copy(&exe, &trader).unwrap();
+        let id = resolve_entry("DENY fixture trader", trader.to_str(), &SystemIdentityEnv::new()).unwrap();
+        let app = &id.app_id;
+        assert_ne!(app, &a2_actual_process_app_id(unsafe { GetCurrentProcess() }));
+        let own = token_identity(unsafe { GetCurrentProcess() }).unwrap();
+        assert!(own.elevated, "explicit BFE runner must have real elevated token");
+        let controller_pid = std::process::id();
+        let stamp = creation_stamp(unsafe { GetCurrentProcess() }).unwrap();
+
+        // Actual product objects are only read, never created/deleted/modified.
+        // CI may have no product persistent installation; prove that status
+        // explicitly instead of calling our dynamic fixture persistent.
+        let audit = WfpEngine::open().unwrap();
+        let product_provider = provider_get(&audit, PROVIDER_GUID).unwrap();
+        let product_sublayer = sublayer_get(&audit, SUBLAYER_GUID).unwrap();
+        let scan = || {
+            let mut rows = lab_enum_layer(&audit, Layer::V4, 4096).unwrap();
+            rows.extend(lab_enum_layer(&audit, Layer::V6, 4096).unwrap());
+            rows
+        };
+        let product_rows = |rows: Vec<super::super::wfp_win::LabFilter>| {
+            let mut out: Vec<_> = rows.into_iter()
+                .filter(|r| r.raw.provider_key == PROVIDER_GUID || r.raw.sublayer_key == SUBLAYER_GUID)
+                .map(|r| r.raw).collect();
+            out.sort_by_key(|r| r.filter_key.to_u128());
+            out
+        };
+        let product_before = product_rows(scan());
+        println!("A3B_DENY_PRODUCT_BEFORE provider_present={} sublayer_present={} filters={} persistent_blocks={}",
+            product_provider.is_some(), product_sublayer.is_some(), product_before.len(),
+            product_before.iter().filter(|r| r.action_type == ACTION_BLOCK &&
+                r.flags & super::super::wfp::FILTER_FLAG_PERSISTENT != 0).count());
+        let verify_product = || {
+            assert_eq!(provider_get(&audit, PROVIDER_GUID).unwrap(), product_provider);
+            assert_eq!(sublayer_get(&audit, SUBLAYER_GUID).unwrap(), product_sublayer);
+            assert_eq!(product_rows(scan()), product_before);
+        };
+        // Actual isolated baseline and exact independent readback. Neither
+        // persistent flags nor production provider/sublayer are installed.
+        let witnesses = ["127.0.0.1:0", "[::1]:0"].map(|a| TcpListener::bind(a).unwrap());
+        for witness in &witnesses {
+            witness.set_nonblocking(true).unwrap();
+            flow(&trader, app, witness, true);
+        }
+        let base = WfpEngine::open_dynamic().unwrap();
+        let mut blocks = Vec::new();
+        for layer in Layer::ALL {
+            let key = Guid::from_bytes_le(decode_nonce(&random_nonce()).unwrap());
+            let filter = lab_block(app, layer, None, key);
+            let id = filter_add(&base, &filter).unwrap();
+            let raw = filter_get_by_id(&audit, id).unwrap().unwrap();
+            assert_eq!(raw.filter_key, key);
+            assert_eq!(raw.action_type, ACTION_BLOCK);
+            assert_eq!(raw.layer, layer.guid());
+            blocks.push(raw);
+        }
+        let scoped = |rows: Vec<super::super::wfp_win::LabFilter>| {
+            let mut out: Vec<_> = rows.into_iter()
+                .filter(|r| r.raw.conditions.iter().any(|c| c.field_key == CONDITION_ALE_APP_ID
+                    && c.blob.as_ref() == Some(app)))
+                .map(|r| r.raw).collect();
+            out.sort_by_key(|r| r.filter_key.to_u128());
+            out
+        };
+        for witness in &witnesses { flow(&trader, app, witness, false); }
+        let mut engine = ChildGuard(cmd(&exe).env("SPIDERVPN_A3B_ROLE", "deny-engine")
+            .env("SPIDERVPN_A3B_DIR", &dir).stdin(Stdio::piped()).spawn().unwrap());
+        a3b_lab_wait(&dir, "deny-engine-ready");
+        let endpoints: Vec<SocketAddr> = std::fs::read_to_string(dir.join("deny-endpoints")).unwrap()
+            .lines().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints[0].is_ipv4() && endpoints[1].is_ipv6());
+        let engine_pid = engine.0.id();
+        assert_ne!(engine_pid, controller_pid);
+        let verify_old_and_base = |before: &[super::super::wfp::FilterRaw], key: Guid| {
+            assert!(old_dynamic_permits_absent(&[key]).unwrap(), "requested permit must not be installed");
+            assert_eq!(scoped(scan()), before);
+            for block in &blocks {
+                assert_eq!(filter_get_by_id(&audit, block.filter_id).unwrap().as_ref(), Some(block));
+            }
+            verify_product();
+        };
+        println!("A3B_DENY_BEGIN live_engine_pid={engine_pid} actual_controller_pid={controller_pid} real_elevated_token=true");
+
+        // Two independent actual helper requests: clean current view and
+        // known old residual. An old session is retained by the test only.
+        // Both histories are untrusted; even the current-empty case denies.
+        let old_session = WfpEngine::open_dynamic().unwrap();
+        let mut old_permit = None;
+        for (index, endpoint) in endpoints.iter().copied().enumerate() {
+            if index == 1 {
+                let nonce = decode_nonce(&random_nonce()).unwrap();
+                let old_addr = witnesses[0].local_addr().unwrap();
+                let raw = RawFilter::isolated_lifecycle_filter(app, Some(old_addr), &nonce).unwrap();
+                let fid = filter_add(&old_session, &raw).unwrap();
+                let key = dynamic_permit_key(app, old_addr, &nonce).unwrap();
+                assert!(!old_dynamic_permits_absent(&[key]).unwrap());
+                old_permit = Some(key);
+                assert_eq!(filter_get_by_id(&audit, fid).unwrap().unwrap().action_type, ACTION_PERMIT);
+                flow(&trader, app, &witnesses[0], true);
+                flow(&trader, app, &witnesses[1], false);
+            }
+            let before = scoped(scan());
+            assert_eq!(before.iter().filter(|r| r.action_type == ACTION_PERMIT).count(), index);
+            super::super::proxy_identity::verify_proxy_owner(endpoint, engine_pid, &exe).unwrap();
+            let nonce = random_nonce();
+            let bytes = decode_nonce(&nonce).unwrap();
+            let key = dynamic_permit_key(app, endpoint, &bytes).unwrap();
+            verify_old_and_base(&before, key);
+            let result = DynamicProxyLease::acquire(&[id.clone()], endpoint, engine_pid, controller_pid, &exe, &bytes);
+            let reason = match result {
+                Err(reason) => reason,
+                Ok(lease) => { let _ = lease.close(); panic!("actual acquire unexpectedly granted permission"); }
+            };
+            assert_eq!(reason, UNKNOWN_MACHINE_HISTORY_REASON);
+            verify_old_and_base(&before, key);
+            println!("A3B_DENY_DIRECT family={} residual={} verified_listener=true exact_absent=true baseline_unchanged=true",
+                if endpoint.is_ipv4() { "v4" } else { "v6" }, index);
+
+            // Distinct process runs the actual serve entry and real token,
+            // same-image + creation time + pipe peer authentication.
+            let req = LeaseRequest { schema: LEASE_SCHEMA, nonce: nonce.clone(), endpoint,
+                engine_pid, controller_pid, engine_executable: exe.clone(), programs: vec![id.clone()] };
+            assert_eq!(validate_request(&req).unwrap(), bytes);
+            let mut helper = ChildGuard(cmd(&exe).env("SPIDERVPN_A3B_ROLE", "deny-helper")
+                .env("SPIDERVPN_A3B_DIR", &dir)
+                .env("SPIDERVPN_A3B_NONCE", &nonce)
+                .env("SPIDERVPN_A3B_CONTROLLER", format!("{controller_pid}-{stamp}"))
+                .spawn().unwrap());
+            let helper_pid = helper.0.id();
+            let handle = helper.0.as_raw_handle();
+            let helper_stamp = creation_stamp(handle).unwrap();
+            let helper_token = token_identity(handle).unwrap();
+            assert!(helper_token.elevated && helper_token.session == own.session);
+            verify_same_image(handle, helper_pid).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let pipe = Pipe::client(&nonce, deadline, || require_live(handle)).unwrap();
+            let check = || -> Result<(), String> {
+                require_live(handle)?;
+                pipe.require_peer(helper_pid, false)?;
+                pipe.require_connected()?;
+                if creation_stamp(handle)? != helper_stamp || token_identity(handle)? != helper_token {
+                    return Err("DENY helper actual identity changed".into());
+                }
+                Ok(())
+            };
+            check().unwrap();
+            pipe.send(&serde_json::to_vec(&req).unwrap(), deadline, &check).unwrap();
+            let body = pipe.receive(4096, deadline, &check).unwrap();
+            let response: LeaseReply = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response.schema, LEASE_SCHEMA);
+            assert_eq!(response.nonce, nonce);
+            assert_eq!(response.state, LeaseState::Rejected);
+            assert_eq!(response.helper_pid, helper_pid);
+            assert_eq!(response.reason, UNKNOWN_MACHINE_HISTORY_REASON);
+            assert_eq!(response.filter_count, 0);
+            assert!(validate_stage(&body, &nonce, 1, helper_pid, LeaseState::Ready)
+                .unwrap_err().contains(UNKNOWN_MACHINE_HISTORY_REASON));
+            // Independent readback WHILE the helper is still alive, before
+            // session rundown could conceal an erroneous transient permit.
+            check().unwrap();
+            verify_old_and_base(&before, key);
+            check().unwrap();
+            println!("A3B_DENY_REPLY family={} residual={} pid={helper_pid} actual_state=Rejected filters=0 helper_alive=true no_new_permit=true baseline_unchanged=true",
+                if endpoint.is_ipv4() { "v4" } else { "v6" }, index);
+            drop(pipe);
+            await_child(&mut helper.0, Instant::now() + Duration::from_secs(5));
+            verify_old_and_base(&before, key);
+            assert!(engine.0.try_wait().unwrap().is_none());
+            // The separate witness endpoints prove BLOCK classification is
+            // unchanged and an existing fixture permit was not deleted.
+            for (i, witness) in witnesses.iter().enumerate() {
+                flow(&trader, app, witness, index == 1 && i == 0);
+            }
+        }
+        let old_key = old_permit.expect("residual positive control must run");
+        assert!(!old_dynamic_permits_absent(&[old_key]).unwrap());
+        old_session.close_checked().unwrap();
+        assert!(old_dynamic_permits_absent(&[old_key]).unwrap());
+        for witness in &witnesses { flow(&trader, app, witness, false); }
+        drop(engine.0.stdin.take());
+        await_child(&mut engine.0, Instant::now() + Duration::from_secs(5));
+        base.close_checked().unwrap();
+        assert!(scoped(scan()).is_empty());
+        verify_product();
+        for witness in &witnesses { flow(&trader, app, witness, true); }
+        println!("A3B_DENY_COMPLETE direct_denied=2 helper_rejected=2 no_new_permit=true baseline_unchanged=true product_objects_unchanged=true residual_preserved=true tcp_restored=true production_barrier_proven=false");
     }
 
     // The real connect.rs disconnect entry, with a disposable runtime directory.
