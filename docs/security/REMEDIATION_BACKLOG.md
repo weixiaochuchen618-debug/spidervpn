@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.91 与 [任务分配表](./TASK_ASSIGNMENTS.md) §27 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.92 与 [任务分配表](./TASK_ASSIGNMENTS.md) §28 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -929,3 +929,7 @@ PR/commit/CI: ...
 ## D.91 2026-11-19 §27：B1已执行范围冻结，G1实际共同门ACTIVE
 - #30 `dcca33733828c07fc2af16e65472f0e03ae052b8`，B停写[7009961168](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7009961168)、D独立最终[7010034438](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7010034438)，四CI全success，正式冻结已执行范围；非完整B1生产PASS。R2真实STAGE_COPY/STAGE_SYNC各自BLOCKED_REAL_ACCEPTANCE/NOT RUN及§26故障环境门槛不变，目标目录ADS实际注入、祖先ACL/跨SID仍实机。
 - [§27正式授权](https://github.com/weixiaochuchen618-debug/spidervpn/commit/a182e3a8ff17657ef0b89a2ad05815689a2bd16d)：B停写、C唯一集成写锁，COORD-INT-LIFECYCLE-GATE/R01-009-G1 ACTIVE，仅真实新短生命周期门、现有Guard最终执行端锁迁移与动态许可入口接线；全机可信历史仍未知，永久unknown拒绝、取消/退出不依赖外门，保留持久BLOCK和现有UI/连接。不消费UNREADY stage或开启实际维护入口。G2真实启动登记及维护接线待后续授权。尚无G1新SHA/CI。真实R2/外部锚、旧writer、UAC/WFP05/L2/L3/Windows/VPS及恢复均未验，16项完整DoD未新增关闭，#3/#29冻结、#30 Draft、main不变。
+
+## D.92 2026-11-20 §28：G1四CI通过，父调度同步链补证
+- #30 `4196a63286378c2e965b9c17875d76756d16b70f`，四workflow MSVC44544029647/GNU-B44544029405/GNU-C44544029547/Linux44544029665全success，D独立[7012498815](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7012498815)；真实kernel/executor双ABI各1/1，实际新门取消fixture、旧完整回归通过。保留首版7795157c三Windows E0505及最小test-only修复。G1仍ACCEPTANCE_PENDING：真实父函数同步等待链未执行，直接spawn CLI和子端自造请求spy不替代。
+- [§28正式裁定](https://github.com/weixiaochuchen618-debug/spidervpn/commit/dc5bb38666cd6dbf180670964c8a0999f5dcc650)，C恢复唯一限量test-only写权，仅mod/elevate测试及MSVC/GNU-C显式父链专项，五父入口生成原请求/nonce、独立子进程与双锁观察、成功和外/短门竞争失败、有界等待及真实父状态/证据，完整四CI及D终审后停写；不改生产逻辑、不转G2、不启用维护写入。B/D只读，R2/外部锚/跨SID/UAC/生产BLOCK/旧writer/WFP05/Windows/VPS均保留阻塞；main及原分支不变。
