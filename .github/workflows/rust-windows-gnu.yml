@@ -1,0 +1,131 @@
+name: Windows GNU Rust release-path validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-gnu:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      # UCRT64 supplies a complete MinGW-w64 GCC/binutils/dlltool suite.
+      # This validates the Windows GNU ABI of build.ps1; the developer's
+      # exact local WinLibs distribution remains a separate release check.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Install Windows GNU Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+
+      - name: Verify full MinGW linker tools
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          foreach ($name in @('x86_64-w64-mingw32-gcc.exe', 'dlltool.exe', 'windres.exe')) {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+              throw "Missing GNU tool: $name"
+            }
+          }
+          & x86_64-w64-mingw32-gcc.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build through the repository GNU script
+        shell: powershell
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          .\build.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Validate WFP, scoped egress and TUN identity Rust tests on GNU target
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
+          foreach ($filter in @('guard::wfp::tests::', 'guard::wfp_win::imp::scoped_v2_tests::', 'guard::egress_policy::tests::', 'guard::tun_identity::tests::', 'guard::proxy_identity::tests::', 'guard::lease_helper::tests::', 'guard::wfp_win::imp::dynamic_proxy_lease_tests::')) {
+            Write-Host "Running GNU Rust tests: $filter"
+            & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn $filter -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: R01-009 G1 actual lifecycle and final Guard executor (GNU)
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
+          & cargo +stable-x86_64-pc-windows-gnu build --locked --bin spidervpn
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metadata = & cargo +stable-x86_64-pc-windows-gnu metadata --locked --format-version 1 --no-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:SPIDERVPN_G1_PRODUCT_EXE = Join-Path (($metadata | ConvertFrom-Json).target_directory) 'debug/spidervpn.exe'
+          if (-not (Test-Path -LiteralPath $env:SPIDERVPN_G1_PRODUCT_EXE -PathType Leaf)) { throw 'Missing actual G1 debug product executable' }
+          foreach ($case in @(
+            @{ Test = 'guard::lifecycle_gate::imp::tests::production_gate_kernel_contract'; Marker = 'G1_GATE_KERNEL_COMPLETE' },
+            @{ Test = 'guard::elevate::tests::g1_final_executor_transaction'; Marker = 'G1_EXECUTOR_COMPLETE' }
+          )) {
+            $output = & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn $case.Test -- --ignored --exact --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) { exit $code }
+            if (($output -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G1 exact test did not execute' }
+            if (($output -join "`n") -notmatch $case.Marker) { throw "G1 missing real execution marker $($case.Marker)" }
+          }
+
+          # §28: actual parent-generated requests and independent holders.
+          $output = & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn guard::elevate::tests::g1_parent_chain -- --ignored --exact --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          $log = $output -join "`n"
+          if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G1 parent chain test did not execute' }
+          if ($log -notmatch 'G1_PARENT_CHAIN_COMPLETE entries=5 cases=18 spy_cases=15 real_cli_cases=3 distinct_nonces=18 independent_holders=true bounded_wait=true parent_request_preserved=true') { throw 'G1 parent chain complete marker missing' }
+          foreach ($entry in @('install', 'sync', 'disconnect', 'remove', 'verify', 'verify-cli')) {
+            foreach ($scenario in @('success', 'outer', 'short')) {
+              $pattern = "G1_PARENT_CASE entry=$entry action=\w+ scenario=$scenario nonce=\w+ child_pid=\d+ holder_pid=\d+ exit="
+              if ([regex]::Matches($log, $pattern).Count -ne 1) { throw "G1 parent case missing or duplicate: $entry $scenario" }
+            }
+          }
+
+      - name: R01-009 G2 actual runtime occupancy and independent process exclusion (GNU)
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
+          & cargo +stable-x86_64-pc-windows-gnu build --locked --bin spidervpn
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metadata = & cargo +stable-x86_64-pc-windows-gnu metadata --locked --format-version 1 --no-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:SPIDERVPN_G2_PRODUCT_EXE = Join-Path (($metadata | ConvertFrom-Json).target_directory) 'debug/spidervpn.exe'
+          if (-not (Test-Path -LiteralPath $env:SPIDERVPN_G2_PRODUCT_EXE -PathType Leaf)) { throw 'Missing actual G2 debug product' }
+          $fixture = Join-Path $env:RUNNER_TEMP ("G2-fixture-" + [guid]::NewGuid().ToString() + ".exe")
+          try {
+            & rustc +stable-x86_64-pc-windows-gnu --edition=2021 --crate-name g2_occupancy_fixture tests/runtime-occupancy-e2e.rs -o $fixture
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $env:SPIDERVPN_G2_FIXTURE_EXE = $fixture
+            $output = & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn runtime_occupancy::imp::tests::g2_runtime_occupancy -- --ignored --exact --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) { exit $code }
+            $log = $output -join "`n"
+            if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G2 exact test did not run' }
+            foreach ($marker in @('G2_FIXTURE_READY','G2_SHARED_COMPLETE','G2_PRODUCT_MISSING_COMPAT','G2_IPC_REAL','G2_PRODUCT_CONTROLLER','G2_REPLACE_REFUSED','G2_ORPHAN_ACTIVE','G2_ORPHAN_CLEANUP','G2_PROXY_CLEANUP',
+              'G2_REAL_ENGINE_ENTRY role=start-ok','G2_REAL_ENGINE_ENTRY role=start-denied','G2_REAL_ENGINE_ENTRY role=version-ok','G2_REAL_ENGINE_ENTRY role=version-denied',
+              'G2_RUNTIME_OCCUPANCY_COMPLETE fixed_anchor=true shared_and_exclusive=true actual_product=true actual_engine_and_version=true orphan_detected=true cleanup_independent=true missing_compatible=true maintenance_authorized=false')) {
+              if (-not $log.Contains($marker)) { throw "G2 missing actual evidence marker: $marker" }
+            }
+          } finally {
+            if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Force }
+          }

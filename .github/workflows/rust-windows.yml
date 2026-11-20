@@ -79,6 +79,18 @@ jobs:
           & cargo test --locked --bin spidervpn pairing::http::tests::sec02_legacy_rsa_ -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Ephemeral WFP IPv4 proxy canary (actual BFE classification)
+        shell: pwsh
+        env:
+          SPIDERVPN_WFP_CANARY: "1"
+        run: |
+          # Only a dynamic session targeting this test executable; never touch
+          # SpiderVPN's persistent WFP provider or the user's firewall.
+          & cargo test --locked --test wfp_proxy_canary -- --ignored --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo test --locked --bin spidervpn guard::lease_helper::tests::real_process_channel_faults_with_bfe -- --ignored --exact --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Rust integration tests (each integration target, no duplicate binary unit tests)
         shell: pwsh
         run: |
@@ -115,3 +127,138 @@ jobs:
           --skip tightening_closes_a_file_that_inherited_the_loose_acl
           --skip a_shortcut_is_replaced_by_the_program_it_points_at
 
+      - name: R01-008-B1 actual standalone Rust bootstrap stage (not installation)
+        shell: pwsh
+        run: |
+          & cargo build --locked --features bootstrap-stage --bin spidervpn-bootstrap
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $output = & cargo test --locked --features bootstrap-stage --test bootstrap-stage-e2e -- --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          if (($output -join [Environment]::NewLine) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'Bootstrap actual EXE test did not run exactly once' }
+          if (($output -join [Environment]::NewLine) -notmatch 'BOOTSTRAP_E2E_COMPLETE real_exe=true files=13') { throw 'Bootstrap actual stage evidence missing' }
+
+      - name: R01-009 G1 actual lifecycle and final Guard executor (MSVC)
+        shell: pwsh
+        run: |
+          & cargo build --locked --bin spidervpn
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metadata = & cargo metadata --locked --format-version 1 --no-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:SPIDERVPN_G1_PRODUCT_EXE = Join-Path (($metadata | ConvertFrom-Json).target_directory) 'debug/spidervpn.exe'
+          if (-not (Test-Path -LiteralPath $env:SPIDERVPN_G1_PRODUCT_EXE -PathType Leaf)) { throw 'Missing actual G1 debug product executable' }
+          foreach ($case in @(
+            @{ Test = 'guard::lifecycle_gate::imp::tests::production_gate_kernel_contract'; Marker = 'G1_GATE_KERNEL_COMPLETE' },
+            @{ Test = 'guard::elevate::tests::g1_final_executor_transaction'; Marker = 'G1_EXECUTOR_COMPLETE' }
+          )) {
+            $output = & cargo test --locked --bin spidervpn $case.Test -- --ignored --exact --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) { exit $code }
+            if (($output -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G1 exact test did not execute' }
+            if (($output -join "`n") -notmatch $case.Marker) { throw "G1 missing real execution marker $($case.Marker)" }
+          }
+
+          # §28: actual parent-generated requests and independent holders.
+          $output = & cargo test --locked --bin spidervpn guard::elevate::tests::g1_parent_chain -- --ignored --exact --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          $log = $output -join "`n"
+          if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G1 parent chain test did not execute' }
+          if ($log -notmatch 'G1_PARENT_CHAIN_COMPLETE entries=5 cases=18 spy_cases=15 real_cli_cases=3 distinct_nonces=18 independent_holders=true bounded_wait=true parent_request_preserved=true') { throw 'G1 parent chain complete marker missing' }
+          foreach ($entry in @('install', 'sync', 'disconnect', 'remove', 'verify', 'verify-cli')) {
+            foreach ($scenario in @('success', 'outer', 'short')) {
+              $pattern = "G1_PARENT_CASE entry=$entry action=\w+ scenario=$scenario nonce=\w+ child_pid=\d+ holder_pid=\d+ exit="
+              if ([regex]::Matches($log, $pattern).Count -ne 1) { throw "G1 parent case missing or duplicate: $entry $scenario" }
+            }
+          }
+
+      - name: R01-009 G2 actual runtime occupancy and independent process exclusion (MSVC)
+        shell: pwsh
+        run: |
+          & cargo build --locked --bin spidervpn
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metadata = & cargo metadata --locked --format-version 1 --no-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:SPIDERVPN_G2_PRODUCT_EXE = Join-Path (($metadata | ConvertFrom-Json).target_directory) 'debug/spidervpn.exe'
+          if (-not (Test-Path -LiteralPath $env:SPIDERVPN_G2_PRODUCT_EXE -PathType Leaf)) { throw 'Missing actual G2 debug product' }
+          $fixture = Join-Path $env:RUNNER_TEMP ("G2-fixture-" + [guid]::NewGuid().ToString() + ".exe")
+          try {
+            & rustc --edition=2021 --crate-name g2_occupancy_fixture tests/runtime-occupancy-e2e.rs -o $fixture
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $env:SPIDERVPN_G2_FIXTURE_EXE = $fixture
+            $output = & cargo test --locked --bin spidervpn runtime_occupancy::imp::tests::g2_runtime_occupancy -- --ignored --exact --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) { exit $code }
+            $log = $output -join "`n"
+            if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G2 exact test did not run' }
+            foreach ($marker in @('G2_FIXTURE_READY','G2_SHARED_COMPLETE','G2_PRODUCT_MISSING_COMPAT','G2_IPC_REAL','G2_PRODUCT_CONTROLLER','G2_REPLACE_REFUSED','G2_ORPHAN_ACTIVE','G2_ORPHAN_CLEANUP','G2_PROXY_CLEANUP',
+              'G2_REAL_ENGINE_ENTRY role=start-ok','G2_REAL_ENGINE_ENTRY role=start-denied','G2_REAL_ENGINE_ENTRY role=version-ok','G2_REAL_ENGINE_ENTRY role=version-denied',
+              'G2_RUNTIME_OCCUPANCY_COMPLETE fixed_anchor=true shared_and_exclusive=true actual_product=true actual_engine_and_version=true orphan_detected=true cleanup_independent=true missing_compatible=true maintenance_authorized=false')) {
+              if (-not $log.Contains($marker)) { throw "G2 missing actual evidence marker: $marker" }
+            }
+          } finally {
+            if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Force }
+          }
+
+      - name: R01-009-D2-CORE real same-object launcher executor (isolated, no maintenance entry)
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked --bin spidervpn uninstall_safety::launcher_executor::tests::d2_core_actual_same_object_executor -- --exact --nocapture --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          if (($output -join [Environment]::NewLine) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'D2 core exact actual executor did not run once' }
+          if (($output -join [Environment]::NewLine) -notmatch 'D2_CORE_COMPLETE real_core=true fixed_launchers=2') { throw 'D2 core actual executor evidence missing' }
+
+      - name: R01-009-D2-DIAG actual native diagnostics and bounded competitor
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked --bin spidervpn uninstall_safety::launcher_executor::tests::d2_diag_actual_native_queries -- --exact --nocapture --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          $log = $output -join [Environment]::NewLine
+          if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'D2 DIAG exact did not run once' }
+          if ($log -notmatch 'D2_DIAG_COMPLETE live_event=true native_info=\d+ native_path=\d+ native_pending=\d+ primary=\d+ secondary=\d+ known_false_pending=true logical_rc_none=true sddl_repeat=true sddl_no_nul=true malformed_bounds_rejected=true bounded_competition=true') { throw 'D2 DIAG actual native evidence missing' }
+          if ($log -notmatch 'D2_DIAG_COMPETITION_COMPLETE child_pid=\d+ ready=true go=true exit=0 elapsed_ms=\d+ deadline_ms=20000') { throw 'D2 DIAG actual bounded competitor evidence missing' }
+
+      - name: R01-009-D3-CORE actual independent Rust recovery and compiled dependency fixtures
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          SPIDER_RECOVERY_TEST_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SPIDER_RECOVERY_TEST_TARGET: x86_64-pc-windows-msvc
+        run: |
+          $env:SPIDER_RECOVERY_TEST_RUSTC = (& rustup which rustc --toolchain stable-x86_64-pc-windows-msvc).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $env:SPIDER_RECOVERY_TEST_RUSTC -PathType Leaf)) { throw 'missing actual fixture rustc' }
+          & $env:SPIDER_RECOVERY_TEST_RUSTC -vV
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --features recovery-core --bin spidervpn-recovery
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $output = & cargo test --locked --features recovery-core --test recovery-executor-e2e real_independent_recovery_executor -- --exact --nocapture --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          $log = $output -join [Environment]::NewLine
+          if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'D3 actual exact did not run once' }
+          if ($log -notmatch 'D3_RECOVERY_COMPLETE source_sha=[0-9a-f]{40} fixture_client_dll=true fixture_engine=true dependency_failure=true independent_recovery=true fixed_vault=true generation_preserved=true actual_timeout=true actual_interrupt=(true|false) production_product_not_run=true source_authenticated=false production_recovery_proven=false maintenance_authorized=false r2_not_run=true d2_timeout_not_run=true') { throw 'D3 actual recovery evidence missing' }
+          foreach ($marker in @('D3_ACTUAL_DLL_FAILURE','D3_ACTUAL_CLIENT','D3_ACTUAL_ENGINE','D3_DEPENDENCY_DAMAGE','D3_NEW_GROUP','D3_TIMEOUT_ACTUAL','D3_ACTUAL_INTERRUPT','D3_READBACK','D3_NEGATIVE_MATRIX')) {
+            if ($log -notmatch $marker) { throw "D3 actual marker missing: $marker" }
+          }
+
+      - name: R01-009-D3-EXEC-EVIDENCE verify actual controller execution evidence
+        shell: pwsh
+        env:
+          EXPECTED_D3_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $actual = $env:SPIDER_D3_EXEC_EVIDENCE
+          $prefix = "D3_EXEC_EVIDENCE_COMPLETE source_sha=$env:EXPECTED_D3_SHA held_groups=4 replacement_id_and_bytes_refused=true pe_four_images=true client_module_observed=true engine_module_observed=true recovery_module_observed="
+          $tail = " path_os_only=true actual_timeout=true snapshot_only=true maintenance_authorized=false"
+          if ($actual -cne ($prefix + "true" + $tail) -and $actual -cne ($prefix + "false" + $tail)) { throw 'missing actual D3 execution evidence from the preceding Rust exact' }
+          if ($actual -ceq ($prefix + "false" + $tail)) { Write-Warning 'Live recovery module snapshot NOT RUN; inspect actual Rust log and coordinator decision' }
+          Write-Host "Validated actual controller evidence for $env:EXPECTED_D3_SHA"

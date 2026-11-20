@@ -4945,6 +4945,8 @@ fn engine_reply(result: Result<(String, String), String>) -> String {
 pub(crate) fn probe_engine_binary(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
     let program = crate::engine::checked_engine_program(path)?;
+    // Hold the same shared registration through real version execution/wait.
+    let _runtime_occupancy = crate::runtime_occupancy::admit()?;
     let mut child = std::process::Command::new(&program)
         .arg("version")
         .stdin(std::process::Stdio::null())
@@ -5582,6 +5584,12 @@ fn status_json(ctx: &Ctx) -> String {
 /// 连接：事务本体复用 `connect::connect`，这里只做两件事——
 /// 把「没配置」翻译成人话，把结果翻译成 JSON。
 fn connect_json(ctx: &Ctx) -> String {
+    // Refusal before config preparation, journal, proxy or new spawn.
+    // Do not clear prior self-check evidence or run cleanup on this refusal.
+    let _runtime_occupancy = match crate::runtime_occupancy::admit() {
+        Ok(held) => held,
+        Err(reason) => return refuse(&reason),
+    };
     // 连接根本不成立时也先把上次的「通过」清掉：留着它就是一条假证据。
     let refuse_now = |msg: &str| -> String {
         crate::selfcheck::clear(&ctx.root);

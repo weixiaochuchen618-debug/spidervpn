@@ -34,9 +34,14 @@
 #![allow(dead_code)]
 
 pub mod elevate;
+pub mod egress_policy;
 pub mod evidence;
 pub mod identity;
+pub mod lease_helper;
+mod lifecycle_gate;
+pub mod proxy_identity;
 pub mod state;
+pub mod tun_identity;
 pub mod wfp;
 pub mod wfp_win;
 
@@ -800,9 +805,13 @@ fn build_request(
 }
 
 /// 拿一次互斥：一次只允许一个交易保护动作。
-pub(crate) fn with_guard_mutex<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+fn acquire_guard_mutex() -> Result<wfp_win::NamedMutex, String> {
     let name = format!("{}{}", GUARD_MUTEX_PREFIX, wfp::PROVIDER_KEY.replace('-', "").to_uppercase());
-    let _guard = wfp_win::NamedMutex::acquire(&name)?;
+    wfp_win::NamedMutex::acquire(&name)
+}
+
+pub(crate) fn with_guard_mutex<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    let _guard = acquire_guard_mutex()?;
     Ok(f())
 }
 
@@ -874,10 +883,10 @@ fn run_install_like(
         };
     }
     let req = build_request(action, &resolved.programs, cfg, store, cache, hooks, explicit);
-    let attempt = with_guard_mutex(|| (hooks.request)(&req));
-    let reply = match attempt {
-        Err(msg) => return failed_with(cfg, store, cache, hooks, msg),
-        Ok(Err(e)) => {
+    // The final privileged executor owns both transaction locks. Holding
+    // either here would deadlock or reject the synchronous UAC child.
+    let reply = match (hooks.request)(&req) {
+        Err(e) => {
             if e.is_declined() {
                 cache.note_declined(now);
             } else {
@@ -885,7 +894,7 @@ fn run_install_like(
             }
             return failed_with(cfg, store, cache, hooks, e.message());
         }
-        Ok(Ok(reply)) => reply,
+        Ok(reply) => reply,
     };
     // A19：reply 必须逐条覆盖「每个参与程序 × {IPv4,IPv6}」且 filterId != 0，
     // 否则视为 BadReply（不落证据、不产生 Protected）。
@@ -990,16 +999,15 @@ pub fn reverify_after_disconnect(
     let resolved = trade_identities(cfg);
     let req =
         build_request(GuardAction::Verify, &resolved.programs, cfg, store, cache, hooks, false);
-    match with_guard_mutex(|| (hooks.request)(&req)) {
-        Err(_) => cache.set_verify_pending(VerifyPending::Failed),
-        Ok(Err(e)) => {
+    match (hooks.request)(&req) {
+        Err(e) => {
             if e.is_declined() {
                 cache.note_declined(now);
             } else {
                 cache.set_verify_pending(VerifyPending::Failed);
             }
         }
-        Ok(Ok(_)) => cache.clear_verify_pending(),
+        Ok(_) => cache.clear_verify_pending(),
     }
     status_with(Some(cfg), store, cache, hooks)
 }
@@ -1019,9 +1027,8 @@ pub fn remove_explicit(
     }
     let req =
         build_request(GuardAction::Remove, &resolved.programs, cfg, store, cache, hooks, true);
-    match with_guard_mutex(|| (hooks.request)(&req)) {
-        Err(msg) => return Err(msg),
-        Ok(Err(e)) => {
+    match (hooks.request)(&req) {
+        Err(e) => {
             // 拒绝/失败：解除**没有**发生，绝不能悄悄返回「已解除」。
             if e.is_declined() {
                 cache.note_declined(hooks.now());
@@ -1030,7 +1037,7 @@ pub fn remove_explicit(
             }
             return Err(e.message());
         }
-        Ok(Ok(_)) => {}
+        Ok(_) => {}
     }
     cache.mark_invalidated(InvalidReason::UserRemove);
     // 回读：子进程已写 `Removed` 标记并删除 `Evidence` 值；若还能读到「provider 仍在」，
@@ -1066,12 +1073,8 @@ pub fn verify_explicit(
     }
     let resolved = trade_identities(cfg);
     let req = build_request(GuardAction::Verify, &resolved.programs, cfg, store, cache, hooks, true);
-    match with_guard_mutex(|| (hooks.request)(&req)) {
-        Err(msg) => {
-            cache.set_verify_pending(VerifyPending::Failed);
-            return Err(msg);
-        }
-        Ok(Err(e)) => {
+    match (hooks.request)(&req) {
+        Err(e) => {
             if e.is_declined() {
                 cache.note_declined(hooks.now());
             } else {
@@ -1079,7 +1082,7 @@ pub fn verify_explicit(
             }
             return Err(e.message());
         }
-        Ok(Ok(_)) => cache.clear_verify_pending(),
+        Ok(_) => cache.clear_verify_pending(),
     }
     Ok(status_with(Some(cfg), store, cache, hooks))
 }

@@ -2,6 +2,7 @@
 name = "spidervpn"
 version = "0.1.4"
 edition = "2021"
+default-run = "spidervpn"
 description = "SpiderVPN — Windows 桌面 VPN 客户端：自建服务器部署、线路管理、交易程序直连阻断。"
 license = "MIT"
 repository = "https://github.com/weixiaochuchen618-debug/spidervpn"
@@ -105,9 +106,13 @@ windows-sys = { version = "=0.61.2", default-features = false, features = [
   "Win32_System_SystemInformation",
   # A8 按网卡探测：GetBestInterface + if_indextoname（默认出口网卡名）。
   "Win32_NetworkManagement_IpHelper",
+  # NET_LUID_LH/MIB_IF_ROW2/ConvertInterfaceAliasToLuid 的绑定需要 Ndis 类型门控。
+  "Win32_NetworkManagement_Ndis",
   "Win32_Storage_FileSystem",
   "Win32_NetworkManagement_WindowsFilteringPlatform",
   "Win32_System_Threading",
+  "Win32_System_Pipes",
+  "Win32_System_IO",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_UI_Shell",
   "Win32_System_Com",
@@ -142,3 +147,19 @@ windows = { version = "0.62.2", features = [
 [[bin]]
 name = "spidervpn"
 path = "src/main.rs"
+
+# Independent bootstrap is deliberately not part of the default build/package.
+[features]
+bootstrap-stage = []
+recovery-core = []
+
+[[bin]]
+name = "spidervpn-bootstrap"
+path = "src/bin/spidervpn-bootstrap.rs"
+required-features = ["bootstrap-stage"]
+
+# Independent recovery candidate builder; default off, not part of the package.
+[[bin]]
+name = "spidervpn-recovery"
+path = "src/bin/spidervpn-recovery.rs"
+required-features = ["recovery-core"]

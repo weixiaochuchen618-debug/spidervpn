@@ -150,6 +150,9 @@ pub fn start(cfg: &EngineConfig, log_dir: &std::path::Path) -> Result<EngineHand
         return Err(format!("引擎程序不存在：{}", cfg.binary));
     }
     let program = checked_engine_program(std::path::Path::new(&cfg.binary))?;
+    // Keep the actual shared registration across Command::spawn. A child
+    // may outlive us; process occupancy is checked independently of this handle.
+    let _runtime_occupancy = crate::runtime_occupancy::admit()?;
     let _ = std::fs::create_dir_all(log_dir);
 
     // 引擎自己的 stdout/stderr 必须落盘（`logs\engine.log`）。

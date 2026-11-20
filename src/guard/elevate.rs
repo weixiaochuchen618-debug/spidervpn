@@ -720,6 +720,29 @@ pub fn guard_apply_main(req_path: &Path, res_path: &Path, backend: &dyn super::G
         legacy_running: req.legacy_running,
     };
 
+    // The final executor, not the waiting UAC parent, owns these locks.
+    // Acquire lifecycle first, then the existing shared Guard mutex. Both
+    // stay live through backend, evidence mutation/readback and reply.
+    let _lifecycle = match super::lifecycle_gate::LifecycleGate::acquire() {
+        Ok(gate) => gate,
+        Err(reason) => {
+            let _ = write_reply_file(res_path, &GuardReply {
+                result: Err(WfpError::InvalidState), notes: vec![reason],
+            });
+            return 3;
+        }
+    };
+    let _short_guard = match super::acquire_guard_mutex() {
+        Ok(gate) => gate,
+        Err(reason) => {
+            let _ = write_reply_file(res_path, &GuardReply {
+                result: Err(WfpError::InvalidState),
+                notes: vec![format!("G1_SHORT_LOCK: {reason}")],
+            });
+            return 3;
+        }
+    };
+
     // 真实动作（在提权会话里跑）
     let outcome = match req.action {
         GuardAction::Install => backend.install(&req.programs, &expect),
@@ -952,6 +975,564 @@ mod tests {
         assert_eq!(guard_apply_main(&files.req, &files.res, &backend), 2);
         assert_eq!(backend.0.load(Ordering::SeqCst), 0,
             "未知 StoreKind 必须在更改 WFP 前拒绝");
+    }
+
+
+    // Explicit CI-only regression with the fixed production name. The
+    // actual debug product EXE uses the existing isolated evidence store;
+    // no real install/sync/remove or product persistent BFE write occurs.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit isolated elevated Windows runner, actual Guard executor"]
+    fn g1_final_executor_transaction() {
+        use super::super::lifecycle_gate::LifecycleGate;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const ROLE: &str = "SPIDERVPN_G1_EXECUTOR_TEST_ROLE";
+        const TEST: &str = "guard::elevate::tests::g1_final_executor_transaction";
+        struct Spy(AtomicUsize);
+        impl Spy {
+            fn observe(&self) -> Result<GuardEvidence, WfpError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(|| {
+                    assert_eq!(LifecycleGate::acquire().err().unwrap(), "G1_GATE_EXISTING win32=183");
+                    assert!(super::super::acquire_guard_mutex().is_err());
+                    println!("G1_EXECUTOR_BACKEND_SPY outer_held=true short_held=true real_bfe_write=false");
+                }).join().unwrap();
+                Ok(GuardEvidence::default())
+            }
+        }
+        impl super::super::GuardBackend for Spy {
+            fn available(&self) -> bool { true }
+            fn read(&self, _: &[ProgramIdentity], _: &super::super::Expect) -> Result<GuardEvidence, WfpError> { self.observe() }
+            fn install(&self, _: &[ProgramIdentity], _: &super::super::Expect) -> Result<GuardEvidence, WfpError> { self.observe() }
+            fn sync(&self, _: &[ProgramIdentity], _: &super::super::Expect) -> Result<GuardEvidence, WfpError> { self.observe() }
+            fn remove(&self) -> Result<GuardEvidence, WfpError> { self.observe() }
+        }
+        fn request(label: &str, action: GuardAction) -> (GuardRequest, GuardIpcFiles) {
+            let mut req = test_ipc_request();
+            req.action = action;
+            req.nonce = format!("g1-{label}");
+            req.store_kind = StoreKind::IsolatedFile.as_str().into();
+            let files = GuardIpcFiles::create(&req).unwrap();
+            write_json_file(&files.req, &req).unwrap();
+            prepare_reply_file(&files.res).unwrap();
+            assert!(validate_guard_ipc_paths(&files.req, &files.res).is_ok());
+            assert_eq!(read_attested_guard_request(&files.req).unwrap(), req);
+            (req, files)
+        }
+        fn wait(mut command: Command) -> i32 {
+            let mut child = command.stdin(Stdio::null()).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() { return status.code().unwrap(); }
+                if Instant::now() >= deadline {
+                    let _ = child.kill(); let _ = child.wait();
+                    panic!("G1 real executor child did not exit within bound");
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        fn cli(exe: &Path, root: &Path, label: &str) -> (i32, GuardReply, String) {
+            let (req, files) = request(label, GuardAction::Verify);
+            let mut cmd = Command::new(exe);
+            cmd.arg(APPLY_FLAG).arg(&files.req).arg(&files.res)
+                .env("SPIDERVPN_ROOT", root);
+            let code = wait(cmd);
+            let reply = read_json_file(&files.res).expect("real product Guard reply");
+            (code, reply, req.nonce)
+        }
+        fn no_record(store: &super::super::IsolatedFileStore) {
+            assert!(matches!(store.read(), Err(super::super::RecordError::Missing)));
+            assert!(store.read_removed().is_none());
+        }
+        if std::env::var(ROLE).as_deref() == Ok("spy") {
+            let root = crate::isolation::dev_root_override().expect("explicit isolated spy store");
+            assert!(root.starts_with(std::env::temp_dir()) && root.is_dir());
+            let store = super::super::IsolatedFileStore::new(&root).unwrap();
+            let spy = Spy(AtomicUsize::new(0));
+            for action in [GuardAction::Install, GuardAction::Sync, GuardAction::Verify, GuardAction::Remove] {
+                let (req, files) = request(action.as_str(), action);
+                assert_eq!(guard_apply_main(&files.req, &files.res, &spy), 0);
+                let reply: GuardReply = read_json_file(&files.res).unwrap();
+                assert!(reply.result.is_ok());
+                if action == GuardAction::Remove {
+                    assert!(matches!(store.read(), Err(super::super::RecordError::Missing)));
+                    assert!(store.read_removed().is_some());
+                } else {
+                    assert_eq!(store.read().unwrap().nonce, req.nonce);
+                    assert!(store.read_removed().is_none());
+                }
+                // Neither lock survives the actual executor's return.
+                let _outer = LifecycleGate::acquire().unwrap();
+                let _short = super::super::acquire_guard_mutex().unwrap();
+                println!("G1_EXECUTOR_SPY_RESULT action={} record_readback=true locks_released_after_reply=true", action.as_str());
+            }
+            assert_eq!(spy.0.load(Ordering::SeqCst), 4);
+            return;
+        }
+        let exe = PathBuf::from(std::env::var_os("SPIDERVPN_G1_PRODUCT_EXE")
+            .expect("CI must supply the actual debug product EXE path"));
+        assert!(exe.is_absolute() && exe.is_file());
+        let nonce = {
+            use ring::rand::{SecureRandom, SystemRandom};
+            let mut b = [0u8;16]; SystemRandom::new().fill(&mut b).unwrap();
+            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+        };
+        let root = std::env::temp_dir().join(format!("spidervpn-g1-executor-{nonce}"));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(root.clone());
+        let store = super::super::IsolatedFileStore::new(&root).unwrap();
+        let sentinel = root.join("neighbor");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        // Full valid attested request, not an earlier IPC rejection.
+        {
+            let _outer = LifecycleGate::acquire().unwrap();
+            let (code, reply, _) = cli(&exe, &root, "outer-contention");
+            assert_eq!(code, 3);
+            assert!(reply.result.is_err());
+            assert_eq!(reply.notes, vec!["G1_GATE_EXISTING win32=183".to_string()]);
+            no_record(&store);
+            println!("G1_EXECUTOR_CLI_REFUSED gate=outer rc=3 native_rc=183 no_evidence=true");
+        }
+        {
+            // Simulate the old writer/maintenance short lock only.
+            let _short = super::super::acquire_guard_mutex().unwrap();
+            let (code, reply, _) = cli(&exe, &root, "short-contention");
+            assert_eq!(code, 3);
+            assert!(reply.result.is_err());
+            assert!(reply.notes.iter().any(|n| n.starts_with("G1_SHORT_LOCK:")));
+            no_record(&store);
+            println!("G1_EXECUTOR_CLI_REFUSED gate=short rc=3 no_evidence=true");
+        }
+        // Real --guard-apply Verify: a read-only BFE backend plus real
+        // isolated evidence write. No persistent WFP mutation is needed.
+        let (code, reply, nonce) = cli(&exe, &root, "uncontended-verify");
+        assert_eq!(code, 0, "{reply:?}");
+        let ev = reply.result.unwrap();
+        assert_eq!(ev.source, super::super::GuardSource::ElevatedVerify);
+        assert!(!ev.detection.provider_present && !ev.detection.sublayer_present,
+            "G1 runner must not contain product persistent WFP infrastructure");
+        assert_eq!(store.read().unwrap().nonce, nonce);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        println!("G1_EXECUTOR_CLI_VERIFY real_exe=true real_bfe_read=true isolated_evidence=true provider_present=false no_persistent_write=true");
+        {
+            let _outer = LifecycleGate::acquire().unwrap();
+            let _short = super::super::acquire_guard_mutex().unwrap();
+        }
+        let spy_root = root.join("spy");
+        std::fs::create_dir(&spy_root).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--ignored", "--exact", TEST, "--nocapture"])
+            .env(ROLE, "spy").env("SPIDERVPN_ROOT", &spy_root);
+        assert_eq!(wait(cmd), 0);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        println!("G1_EXECUTOR_COMPLETE real_cli_negative=2 real_verify=true spy_actions=4 no_persistent_write=true cross_sid_not_run=true actual_uac_not_run=true");
+    }
+
+
+    // §28: drive the original parent entry functions, not handcrafted
+    // requests. Only the existing request hook changes transport. All
+    // production executor admission and evidence/reply code stays intact.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit isolated Windows CI, fixed production gate names"]
+    fn g1_parent_chain() {
+        use super::super as guard;
+        use guard::lifecycle_gate::LifecycleGate;
+        use std::io::Read;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::{Arc, Mutex};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        const TEST: &str = "guard::elevate::tests::g1_parent_chain";
+        const ROLE: &str = "SPIDERVPN_G1_PARENT_TEST_ROLE";
+        const LIMIT: Duration = Duration::from_secs(20);
+
+        // Observe from another OS thread: a recursive wait on the parent's
+        // original mutex handle could otherwise look like a free short lock.
+        fn observe_locks(outer_busy: bool, short_busy: bool) {
+            std::thread::spawn(move || {
+                let outer = LifecycleGate::acquire();
+                if outer_busy {
+                    assert_eq!(outer.err().unwrap(), "G1_GATE_EXISTING win32=183");
+                } else {
+                    drop(outer.expect("outer gate must be free"));
+                }
+                let short = guard::acquire_guard_mutex();
+                if short_busy {
+                    assert!(short.is_err(), "short gate unexpectedly free");
+                } else {
+                    drop(short.expect("short gate must be free"));
+                }
+            }).join().unwrap();
+        }
+
+        // Only disposable synthetic evidence; no BFE mutations. The
+        // parent must still pass its original A19 per-program v4/v6 checks.
+        fn fixture_evidence(ids: &[ProgramIdentity]) -> GuardEvidence {
+            let slot = guard::FilterSlot {
+                present: true, recognized: true, persistent: true,
+                disabled: false, filter_id: Some(17),
+            };
+            GuardEvidence {
+                programs: ids.iter().map(|id| guard::ProgramEvidence {
+                    name: id.name.clone(), path: id.path.to_string_lossy().into_owned(),
+                    app_id: id.app_id.clone(), ipv4: slot,
+                    ipv6: guard::FilterSlot { filter_id: Some(18), ..slot },
+                }).collect(),
+                detection: guard::GuardDetection {
+                    provider_present: true, sublayer_present: true,
+                    infrastructure_verified: true, ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+        struct Spy {
+            request: GuardRequest,
+            marker: PathBuf,
+            calls: AtomicUsize,
+        }
+        impl Spy {
+            fn call(&self, action: GuardAction, ids: &[ProgramIdentity],
+                expect: Option<&guard::Expect>) -> Result<GuardEvidence, WfpError> {
+                assert_eq!(action, self.request.action);
+                if let Some(expect) = expect {
+                    assert_eq!(ids, self.request.programs.as_slice());
+                    assert_eq!(expect.config_digest, self.request.config_digest);
+                    assert_eq!(expect.boot_id, self.request.boot_id);
+                    assert_eq!(expect.store_kind, StoreKind::IsolatedFile);
+                    assert_eq!(expect.legacy_running, self.request.legacy_running);
+                }
+                assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+                observe_locks(true, true);
+                let marker = format!("{}:{}:{}", self.request.action.as_str(),
+                    self.request.nonce, std::process::id());
+                // Real marker can exist only after this backend was called
+                // and the independent thread observed both held gates.
+                use std::io::Write;
+                std::fs::OpenOptions::new().write(true).create_new(true)
+                    .open(&self.marker).unwrap().write_all(marker.as_bytes()).unwrap();
+                println!("G1_PARENT_CHILD_SPY action={} nonce={} pid={} outer_held=true short_held=true real_bfe_write=false",
+                    action.as_str(), self.request.nonce, std::process::id());
+                Ok(if action == GuardAction::Remove { GuardEvidence::default() }
+                    else { fixture_evidence(ids) })
+            }
+        }
+        impl guard::GuardBackend for Spy {
+            fn available(&self) -> bool { true }
+            fn install(&self, ids: &[ProgramIdentity], e: &guard::Expect)
+                -> Result<GuardEvidence, WfpError> { self.call(GuardAction::Install, ids, Some(e)) }
+            fn sync(&self, ids: &[ProgramIdentity], e: &guard::Expect)
+                -> Result<GuardEvidence, WfpError> { self.call(GuardAction::Sync, ids, Some(e)) }
+            fn read(&self, ids: &[ProgramIdentity], e: &guard::Expect)
+                -> Result<GuardEvidence, WfpError> { self.call(GuardAction::Verify, ids, Some(e)) }
+            fn remove(&self) -> Result<GuardEvidence, WfpError> { self.call(GuardAction::Remove, &[], None) }
+        }
+
+        if let Ok(role) = std::env::var(ROLE) {
+            let root = crate::isolation::dev_root_override().expect("isolated child root");
+            assert!(root.starts_with(std::env::temp_dir()) && root.is_dir());
+            if role == "outer" || role == "short" {
+                // A separate process owns the exact production lock. The
+                // ready signal is written only after acquisition succeeds.
+                let _outer = if role == "outer" { Some(LifecycleGate::acquire().unwrap()) } else { None };
+                let _short = if role == "short" { Some(guard::acquire_guard_mutex().unwrap()) } else { None };
+                std::fs::write(root.join("holder-ready"), std::process::id().to_string()).unwrap();
+                println!("G1_PARENT_HOLDER gate={role} pid={} ready=true", std::process::id());
+                assert_eq!(std::io::stdin().read(&mut [0u8;1]).unwrap(), 0);
+                return;
+            }
+            assert_eq!(role, "spy");
+            let req_path = PathBuf::from(std::env::var_os("G1_PARENT_REQ").unwrap());
+            let res_path = PathBuf::from(std::env::var_os("G1_PARENT_RES").unwrap());
+            assert!(validate_guard_ipc_paths(&req_path, &res_path).is_ok());
+            let request = read_attested_guard_request(&req_path).unwrap();
+            assert_eq!(request.store_kind, StoreKind::IsolatedFile.as_str());
+            assert_eq!(request.programs.len(), 1);
+            assert!(!request.legacy_running);
+            // The exact parent request is consumed by the real final
+            // executor. No alternate request or test-only admission path.
+            let spy = Spy { request, marker: root.join("backend-called"), calls: AtomicUsize::new(0) };
+            let code = guard_apply_main(&req_path, &res_path, &spy);
+            let calls = spy.calls.load(Ordering::SeqCst);
+            assert_eq!(calls, if code == 0 { 1 } else { 0 });
+            println!("G1_PARENT_CHILD_RESULT action={} nonce={} pid={} exit={code} backend_calls={calls}",
+                spy.request.action.as_str(), spy.request.nonce, std::process::id());
+            // Propagate the actual executor exit code, rather than the
+            // test harness's generic success code.
+            std::process::exit(code);
+        }
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        fn wait(child: &mut ChildGuard) -> i32 {
+            let deadline = Instant::now() + LIMIT;
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    return status.code().expect("native exit code");
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.0.kill();
+                    let _ = child.0.wait();
+                    panic!("G1 parent chain child timeout (20s)");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn test_command(role: &str, root: &Path) -> Command {
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--ignored", "--exact", TEST, "--nocapture"])
+                .env(ROLE, role).env("SPIDERVPN_ROOT", root);
+            cmd
+        }
+        fn holder(scenario: &str, root: &Path) -> Option<ChildGuard> {
+            if scenario == "success" { return None; }
+            let mut cmd = test_command(scenario, root);
+            let mut child = ChildGuard(cmd.stdin(Stdio::piped()).spawn().unwrap());
+            let deadline = Instant::now() + LIMIT;
+            loop {
+                assert!(child.0.try_wait().unwrap().is_none(), "holder exited before ready");
+                if let Ok(ready) = std::fs::read_to_string(root.join("holder-ready")) {
+                    if ready == child.0.id().to_string() { break; }
+                }
+                assert!(Instant::now() < deadline, "holder ready timeout");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_ne!(child.0.id(), std::process::id());
+            observe_locks(scenario == "outer", scenario == "short");
+            Some(child)
+        }
+        #[derive(Debug)]
+        struct Observation {
+            request: GuardRequest,
+            child_pid: u32,
+            code: i32,
+            reply: GuardReply,
+            elapsed_ms: u128,
+        }
+        let product = PathBuf::from(std::env::var_os("SPIDERVPN_G1_PRODUCT_EXE")
+            .expect("actual debug product EXE from CI"));
+        assert!(product.is_absolute() && product.is_file());
+        let random = {
+            use ring::rand::{SecureRandom, SystemRandom};
+            let mut bytes = [0u8;16];
+            SystemRandom::new().fill(&mut bytes).unwrap();
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let root = std::env::temp_dir().join(format!("spidervpn-g1-parent-{random}"));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(root.clone());
+        let mut cfg = crate::config::parse(r#"{"schema":2}"#).unwrap();
+        let mut split = crate::config::SplitConfig::default();
+        split.add_process_entry("fixture.exe", crate::config::SplitTarget::Trade,
+            Some(product.to_str().unwrap()));
+        cfg.split = split;
+        let resolved = guard::trade_identities(&cfg);
+        assert_eq!(resolved.programs.len(), 1);
+        let light = guard::trade_entries_light(&cfg);
+        assert!(light.unresolved.is_empty());
+        let digest = guard::state::config_digest(&resolved.programs, &light.unresolved, false);
+        let mut seed: Option<GuardRecord> = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut completed = 0;
+        // All five parent entries exercise all three scenarios via the
+        // observable spy child. The additional three real CLI Verify
+        // cases show the same complete parent-generated request transport
+        // through the actual BFE read backend, with no persistent mutation.
+        for (entry, action, real_cli) in [
+            ("install", GuardAction::Install, false),
+            ("sync", GuardAction::Sync, false),
+            ("disconnect", GuardAction::Verify, false),
+            ("remove", GuardAction::Remove, false),
+            ("verify", GuardAction::Verify, false),
+            ("verify-cli", GuardAction::Verify, true),
+        ] {
+            for scenario in ["success", "outer", "short"] {
+                let case_root = root.join(format!("{entry}-{scenario}"));
+                std::fs::create_dir(&case_root).unwrap();
+                let neighbor = case_root.join("neighbor");
+                std::fs::write(&neighbor, b"unchanged").unwrap();
+                let store = guard::IsolatedFileStore::new(&case_root).unwrap();
+                // Preserve a real prior isolated record produced by the
+                // first successful parent Install/spy child, including on
+                // Remove failure. Never seed actual product storage.
+                if let Some(prior) = &seed { store.write(prior).unwrap(); }
+                let prior = std::fs::read(&store.path).ok();
+                let prior_nonce = store.read().ok().map(|r| r.nonce);
+                assert!(store.read_removed().is_none());
+                let cache = guard::GuardCache::new();
+                let mut hooks = guard::GuardHooks::production();
+                assert!(hooks.elevated() && !hooks.legacy());
+                assert!((hooks.running_programs)(&resolved.programs).is_empty());
+                let observed = Arc::new(Mutex::new(None::<Observation>));
+                let captured = observed.clone();
+                let child_root = case_root.clone();
+                let child_product = product.clone();
+                let expected_ids = resolved.programs.clone();
+                let expected_digest = digest.clone();
+                let mut held = holder(scenario, &case_root);
+                hooks.request = Box::new(move |req| {
+                    assert!(captured.lock().unwrap().is_none(), "one request per real parent entry");
+                    assert_eq!(req.action, action);
+                    assert_eq!(req.programs, expected_ids);
+                    assert_eq!(req.config_digest, expected_digest);
+                    assert_eq!(req.explicit, entry != "disconnect");
+                    assert_eq!(req.store_kind, StoreKind::IsolatedFile.as_str());
+                    assert!(!req.legacy_running && !req.nonce.is_empty() && !req.boot_id.is_empty());
+                    // Critically this probe runs inside the parent hook:
+                    // no lock can be taken by the parent around the call.
+                    observe_locks(scenario == "outer", scenario == "short");
+                    println!("G1_PARENT_PRE entry={entry} scenario={scenario} nonce={} independent_thread=true outer_busy={} short_busy={}",
+                        req.nonce, scenario == "outer", scenario == "short");
+                    let files = GuardIpcFiles::create(req).unwrap();
+                    write_json_file(&files.req, req).unwrap();
+                    prepare_reply_file(&files.res).unwrap();
+                    assert!(validate_guard_ipc_paths(&files.req, &files.res).is_ok());
+                    assert_eq!(read_attested_guard_request(&files.req).unwrap(), *req);
+                    let mut cmd = if real_cli {
+                        let mut c = Command::new(&child_product);
+                        c.arg(APPLY_FLAG).arg(&files.req).arg(&files.res)
+                            .env("SPIDERVPN_ROOT", &child_root);
+                        c
+                    } else {
+                        let mut c = test_command("spy", &child_root);
+                        c.env("G1_PARENT_REQ", &files.req).env("G1_PARENT_RES", &files.res);
+                        c
+                    };
+                    let started = Instant::now();
+                    let mut child = ChildGuard(cmd.stdin(Stdio::null()).spawn().unwrap());
+                    let child_pid = child.0.id();
+                    assert_ne!(child_pid, std::process::id());
+                    let code = wait(&mut child);
+                    let elapsed_ms = started.elapsed().as_millis();
+                    let reply: GuardReply = read_json_file(&files.res).expect("actual attested child reply");
+                    let success = scenario == "success";
+                    assert_eq!(code, if success { 0 } else { 3 });
+                    if success {
+                        assert!(reply.result.is_ok() && reply.notes.is_empty());
+                        if let Ok(ev) = &reply.result {
+                            assert_eq!(ev.boot_id, req.boot_id);
+                            assert_eq!(ev.config_digest, req.config_digest);
+                            assert_eq!(ev.store_kind, req.store_kind);
+                            if real_cli {
+                                assert!(!ev.detection.provider_present && !ev.detection.sublayer_present);
+                            }
+                        }
+                    } else {
+                        assert_eq!(reply.result, Err(WfpError::InvalidState));
+                        if scenario == "outer" {
+                            assert_eq!(reply.notes, vec!["G1_GATE_EXISTING win32=183".to_string()]);
+                        } else {
+                            assert_eq!(reply.notes.len(), 1);
+                            assert!(reply.notes[0].starts_with("G1_SHORT_LOCK:"));
+                        }
+                    }
+                    let result = if let Some(error) = classify_exit_code(code) {
+                        assert!(!error.is_declined());
+                        Err(ElevateError::ChildFailedNote(code, reply.notes.join("；")))
+                    } else { Ok(reply.clone()) };
+                    *captured.lock().unwrap() = Some(Observation {
+                        request: req.clone(), child_pid, code, reply, elapsed_ms,
+                    });
+                    result
+                });
+
+                // These are the original five parent entry implementations.
+                let result = match entry {
+                    "install" | "sync" => guard::run_explicit_install(action, &cfg, &store, &cache, &hooks, false),
+                    "disconnect" => Ok(guard::reverify_after_disconnect(Some(&cfg), &store, &cache, &hooks)),
+                    "remove" => guard::remove_explicit(&cfg, &store, &cache, &hooks),
+                    "verify" | "verify-cli" => guard::verify_explicit(&cfg, &store, &cache, &hooks),
+                    _ => unreachable!(),
+                };
+                let o = observed.lock().unwrap().take().expect("parent really sent a request");
+                assert!(seen.insert(o.request.nonce.clone()), "duplicate parent nonce");
+                assert_eq!(cache.record_version(), o.request.record_version);
+                assert!(o.elapsed_ms < LIMIT.as_millis(), "parent wait exceeded bound");
+                let success = scenario == "success";
+                let pending = if success { guard::VerifyPending::None } else { guard::VerifyPending::Failed };
+                assert_eq!(cache.verify_pending(), pending);
+                if success {
+                    let st = result.expect("real parent success");
+                    assert_eq!(st.verify_pending, pending);
+                    if entry == "remove" {
+                        assert!(matches!(store.read(), Err(guard::RecordError::Missing)));
+                        assert_eq!(store.read_removed().unwrap().by, "ElevatedRemove");
+                        assert_eq!(st.reason, guard::GuardReason::UserRemoved);
+                        let archived = store.path.with_extension("invalid.json");
+                        assert_eq!(std::fs::read(archived).unwrap(), prior.as_ref().unwrap().as_slice());
+                    } else {
+                        let rec = store.read().unwrap();
+                        assert_eq!(rec.nonce, o.request.nonce);
+                        assert_eq!(rec.config_digest, o.request.config_digest);
+                        assert_eq!(rec.verifier_pid, o.child_pid);
+                        assert_eq!(rec.record_version, o.request.record_version);
+                        assert!(rec.verifier_elevated && rec.verify_seal());
+                        assert!(store.read_removed().is_none());
+                        if real_cli {
+                            assert_eq!(st.reason, guard::GuardReason::InfrastructureMissing);
+                            assert!(!st.is_protected());
+                            assert!(!rec.provider_present && !rec.sublayer_present);
+                        } else {
+                            assert!(st.is_protected(), "fixture status must cover the actual configured program: {st:?}");
+                            if seed.is_none() { seed = Some(rec); }
+                        }
+                    }
+                } else {
+                    if entry == "disconnect" {
+                        // This original entry never returns Err. Its
+                        // failure must be visible as Failed, not success.
+                        let st = result.unwrap();
+                        assert_eq!(st.verify_pending, guard::VerifyPending::Failed);
+                    } else {
+                        assert_eq!(result.unwrap_err(),
+                            ElevateError::ChildFailedNote(o.code, o.reply.notes.join("；")).message());
+                    }
+                    assert_eq!(std::fs::read(&store.path).ok(), prior);
+                    assert_eq!(store.read().unwrap().nonce, prior_nonce.unwrap());
+                    assert!(store.read_removed().is_none());
+                    assert!(!store.path.with_extension("invalid.json").exists());
+                }
+                let marker = case_root.join("backend-called");
+                if success && !real_cli {
+                    assert_eq!(std::fs::read_to_string(&marker).unwrap(),
+                        format!("{}:{}:{}", action.as_str(), o.request.nonce, o.child_pid));
+                } else { assert!(!marker.exists()); }
+                assert_eq!(std::fs::read(&neighbor).unwrap(), b"unchanged");
+                // While the holder is alive the other gate must already
+                // be free; after release both must be freshly acquirable.
+                observe_locks(scenario == "outer", scenario == "short");
+                let holder_pid = held.as_ref().map(|c| c.0.id()).unwrap_or(0);
+                if let Some(mut child) = held.take() {
+                    assert_ne!(child.0.id(), o.child_pid);
+                    assert!(child.0.try_wait().unwrap().is_none());
+                    drop(child.0.stdin.take());
+                    assert_eq!(wait(&mut child), 0);
+                }
+                observe_locks(false, false);
+                println!("G1_PARENT_CASE entry={entry} action={} scenario={scenario} nonce={} child_pid={} holder_pid={holder_pid} exit={} elapsed_ms={} limit_ms=20000 real_cli={real_cli} parent_pending={pending:?} evidence_checked=true neighbor_unchanged=true spy_observed_both={} gates_free_after=true",
+                    action.as_str(), o.request.nonce, o.child_pid, o.code, o.elapsed_ms, success && !real_cli);
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 18);
+        assert_eq!(seen.len(), 18);
+        println!("G1_PARENT_CHAIN_COMPLETE entries=5 cases=18 spy_cases=15 real_cli_cases=3 distinct_nonces=18 independent_holders=true bounded_wait=true parent_request_preserved=true product_bfe_write=false actual_uac_not_run=true write_instant_probe_not_run=true");
     }
 
     #[test]
