@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.94 与 [任务分配表](./TASK_ASSIGNMENTS.md) §30 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.95 与 [任务分配表](./TASK_ASSIGNMENTS.md) §31 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -941,3 +941,7 @@ PR/commit/CI: ...
 ## D.94 2026-11-20 §30：G2已执行范围冻结，B独占D2执行器核心
 - #30 `5636bf53c374aab377a8fbc317b642975cbb9307` 四workflow MSVC44660293444/GNU-B44660293515/GNU-C44660293601/Linux44660293434全success，D独立[7028771337](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7028771337)、C正式停写7028832325，实际双ABI G2各1/1，12真实Unknown/ABI、共享排他/真实运行/引擎/孤儿/隔离恢复及原完整回归已验，正式冻结已执行范围；非完整生产PASS，可信锚部署、跨SID/普通Token及旧writer未证。
 - [§30](https://github.com/weixiaochuchen618-debug/spidervpn/commit/091ee12eac3b4b2d8038fbce95a5bd69c83ad03d) C停写、B唯一集成写权 COORD-INT-UNINSTALL-EXECUTOR/R01-009-D2-CORE：真实私有Rust固定launcher同对象验证/处置/独立absence执行器核心，仅隔离fixture验证，非重复LAB、不接真实删除入口、不删除产品依赖/数据。D3独立可运行恢复待授权；R2/可信外部锚/生产占用过渡与历史/真实维护/跨SID/UAC/WFP05/Windows/VPS等仍BLOCKED_REAL_ACCEPTANCE。C只读、D独立，尚无D2-CORE提交或CI，main及原分支不变。
+
+## D.95 2026-11-20 §31：D2-CORE实际处置通过，诊断缺口待补
+- #30 `006eb7e36ac131c728c2ac143661ee84e2feccf1` 四workflow MSVC44674678294/GNU-B44674678247/GNU-C44674678223/Linux44674678191全success，D[7030704836](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7030704836)、B停写7030693562，实际同对象处置双ABI及全部负控/旧回归PASS；不冻结D2-CORE，原生对象/路径查询rc丢失、secondary pending诊断、SDDL终止长度及竞争独立截止时间按§30待补。
+- [§31](https://github.com/weixiaochuchen618-debug/spidervpn/commit/5b56af0101779e8029b0c25147935b3b76c1e7d0) 恢复B唯一限量D2-DIAG写权，仅launcher_executor私有诊断与同文件test及MSVC/GNU-B追加实际专项；保持原D1/处置原则/生产不可达及旧回归，双ABI真实native证据与有界竞争、四CI/D独立/B再次停写后核冻结。C只读、不进D3、无实际维护删除/消费B1；尚无整改提交/CI。R2、可信外部锚、真实恢复/旧writer/跨SID/UAC/WFP05/Windows/VPS仍阻塞，main及原分支不变。
