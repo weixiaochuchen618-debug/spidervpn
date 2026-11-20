@@ -38,6 +38,7 @@ mod exit_probe;
 // 分层见 src/guard/mod.rs 的头注释：判定不碰 FFI，FFI 不决定状态。
 mod guard;
 mod instance;
+mod runtime_occupancy;
 mod ipc;
 mod isolation;
 mod install_trust;
@@ -1050,6 +1051,20 @@ fn main() -> ExitCode {
             println!("  {msg}");
         }
     }
+
+    // G2: owner-only GUI and actual CLI network writers keep a shared
+    // registration until return. Existing startup repair above stays
+    // independent of this gate. No G1 or maintenance lock is held here.
+    let _runtime_occupancy = if guard.is_some() && matches!(main_command(&argv),
+        None | Some("--connect" | "--apply")) {
+        match runtime_occupancy::admit() {
+            Ok(held) => Some(held),
+            Err(reason) => {
+                eprintln!("{reason}");
+                return ExitCode::from(exit::CONFLICT);
+            }
+        }
+    } else { None };
 
     // `--import <profile.json> --engine <引擎exe> [--port N] [--line-name 名称]`：
     // 把 旧版的线路文件转成本程序自己的引擎配置，并写好线路。
@@ -2499,10 +2514,25 @@ fn main() -> ExitCode {
         }
     }
 
+    // Headless legitimately remains a read-only status command when
+    // a verified maintenance exclusion prevents a new controller.
+    let headless = main_command(&argv) == Some("--headless");
+    let mut _headless_occupancy = None;
+    let mut headless_read_only = false;
+    if headless && guard.is_some() {
+        match runtime_occupancy::admit() {
+            Ok(held) => _headless_occupancy = Some(held),
+            Err(reason) => {
+                eprintln!("{reason}");
+                headless_read_only = true;
+            }
+        }
+    }
+
     // A shared-read headless process must NEVER become a control server.
     // The original owner may exit between the conflict check and bind.
-    if guard.is_none() {
-        if main_command(&argv) != Some("--headless") {
+    if guard.is_none() || headless_read_only {
+        if !headless {
             eprintln!("未持有单实例锁，不启动控制接口");
             return ExitCode::from(exit::CONFLICT);
         }

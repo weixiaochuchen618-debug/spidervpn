@@ -174,3 +174,32 @@ jobs:
               if ([regex]::Matches($log, $pattern).Count -ne 1) { throw "G1 parent case missing or duplicate: $entry $scenario" }
             }
           }
+
+      - name: R01-009 G2 actual runtime occupancy and independent process exclusion (MSVC)
+        shell: pwsh
+        run: |
+          & cargo build --locked --bin spidervpn
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metadata = & cargo metadata --locked --format-version 1 --no-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:SPIDERVPN_G2_PRODUCT_EXE = Join-Path (($metadata | ConvertFrom-Json).target_directory) 'debug/spidervpn.exe'
+          if (-not (Test-Path -LiteralPath $env:SPIDERVPN_G2_PRODUCT_EXE -PathType Leaf)) { throw 'Missing actual G2 debug product' }
+          $fixture = Join-Path $env:RUNNER_TEMP ("G2-fixture-" + [guid]::NewGuid().ToString() + ".exe")
+          try {
+            & rustc --edition=2021 --crate-name g2_occupancy_fixture tests/runtime-occupancy-e2e.rs -o $fixture
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $env:SPIDERVPN_G2_FIXTURE_EXE = $fixture
+            $output = & cargo test --locked --bin spidervpn runtime_occupancy::imp::tests::g2_runtime_occupancy -- --ignored --exact --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) { exit $code }
+            $log = $output -join "`n"
+            if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'G2 exact test did not run' }
+            foreach ($marker in @('G2_FIXTURE_READY','G2_SHARED_COMPLETE','G2_PRODUCT_MISSING_COMPAT','G2_IPC_REAL','G2_PRODUCT_CONTROLLER','G2_REPLACE_REFUSED','G2_ORPHAN_ACTIVE','G2_ORPHAN_CLEANUP','G2_PROXY_CLEANUP',
+              'G2_REAL_ENGINE_ENTRY role=start-ok','G2_REAL_ENGINE_ENTRY role=start-denied','G2_REAL_ENGINE_ENTRY role=version-ok','G2_REAL_ENGINE_ENTRY role=version-denied',
+              'G2_RUNTIME_OCCUPANCY_COMPLETE fixed_anchor=true shared_and_exclusive=true actual_product=true actual_engine_and_version=true orphan_detected=true cleanup_independent=true missing_compatible=true maintenance_authorized=false')) {
+              if (-not $log.Contains($marker)) { throw "G2 missing actual evidence marker: $marker" }
+            }
+          } finally {
+            if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Force }
+          }

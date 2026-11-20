@@ -291,6 +291,9 @@ fn connect_inner(
     deps: &Deps,
     legacy_running: bool,
 ) -> Result<Outcome, String> {
+    // Final connection transaction entry, before journal, proxy, Guard
+    // requests or engine spawn. Cleanup paths do not acquire this gate.
+    let _runtime_occupancy = crate::runtime_occupancy::admit()?;
     // Snapshot only the opt-in experimental intent at entry. Failure never
     // interrupts the existing connection transaction or its error paths.
     #[cfg(windows)]
