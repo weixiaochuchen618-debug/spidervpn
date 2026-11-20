@@ -250,3 +250,15 @@ jobs:
           foreach ($marker in @('D3_ACTUAL_DLL_FAILURE','D3_ACTUAL_CLIENT','D3_ACTUAL_ENGINE','D3_DEPENDENCY_DAMAGE','D3_NEW_GROUP','D3_TIMEOUT_ACTUAL','D3_ACTUAL_INTERRUPT','D3_READBACK','D3_NEGATIVE_MATRIX')) {
             if ($log -notmatch $marker) { throw "D3 actual marker missing: $marker" }
           }
+
+      - name: R01-009-D3-EXEC-EVIDENCE verify actual controller execution evidence
+        shell: pwsh
+        env:
+          EXPECTED_D3_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $actual = $env:SPIDER_D3_EXEC_EVIDENCE
+          $prefix = "D3_EXEC_EVIDENCE_COMPLETE source_sha=$env:EXPECTED_D3_SHA held_groups=4 replacement_id_and_bytes_refused=true pe_four_images=true client_module_observed=true engine_module_observed=true recovery_module_observed="
+          $tail = " path_os_only=true actual_timeout=true snapshot_only=true maintenance_authorized=false"
+          if ($actual -cne ($prefix + "true" + $tail) -and $actual -cne ($prefix + "false" + $tail)) { throw 'missing actual D3 execution evidence from the preceding Rust exact' }
+          if ($actual -ceq ($prefix + "false" + $tail)) { Write-Warning 'Live recovery module snapshot NOT RUN; inspect actual Rust log and coordinator decision' }
+          Write-Host "Validated actual controller evidence for $env:EXPECTED_D3_SHA"

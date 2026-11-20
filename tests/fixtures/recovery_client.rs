@@ -30,5 +30,14 @@ fn main(){
     let mark=unsafe{entry()};
     assert_eq!(mark,0x5350_4433);
     println!("D3_CLIENT_DLL_OK pid={} value={mark:#x} exe={} loaded={}",std::process::id(),exe.display(),actual.display());
+    // Test-only module observation: the real adjacent DLL and called
+    // export remain loaded until the independent controller releases us.
+    if std::env::args().nth(1).as_deref()==Some("--observe-fixture"){
+        use std::io::{BufRead,Write};
+        println!("D3_CLIENT_OBSERVE_READY pid={}",std::process::id());
+        std::io::stdout().flush().unwrap();
+        let mut go=String::new();std::io::stdin().lock().read_line(&mut go).unwrap();
+        assert_eq!(go.trim_end_matches(['\r','\n']),"G");
+    }
     assert_ne!(unsafe{FreeLibrary(module)},0);
 }

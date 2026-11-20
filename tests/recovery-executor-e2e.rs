@@ -4,7 +4,7 @@
 #![cfg(all(windows,feature="recovery-core"))]
 use std::{
     collections::{BTreeMap,BTreeSet},ffi::OsStr,fs::{self,File,OpenOptions},
-    io::{self,BufRead,BufReader,Read,Write},
+    io::{self,BufRead,BufReader,Read,Seek,SeekFrom,Write},
     os::windows::{ffi::OsStrExt,fs::OpenOptionsExt,io::{AsRawHandle,FromRawHandle}},
     path::{Path,PathBuf},process::{Child,Command,ExitStatus,Stdio},
     sync::mpsc,thread::{self,JoinHandle},time::{Duration,Instant},ptr::null_mut,
@@ -20,12 +20,16 @@ use windows_sys::Win32::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW,
         ConvertSecurityDescriptorToStringSecurityDescriptorW,SDDL_REVISION_1},
     Storage::FileSystem::{CreateDirectoryW,CreateFileW,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,
-        GetFileInformationByHandle,GetFinalPathNameByHandleW,GetFileType,FILE_TYPE_DISK,
-        BY_HANDLE_FILE_INFORMATION,FILE_READ_ATTRIBUTES,DELETE,FILE_SHARE_READ,
+        GetFileInformationByHandle,GetFileInformationByHandleEx,FileStreamInfo,GetFinalPathNameByHandleW,GetFileType,FILE_TYPE_DISK,
+        BY_HANDLE_FILE_INFORMATION,FILE_READ_ATTRIBUTES,FILE_LIST_DIRECTORY,DELETE,FILE_SHARE_READ,
         FILE_FLAG_BACKUP_SEMANTICS,FILE_FLAG_OPEN_REPARSE_POINT},
     System::{Com::CoTaskMemFree,Threading::WaitForSingleObject},
     UI::Shell::{SHGetKnownFolderPath,FOLDERID_ProgramFiles},
 };
+#[path="fixtures/recovery_pe.rs"]
+mod recovery_pe;
+#[path="fixtures/recovery_modules.rs"]
+mod recovery_modules;
 const NAMES:[&str;4]=["spidervpn.exe","WebView2Loader.dll","sing-box.exe","sing-box.LICENSE.txt"];
 const MANIFEST:&str="manifest.json";
 const ACL:&str="O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
@@ -110,21 +114,101 @@ fn names(p:&Path)->BTreeSet<String>{
 }
 #[derive(Debug,PartialEq,Eq,Clone)]
 struct Snap{id:Id,len:u64,sha:String}
-fn readback(p:&Path,expected:&[u8],protected:bool)->Snap{
-    let mut f=open(p);
-    let (id,len)=info(&f,p,false);assert_eq!(len,expected.len() as u64,"{p:?}");
-    if protected{exact_acl(&f);}
+fn streams(f:&File,p:&Path,dir:bool){
+    let mut aligned=vec![0u64;8192];
+    let b=unsafe{std::slice::from_raw_parts_mut(aligned.as_mut_ptr().cast::<u8>(),aligned.len()*8)};
+    if unsafe{GetFileInformationByHandleEx(f.as_raw_handle(),FileStreamInfo,b.as_mut_ptr().cast(),b.len() as u32)}==0{
+        let e=io::Error::last_os_error();
+        if dir&&e.raw_os_error()==Some(38){return;}
+        panic!("held stream query {p:?}: {e}");
+    }
+    let next=u32::from_le_bytes(b[..4].try_into().unwrap());
+    let len=u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+    let wanted:Vec<u8>="::$DATA".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert!(next==0&&len==wanted.len()&&b[24..24+wanted.len()]==wanted,"unexpected stream {p:?}");
+}
+fn readback_handle(f:&File,p:&Path,expected:&[u8],protected:bool)->Result<Snap,&'static str>{
+    let (id,len)=info(f,p,false);
+    if protected{exact_acl(f);streams(f,p,false);}
+    if len!=expected.len() as u64{return Err("SIZE_MISMATCH");}
+    let mut reader=f;
+    reader.seek(SeekFrom::Start(0)).unwrap();
     let mut h=Sha256::new();
     let mut buf=[0u8;65536];
     for chunk in expected.chunks(buf.len()){
-        f.read_exact(&mut buf[..chunk.len()]).unwrap();
-        assert!(&buf[..chunk.len()]==chunk,"independent bytes mismatch {p:?}");
+        reader.read_exact(&mut buf[..chunk.len()]).unwrap();
+        if &buf[..chunk.len()]!=chunk{return Err("BYTES_MISMATCH");}
         h.update(&buf[..chunk.len()]);
     }
-    assert_eq!(f.read(&mut buf[..1]).unwrap(),0);
-    assert_eq!(info(&f,p,false),(id,len));
-    if protected{exact_acl(&f);}
-    Snap{id,len,sha:format!("{:x}",h.finalize())}
+    if reader.read(&mut buf[..1]).unwrap()!=0{return Err("EOF_MISMATCH");}
+    assert_eq!(info(f,p,false),(id,len));
+    if protected{exact_acl(f);streams(f,p,false);}
+    Ok(Snap{id,len,sha:format!("{:x}",h.finalize())})
+}
+fn readback(p:&Path,expected:&[u8],protected:bool)->Snap{
+    let f=open(p);
+    readback_handle(&f,p,expected,protected).unwrap_or_else(|e|panic!("independent readback {p:?}: {e}"))
+}
+// Admission uses the original external expectation and previously verified
+// ID, not a fresh self-digest of a replacement object.
+fn bind(p:&Path,e:&[u8],prior:&Snap)->Result<File,&'static str>{
+    let f=open(p);
+    if info(&f,p,false).0!=prior.id{return Err("ID_MISMATCH");}
+    let actual=readback_handle(&f,p,e,true)?;
+    if &actual!=prior{return Err("SNAP_MISMATCH");}
+    Ok(f)
+}
+fn reverify(f:&File,p:&Path,e:&[u8],prior:&Snap){
+    assert_eq!(&readback_handle(f,p,e,true).unwrap(),prior);
+}
+struct HeldDirs(Vec<(PathBuf,File,Id,String,bool)>);
+impl HeldDirs{
+    fn new(p:&Path,expected:&[(&Path,Id)])->Self{
+        let pf=program_files();assert!(p.starts_with(&pf)&&p!=pf);
+        let mut dirs=Vec::new();
+        let ancestors:Vec<_>=p.ancestors().collect();
+        for d in ancestors.into_iter().rev(){
+            let f=OpenOptions::new().access_mode(FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES|READ_CONTROL)
+                .share_mode(FILE_SHARE_READ).custom_flags(FLAGS).open(d).unwrap();
+            let id=info(&f,d,true).0;let acl=sddl(&f);streams(&f,d,true);
+            let exact=d.starts_with(&pf)&&d!=pf;
+            if exact{exact_acl(&f);}
+            for (known,want) in expected{if d==*known{assert_eq!(id,*want);}}
+            dirs.push((d.to_owned(),f,id,acl,exact));
+        }
+        assert!(expected.iter().all(|(d,_)|dirs.iter().any(|x|x.0.as_path()==*d)));
+        let volume=dirs[0].2.0;assert!(dirs.iter().all(|x|x.2.0==volume));
+        Self(dirs)
+    }
+    fn check(&self){
+        for (p,f,id,acl,exact) in &self.0{
+            assert_eq!(info(f,p,true).0,*id);assert_eq!(&sddl(f),acl);
+            streams(f,p,true);if *exact{exact_acl(f);}
+        }
+    }
+}
+fn pe_evidence(f:&File,p:&Path,expected:&[u8],snap:&Snap){
+    reverify(f,p,expected,snap);
+    assert!(snap.len<=128*1024*1024);
+    let mut reader=f;reader.seek(SeekFrom::Start(0)).unwrap();
+    let mut b=Vec::new();reader.take(snap.len+1).read_to_end(&mut b).unwrap();
+    assert_eq!(b,expected);assert_eq!(hash(&b),snap.sha);
+    let pe=recovery_pe::parse(&b).unwrap_or_else(|e|panic!("PE UNKNOWN {p:?}: {e}"));
+    assert!(recovery_pe::parse(&b[..64]).is_err(),"truncated PE must fail");
+    for name in pe.normal.iter().chain(pe.delay.iter()).flatten(){
+        assert!(!["spidervpn.exe","WebView2Loader.dll","sing-box.exe"].iter().any(|n|name.eq_ignore_ascii_case(n)),
+            "unexpected static product import {name}");
+    }
+    println!("D3_EXEC_PE parser=bounded_fixture_pe32plus_v1 path={p:?} id={:?} size={} sha256={} machine={:#x} image_base={:#x} normal={:?} delay={:?} dependency_graph=false",snap.id,snap.len,snap.sha,pe.machine,pe.image_base,pe.normal,pe.delay);
+    reverify(f,p,expected,snap);
+}
+struct Runner<'a>{path:PathBuf,file:File,snap:Snap,expected:&'a[u8],dirs:HeldDirs}
+impl Runner<'_>{
+    fn check(&self){self.dirs.check();reverify(&self.file,&self.path,self.expected,&self.snap);}
+    fn after(&self,pid:u32,exit:Option<i32>){
+        self.check();
+        println!("D3_EXEC_RUNNER_HELD pid={pid} exit={exit:?} id={:?} sha256={} same_handle=true exact_acl=true ancestors_stable=true",self.snap.id,self.snap.sha);
+    }
 }
 fn set_dacl(p:&Path,new:&str){
     let f=OpenOptions::new().access_mode(READ_CONTROL|0x40000)
@@ -181,6 +265,7 @@ impl Drop for Proc{fn drop(&mut self){
 }}
 impl Proc{
     fn start(c:&mut Command)->Self{
+        recovery_modules::isolate(c);
         let mut child=c.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let pid=child.id();let reader=child.stdout.take().unwrap();let errors=child.stderr.take().unwrap();
         let (tx,lines)=mpsc::channel();
@@ -230,18 +315,22 @@ fn gen_from(run:&Run,work:&Path)->PathBuf{
     assert_eq!(n.len(),32);assert!(n.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)));
     p
 }
-fn recover(exe:&Path,raw:&[u8],sha:&str,work:&Path,cwd:&Path)->PathBuf{
-    let result=run(&mut recovery(exe,&hash(raw),sha,cwd),120000);
+fn recover(exe:&Runner<'_>,raw:&[u8],sha:&str,work:&Path,cwd:&Path)->PathBuf{
+    exe.check();
+    let result=run(&mut recovery(&exe.path,&hash(raw),sha,cwd),120000);
+    exe.after(result.pid,result.status.code());
     assert_eq!(result.status.code(),Some(0),"{}",result.all());
     assert!(result.out.contains(&format!("RECOVERY_CONTENT_MATCH files=4 pid={} source_sha={sha} manifest_sha256={}",result.pid,hash(raw))));
     assert!(result.out.contains("source_authenticated=false production_recovery_proven=false maintenance_authorized=false"));
     let p=gen_from(&result,work);
-    println!("D3_RECOVERY_PROCESS pid={} exit=0 sha={sha} independent_exe={exe:?} generation={p:?}",result.pid);
+    println!("D3_RECOVERY_PROCESS pid={} exit=0 sha={sha} independent_exe={exe:?} generation={p:?}",result.pid,exe=&exe.path);
     p
 }
-fn refuse(exe:&Path,digest:&str,sha:&str,cwd:&Path,work:&Path,want:&str){
+fn refuse(exe:&Runner<'_>,digest:&str,sha:&str,cwd:&Path,work:&Path,want:&str){
     let before=if work.exists(){Some(names(work))}else{None};
-    let result=run(&mut recovery(exe,digest,sha,cwd),120000);
+    exe.check();
+    let result=run(&mut recovery(&exe.path,digest,sha,cwd),120000);
+    exe.after(result.pid,result.status.code());
     assert_eq!(result.status.code(),Some(1),"{}",result.all());
     let msg=result.err.lines().find(|l|l.contains("RECOVERY_REFUSED")).unwrap();
     assert!(msg.contains(want),"expected {want}: {msg}");
@@ -273,27 +362,116 @@ fn clean_group(g:Group,e:&Expected){
     for (n,s) in &g.files{remove_known(&g.path.join(n),&e[n.as_str()],s);}
     assert_eq!(dir_id(&g.path),g.id);fs::remove_dir(g.path).unwrap();
 }
-fn run_group(g:&Group,e:&Expected,cwd:&Path,broken:bool){
-    check_preserved(g,e);
-    // Keep authenticated candidate files open with no write/delete share
-    // while running. The fixtures never consult the old group or PATH.
-    let _held:Vec<_>=g.files.keys().map(|n|open(&g.path.join(n))).collect();
-    let client=g.path.join(NAMES[0]);
-    let c=run(Command::new(&client).current_dir(cwd).stdin(Stdio::null()),20000);
+struct HeldGroup<'a>{g:&'a Group,e:&'a Expected,files:BTreeMap<String,File>,dirs:HeldDirs}
+impl<'a> HeldGroup<'a>{
+    fn new(g:&'a Group,e:&'a Expected,work_id:Id)->Self{
+        check_preserved(g,e);
+        let dirs=HeldDirs::new(&g.path,&[(&g.path,g.id),(g.path.parent().unwrap(),work_id)]);
+        let files=g.files.iter().map(|(n,s)|(n.clone(),bind(&g.path.join(n),&e[n.as_str()],s).unwrap())).collect();
+        let h=Self{g,e,files,dirs};h.check();h
+    }
+    fn check(&self){
+        self.dirs.check();
+        assert_eq!(names(&self.g.path),self.g.files.keys().cloned().collect());
+        for(n,f)in &self.files{reverify(f,&self.g.path.join(n),&self.e[n.as_str()],&self.g.files[n]);}
+    }
+    fn after(&self,pid:u32,exit:Option<i32>){
+        self.check();
+        for(n,s)in &self.g.files{
+            println!("D3_EXEC_HELD pid={pid} exit={exit:?} name={n} id={:?} size={} sha256={} same_handle=true exact_acl=true ancestors_stable=true",s.id,s.len,s.sha);
+        }
+    }
+}
+fn replacement_negative(g:&Group,e:&Expected,cwd:&Path,neighbor:&Snap,neighbor_bytes:&[u8]){
+    let name=NAMES[0];let p=g.path.join(name);let saved=g.path.join("held-original-fixture.exe");
+    assert_eq!(readback(&p,&e[name],true),g.files[name]);
+    assert!(!saved.exists());
+    fs::rename(&p,&saved).unwrap();
+    // Byte-identical new file: digest alone would accept it, original ID
+    // must reject it before any spawn. Both files created by this test.
+    new_file(&p,&e[name]);
+    let replacement=readback(&p,&e[name],true);
+    assert_ne!(replacement.id,g.files[name].id);assert_eq!(replacement.sha,g.files[name].sha);
+    assert_eq!(bind(&p,&e[name],&g.files[name]).unwrap_err(),"ID_MISMATCH");
+    assert_eq!(readback(&saved,&e[name],true),g.files[name]);
+    assert_eq!(readback(&cwd.join("neighbor.bin"),neighbor_bytes,true),*neighbor);
+    remove_known(&p,&e[name],&replacement);fs::rename(&saved,&p).unwrap();
+    // Same ID but actual changed bytes must also fail before spawn.
+    let mut changed=e[name].clone();let last=changed.len()-1;changed[last]^=1;
+    replace_known(&p,&e[name],&changed);
+    assert_eq!(bind(&p,&e[name],&g.files[name]).unwrap_err(),"BYTES_MISMATCH");
+    assert_eq!(readback(&p,&changed,true).id,g.files[name].id);
+    replace_known(&p,&changed,&e[name]);check_preserved(g,e);
+    assert_eq!(readback(&cwd.join("neighbor.bin"),neighbor_bytes,true),*neighbor);
+    println!("D3_EXEC_REPLACEMENT_REFUSED original_id={:?} replacement_id={:?} same_digest=true id_refused=true bytes_refused=true before_spawn=true original_restored=true neighbor_preserved=true",g.files[name].id,replacement.id);
+}
+fn wait_ready(p:&Proc,line:&str,start:Instant){
+    loop{
+        let actual=p.lines.recv_timeout(Duration::from_secs(20).saturating_sub(start.elapsed())).expect("fixture READY deadline");
+        if actual==line{break;}
+    }
+    assert_eq!(p.wait_code(0),258);
+}
+fn release(mut p:Proc,start:Instant)->Run{
+    let mut input=p.child.stdin.take().expect("live fixture pipe");
+    input.write_all(b"G\n").unwrap();drop(input);
+    p.finish(Duration::from_secs(20).saturating_sub(start.elapsed()).as_millis() as u32)
+}
+fn compete(h:&HeldGroup<'_>,cwd:&Path,pid:u32){
+    let p=h.g.path.join(NAMES[0]);
+    let replacement=cwd.join("neighbor.bin");
+    let bytes=b"unrelated known sentinel";
+    let original=readback(&replacement,bytes,true);
+    // Actual controller operations while distinct client is alive and all
+    // admitted file/ancestor handles remain held. No mocked sharing errors.
+    let write=rc(OpenOptions::new().write(true).share_mode(ALL_SHARES).open(&p),"execute write",&[32]);
+    let delete=rc(fs::remove_file(&p),"execute delete",&[32,5]);
+    let rename=rc(fs::rename(&p,h.g.path.join("moved-exec.exe")),"execute rename",&[32,5]);
+    let replace=rc(fs::rename(&replacement,&p),"execute replacement",&[32,5]);
+    let parent=rc(fs::rename(&h.g.path,h.g.path.with_extension("moved")),"execute generation rename",&[32,5]);
+    assert_eq!(readback(&replacement,bytes,true),original);h.check();
+    println!("D3_EXEC_COMPETITION pid={pid} write={write} delete={delete} rename={rename} replace={replace} parent={parent} same_objects=true neighbor_preserved=true");
+}
+fn run_group(g:&Group,e:&Expected,cwd:&Path,broken:bool,work_id:Id){
+    let h=HeldGroup::new(g,e,work_id);
+    for &n in NAMES[..3].iter().filter(|n|g.files.contains_key(**n)){
+        pe_evidence(&h.files[n],&g.path.join(n),&e[n],&g.files[n]);
+    }
+    let client=g.path.join(NAMES[0]);let dll=g.path.join(NAMES[1]);
+    let c=if broken{
+        assert_eq!(rc(fs::symlink_metadata(&dll),"broken DLL remains absent",&[2]),2);
+        run(Command::new(&client).current_dir(cwd).stdin(Stdio::null()),20000)
+    }else{
+        let start=Instant::now();
+        let p=Proc::start(Command::new(&client).arg("--observe-fixture").current_dir(cwd).stdin(Stdio::piped()));
+        wait_ready(&p,&format!("D3_CLIENT_OBSERVE_READY pid={}",p.pid),start);
+        recovery_modules::snapshot(&p,&client,&[(&client,&g.files[NAMES[0]],&e[NAMES[0]]),(&dll,&g.files[NAMES[1]],&e[NAMES[1]])],"client");
+        compete(&h,cwd,p.pid);
+        assert_eq!(p.wait_code(0),258);
+        release(p,start)
+    };
+    h.after(c.pid,c.status.code());
     if broken{
         assert_eq!(c.status.code(),Some(41),"{}",c.all());
         assert!(c.err.contains(&format!("D3_CLIENT_DLL_FAILED pid={} win32=Some(126)",c.pid)),"{}",c.all());
+        assert_eq!(rc(fs::symlink_metadata(&dll),"broken DLL after child",&[2]),2);
         println!("D3_ACTUAL_DLL_FAILURE pid={} exit=41 {}",c.pid,c.err.trim());
     }else{
         assert_eq!(c.status.code(),Some(0),"{}",c.all());
-        assert!(c.out.contains(&format!("D3_CLIENT_DLL_OK pid={} value=0x53504433 exe={} loaded={}",c.pid,client.display(),g.path.join(NAMES[1]).display())),"{}",c.all());
+        assert!(c.out.contains(&format!("D3_CLIENT_DLL_OK pid={} value=0x53504433 exe={} loaded={}",c.pid,client.display(),dll.display())),"{}",c.all());
         println!("D3_ACTUAL_CLIENT pid={} exit=0 {}",c.pid,c.out.trim());
     }
-    let engine=g.path.join(NAMES[2]);
-    let p=run(Command::new(&engine).current_dir(cwd).stdin(Stdio::null()),20000);
+    h.check();
+    let engine=g.path.join(NAMES[2]);let start=Instant::now();
+    let waiting=Proc::start(Command::new(&engine).arg("--wait-fixture").current_dir(cwd).stdin(Stdio::piped()));
+    wait_ready(&waiting,&format!("D3_ENGINE_WAIT_READY pid={}",waiting.pid),start);
+    recovery_modules::snapshot(&waiting,&engine,&[(&engine,&g.files[NAMES[2]],&e[NAMES[2]])],"engine");
+    let p=release(waiting,start);
+    h.after(p.pid,p.status.code());
     assert_eq!(p.status.code(),Some(0),"{}",p.all());
     assert!(p.out.contains(&format!("D3_ENGINE_OK pid={} fixture=0x454e4733 exe={}",p.pid,engine.display())),"{}",p.all());
     println!("D3_ACTUAL_ENGINE pid={} exit=0 {}",p.pid,p.out.trim());
+    println!("D3_EXEC_GROUP_COMPLETE path={:?} broken={broken} held_before_after=true",g.path);
 }
 fn compile_fixtures(out:&Path)->Expected{
     let rustc=PathBuf::from(std::env::var_os("SPIDER_RECOVERY_TEST_RUSTC").expect("explicit workflow rustc"));
@@ -339,9 +517,10 @@ fn clean_partial(g:Group,e:&Expected){
 }
 // Real copy progress, independent metadata observation, active source
 // competition, then interruption. No production wait or fault-injection flag.
-fn interrupt(exe:&Path,raw:&[u8],sha:&str,work:&Path,vault:&Path,cwd:&Path,e:&Expected,
-    neighbor:&Path,neighbor_expected:&[u8])->(Group,bool){
-    let mut child=Proc::start(&mut recovery(exe,&hash(raw),sha,cwd));
+fn interrupt(exe:&Runner<'_>,raw:&[u8],sha:&str,work:&Path,vault:&Path,cwd:&Path,e:&Expected,
+    neighbor:&Path,neighbor_expected:&[u8])->(Group,bool,bool){
+    exe.check();
+    let mut child=Proc::start(&mut recovery(&exe.path,&hash(raw),sha,cwd));
     let pid=child.pid;let start=Instant::now();let limit=Duration::from_secs(120);
     let gen_prefix=format!("RECOVERY_GENERATION_UNREADY pid={pid} path=");
     let target_marker=format!("RECOVERY_COPY_TARGET name={} pid={pid}",NAMES[3]);
@@ -387,6 +566,7 @@ fn interrupt(exe:&Path,raw:&[u8],sha:&str,work:&Path,vault:&Path,cwd:&Path,e:&Ex
         // Still in live copy; use actual source operations while original
         // verified source handles are held by the independent process.
         assert!(child.child.try_wait().unwrap().is_none());
+        recovery_modules::snapshot(&child,&exe.path,&[(&exe.path,&exe.snap,exe.expected)],"recovery");
         let target=vault.join(NAMES[0]);
         let write=rc(OpenOptions::new().write(true).share_mode(ALL_SHARES).open(&target),"active write",&[32]);
         let rename=rc(fs::rename(&target,vault.join("moved-client.exe")),"active rename",&[32,5]);
@@ -400,6 +580,7 @@ fn interrupt(exe:&Path,raw:&[u8],sha:&str,work:&Path,vault:&Path,cwd:&Path,e:&Ex
         result=child.finish(120000);
         assert!(result.status.success(),"{}",result.all());
     }
+    exe.after(result.pid,result.status.code());
     assert_eq!(gen_from(&result,work),p);
     let g=partial_group(&p,e);
     assert_eq!(fs::read(neighbor).unwrap(),neighbor_expected);
@@ -411,7 +592,7 @@ fn interrupt(exe:&Path,raw:&[u8],sha:&str,work:&Path,vault:&Path,cwd:&Path,e:&Ex
     }else{
         println!("D3_ACTUAL_INTERRUPT NOT_RUN pid={pid} exit={:?} observed={observed:?} retained_partial={actual_partial} reason=unable_to_capture_incomplete_generation",result.status.code());
     }
-    (g,real)
+    (g,real,observed.is_some())
 }
 #[test]
 fn real_independent_recovery_executor(){
@@ -444,9 +625,9 @@ fn real_independent_recovery_executor(){
     let original_exe=fs::read(env!("CARGO_BIN_EXE_spidervpn-recovery")).unwrap();
     assert!(original_exe.starts_with(b"MZ"));
     let exe=runner.join("spidervpn-recovery.exe");new_file(&exe,&original_exe);
-    let exe_guard=open(&exe);
     let runner_exe=readback(&exe,&original_exe,true);
-    assert_eq!(info(&exe_guard,&exe,false).0,runner_exe.id);exact_acl(&exe_guard);
+    let exe_guard=Runner{path:exe.clone(),file:bind(&exe,&original_exe,&runner_exe).unwrap(),snap:runner_exe.clone(),expected:&original_exe,dirs:HeldDirs::new(&runner,&[(&runner,runner_id)])};
+    exe_guard.check();pe_evidence(&exe_guard.file,&exe,&original_exe,&runner_exe);
     assert_eq!(runner_exe.sha,hash(&original_exe));
     let sentinel=runner.join("neighbor.bin");let sent=b"unrelated known sentinel";
     new_file(&sentinel,sent);let neighbor_before=readback(&sentinel,sent,true);
@@ -465,13 +646,15 @@ fn real_independent_recovery_executor(){
     }
     assert_eq!(dir_id(&builder),builder_id);fs::remove_dir(&builder).unwrap();
 
+    exe_guard.check();
     let noargs=run(Command::new(&exe).current_dir(&runner),20000);
+    exe_guard.after(noargs.pid,noargs.status.code());
     assert_eq!(noargs.status.code(),Some(1));assert!(noargs.err.contains("RECOVERY_REFUSED USAGE"));
-    refuse(&exe,&hash(&raw),&sha,&runner,&work,"OBJECT_OPEN");
+    refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"OBJECT_OPEN");
     new_dir(&vault);let vault_id=dir_id(&vault);
     for n in NAMES{new_file(&vault.join(n),&expected[n]);}
     new_file(&vault.join(MANIFEST),&raw);
-    refuse(&exe,&hash(&raw),&sha,&runner,&work,"OBJECT_OPEN");
+    refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"OBJECT_OPEN");
     new_dir(&work);let work_id=dir_id(&work);
     let source=verify_vault(&vault,&expected,&raw);
     // Existing bad generation + file (not a forced nonce collision) must
@@ -480,66 +663,66 @@ fn real_independent_recovery_executor(){
     new_dir(&stale);let stale_id=dir_id(&stale);
     let stale_file=stale.join(NAMES[0]);let stale_bytes=b"old unready neighbor sentinel";
     new_file(&stale_file,stale_bytes);let stale_before=readback(&stale_file,stale_bytes,true);
-    refuse(&exe,"x",&sha,&runner,&work,"ARG_EXTERNAL_ANCHOR_FORMAT");
-    refuse(&exe,&"0".repeat(64),&sha,&runner,&work,"MANIFEST_DIGEST");
+    refuse(&exe_guard,"x",&sha,&runner,&work,"ARG_EXTERNAL_ANCHOR_FORMAT");
+    refuse(&exe_guard,&"0".repeat(64),&sha,&runner,&work,"MANIFEST_DIGEST");
     let wrong_sha=if sha=="a".repeat(40){"b".repeat(40)}else{"a".repeat(40)};
-    refuse(&exe,&hash(&raw),&wrong_sha,&runner,&work,"SOURCE_SHA_MISMATCH");
+    refuse(&exe_guard,&hash(&raw),&wrong_sha,&runner,&work,"SOURCE_SHA_MISMATCH");
     for (key,value) in [("schema",json!(2)),("kind",json!("approved")),("unknown",json!(true))]{
         let mut v=m.clone();v[key]=value;let bad=raw_manifest(&v);
         replace_known(&vault.join(MANIFEST),&raw,&bad);
-        refuse(&exe,&hash(&bad),&sha,&runner,&work,"MANIFEST_SCHEMA");
+        refuse(&exe_guard,&hash(&bad),&sha,&runner,&work,"MANIFEST_SCHEMA");
         replace_known(&vault.join(MANIFEST),&bad,&raw);
     }
     let duplicate=String::from_utf8(raw.clone()).unwrap().replace("\"schema\":1","\"schema\":1,\"schema\":1").into_bytes();
     assert_ne!(duplicate,raw);
     replace_known(&vault.join(MANIFEST),&raw,&duplicate);
-    refuse(&exe,&hash(&duplicate),&sha,&runner,&work,"MANIFEST_SCHEMA");
+    refuse(&exe_guard,&hash(&duplicate),&sha,&runner,&work,"MANIFEST_SCHEMA");
     replace_known(&vault.join(MANIFEST),&duplicate,&raw);
     let mut v=m.clone();v["files"].as_array_mut().unwrap().pop();
     let missing_entry=raw_manifest(&v);
     replace_known(&vault.join(MANIFEST),&raw,&missing_entry);
-    refuse(&exe,&hash(&missing_entry),&sha,&runner,&work,"MANIFEST_COUNT");
+    refuse(&exe_guard,&hash(&missing_entry),&sha,&runner,&work,"MANIFEST_COUNT");
     replace_known(&vault.join(MANIFEST),&missing_entry,&raw);
     let mut v=m.clone();v["files"][0]["unexpected"]=json!(true);
     let unknown_entry=raw_manifest(&v);
     replace_known(&vault.join(MANIFEST),&raw,&unknown_entry);
-    refuse(&exe,&hash(&unknown_entry),&sha,&runner,&work,"MANIFEST_SCHEMA");
+    refuse(&exe_guard,&hash(&unknown_entry),&sha,&runner,&work,"MANIFEST_SCHEMA");
     replace_known(&vault.join(MANIFEST),&unknown_entry,&raw);
     for bad_name in [NAMES[1],"SPIDERVPN.EXE","../spidervpn.exe","spidervpn.exe:ads"]{
         let mut v=m.clone();v["files"][0]["path"]=json!(bad_name);let bad=raw_manifest(&v);
         replace_known(&vault.join(MANIFEST),&raw,&bad);
-        refuse(&exe,&hash(&bad),&sha,&runner,&work,"MANIFEST_NAME_OR_DUPLICATE");
+        refuse(&exe_guard,&hash(&bad),&sha,&runner,&work,"MANIFEST_NAME_OR_DUPLICATE");
         replace_known(&vault.join(MANIFEST),&bad,&raw);
     }
     for (field,value,want) in [("size",json!(536870913u64),"MANIFEST_ENTRY_BOUNDS"),
         ("size",json!(1),"FILE_SIZE"),("sha256",json!("0".repeat(64)),"FILE_DIGEST")]{
         let mut v=m.clone();v["files"][0][field]=value;let bad=raw_manifest(&v);
         replace_known(&vault.join(MANIFEST),&raw,&bad);
-        refuse(&exe,&hash(&bad),&sha,&runner,&work,want);
+        refuse(&exe_guard,&hash(&bad),&sha,&runner,&work,want);
         replace_known(&vault.join(MANIFEST),&bad,&raw);
     }
     let leaf=vault.join(NAMES[0]);
     let moved=runner.join("known-quarantine.exe");
     fs::rename(&leaf,&moved).unwrap();
-    refuse(&exe,&hash(&raw),&sha,&runner,&work,"SET_MISSING");
+    refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"SET_MISSING");
     assert_eq!(readback(&moved,&expected[NAMES[0]],true),source[NAMES[0]]);
     fs::rename(&moved,&leaf).unwrap();
     let extra=vault.join("unexpected.txt");new_file(&extra,b"extra");let extra_id=readback(&extra,b"extra",true);
-    refuse(&exe,&hash(&raw),&sha,&runner,&work,"SET_UNKNOWN_OR_TYPE");
+    refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"SET_UNKNOWN_OR_TYPE");
     remove_known(&extra,b"extra",&extra_id);
     let mut bad=expected[NAMES[0]].clone();bad[0]^=1;
     replace_known(&leaf,&expected[NAMES[0]],&bad);
-    refuse(&exe,&hash(&raw),&sha,&runner,&work,"FILE_DIGEST");
+    refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"FILE_DIGEST");
     replace_known(&leaf,&bad,&expected[NAMES[0]]);
     // Real kernel sharing failures, not a parser rejection.
     let writer=OpenOptions::new().write(true).share_mode(ALL_SHARES).open(&leaf).unwrap();
-    refuse(&exe,&hash(&raw),&sha,&runner,&work,"win32=Some(32)");drop(writer);
+    refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"win32=Some(32)");drop(writer);
     let old_delete=OpenOptions::new().access_mode(DELETE|FILE_READ_ATTRIBUTES).share_mode(ALL_SHARES).open(&leaf).unwrap();
-    refuse(&exe,&hash(&raw),&sha,&runner,&work,"win32=Some(32)");drop(old_delete);
+    refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"win32=Some(32)");drop(old_delete);
     for p in [&vault,&work]{
         let old_parent=OpenOptions::new().access_mode(DELETE|FILE_READ_ATTRIBUTES).share_mode(ALL_SHARES)
             .custom_flags(FLAGS).open(p).unwrap();
-        refuse(&exe,&hash(&raw),&sha,&runner,&work,"win32=Some(32)");drop(old_parent);
+        refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"win32=Some(32)");drop(old_parent);
     }
     // A deliberately wider actual ACL with an unmapped test SID (not a
     // real account) is still refused. Restore only our own test ACL.
@@ -550,18 +733,18 @@ fn real_independent_recovery_executor(){
     for p in [&leaf,&vault,&work]{
         set_dacl(p,&wide_acl);
         let descriptor=sddl(&open(p));assert!(descriptor.contains(&sid));
-        refuse(&exe,&hash(&raw),&sha,&runner,&work,"ACL_COUNT");
+        refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"ACL_COUNT");
         assert_eq!(sddl(&open(p)),descriptor);set_dacl(p,ACL);exact_acl(&open(p));
     }
     let link=runner.join("known-hardlink.exe");
     fs::hard_link(&leaf,&link).unwrap();
-    refuse(&exe,&hash(&raw),&sha,&runner,&work,"OBJECT_TYPE_OR_LINK");
+    refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"OBJECT_TYPE_OR_LINK");
     assert_eq!(fs::read(&link).unwrap(),expected[NAMES[0]]);assert_eq!(fs::read(&leaf).unwrap(),expected[NAMES[0]]);
     fs::remove_file(&link).unwrap();
     for p in [&leaf,&vault,&work]{
         let ads=PathBuf::from(format!("{}:fixture",p.display()));
         fs::write(&ads,b"named stream").unwrap();
-        refuse(&exe,&hash(&raw),&sha,&runner,&work,"OBJECT_ALTERNATE_STREAM");
+        refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"OBJECT_ALTERNATE_STREAM");
         assert_eq!(fs::read(&ads).unwrap(),b"named stream");fs::remove_file(&ads).unwrap();
     }
     let saved=runner.join("saved-vault");
@@ -569,7 +752,7 @@ fn real_independent_recovery_executor(){
     let cmd=PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe");
     let out=Command::new(cmd).args(["/D","/C","mklink","/J"]).arg(&vault).arg(&saved).output().unwrap();
     assert!(out.status.success(),"{out:?}");
-    refuse(&exe,&hash(&raw),&sha,&runner,&work,"OBJECT_TYPE_OR_LINK");
+    refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"OBJECT_TYPE_OR_LINK");
     assert_eq!(dir_id(&saved),vault_id);assert_eq!(verify_vault(&saved,&expected,&raw),source);
     fs::remove_dir(&vault).unwrap();fs::rename(&saved,&vault).unwrap();
     assert_eq!(dir_id(&vault),vault_id);assert_eq!(dir_id(&work),work_id);
@@ -578,8 +761,9 @@ fn real_independent_recovery_executor(){
     assert_eq!(readback(&sentinel,sent,true),neighbor_before);
     println!("D3_NEGATIVE_MATRIX actual_sharing=true exact_acl=true reparse=true hardlink=true ads=true external_anchor=true source_preserved=true stale_generation_preserved=true");
 
-    let p1=recover(&exe,&raw,&sha,&work,&runner);let mut first=check_group(&p1,&expected,&source);
-    run_group(&first,&expected,&runner,false);
+    let p1=recover(&exe_guard,&raw,&sha,&work,&runner);let mut first=check_group(&p1,&expected,&source);
+    replacement_negative(&first,&expected,&runner,&neighbor_before,sent);
+    run_group(&first,&expected,&runner,false,work_id);
     // Only a known, independently verified fixture working group is damaged.
     // Delete its actual adjacent DLL, then prove another dependency cannot
     // be deleted while a real reader denies delete sharing.
@@ -592,19 +776,19 @@ fn real_independent_recovery_executor(){
     assert_eq!(readback(&sentinel,sent,true),neighbor_before);
     println!("D3_DEPENDENCY_DAMAGE dll_removed_id={:?} dll_absence=2 engine_delete_win32={denied} engine_id={:?} engine_hash={} neighbors_preserved=true",
         dll.id,first.files[NAMES[2]].id,first.files[NAMES[2]].sha);
-    run_group(&first,&expected,&runner,true);
+    run_group(&first,&expected,&runner,true,work_id);
     // Separate executable and PID rebuild a NEW group from unchanged vault.
     assert_eq!(readback(&exe,&original_exe,true),runner_exe);
-    let p2=recover(&exe,&raw,&sha,&work,&runner);let second=check_group(&p2,&expected,&source);
+    let p2=recover(&exe_guard,&raw,&sha,&work,&runner);let second=check_group(&p2,&expected,&source);
     assert_ne!(first.id,second.id);assert_ne!(p1,p2);
     for(n,s)in &first.files{assert_ne!(s.id,second.files[n].id);}
     check_preserved(&first,&expected);assert!(!first.path.join(NAMES[1]).exists());
-    run_group(&second,&expected,&runner,false);
+    run_group(&second,&expected,&runner,false,work_id);
     println!("D3_NEW_GROUP old={p1:?} new={p2:?} old_broken_unchanged=true actual_client_dll_engine=true");
 
     // Native timeout on a benign independent fixture process that has
     // explicitly signalled readiness and is waiting on a live stdin pipe.
-    let _hold_engine=open(&second.path.join(NAMES[2]));
+    let hold_timeout=HeldGroup::new(&second,&expected,work_id);
     let waiting=Proc::start(Command::new(second.path.join(NAMES[2])).arg("--wait-fixture").current_dir(&runner).stdin(Stdio::piped()));
     let pid=waiting.pid;let start=Instant::now();let ready=format!("D3_ENGINE_WAIT_READY pid={pid}");
     loop{
@@ -612,8 +796,10 @@ fn real_independent_recovery_executor(){
         if line==ready{break;}
     }
     assert!(waiting.child.stdin.is_some());
+    let engine=second.path.join(NAMES[2]);
+    recovery_modules::snapshot(&waiting,&engine,&[(&engine,&second.files[NAMES[2]],&expected[NAMES[2]])],"engine_timeout");
     let clock=Instant::now();assert_eq!(waiting.wait_code(100),258);
-    let killed=waiting.kill();assert!(!killed.status.success());drop(_hold_engine);
+    let killed=waiting.kill();assert!(!killed.status.success());hold_timeout.after(pid,killed.status.code());drop(hold_timeout);
     check_preserved(&second,&expected);
     println!("D3_TIMEOUT_ACTUAL pid={pid} wait_rc=258 requested_ms=100 elapsed_ms={} exit={:?} child_reaped=true original_group_unchanged=true",clock.elapsed().as_millis(),killed.status.code());
 
@@ -627,15 +813,15 @@ fn real_independent_recovery_executor(){
     let new_raw=raw_manifest(&manifest(&expected,&sha));
     replace_known(&vault.join(MANIFEST),&raw,&new_raw);raw=new_raw;
     let large_source=verify_vault(&vault,&expected,&raw);
-    let (interrupted,actual_interrupted)=interrupt(&exe,&raw,&sha,&work,&vault,&runner,&expected,&sentinel,sent);
+    let (interrupted,actual_interrupted,recovery_module_observed)=interrupt(&exe_guard,&raw,&sha,&work,&vault,&runner,&expected,&sentinel,sent);
     assert_eq!(verify_vault(&vault,&expected,&raw),large_source);
     assert_eq!(readback(&sentinel,sent,true),neighbor_before);
-    let new_path=recover(&exe,&raw,&sha,&work,&runner);
+    let new_path=recover(&exe_guard,&raw,&sha,&work,&runner);
     let rebuilt=check_group(&new_path,&expected,&large_source);
     assert_ne!(interrupted.path,rebuilt.path);assert_ne!(interrupted.id,rebuilt.id);
     for(n,s)in &interrupted.files{assert_ne!(s.id,rebuilt.files[n].id);}
     partial_preserved(&interrupted,&expected);
-    run_group(&rebuilt,&expected,&runner,false);
+    run_group(&rebuilt,&expected,&runner,false,work_id);
     assert_eq!(readback(&stale_file,stale_bytes,true),stale_before);
     assert_eq!(dir_id(&stale),stale_id);
     clean_partial(interrupted,&expected);clean_group(rebuilt,&expected);
@@ -646,7 +832,17 @@ fn real_independent_recovery_executor(){
     }
     assert_eq!(dir_id(&vault),vault_id);assert_eq!(dir_id(&work),work_id);
     fs::remove_dir(&vault).unwrap();fs::remove_dir(&work).unwrap();
+    exe_guard.check();
     remove_known(&sentinel,sent,&neighbor_before);drop(exe_guard);remove_known(&exe,&original_exe,&runner_exe);
     assert_eq!(dir_id(&runner),runner_id);fs::remove_dir(&runner).unwrap();
+    if !recovery_module_observed{println!("D3_EXEC_RECOVERY_MODULES NOT_RUN no safe live copy observation");}
+    let evidence=format!("D3_EXEC_EVIDENCE_COMPLETE source_sha={sha} held_groups=4 replacement_id_and_bytes_refused=true pe_four_images=true client_module_observed=true engine_module_observed=true recovery_module_observed={recovery_module_observed} path_os_only=true actual_timeout=true snapshot_only=true maintenance_authorized=false");
+    println!("{evidence}");
+    // Only transfer the actual assertion-backed marker across CI steps.
+    // No production env branch; original exact remains the test authority.
+    if let Some(env)=std::env::var_os("GITHUB_ENV"){
+        let mut f=OpenOptions::new().append(true).open(env).unwrap();
+        writeln!(f,"SPIDER_D3_EXEC_EVIDENCE={evidence}").unwrap();
+    }
     println!("D3_RECOVERY_COMPLETE source_sha={sha} fixture_client_dll=true fixture_engine=true dependency_failure=true independent_recovery=true fixed_vault=true generation_preserved=true actual_timeout=true actual_interrupt={actual_interrupted} production_product_not_run=true source_authenticated=false production_recovery_proven=false maintenance_authorized=false r2_not_run=true d2_timeout_not_run=true");
 }
