@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §92、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §31 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.95；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §93、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §32 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.96；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -735,3 +735,7 @@
 ## 92. 2026-11-20 §31最新恢复入口：D2-CORE CI PASS，B限量诊断整改
 - [§31](https://github.com/weixiaochuchen618-debug/spidervpn/commit/5b56af0101779e8029b0c25147935b3b76c1e7d0)、[Backlog D.95](./REMEDIATION_BACKLOG.md) 已生效；#30 Draft HEAD `006eb7e36ac131c728c2ac143661ee84e2feccf1`，D终审7030704836/B停写7030693562/四workflow全success已核。真实同对象处置、竞争和独立absence已执行范围PASS，不冻结D2-CORE；诊断缺口需整改，未进入D3。
 - B恢复唯一限量集成写权，以该SHA按§31执行COORD-INT-UNINSTALL-EXECUTOR/R01-009-D2-DIAG，严格限launcher_executor私有typed Win32 rc、primary/secondary pending、SDDL终止边界、同文件有界真实竞争及实际测试、MSVC/GNU-B追加专项；不改D1/旧LAB/安全处置判据/其它生产路径。四CI、D独立、B再停写后A核冻结，C只读。尚无诊断整改提交或CI，R2、真实可信锚/旧writer/跨SID/UAC/WFP05/D3独立恢复及真实维护/Windows/VPS未验。总控[7032154229](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7032154229)。
+
+## 93. 2026-11-20 §32最新恢复入口：D2已执行范围冻结，B独占D3独立恢复核心
+- [§32](https://github.com/weixiaochuchen618-debug/spidervpn/commit/78fbe2998ab8155912e164d935939387fa5dc819)、[Backlog D.96](./REMEDIATION_BACKLOG.md) 生效；#30 Draft HEAD `5e18c568be631aa874b85ba510cd4cbe231a239e`，D终审7033075433/B正式停写7033040701、四workflow五Job/76 steps全success实核。D2-CORE/DIAG已执行范围冻结，主动超时kill+wait及极端OS故障NOT RUN，真实调用方/PS路径删除风险尚未闭合。
+- B新唯一集成写权，以该SHA按§32执行COORD-INT-RECOVERY-EXECUTOR/R01-009-D3-CORE，独立默认OFF Rust EXE、固定受保护候选vault及新generation真实恢复、实际失效后独立恢复进程与DLL/engine fixture真实运行，保留不完整旧组，无实际产品删除/维护接线/消费B1/生产真实锚；双ABI四CI与D审查后再停写，C只读。尚无D3源码/CI，R2/外部可信锚/真实供应链及真实产品恢复/旧writer/跨SID/UAC/WFP05/Windows/VPS等均未验。总控[7033141916](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7033141916)。
