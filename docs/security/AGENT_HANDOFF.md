@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §89、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §28 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.92；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §90、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §29 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.93；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -723,3 +723,7 @@
 ## 89. 2026-11-20 §28最新恢复入口：G1验收待补真实父链
 - [§28](https://github.com/weixiaochuchen618-debug/spidervpn/commit/dc5bb38666cd6dbf180670964c8a0999f5dcc650)、[Backlog D.92](./REMEDIATION_BACKLOG.md) 生效，#30 Draft `4196a63286378c2e965b9c17875d76756d16b70f` 四workflow通过，C停写7012370022、D独立7012498815；不冻结G1，接受真实父函数同步等子运行缺口，首版E0505及旧lines-e2e未知根因保留。
 - C恢复唯一限量test-only写权，基于上述HEAD按§28 G1-PARENT-CHAIN补证；mod/elevate cfg(test)及MSVC/GNU-C追加真实专项，五父入口实际request/nonce、独立子/holder、双门观察、正确父状态、有界成功/两类竞争失败，四CI+D后再次停写。禁止改生产门或原断言、不进G2/安装卸载；B/D只读，R2、外部锚、真实跨SID/UAC、旧writer/生产BLOCK/Windows/VPS未验。总控[7025205277](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7025205277)。
+
+## 90. 2026-11-20 §29最新恢复入口：G1已执行范围冻结，C独占G2
+- [§29](https://github.com/weixiaochuchen618-debug/spidervpn/commit/a87206895bf9d104e7f831834194ec010876a331)、[Backlog D.93](./REMEDIATION_BACKLOG.md) 已生效；#30 Draft HEAD `ed76b84b984b908f0735321d556cc9171992aa0b`，四workflow全success，D最终PASS7026436765/C再次停写7025870558实核，双ABI父链36/36。G1已执行范围正式冻结，保持旧G1生产逻辑/测试；真实普通账户UAC、跨SID/生产BLOCK等未验。
+- C新唯一集成写权，以该SHA按§29实际COORD-INT-LIFECYCLE-OCCUPANCY/R01-009-G2执行运行准入、共享占用/维护排他真实内核边界与process占用证据，固定受保护独立锚只读、不部署生产锚；无锚/未知不赋予维护许可且保留原合法运行，已证排他冲突拒新准入、清理退出独立。禁止实际维护写入/消费B1、改变UI/通常连接/持久BLOCK，B只读、D独立，尚无G2代码/CI。R2与可信来源/旧writer/跨SID/UAC/WFP05/真实Windows/VPS及安装卸载恢复继续阻塞，main与原分支不变。总控[7027265709](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7027265709)。
