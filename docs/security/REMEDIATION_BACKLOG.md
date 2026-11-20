@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.93 与 [任务分配表](./TASK_ASSIGNMENTS.md) §29 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.94 与 [任务分配表](./TASK_ASSIGNMENTS.md) §30 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -937,3 +937,7 @@ PR/commit/CI: ...
 ## D.93 2026-11-20 §29：G1已执行范围冻结，G2运行占用ACTIVE
 - #30 `ed76b84b984b908f0735321d556cc9171992aa0b` 四workflow MSVC44640255186/GNU-B44640255431/GNU-C44640255189/Linux44640255191全success，D独立[7026436765](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7026436765)、C停写7025870558，父链双ABI36/36（12成功/24竞争拒绝），原生产与测试保留，正式冻结G1已执行范围。真实UAC/跨SID、生产BFE/BLOCK、写瞬间观察等未验，R2不关闭，非完整生产PASS。
 - [§29](https://github.com/weixiaochuchen618-debug/spidervpn/commit/a87206895bf9d104e7f831834194ec010876a331) 新授权C独占集成分支 COORD-INT-LIFECYCLE-OCCUPANCY/R01-009-G2，实际普通运行共享登记、独立维护排他及真实process占用判据；未有可信锚仍保留既有合法运行且维护必拒，已证真实排他时阻新准入，清理退出独立；不部署生产锚/不消费B1/不开放实际维护写入。B只读、D独立审新SHA。尚无G2提交/CI。R2及真实可信来源、全机旧writer、跨SID/UAC/WFP05、Windows/VPS、实际安装卸载恢复仍阻塞，main及原分支不变。
+
+## D.94 2026-11-20 §30：G2已执行范围冻结，B独占D2执行器核心
+- #30 `5636bf53c374aab377a8fbc317b642975cbb9307` 四workflow MSVC44660293444/GNU-B44660293515/GNU-C44660293601/Linux44660293434全success，D独立[7028771337](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7028771337)、C正式停写7028832325，实际双ABI G2各1/1，12真实Unknown/ABI、共享排他/真实运行/引擎/孤儿/隔离恢复及原完整回归已验，正式冻结已执行范围；非完整生产PASS，可信锚部署、跨SID/普通Token及旧writer未证。
+- [§30](https://github.com/weixiaochuchen618-debug/spidervpn/commit/091ee12eac3b4b2d8038fbce95a5bd69c83ad03d) C停写、B唯一集成写权 COORD-INT-UNINSTALL-EXECUTOR/R01-009-D2-CORE：真实私有Rust固定launcher同对象验证/处置/独立absence执行器核心，仅隔离fixture验证，非重复LAB、不接真实删除入口、不删除产品依赖/数据。D3独立可运行恢复待授权；R2/可信外部锚/生产占用过渡与历史/真实维护/跨SID/UAC/WFP05/Windows/VPS等仍BLOCKED_REAL_ACCEPTANCE。C只读、D独立，尚无D2-CORE提交或CI，main及原分支不变。
