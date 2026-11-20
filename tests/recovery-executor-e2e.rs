@@ -202,11 +202,26 @@ fn pe_evidence(f:&File,p:&Path,expected:&[u8],snap:&Snap){
     println!("D3_EXEC_PE parser=bounded_fixture_pe32plus_v1 path={p:?} id={:?} size={} sha256={} machine={:#x} image_base={:#x} normal={:?} delay={:?} dependency_graph=false",snap.id,snap.len,snap.sha,pe.machine,pe.image_base,pe.normal,pe.delay);
     reverify(f,p,expected,snap);
 }
-struct Runner<'a>{path:PathBuf,file:File,snap:Snap,expected:&'a[u8],dirs:HeldDirs}
+struct Runner<'a>{
+    path:PathBuf,file:File,snap:Snap,expected:&'a[u8],
+    dir_baseline:Vec<(PathBuf,Id,String)>,
+}
 impl Runner<'_>{
-    fn check(&self){self.dirs.check();reverify(&self.file,&self.path,self.expected,&self.snap);}
-    fn after(&self,pid:u32,exit:Option<i32>){
-        self.check();
+    // Keep the EXE handle continuously. Hold the entire original directory
+    // chain continuously from admission through each child exit/reap.
+    // Between invocations, the controller must be able to restore its own
+    // deliberately renamed sibling vault; never weaken any share mode.
+    fn hold(&self)->HeldDirs{
+        let ids:Vec<_>=self.dir_baseline.iter().map(|(p,id,_)|(p.as_path(),*id)).collect();
+        let dirs=HeldDirs::new(self.path.parent().unwrap(),&ids);
+        let actual:Vec<_>=dirs.0.iter().map(|(p,_,id,acl,_)|(p.clone(),*id,acl.clone())).collect();
+        assert_eq!(actual,self.dir_baseline,"runner ancestor identity or ACL changed");
+        dirs.check();reverify(&self.file,&self.path,self.expected,&self.snap);
+        dirs
+    }
+    fn check(&self){let _dirs=self.hold();}
+    fn after(&self,dirs:&HeldDirs,pid:u32,exit:Option<i32>){
+        dirs.check();reverify(&self.file,&self.path,self.expected,&self.snap);
         println!("D3_EXEC_RUNNER_HELD pid={pid} exit={exit:?} id={:?} sha256={} same_handle=true exact_acl=true ancestors_stable=true",self.snap.id,self.snap.sha);
     }
 }
@@ -316,9 +331,9 @@ fn gen_from(run:&Run,work:&Path)->PathBuf{
     p
 }
 fn recover(exe:&Runner<'_>,raw:&[u8],sha:&str,work:&Path,cwd:&Path)->PathBuf{
-    exe.check();
+    let dirs=exe.hold();
     let result=run(&mut recovery(&exe.path,&hash(raw),sha,cwd),120000);
-    exe.after(result.pid,result.status.code());
+    exe.after(&dirs,result.pid,result.status.code());
     assert_eq!(result.status.code(),Some(0),"{}",result.all());
     assert!(result.out.contains(&format!("RECOVERY_CONTENT_MATCH files=4 pid={} source_sha={sha} manifest_sha256={}",result.pid,hash(raw))));
     assert!(result.out.contains("source_authenticated=false production_recovery_proven=false maintenance_authorized=false"));
@@ -328,9 +343,9 @@ fn recover(exe:&Runner<'_>,raw:&[u8],sha:&str,work:&Path,cwd:&Path)->PathBuf{
 }
 fn refuse(exe:&Runner<'_>,digest:&str,sha:&str,cwd:&Path,work:&Path,want:&str){
     let before=if work.exists(){Some(names(work))}else{None};
-    exe.check();
+    let dirs=exe.hold();
     let result=run(&mut recovery(&exe.path,digest,sha,cwd),120000);
-    exe.after(result.pid,result.status.code());
+    exe.after(&dirs,result.pid,result.status.code());
     assert_eq!(result.status.code(),Some(1),"{}",result.all());
     let msg=result.err.lines().find(|l|l.contains("RECOVERY_REFUSED")).unwrap();
     assert!(msg.contains(want),"expected {want}: {msg}");
@@ -432,7 +447,8 @@ fn compete(h:&HeldGroup<'_>,competitor:&Path,pid:u32){
     assert_eq!(readback(&replacement,bytes,true),original);h.check();
     println!("D3_EXEC_COMPETITION pid={pid} write={write} delete={delete} rename={rename} replace={replace} parent={parent} same_objects=true neighbor_preserved=true");
 }
-fn run_group(g:&Group,e:&Expected,cwd:&Path,broken:bool,work_id:Id,competitor:&Path){
+fn run_group(g:&Group,e:&Expected,cwd:&Path,broken:bool,work_id:Id,competitor:&Path,runner:&Runner<'_>){
+    let cwd_dirs=runner.hold();
     let h=HeldGroup::new(g,e,work_id);
     for &n in NAMES[..3].iter().filter(|n|g.files.contains_key(**n)){
         pe_evidence(&h.files[n],&g.path.join(n),&e[n],&g.files[n]);
@@ -450,7 +466,7 @@ fn run_group(g:&Group,e:&Expected,cwd:&Path,broken:bool,work_id:Id,competitor:&P
         assert_eq!(p.wait_code(0),258);
         release(p,start)
     };
-    h.after(c.pid,c.status.code());
+    h.after(c.pid,c.status.code());cwd_dirs.check();
     if broken{
         assert_eq!(c.status.code(),Some(41),"{}",c.all());
         assert!(c.err.contains(&format!("D3_CLIENT_DLL_FAILED pid={} win32=Some(126)",c.pid)),"{}",c.all());
@@ -467,7 +483,7 @@ fn run_group(g:&Group,e:&Expected,cwd:&Path,broken:bool,work_id:Id,competitor:&P
     wait_ready(&waiting,&format!("D3_ENGINE_WAIT_READY pid={}",waiting.pid),start);
     recovery_modules::snapshot(&waiting,&engine,&[(&engine,&g.files[NAMES[2]],&e[NAMES[2]])],"engine");
     let p=release(waiting,start);
-    h.after(p.pid,p.status.code());
+    h.after(p.pid,p.status.code());cwd_dirs.check();
     assert_eq!(p.status.code(),Some(0),"{}",p.all());
     assert!(p.out.contains(&format!("D3_ENGINE_OK pid={} fixture=0x454e4733 exe={}",p.pid,engine.display())),"{}",p.all());
     println!("D3_ACTUAL_ENGINE pid={} exit=0 {}",p.pid,p.out.trim());
@@ -519,7 +535,7 @@ fn clean_partial(g:Group,e:&Expected){
 // competition, then interruption. No production wait or fault-injection flag.
 fn interrupt(exe:&Runner<'_>,raw:&[u8],sha:&str,work:&Path,vault:&Path,cwd:&Path,e:&Expected,
     neighbor:&Path,neighbor_expected:&[u8])->(Group,bool,bool){
-    exe.check();
+    let dirs=exe.hold();
     let mut child=Proc::start(&mut recovery(&exe.path,&hash(raw),sha,cwd));
     let pid=child.pid;let start=Instant::now();let limit=Duration::from_secs(120);
     let gen_prefix=format!("RECOVERY_GENERATION_UNREADY pid={pid} path=");
@@ -580,7 +596,7 @@ fn interrupt(exe:&Runner<'_>,raw:&[u8],sha:&str,work:&Path,vault:&Path,cwd:&Path
         result=child.finish(120000);
         assert!(result.status.success(),"{}",result.all());
     }
-    exe.after(result.pid,result.status.code());
+    exe.after(&dirs,result.pid,result.status.code());
     assert_eq!(gen_from(&result,work),p);
     let g=partial_group(&p,e);
     assert_eq!(fs::read(neighbor).unwrap(),neighbor_expected);
@@ -630,7 +646,12 @@ fn real_independent_recovery_executor(){
     assert!(original_exe.starts_with(b"MZ"));
     let exe=runner.join("spidervpn-recovery.exe");new_file(&exe,&original_exe);
     let runner_exe=readback(&exe,&original_exe,true);
-    let exe_guard=Runner{path:exe.clone(),file:bind(&exe,&original_exe,&runner_exe).unwrap(),snap:runner_exe.clone(),expected:&original_exe,dirs:HeldDirs::new(&runner,&[(&runner,runner_id)])};
+    let dir_baseline={
+        let initial=HeldDirs::new(&runner,&[(&runner,runner_id)]);
+        initial.check();
+        initial.0.iter().map(|(p,_,id,acl,_)|(p.clone(),*id,acl.clone())).collect()
+    };
+    let exe_guard=Runner{path:exe.clone(),file:bind(&exe,&original_exe,&runner_exe).unwrap(),snap:runner_exe.clone(),expected:&original_exe,dir_baseline};
     exe_guard.check();pe_evidence(&exe_guard.file,&exe,&original_exe,&runner_exe);
     assert_eq!(runner_exe.sha,hash(&original_exe));
     let sentinel=runner.join("neighbor.bin");let sent=b"unrelated known sentinel";
@@ -652,9 +673,9 @@ fn real_independent_recovery_executor(){
     }
     assert_eq!(dir_id(&builder),builder_id);fs::remove_dir(&builder).unwrap();
 
-    exe_guard.check();
+    let noargs_dirs=exe_guard.hold();
     let noargs=run(Command::new(&exe).current_dir(&runner),20000);
-    exe_guard.after(noargs.pid,noargs.status.code());
+    exe_guard.after(&noargs_dirs,noargs.pid,noargs.status.code());drop(noargs_dirs);
     assert_eq!(noargs.status.code(),Some(1));assert!(noargs.err.contains("RECOVERY_REFUSED USAGE"));
     refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"OBJECT_OPEN");
     new_dir(&vault);let vault_id=dir_id(&vault);
@@ -760,7 +781,8 @@ fn real_independent_recovery_executor(){
     assert!(out.status.success(),"{out:?}");
     refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"OBJECT_TYPE_OR_LINK");
     assert_eq!(dir_id(&saved),vault_id);assert_eq!(verify_vault(&saved,&expected,&raw),source);
-    fs::remove_dir(&vault).unwrap();fs::rename(&saved,&vault).unwrap();
+    fs::remove_dir(&vault).expect("remove known fixture junction after child reap");
+    fs::rename(&saved,&vault).expect("restore known vault after child reap");
     assert_eq!(dir_id(&vault),vault_id);assert_eq!(dir_id(&work),work_id);
     assert_eq!(verify_vault(&vault,&expected,&raw),source);
     assert_eq!(readback(&stale_file,stale_bytes,true),stale_before);
@@ -769,7 +791,7 @@ fn real_independent_recovery_executor(){
 
     let p1=recover(&exe_guard,&raw,&sha,&work,&runner);let mut first=check_group(&p1,&expected,&source);
     replacement_negative(&first,&expected,&runner,&neighbor_before,sent);
-    run_group(&first,&expected,&runner,false,work_id,&competitor);
+    run_group(&first,&expected,&runner,false,work_id,&competitor,&exe_guard);
     // Only a known, independently verified fixture working group is damaged.
     // Delete its actual adjacent DLL, then prove another dependency cannot
     // be deleted while a real reader denies delete sharing.
@@ -782,18 +804,19 @@ fn real_independent_recovery_executor(){
     assert_eq!(readback(&sentinel,sent,true),neighbor_before);
     println!("D3_DEPENDENCY_DAMAGE dll_removed_id={:?} dll_absence=2 engine_delete_win32={denied} engine_id={:?} engine_hash={} neighbors_preserved=true",
         dll.id,first.files[NAMES[2]].id,first.files[NAMES[2]].sha);
-    run_group(&first,&expected,&runner,true,work_id,&competitor);
+    run_group(&first,&expected,&runner,true,work_id,&competitor,&exe_guard);
     // Separate executable and PID rebuild a NEW group from unchanged vault.
     assert_eq!(readback(&exe,&original_exe,true),runner_exe);
     let p2=recover(&exe_guard,&raw,&sha,&work,&runner);let second=check_group(&p2,&expected,&source);
     assert_ne!(first.id,second.id);assert_ne!(p1,p2);
     for(n,s)in &first.files{assert_ne!(s.id,second.files[n].id);}
     check_preserved(&first,&expected);assert!(!first.path.join(NAMES[1]).exists());
-    run_group(&second,&expected,&runner,false,work_id,&competitor);
+    run_group(&second,&expected,&runner,false,work_id,&competitor,&exe_guard);
     println!("D3_NEW_GROUP old={p1:?} new={p2:?} old_broken_unchanged=true actual_client_dll_engine=true");
 
     // Native timeout on a benign independent fixture process that has
     // explicitly signalled readiness and is waiting on a live stdin pipe.
+    let timeout_dirs=exe_guard.hold();
     let hold_timeout=HeldGroup::new(&second,&expected,work_id);
     let waiting=Proc::start(Command::new(second.path.join(NAMES[2])).arg("--wait-fixture").current_dir(&runner).stdin(Stdio::piped()));
     let pid=waiting.pid;let start=Instant::now();let ready=format!("D3_ENGINE_WAIT_READY pid={pid}");
@@ -805,7 +828,7 @@ fn real_independent_recovery_executor(){
     let engine=second.path.join(NAMES[2]);
     recovery_modules::snapshot(&waiting,&engine,&[(&engine,&second.files[NAMES[2]],&expected[NAMES[2]])],"engine_timeout");
     let clock=Instant::now();assert_eq!(waiting.wait_code(100),258);
-    let killed=waiting.kill();assert!(!killed.status.success());hold_timeout.after(pid,killed.status.code());drop(hold_timeout);
+    let killed=waiting.kill();assert!(!killed.status.success());hold_timeout.after(pid,killed.status.code());timeout_dirs.check();drop(hold_timeout);drop(timeout_dirs);
     check_preserved(&second,&expected);
     println!("D3_TIMEOUT_ACTUAL pid={pid} wait_rc=258 requested_ms=100 elapsed_ms={} exit={:?} child_reaped=true original_group_unchanged=true",clock.elapsed().as_millis(),killed.status.code());
 
@@ -827,7 +850,7 @@ fn real_independent_recovery_executor(){
     assert_ne!(interrupted.path,rebuilt.path);assert_ne!(interrupted.id,rebuilt.id);
     for(n,s)in &interrupted.files{assert_ne!(s.id,rebuilt.files[n].id);}
     partial_preserved(&interrupted,&expected);
-    run_group(&rebuilt,&expected,&runner,false,work_id,&competitor);
+    run_group(&rebuilt,&expected,&runner,false,work_id,&competitor,&exe_guard);
     assert_eq!(readback(&stale_file,stale_bytes,true),stale_before);
     assert_eq!(dir_id(&stale),stale_id);
     clean_partial(interrupted,&expected);clean_group(rebuilt,&expected);
