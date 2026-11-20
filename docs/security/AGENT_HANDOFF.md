@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §90、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §29 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.93；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §91、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §30 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.94；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -727,3 +727,7 @@
 ## 90. 2026-11-20 §29最新恢复入口：G1已执行范围冻结，C独占G2
 - [§29](https://github.com/weixiaochuchen618-debug/spidervpn/commit/a87206895bf9d104e7f831834194ec010876a331)、[Backlog D.93](./REMEDIATION_BACKLOG.md) 已生效；#30 Draft HEAD `ed76b84b984b908f0735321d556cc9171992aa0b`，四workflow全success，D最终PASS7026436765/C再次停写7025870558实核，双ABI父链36/36。G1已执行范围正式冻结，保持旧G1生产逻辑/测试；真实普通账户UAC、跨SID/生产BLOCK等未验。
 - C新唯一集成写权，以该SHA按§29实际COORD-INT-LIFECYCLE-OCCUPANCY/R01-009-G2执行运行准入、共享占用/维护排他真实内核边界与process占用证据，固定受保护独立锚只读、不部署生产锚；无锚/未知不赋予维护许可且保留原合法运行，已证排他冲突拒新准入、清理退出独立。禁止实际维护写入/消费B1、改变UI/通常连接/持久BLOCK，B只读、D独立，尚无G2代码/CI。R2与可信来源/旧writer/跨SID/UAC/WFP05/真实Windows/VPS及安装卸载恢复继续阻塞，main与原分支不变。总控[7027265709](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7027265709)。
+
+## 91. 2026-11-20 §30最新恢复入口：G2已执行范围冻结，B独占D2执行器核心
+- [§30](https://github.com/weixiaochuchen618-debug/spidervpn/commit/091ee12eac3b4b2d8038fbce95a5bd69c83ad03d)、[Backlog D.94](./REMEDIATION_BACKLOG.md) 生效；#30 Draft `5636bf53c374aab377a8fbc317b642975cbb9307`，D终态7028771337与C停写7028832325、四workflow全success均实核，G2已执行范围冻结，真实可信锚/跨SID/全机旧writer等未验。
+- B独占integration/security-remediation-20261119，以该SHA按§30执行实际 COORD-INT-UNINSTALL-EXECUTOR/R01-009-D2-CORE，新增私有Rust固定launcher同对象验证/处置/独立absence核心，仅无害隔离fixture实际运行，旧LAB不重复、保留全部测试；不接真实维护/删除CLI，不动实际产品/数据/真实快捷入口、无任意删除工具或票据。C/D只读、D独立新SHA及四CI，D3实际可运行恢复待另授权，尚无D2-CORE源码/CI。R2及可信来源/实际部署/旧writer/跨SID/UAC/WFP05/真实Windows/VPS/安装卸载恢复仍阻塞，main及原分支不变。总控[7028935664](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7028935664)。
