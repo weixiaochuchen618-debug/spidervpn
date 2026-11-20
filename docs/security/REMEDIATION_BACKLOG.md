@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.95 与 [任务分配表](./TASK_ASSIGNMENTS.md) §31 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.96 与 [任务分配表](./TASK_ASSIGNMENTS.md) §32 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -945,3 +945,7 @@ PR/commit/CI: ...
 ## D.95 2026-11-20 §31：D2-CORE实际处置通过，诊断缺口待补
 - #30 `006eb7e36ac131c728c2ac143661ee84e2feccf1` 四workflow MSVC44674678294/GNU-B44674678247/GNU-C44674678223/Linux44674678191全success，D[7030704836](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7030704836)、B停写7030693562，实际同对象处置双ABI及全部负控/旧回归PASS；不冻结D2-CORE，原生对象/路径查询rc丢失、secondary pending诊断、SDDL终止长度及竞争独立截止时间按§30待补。
 - [§31](https://github.com/weixiaochuchen618-debug/spidervpn/commit/5b56af0101779e8029b0c25147935b3b76c1e7d0) 恢复B唯一限量D2-DIAG写权，仅launcher_executor私有诊断与同文件test及MSVC/GNU-B追加实际专项；保持原D1/处置原则/生产不可达及旧回归，双ABI真实native证据与有界竞争、四CI/D独立/B再次停写后核冻结。C只读、不进D3、无实际维护删除/消费B1；尚无整改提交/CI。R2、可信外部锚、真实恢复/旧writer/跨SID/UAC/WFP05/Windows/VPS仍阻塞，main及原分支不变。
+
+## D.96 2026-11-20 §32：D2已执行范围冻结，独立D3恢复核心ACTIVE
+- #30 `5e18c568be631aa874b85ba510cd4cbe231a239e` 四workflow MSVC44691009926/GNU-B44691009904/GNU-C44691009914/Linux44691009700全success，D独立[7033075433](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7033075433)、B正式停写7033040701，真实CORE/DIAG双ABI及全部旧回归PASS；正式冻结D2已执行范围，主动timeout kill+wait与极端故障NOT RUN、旧PS路径删除风险/真实调用方认证未闭合。
+- [§32](https://github.com/weixiaochuchen618-debug/spidervpn/commit/78fbe2998ab8155912e164d935939387fa5dc819) B唯一集成写权 COORD-INT-RECOVERY-EXECUTOR/R01-009-D3-CORE，独立默认OFF Rust EXE、固定受保护候选vault及新generation真实恢复、独立实际DLL/engine fixture失效后可运行，保留破损组/不重写旧对象，双ABI四CI及D独立审查；严格限定候选，不接真实维护/产品路径/消费B1或生产锚。C只读，尚无D3提交或CI。R2、真实外部认证/release/供应链、标准Token/跨SID/UAC、旧writer、真实恢复/安装升级卸载、WFP05/Windows/VPS等仍阻塞，main及原分支不变。
