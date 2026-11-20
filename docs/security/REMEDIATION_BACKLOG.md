@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.96 与 [任务分配表](./TASK_ASSIGNMENTS.md) §32 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.97 与 [任务分配表](./TASK_ASSIGNMENTS.md) §33 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -949,3 +949,7 @@ PR/commit/CI: ...
 ## D.96 2026-11-20 §32：D2已执行范围冻结，独立D3恢复核心ACTIVE
 - #30 `5e18c568be631aa874b85ba510cd4cbe231a239e` 四workflow MSVC44691009926/GNU-B44691009904/GNU-C44691009914/Linux44691009700全success，D独立[7033075433](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7033075433)、B正式停写7033040701，真实CORE/DIAG双ABI及全部旧回归PASS；正式冻结D2已执行范围，主动timeout kill+wait与极端故障NOT RUN、旧PS路径删除风险/真实调用方认证未闭合。
 - [§32](https://github.com/weixiaochuchen618-debug/spidervpn/commit/78fbe2998ab8155912e164d935939387fa5dc819) B唯一集成写权 COORD-INT-RECOVERY-EXECUTOR/R01-009-D3-CORE，独立默认OFF Rust EXE、固定受保护候选vault及新generation真实恢复、独立实际DLL/engine fixture失效后可运行，保留破损组/不重写旧对象，双ABI四CI及D独立审查；严格限定候选，不接真实维护/产品路径/消费B1或生产锚。C只读，尚无D3提交或CI。R2、真实外部认证/release/供应链、标准Token/跨SID/UAC、旧writer、真实恢复/安装升级卸载、WFP05/Windows/VPS等仍阻塞，main及原分支不变。
+
+## D.97 2026-11-20 §33：D3-CORE已执行隔离范围冻结，实际执行证据补齐ACTIVE
+- #30 `1286c501f0fa7de7481ac06d7d13224bcdf68a23` 四workflow MSVC44695617224/GNU-B44695617181/GNU-C44695617195/Linux44695617207全success，D独立[7037428609](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7037428609)、B正式停写7033712623。双ABI真实DLL删除/126/41失败、新组依赖实际运行、33拒绝/ABI、真实256MiB copy中止65536 bytes保留、独立重新恢复、真实timeout258/回收、全部旧回归PASS，正式冻结D3已执行隔离范围，不是真实产品恢复/完整生产PASS。PE/模块路径观察、实际执行持有handle与expected完整复验待补。
+- [§33](https://github.com/weixiaochuchen618-debug/spidervpn/commit/5a50083b66deb8bf7684626a1a4653eee19a271c) B唯一限量test-only写权 COORD-INT-RECOVERY-EXECUTOR/R01-009-D3-EXEC-EVIDENCE，按实际执行handle/ID/hash/ACL与替换拒绝/PE imports与真实模块来源观察补齐，保持生产核心及已验断言、双ABI及四CI、D独立、结束后再停写。C只读，尚无本段提交/CI。后续优先真实外部信任及实机条件，R2/可信锚/真实供应链/全机旧writer/跨SID/UAC/真实维护/WFP05/Windows/VPS仍BLOCKED_REAL_ACCEPTANCE；D2超时主动触发仍NOT RUN。main及原分支不动。
