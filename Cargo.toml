@@ -151,8 +151,15 @@ path = "src/main.rs"
 # Independent bootstrap is deliberately not part of the default build/package.
 [features]
 bootstrap-stage = []
+recovery-core = []
 
 [[bin]]
 name = "spidervpn-bootstrap"
 path = "src/bin/spidervpn-bootstrap.rs"
 required-features = ["bootstrap-stage"]
+
+# Independent recovery candidate builder; default off, not part of the package.
+[[bin]]
+name = "spidervpn-recovery"
+path = "src/bin/spidervpn-recovery.rs"
+required-features = ["recovery-core"]
