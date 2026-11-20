@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.92 与 [任务分配表](./TASK_ASSIGNMENTS.md) §28 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.93 与 [任务分配表](./TASK_ASSIGNMENTS.md) §29 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -933,3 +933,7 @@ PR/commit/CI: ...
 ## D.92 2026-11-20 §28：G1四CI通过，父调度同步链补证
 - #30 `4196a63286378c2e965b9c17875d76756d16b70f`，四workflow MSVC44544029647/GNU-B44544029405/GNU-C44544029547/Linux44544029665全success，D独立[7012498815](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7012498815)；真实kernel/executor双ABI各1/1，实际新门取消fixture、旧完整回归通过。保留首版7795157c三Windows E0505及最小test-only修复。G1仍ACCEPTANCE_PENDING：真实父函数同步等待链未执行，直接spawn CLI和子端自造请求spy不替代。
 - [§28正式裁定](https://github.com/weixiaochuchen618-debug/spidervpn/commit/dc5bb38666cd6dbf180670964c8a0999f5dcc650)，C恢复唯一限量test-only写权，仅mod/elevate测试及MSVC/GNU-C显式父链专项，五父入口生成原请求/nonce、独立子进程与双锁观察、成功和外/短门竞争失败、有界等待及真实父状态/证据，完整四CI及D终审后停写；不改生产逻辑、不转G2、不启用维护写入。B/D只读，R2/外部锚/跨SID/UAC/生产BLOCK/旧writer/WFP05/Windows/VPS均保留阻塞；main及原分支不变。
+
+## D.93 2026-11-20 §29：G1已执行范围冻结，G2运行占用ACTIVE
+- #30 `ed76b84b984b908f0735321d556cc9171992aa0b` 四workflow MSVC44640255186/GNU-B44640255431/GNU-C44640255189/Linux44640255191全success，D独立[7026436765](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7026436765)、C停写7025870558，父链双ABI36/36（12成功/24竞争拒绝），原生产与测试保留，正式冻结G1已执行范围。真实UAC/跨SID、生产BFE/BLOCK、写瞬间观察等未验，R2不关闭，非完整生产PASS。
+- [§29](https://github.com/weixiaochuchen618-debug/spidervpn/commit/a87206895bf9d104e7f831834194ec010876a331) 新授权C独占集成分支 COORD-INT-LIFECYCLE-OCCUPANCY/R01-009-G2，实际普通运行共享登记、独立维护排他及真实process占用判据；未有可信锚仍保留既有合法运行且维护必拒，已证真实排他时阻新准入，清理退出独立；不部署生产锚/不消费B1/不开放实际维护写入。B只读、D独立审新SHA。尚无G2提交/CI。R2及真实可信来源、全机旧writer、跨SID/UAC/WFP05、Windows/VPS、实际安装卸载恢复仍阻塞，main及原分支不变。
