@@ -417,9 +417,9 @@ fn release(mut p:Proc,start:Instant)->Run{
     input.write_all(b"G\n").unwrap();drop(input);
     p.finish(Duration::from_secs(20).saturating_sub(start.elapsed()).as_millis() as u32)
 }
-fn compete(h:&HeldGroup<'_>,cwd:&Path,pid:u32){
+fn compete(h:&HeldGroup<'_>,competitor:&Path,pid:u32){
     let p=h.g.path.join(NAMES[0]);
-    let replacement=cwd.join("neighbor.bin");
+    let replacement=competitor.to_owned();
     let bytes=b"unrelated known sentinel";
     let original=readback(&replacement,bytes,true);
     // Actual controller operations while distinct client is alive and all
@@ -432,7 +432,7 @@ fn compete(h:&HeldGroup<'_>,cwd:&Path,pid:u32){
     assert_eq!(readback(&replacement,bytes,true),original);h.check();
     println!("D3_EXEC_COMPETITION pid={pid} write={write} delete={delete} rename={rename} replace={replace} parent={parent} same_objects=true neighbor_preserved=true");
 }
-fn run_group(g:&Group,e:&Expected,cwd:&Path,broken:bool,work_id:Id){
+fn run_group(g:&Group,e:&Expected,cwd:&Path,broken:bool,work_id:Id,competitor:&Path){
     let h=HeldGroup::new(g,e,work_id);
     for &n in NAMES[..3].iter().filter(|n|g.files.contains_key(**n)){
         pe_evidence(&h.files[n],&g.path.join(n),&e[n],&g.files[n]);
@@ -446,7 +446,7 @@ fn run_group(g:&Group,e:&Expected,cwd:&Path,broken:bool,work_id:Id){
         let p=Proc::start(Command::new(&client).arg("--observe-fixture").current_dir(cwd).stdin(Stdio::piped()));
         wait_ready(&p,&format!("D3_CLIENT_OBSERVE_READY pid={}",p.pid),start);
         recovery_modules::snapshot(&p,&client,&[(&client,&g.files[NAMES[0]],&e[NAMES[0]]),(&dll,&g.files[NAMES[1]],&e[NAMES[1]])],"client");
-        compete(&h,cwd,p.pid);
+        compete(&h,competitor,p.pid);
         assert_eq!(p.wait_code(0),258);
         release(p,start)
     };
@@ -615,6 +615,10 @@ fn real_independent_recovery_executor(){
     }
     let runner=parent.join(format!("SpiderVPN-Recovery-Runner-{}",nonce()));
     let builder=parent.join(format!("SpiderVPN-Recovery-FixtureBuild-{}",nonce()));
+    // Mutated negative-control fixtures must not be moved into the held
+    // runner directory. Keep those known objects in a separate protected sibling.
+    let quarantine=parent.join(format!("SpiderVPN-Recovery-Quarantine-{}",nonce()));
+    new_dir(&quarantine);let quarantine_id=dir_id(&quarantine);
     new_dir(&runner);let runner_id=dir_id(&runner);
     new_dir(&builder);let builder_id=dir_id(&builder);
     let mut expected=compile_fixtures(&builder);
@@ -631,6 +635,8 @@ fn real_independent_recovery_executor(){
     assert_eq!(runner_exe.sha,hash(&original_exe));
     let sentinel=runner.join("neighbor.bin");let sent=b"unrelated known sentinel";
     new_file(&sentinel,sent);let neighbor_before=readback(&sentinel,sent,true);
+    let competitor=quarantine.join("neighbor.bin");new_file(&competitor,sent);
+    let competitor_before=readback(&competitor,sent,true);
     assert_eq!(names(&runner),["spidervpn-recovery.exe","neighbor.bin"].into_iter().map(String::from).collect());
     println!("D3_EXTERNAL_FIXTURE_AUTH source_sha={sha} manifest_sha256={} recovery_exe_sha256={} isolated_exe_dir={runner:?} no_product_dependencies=true fixture_only=true",
         hash(&raw),runner_exe.sha);
@@ -702,7 +708,7 @@ fn real_independent_recovery_executor(){
         replace_known(&vault.join(MANIFEST),&bad,&raw);
     }
     let leaf=vault.join(NAMES[0]);
-    let moved=runner.join("known-quarantine.exe");
+    let moved=quarantine.join("known-quarantine.exe");
     fs::rename(&leaf,&moved).unwrap();
     refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"SET_MISSING");
     assert_eq!(readback(&moved,&expected[NAMES[0]],true),source[NAMES[0]]);
@@ -736,7 +742,7 @@ fn real_independent_recovery_executor(){
         refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"ACL_COUNT");
         assert_eq!(sddl(&open(p)),descriptor);set_dacl(p,ACL);exact_acl(&open(p));
     }
-    let link=runner.join("known-hardlink.exe");
+    let link=quarantine.join("known-hardlink.exe");
     fs::hard_link(&leaf,&link).unwrap();
     refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"OBJECT_TYPE_OR_LINK");
     assert_eq!(fs::read(&link).unwrap(),expected[NAMES[0]]);assert_eq!(fs::read(&leaf).unwrap(),expected[NAMES[0]]);
@@ -747,7 +753,7 @@ fn real_independent_recovery_executor(){
         refuse(&exe_guard,&hash(&raw),&sha,&runner,&work,"OBJECT_ALTERNATE_STREAM");
         assert_eq!(fs::read(&ads).unwrap(),b"named stream");fs::remove_file(&ads).unwrap();
     }
-    let saved=runner.join("saved-vault");
+    let saved=quarantine.join("saved-vault");
     fs::rename(&vault,&saved).unwrap();
     let cmd=PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe");
     let out=Command::new(cmd).args(["/D","/C","mklink","/J"]).arg(&vault).arg(&saved).output().unwrap();
@@ -763,7 +769,7 @@ fn real_independent_recovery_executor(){
 
     let p1=recover(&exe_guard,&raw,&sha,&work,&runner);let mut first=check_group(&p1,&expected,&source);
     replacement_negative(&first,&expected,&runner,&neighbor_before,sent);
-    run_group(&first,&expected,&runner,false,work_id);
+    run_group(&first,&expected,&runner,false,work_id,&competitor);
     // Only a known, independently verified fixture working group is damaged.
     // Delete its actual adjacent DLL, then prove another dependency cannot
     // be deleted while a real reader denies delete sharing.
@@ -776,14 +782,14 @@ fn real_independent_recovery_executor(){
     assert_eq!(readback(&sentinel,sent,true),neighbor_before);
     println!("D3_DEPENDENCY_DAMAGE dll_removed_id={:?} dll_absence=2 engine_delete_win32={denied} engine_id={:?} engine_hash={} neighbors_preserved=true",
         dll.id,first.files[NAMES[2]].id,first.files[NAMES[2]].sha);
-    run_group(&first,&expected,&runner,true,work_id);
+    run_group(&first,&expected,&runner,true,work_id,&competitor);
     // Separate executable and PID rebuild a NEW group from unchanged vault.
     assert_eq!(readback(&exe,&original_exe,true),runner_exe);
     let p2=recover(&exe_guard,&raw,&sha,&work,&runner);let second=check_group(&p2,&expected,&source);
     assert_ne!(first.id,second.id);assert_ne!(p1,p2);
     for(n,s)in &first.files{assert_ne!(s.id,second.files[n].id);}
     check_preserved(&first,&expected);assert!(!first.path.join(NAMES[1]).exists());
-    run_group(&second,&expected,&runner,false,work_id);
+    run_group(&second,&expected,&runner,false,work_id,&competitor);
     println!("D3_NEW_GROUP old={p1:?} new={p2:?} old_broken_unchanged=true actual_client_dll_engine=true");
 
     // Native timeout on a benign independent fixture process that has
@@ -813,7 +819,7 @@ fn real_independent_recovery_executor(){
     let new_raw=raw_manifest(&manifest(&expected,&sha));
     replace_known(&vault.join(MANIFEST),&raw,&new_raw);raw=new_raw;
     let large_source=verify_vault(&vault,&expected,&raw);
-    let (interrupted,actual_interrupted,recovery_module_observed)=interrupt(&exe_guard,&raw,&sha,&work,&vault,&runner,&expected,&sentinel,sent);
+    let (interrupted,actual_interrupted,recovery_module_observed)=interrupt(&exe_guard,&raw,&sha,&work,&vault,&runner,&expected,&competitor,sent);
     assert_eq!(verify_vault(&vault,&expected,&raw),large_source);
     assert_eq!(readback(&sentinel,sent,true),neighbor_before);
     let new_path=recover(&exe_guard,&raw,&sha,&work,&runner);
@@ -821,7 +827,7 @@ fn real_independent_recovery_executor(){
     assert_ne!(interrupted.path,rebuilt.path);assert_ne!(interrupted.id,rebuilt.id);
     for(n,s)in &interrupted.files{assert_ne!(s.id,rebuilt.files[n].id);}
     partial_preserved(&interrupted,&expected);
-    run_group(&rebuilt,&expected,&runner,false,work_id);
+    run_group(&rebuilt,&expected,&runner,false,work_id,&competitor);
     assert_eq!(readback(&stale_file,stale_bytes,true),stale_before);
     assert_eq!(dir_id(&stale),stale_id);
     clean_partial(interrupted,&expected);clean_group(rebuilt,&expected);
@@ -834,6 +840,8 @@ fn real_independent_recovery_executor(){
     fs::remove_dir(&vault).unwrap();fs::remove_dir(&work).unwrap();
     exe_guard.check();
     remove_known(&sentinel,sent,&neighbor_before);drop(exe_guard);remove_known(&exe,&original_exe,&runner_exe);
+    remove_known(&competitor,sent,&competitor_before);
+    assert_eq!(dir_id(&quarantine),quarantine_id);fs::remove_dir(&quarantine).unwrap();
     assert_eq!(dir_id(&runner),runner_id);fs::remove_dir(&runner).unwrap();
     if !recovery_module_observed{println!("D3_EXEC_RECOVERY_MODULES NOT_RUN no safe live copy observation");}
     let evidence=format!("D3_EXEC_EVIDENCE_COMPLETE source_sha={sha} held_groups=4 replacement_id_and_bytes_refused=true pe_four_images=true client_module_observed=true engine_module_observed=true recovery_module_observed={recovery_module_observed} path_os_only=true actual_timeout=true snapshot_only=true maintenance_authorized=false");
