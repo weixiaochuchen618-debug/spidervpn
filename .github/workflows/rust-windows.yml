@@ -213,3 +213,16 @@ jobs:
           if ($code -ne 0) { exit $code }
           if (($output -join [Environment]::NewLine) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'D2 core exact actual executor did not run once' }
           if (($output -join [Environment]::NewLine) -notmatch 'D2_CORE_COMPLETE real_core=true fixed_launchers=2') { throw 'D2 core actual executor evidence missing' }
+
+      - name: R01-009-D2-DIAG actual native diagnostics and bounded competitor
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked --bin spidervpn uninstall_safety::launcher_executor::tests::d2_diag_actual_native_queries -- --exact --nocapture --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          $log = $output -join [Environment]::NewLine
+          if ($log -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'D2 DIAG exact did not run once' }
+          if ($log -notmatch 'D2_DIAG_COMPLETE live_event=true native_info=\d+ native_path=\d+ native_pending=\d+ primary=\d+ secondary=\d+ known_false_pending=true logical_rc_none=true sddl_repeat=true sddl_no_nul=true malformed_bounds_rejected=true bounded_competition=true') { throw 'D2 DIAG actual native evidence missing' }
+          if ($log -notmatch 'D2_DIAG_COMPETITION_COMPLETE child_pid=\d+ ready=true go=true exit=0 elapsed_ms=\d+ deadline_ms=20000') { throw 'D2 DIAG actual bounded competitor evidence missing' }

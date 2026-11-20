@@ -8,19 +8,22 @@
 //! authorization. User-owned folders can be writable; ACL observation is not
 //! a claim of isolation against the same SID, administrators or old mappings.
 #![allow(dead_code)]
-use super::{launcher_handle_info, launcher_handle_path, launcher_path_parts,
+use super::{launcher_path_parts,
     launcher_size, launcher_template, read_launcher_bounded, safe_local_root,
     owned_launcher_bytes, MAX_LAUNCHER_BYTES};
 use std::{fs::{self, File, OpenOptions}, io::{self, Seek, SeekFrom},
-    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::{AsRawHandle, AsHandle, BorrowedHandle}},
     path::{Path, PathBuf}, ptr::null_mut};
 use windows_sys::Win32::{
-    Foundation::{GENERIC_READ, LocalFree},
+    Foundation::{GENERIC_READ, LocalFree, SetLastError},
     Security::{ACL, ACE_HEADER, GetAce, GetSecurityDescriptorDacl, IsValidSid,
         OWNER_SECURITY_INFORMATION, DACL_SECURITY_INFORMATION},
     Security::Authorization::{GetSecurityInfo, ConvertSecurityDescriptorToStringSecurityDescriptorW,
         SE_FILE_OBJECT, SDDL_REVISION_1},
-    Storage::FileSystem::{GetDriveTypeW, GetFileInformationByHandleEx, SetFileInformationByHandle,
+    Storage::FileSystem::{GetDriveTypeW, GetFileType, GetFileInformationByHandle,
+        GetFinalPathNameByHandleW, GetFileInformationByHandleEx, SetFileInformationByHandle,
+        FILE_TYPE_UNKNOWN, FILE_TYPE_DISK, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_DEVICE,
         BY_HANDLE_FILE_INFORMATION, FILE_STANDARD_INFO, FILE_DISPOSITION_INFO,
         FileStandardInfo, FileDispositionInfo, FileStreamInfo, DELETE, FILE_READ_ATTRIBUTES,
         FILE_LIST_DIRECTORY, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE,
@@ -50,15 +53,19 @@ impl Launcher {
 #[derive(Debug,PartialEq,Eq)]
 enum Mutation { None, DispositionFailed{pending:Option<bool>}, PendingOrUnknown }
 #[derive(Debug)]
-struct Fault { phase:&'static str, win32:Option<i32>, detail:String, mutation:Mutation }
+struct QueryDiagnostic { phase:&'static str, win32:Option<i32>, detail:String }
+#[derive(Debug)]
+struct Fault { phase:&'static str, win32:Option<i32>, detail:String, mutation:Mutation,
+    secondary:Option<QueryDiagnostic> }
 impl Fault {
     fn before(phase:&'static str,detail:impl Into<String>)->Self{
-        Self{phase,win32:None,detail:detail.into(),mutation:Mutation::None}
+        Self{phase,win32:None,detail:detail.into(),mutation:Mutation::None,secondary:None}
     }
     fn os(phase:&'static str,e:io::Error)->Self{
-        Self{phase,win32:e.raw_os_error(),detail:e.to_string(),mutation:Mutation::None}
+        Self{phase,win32:e.raw_os_error(),detail:e.to_string(),mutation:Mutation::None,secondary:None}
     }
     fn after(mut self)->Self{self.mutation=Mutation::PendingOrUnknown;self}
+    fn at(mut self,path:&Path)->Self{self.detail=format!("path={path:?}; {}",self.detail);self}
 }
 fn id(i:&Info)->Id{(i.dwVolumeSerialNumber,i.nFileIndexHigh,i.nFileIndexLow)}
 fn same(a:&Info,b:&Info)->bool{
@@ -115,9 +122,25 @@ fn acl(file:&File)->Result<String>{
         return Err(Fault::os("ACL_STRING",io::Error::last_os_error()));
     }
     let _text=Local(text.cast());
+    // API owns the returned LocalAlloc string; n is a WCHAR count
+    // including the terminator. Never build a slice across trailing storage.
+    // SAFETY: the successful API result is live until _text is dropped.
+    unsafe{read_sddl(text,n)}
+}
+// SAFETY: text must be a live API-returned WCHAR string (or a test buffer
+// initialized through its bound); n is the reported maximum WCHAR count.
+unsafe fn read_sddl(text:*const u16,n:u32)->Result<String>{
     if text.is_null()||n==0||n>65536{return Err(Fault::before("ACL_UNKNOWN","invalid descriptor length"));}
-    String::from_utf16(unsafe{std::slice::from_raw_parts(text,n as usize)})
-        .map_err(|_|Fault::before("ACL_UNKNOWN","invalid descriptor text"))
+    let mut units=Vec::new();
+    for idx in 0..n as usize{
+        let unit=unsafe{*text.add(idx)};
+        if unit==0{
+            if units.is_empty(){return Err(Fault::before("ACL_UNKNOWN","empty descriptor text"));}
+            return String::from_utf16(&units).map_err(|_|Fault::before("ACL_UNKNOWN","invalid descriptor text"));
+        }
+        units.push(unit);
+    }
+    Err(Fault::before("ACL_UNKNOWN","unterminated descriptor text"))
 }
 fn streams(file:&File,dir:bool)->Result<()>{
     let mut aligned=vec![0u64;8192];
@@ -136,10 +159,47 @@ fn streams(file:&File,dir:bool)->Result<()>{
     }
     Ok(())
 }
+// Typed queries preserve the immediate native result independently of
+// logical policy rejection. BorrowedHandle keeps every tested handle live.
+fn query_type(h:BorrowedHandle<'_>)->Result<u32>{
+    unsafe{SetLastError(0);}
+    let kind=unsafe{GetFileType(h.as_raw_handle())};
+    if kind==FILE_TYPE_UNKNOWN{
+        let e=io::Error::last_os_error();
+        if e.raw_os_error()!=Some(0){return Err(Fault::os("OBJECT_TYPE_QUERY",e));}
+    }
+    Ok(kind)
+}
+fn query_info(h:BorrowedHandle<'_>)->Result<Info>{
+    let mut info:Info=unsafe{std::mem::zeroed()};
+    if unsafe{GetFileInformationByHandle(h.as_raw_handle(),&mut info)}==0{
+        return Err(Fault::os("OBJECT_INFO_QUERY",io::Error::last_os_error()));
+    }
+    Ok(info)
+}
+fn query_path(h:BorrowedHandle<'_>)->Result<String>{
+    let mut buffer=vec![0u16;32768];
+    let n=unsafe{GetFinalPathNameByHandleW(h.as_raw_handle(),buffer.as_mut_ptr(),buffer.len() as u32,0)} as usize;
+    if n==0{return Err(Fault::os("OBJECT_PATH_QUERY",io::Error::last_os_error()));}
+    if n>=buffer.len(){return Err(Fault::before("CANONICAL_PATH","normalized path too long"));}
+    let actual=String::from_utf16(&buffer[..n]).map_err(|_|Fault::before("CANONICAL_PATH","invalid UTF-16"))?;
+    Ok(actual.strip_prefix(r"\\?\").ok_or_else(||Fault::before("CANONICAL_PATH","not local DOS path"))?.to_owned())
+}
 fn inspect(file:&File,path:&Path,dir:bool)->Result<Info>{
-    let i=launcher_handle_info(file,dir).map_err(|e|Fault::before("OBJECT_TYPE_OR_ID",e))?;
-    if (i.nFileIndexHigh,i.nFileIndexLow)==(0,0){return Err(Fault::before("OBJECT_TYPE_OR_ID","zero ID"));}
-    launcher_handle_path(file,path).map_err(|e|Fault::before("CANONICAL_PATH",e))?;
+    let h=file.as_handle();
+    if query_type(h).map_err(|e|e.at(path))?!=FILE_TYPE_DISK{
+        return Err(Fault::before("OBJECT_TYPE_OR_ID","not a disk object").at(path));
+    }
+    let i=query_info(h).map_err(|e|e.at(path))?;
+    if i.dwFileAttributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DEVICE)!=0
+        ||(i.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY!=0)!=dir
+        ||(i.nFileIndexHigh,i.nFileIndexLow)==(0,0)||(!dir&&i.nNumberOfLinks!=1){
+        return Err(Fault::before("OBJECT_TYPE_OR_ID","reparse/device/type/link/identity rejected").at(path));
+    }
+    let actual=query_path(h).map_err(|e|e.at(path))?;
+    if !path.to_str().is_some_and(|p|actual.eq_ignore_ascii_case(p)){
+        return Err(Fault::before("CANONICAL_PATH",format!("actual={actual:?}")).at(path));
+    }
     streams(file,dir)?;
     Ok(i)
 }
@@ -174,19 +234,41 @@ fn matching_entries(parent:&Path,which:Launcher)->Result<usize>{
 fn independent(path:&Path)->io::Result<File>{
     OpenOptions::new().read(true).share_mode(ALL_SHARES).custom_flags(FLAGS).open(path)
 }
-fn pending(file:&File)->io::Result<bool>{
+fn pending_handle(h:BorrowedHandle<'_>)->io::Result<bool>{
     let mut i:FILE_STANDARD_INFO=unsafe{std::mem::zeroed()};
-    if unsafe{GetFileInformationByHandleEx(file.as_raw_handle(),FileStandardInfo,
+    if unsafe{GetFileInformationByHandleEx(h.as_raw_handle(),FileStandardInfo,
         (&mut i as *mut FILE_STANDARD_INFO).cast(),std::mem::size_of::<FILE_STANDARD_INFO>() as u32)}==0{
         return Err(io::Error::last_os_error());
     }
     Ok(i.DeletePending as u8!=0)
 }
-fn disposition(file:&File)->io::Result<()>{
+fn pending(file:&File)->io::Result<bool>{pending_handle(file.as_handle())}
+fn disposition_handle(h:BorrowedHandle<'_>)->io::Result<()>{
     let i=FILE_DISPOSITION_INFO{DeleteFile:true as _};
-    if unsafe{SetFileInformationByHandle(file.as_raw_handle(),FileDispositionInfo,
+    if unsafe{SetFileInformationByHandle(h.as_raw_handle(),FileDispositionInfo,
         (&i as *const FILE_DISPOSITION_INFO).cast(),std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32)}==0{
         return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+fn disposition(file:&File)->io::Result<()>{disposition_handle(file.as_handle())}
+// Only mark() after recheck invokes this on a verified production object.
+// Tests also exercise the same diagnostic path on a live private event.
+fn request_disposition(h:BorrowedHandle<'_>)->Result<()>{
+    if let Err(e)=disposition_handle(h){
+        let mut fault=Fault::os("DISPOSITION_FAILED",e);
+        match pending_handle(h){
+            Ok(value)=>fault.mutation=Mutation::DispositionFailed{pending:Some(value)},
+            Err(e)=>{
+                fault.mutation=Mutation::DispositionFailed{pending:None};
+                let independent=Fault::os("PENDING_QUERY_AFTER_FAILURE",e);
+                fault.secondary=Some(QueryDiagnostic{phase:independent.phase,win32:independent.win32,detail:independent.detail});
+            }
+        }
+        return Err(fault);
+    }
+    if !pending_handle(h).map_err(|e|Fault::os("PENDING_QUERY",e).after())?{
+        return Err(Fault::before("PENDING_NOT_CONFIRMED","disposition returned success").after());
     }
     Ok(())
 }
@@ -256,14 +338,7 @@ impl Verified{
     // the error boundary, even if pending readback itself fails.
     fn mark(mut self)->Result<Marked>{
         self.recheck()?;
-        if let Err(e)=disposition(&self.file){
-            let mut fault=Fault::os("DISPOSITION_FAILED",e);
-            fault.mutation=Mutation::DispositionFailed{pending:pending(&self.file).ok()};
-            return Err(fault);
-        }
-        if !pending(&self.file).map_err(|e|Fault::os("PENDING_QUERY",e).after())?{
-            return Err(Fault::before("PENDING_NOT_CONFIRMED","disposition returned success").after());
-        }
+        request_disposition(self.file.as_handle()).map_err(|e|e.at(&self.path))?;
         Ok(Marked(self))
     }
 }
@@ -298,8 +373,12 @@ impl Marked{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::launcher_handle_info;
     use ring::rand::{SecureRandom,SystemRandom};
-    use std::io::Write;
+    use std::{io::{Write,BufRead,BufReader}, process::{Child,Command,Stdio},
+        sync::mpsc, time::{Duration,Instant}};
+    use std::os::windows::io::{OwnedHandle,FromRawHandle};
+    use windows_sys::Win32::System::Threading::{CreateEventW,WaitForSingleObject};
     use windows_sys::Win32::Security::{PROTECTED_DACL_SECURITY_INFORMATION};
     use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW,SetSecurityInfo};
 
@@ -380,8 +459,121 @@ mod tests {
         match r{Ok(Admission::NotOwned)=>{},Err(e)=>panic!("expected not-owned: {e:?}"),_=>panic!("expected not-owned")}
     }
     fn remove_own(path:&Path){fs::remove_file(path).unwrap();}
+    const ROLE:&str="SPIDERVPN_D2_DIAG_COMPETITOR_FIXTURE";
+    const DEADLINE:Duration=Duration::from_secs(20);
+    const COMPETITION_TEST:&str="uninstall_safety::launcher_executor::tests::d2_core_actual_same_object_executor";
+
+    // Test harness role only. No product argument or env branch. Refuse
+    // any location other than our own randomly named canonical temp fixture
+    // before opening candidates or attempting non-destructive competition.
+    fn competitor(base:&Path){
+        let temp=fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dos=PathBuf::from(temp.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        assert_eq!(base.parent(),Some(dos.as_path()));
+        let name=base.file_name().unwrap().to_str().unwrap();
+        let token=name.strip_prefix("spider-d2-core-").unwrap();
+        assert_eq!(token.len(),32);
+        assert!(token.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)));
+        drop(hold(base).unwrap());
+        let root=base.join("installation");let parent=base.join("fixture-launchers");
+        let p=parent.join(Launcher::Start.name());
+        let replacement=parent.join("replacement.cmd");
+        assert_eq!(fs::read(base.join("neighbor").join("sentinel")).unwrap(),b"unrelated user data");
+        let prior=snapshot(&p);let other=snapshot(&replacement);
+        assert_eq!(prior.1,launcher_template(&root,Launcher::Start.name()).unwrap().into_bytes());
+        assert_eq!(other.1,b"replacement sentinel");
+        // Do not retain any independent blocker handles in the child.
+        // Parent's Verified must be the reason the five operations fail.
+        println!("D2_DIAG_CHILD_READY token={token} pid={}",std::process::id());
+        io::stdout().flush().unwrap();
+        let mut go=String::new();io::stdin().lock().read_line(&mut go).unwrap();
+        assert_eq!(go.trim_end_matches(['\r','\n']),format!("GO {token}"));
+        let write=rc(OpenOptions::new().write(true).share_mode(ALL_SHARES).open(&p),"write",&[32]);
+        let rename=rc(fs::rename(&p,parent.join("moved.cmd")),"rename",&[5,32]);
+        let replace=rc(fs::rename(&replacement,&p),"replace",&[5,32]);
+        let parent_rc=rc(fs::rename(&parent,base.join("moved-parent")),"parent",&[5,32]);
+        let ancestor=rc(fs::rename(base,base.with_extension("moved")),"ancestor",&[5,32]);
+        assert_eq!(snapshot(&p),prior);assert_eq!(snapshot(&replacement),other);
+        println!("D2_DIAG_CHILD_RESULT token={token} write={write} rename={rename} replace={replace} parent={parent_rc} ancestor={ancestor}");
+        io::stdout().flush().unwrap();
+    }
+    // A child only executes this one native-test role and never spawns
+    // descendants. The pipe reader is joined only AFTER the child is
+    // reaped; on deadline/error the guard kills and waits before unwinding.
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard{
+        fn drop(&mut self){
+            if !matches!(self.0.try_wait(),Ok(Some(_))){
+                let _=self.0.kill();
+                let _=self.0.wait();
+            }
+        }
+    }
+    fn remaining(start:Instant)->Duration{DEADLINE.saturating_sub(start.elapsed())}
+    fn bounded_competition(f:&Fixture)->(i32,i32,i32,i32,i32){
+        let name=f.base.file_name().unwrap().to_str().unwrap();
+        let token=name.strip_prefix("spider-d2-core-").unwrap();
+        let start=Instant::now();
+        let mut child=ChildGuard(Command::new(std::env::current_exe().unwrap())
+            .args([COMPETITION_TEST,"--exact","--nocapture","--test-threads=1"])
+            .env(ROLE,&f.base).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+            .spawn().unwrap());
+        let pid=child.0.id();
+        let expect_ready=format!("D2_DIAG_CHILD_READY token={token} pid={pid}");
+        let reader=child.0.stdout.take().unwrap();
+        let (tx,rx)=mpsc::sync_channel(1);
+        let expected=expect_ready.clone();
+        let log_thread=std::thread::spawn(move||{
+            let mut all=String::new();
+            for line in BufReader::new(reader).lines(){
+                let line=line.unwrap();
+                if line.contains(&expected){tx.try_send(()).unwrap();}
+                assert!(all.len()+line.len()<65536,"unexpected test subprocess output");
+                all.push_str(&line);all.push('\n');
+            }
+            all
+        });
+        // Real ready from the child, then explicit GO while the caller
+        // still owns Verified. No sleeps or guessed race windows.
+        let ready=rx.recv_timeout(remaining(start));
+        if ready.is_err(){
+            let _=child.0.kill();let status=child.0.wait().unwrap();
+            let log=log_thread.join().unwrap();
+            panic!("D2 competition ready timeout/failure; reaped={status:?} no_mark=true {log}");
+        }
+        let mut input=child.0.stdin.take().unwrap();
+        let go=writeln!(input,"GO {token}");
+        drop(input);
+        if let Err(e)=go{
+            let _=child.0.kill();let status=child.0.wait().unwrap();
+            let log=log_thread.join().unwrap();
+            panic!("D2 competition GO failed: {e}; reaped={status:?} no_mark=true {log}");
+        }
+        let wait_ms=remaining(start).as_millis().min(u128::from(u32::MAX-1)) as u32;
+        let wait=unsafe{WaitForSingleObject(child.0.as_raw_handle(),wait_ms)};
+        if wait!=0{
+            let native=if wait==u32::MAX{Some(io::Error::last_os_error())}else{None};
+            let _=child.0.kill();let status=child.0.wait().unwrap();
+            let log=log_thread.join().unwrap();
+            panic!("D2 competition wait={wait} native={native:?} reaped={status:?} no_mark=true {log}");
+        }
+        let status=child.0.wait().unwrap();
+        let log=log_thread.join().unwrap();
+        assert!(status.success()&&start.elapsed()<=DEADLINE,"competition exit/deadline: {status:?} {log}");
+        let prefix=format!("D2_DIAG_CHILD_RESULT token={token} ");
+        let line=log.lines().find_map(|l|l.strip_prefix(&prefix)).expect("actual child result");
+        let fields:Vec<_>=line.split_whitespace().collect();assert_eq!(fields.len(),5);
+        let code=|i:usize,name:&str|fields[i].strip_prefix(name).unwrap().parse::<i32>().unwrap();
+        let codes=(code(0,"write="),code(1,"rename="),code(2,"replace="),code(3,"parent="),code(4,"ancestor="));
+        assert_eq!(codes.0,32);
+        for c in [codes.1,codes.2,codes.3,codes.4]{assert!([5,32].contains(&c));}
+        println!("D2_DIAG_COMPETITION_COMPLETE child_pid={pid} ready=true go=true exit=0 elapsed_ms={} deadline_ms=20000 write={} rename={} replace={} parent={} ancestor={} child_reaped=true",start.elapsed().as_millis(),codes.0,codes.1,codes.2,codes.3,codes.4);
+        codes
+    }
+
     #[test]
     fn d2_core_actual_same_object_executor(){
+        if let Some(base)=std::env::var_os(ROLE){competitor(Path::new(&base));return;}
         let f=Fixture::new();
         let neighbor=f.neighbor.join(Launcher::Start.name());
         fs::write(&neighbor,f.bytes(Launcher::Start)).unwrap();
@@ -425,25 +617,19 @@ mod tests {
         let observer=independent(&p).unwrap();
         let error=fault(v.mark(),"DISPOSITION_FAILED",Some(5));
         assert_eq!(error.mutation,Mutation::DispositionFailed{pending:Some(false)});
+        assert!(error.secondary.is_none());
         assert!(!pending(&observer).unwrap());drop(observer);
         assert_eq!(snapshot(&p),before);assert!(fs::metadata(&p).unwrap().permissions().readonly());
         let mut permissions=fs::metadata(&p).unwrap().permissions();permissions.set_readonly(false);
         fs::set_permissions(&p,permissions).unwrap();assert_eq!(snapshot(&p),original);
         println!("D2_CORE_ACCESS old_writer=32 no_delete_share=32 no_delete_access=5 readonly_disposition=5 pending=false same_id_bytes=true");
 
-        // Independent scoped thread runs while the real Verified object owns
+        // Independent process runs while the real Verified object owns
         // the handles. No sleeps, fabricated kernel errors or timing guesses.
         let replacement=f.parent.join("replacement.cmd");fs::write(&replacement,b"replacement sentinel").unwrap();
         let replacement_before=snapshot(&replacement);
         let mut v=f.ready(w);
-        let codes=std::thread::scope(|s|s.spawn(||{
-            let write=rc(OpenOptions::new().write(true).share_mode(ALL_SHARES).open(&p),"write",&[32]);
-            let rename=rc(fs::rename(&p,f.parent.join("moved.cmd")),"rename",&[5,32]);
-            let replace=rc(fs::rename(&replacement,&p),"replace",&[5,32]);
-            let parent=rc(fs::rename(&f.parent,f.base.join("moved-parent")),"parent",&[5,32]);
-            let ancestor=rc(fs::rename(&f.base,f.base.with_extension("moved")),"ancestor",&[5,32]);
-            (write,rename,replace,parent,ancestor)
-        }).join().unwrap());
+        let codes=bounded_competition(&f);
         v.recheck().unwrap();assert_eq!(snapshot(&p),original);assert_eq!(snapshot(&replacement),replacement_before);
         assert_eq!(v.mark().unwrap().finish().unwrap(),Completion::Removed);
         assert_eq!(snapshot(&replacement),replacement_before);
@@ -511,7 +697,8 @@ mod tests {
         // actual descriptor recheck must stop before disposition.
         let metadata=OpenOptions::new().access_mode(READ_CONTROL|0x40000|FILE_READ_ATTRIBUTES)
             .share_mode(ALL_SHARES).custom_flags(FLAGS).open(&p).unwrap();
-        let old=acl(&metadata).unwrap();let v=f.ready(w);
+        let old=acl(&metadata).unwrap();assert_eq!(acl(&metadata).unwrap(),old);assert!(!old.contains('\0'));
+        let v=f.ready(w);
         let mut nonce=[0u8;16];SystemRandom::new().fill(&mut nonce).unwrap();
         let ns:Vec<_>=nonce.chunks_exact(4).map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect();
         let sid=format!("S-1-5-21-{}-{}-{}-{}",ns[0],ns[1],ns[2],ns[3]);
@@ -530,6 +717,7 @@ mod tests {
         let code=apply(dacl);
         assert_eq!(code,0);
         let actual=acl(&metadata).unwrap();assert_ne!(actual,old);assert!(actual.contains(&sid));
+        assert_eq!(acl(&metadata).unwrap(),actual);assert!(!actual.contains('\0'));
         let error=fault(v.mark(),"LEAF_CHANGED",None);assert_eq!(error.mutation,Mutation::None);
         assert!(!pending(&metadata).unwrap());
         assert_eq!(snapshot(&p),original);
@@ -550,7 +738,7 @@ mod tests {
         assert_ne!(present,0);assert!(!restricted_acl.is_null());
         assert_eq!(apply(restricted_acl),0);
         let restricted_actual=acl(&metadata).unwrap();
-        assert_ne!(restricted_actual,actual);
+        assert_ne!(restricted_actual,actual);assert_eq!(acl(&metadata).unwrap(),restricted_actual);assert!(!restricted_actual.contains('\0'));
         let denied=fault(f.admit(w),"LEAF_OPEN",Some(5));
         assert_eq!(denied.mutation,Mutation::None);
         assert!(!pending(&metadata).unwrap());
@@ -561,4 +749,82 @@ mod tests {
         f.cleanup();
         writeln!(std::io::stdout().lock(),"D2_CORE_COMPLETE real_core=true fixed_launchers=2 same_object_disposition=true independent_absence=true readonly_failure=true pending_unknown=true source_competition=true acl_change_rejected=true no_production_caller=true maintenance_authorized=false recovery_proven=false cross_sid_not_run=true").unwrap();
     }
+
+    fn native<T>(r:Result<T>,phase:&str)->Fault{
+        match r{
+            Err(e)=>{assert_eq!(e.phase,phase,"{e:?}");assert!(e.win32.is_some_and(|n|n!=0),"{e:?}");assert_eq!(e.mutation,Mutation::None);e}
+            Ok(_)=>panic!("unexpected native success for {phase}"),
+        }
+    }
+    #[test]
+    fn d2_diag_actual_native_queries(){
+        // Live, privately created event, no fake File, no closed/reused
+        // handle. The borrowed handle is valid but not a filesystem object.
+        let raw=unsafe{CreateEventW(std::ptr::null(),0,0,std::ptr::null())};
+        assert!(!raw.is_null(),"CreateEventW: {}",io::Error::last_os_error());
+        let event=unsafe{OwnedHandle::from_raw_handle(raw)};
+        let h=event.as_handle();
+        let kind=match query_type(h){
+            Err(e)=>{assert_eq!(e.phase,"OBJECT_TYPE_QUERY");assert!(e.win32.is_some_and(|n|n!=0));format!("{e:?}")},
+            Ok(k)=>{assert_ne!(k,FILE_TYPE_DISK);format!("NOT_RUN type_api_native_failure kind={k} logical_non_disk=true")},
+        };
+        let info=native(query_info(h),"OBJECT_INFO_QUERY");
+        let path=native(query_path(h),"OBJECT_PATH_QUERY");
+        let pend=native(pending_handle(h).map_err(|e|Fault::os("PENDING_QUERY",e)),"PENDING_QUERY");
+        let both=match request_disposition(h){Err(e)=>e,Ok(())=>panic!("non-file disposition accepted")};
+        assert_eq!(both.phase,"DISPOSITION_FAILED");
+        assert!(both.win32.is_some_and(|n|n!=0));
+        assert_eq!(both.mutation,Mutation::DispositionFailed{pending:None});
+        let second=both.secondary.as_ref().expect("actual independent pending failure");
+        assert_eq!(second.phase,"PENDING_QUERY_AFTER_FAILURE");
+        assert!(second.win32.is_some_and(|n|n!=0));
+        assert_eq!(second.win32,pend.win32);assert_eq!(second.detail,pend.detail);
+        println!("D2_DIAG_NATIVE type={kind} info={info:?} path={path:?} pending={pend:?} primary={both:?}");
+        drop(event);
+        // A logical canonical-path/type rejection from a real valid file is
+        // not a failed Win32 call and must not invent an error number.
+        let f=Fixture::new();let w=Launcher::Start;f.seed(w);let p=f.path(w);
+        let reader=independent(&p).unwrap();
+        assert_eq!(query_type(reader.as_handle()).unwrap(),FILE_TYPE_DISK);
+        assert!(query_path(reader.as_handle()).unwrap().eq_ignore_ascii_case(p.to_str().unwrap()));
+        assert_eq!(id(&query_info(reader.as_handle()).unwrap()),id(&inspect(&reader,&p,false).unwrap()));
+        fault(inspect(&reader,&p,true),"OBJECT_TYPE_OR_ID",None);
+        fault(inspect(&reader,&f.parent.join("different.cmd"),false),"CANONICAL_PATH",None);
+        let text=acl(&reader).unwrap();assert_eq!(acl(&reader).unwrap(),text);assert!(!text.contains('\0'));
+        // Real no-DELETE access on a file independently confirms primary
+        // failure plus known false pending, distinct from the event dual error.
+        let no_delete=fault(request_disposition(reader.as_handle()),"DISPOSITION_FAILED",Some(5));
+        assert_eq!(no_delete.mutation,Mutation::DispositionFailed{pending:Some(false)});
+        assert!(no_delete.secondary.is_none());assert!(!pending(&reader).unwrap());
+        let original=snapshot(&p);drop(reader);
+        // Initialized test buffers only; malformed UTF-16 and missing NUL
+        // are logical boundary controls, not injected native return codes.
+        let padded=[b'O' as u16,b':' as u16,0,0xd800,0xffff];
+        assert_eq!(unsafe{read_sddl(padded.as_ptr(),padded.len() as u32)}.unwrap(),"O:");
+        let unterminated=[b'O' as u16,b':' as u16];
+        fault(unsafe{read_sddl(unterminated.as_ptr(),2)},"ACL_UNKNOWN",None);
+        let invalid=[0xd800,0];
+        fault(unsafe{read_sddl(invalid.as_ptr(),2)},"ACL_UNKNOWN",None);
+        let empty=[0u16];fault(unsafe{read_sddl(empty.as_ptr(),1)},"ACL_UNKNOWN",None);
+        fault(unsafe{read_sddl(empty.as_ptr(),0)},"ACL_UNKNOWN",None);
+        fault(unsafe{read_sddl(empty.as_ptr(),65537)},"ACL_UNKNOWN",None);
+        assert_eq!(snapshot(&p),original);
+        let replacement=f.parent.join("replacement.cmd");
+        fs::write(&replacement,b"replacement sentinel").unwrap();
+        let replacement_before=snapshot(&replacement);
+        let mut v=f.ready(w);
+        let codes=bounded_competition(&f);
+        assert_eq!(codes.0,32);
+        v.recheck().unwrap();
+        assert_eq!(snapshot(&p),original);
+        assert_eq!(snapshot(&replacement),replacement_before);
+        // Original core exact still proves disposition after real competition;
+        // diagnostic exact independently proves the bounded competitor and
+        // deliberately leaves its candidate unmarked.
+        assert!(!pending(&v.file).unwrap());drop(v);
+        remove_own(&replacement);remove_own(&p);f.cleanup();
+        writeln!(io::stdout().lock(),"D2_DIAG_COMPLETE live_event=true native_info={} native_path={} native_pending={} primary={} secondary={} known_false_pending=true logical_rc_none=true sddl_repeat=true sddl_no_nul=true malformed_bounds_rejected=true bounded_competition=true production_caller=false maintenance_authorized=false",
+            info.win32.unwrap(),path.win32.unwrap(),pend.win32.unwrap(),both.win32.unwrap(),second.win32.unwrap()).unwrap();
+    }
+
 }
