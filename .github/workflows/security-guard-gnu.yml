@@ -112,3 +112,15 @@ jobs:
           if ($code -ne 0) { exit $code }
           if (($output -join [Environment]::NewLine) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'Bootstrap actual EXE test did not run exactly once' }
           if (($output -join [Environment]::NewLine) -notmatch 'BOOTSTRAP_E2E_COMPLETE real_exe=true files=13') { throw 'Bootstrap actual stage evidence missing' }
+
+      - name: R01-009-D2-CORE real same-object launcher executor (isolated, no maintenance entry)
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\ucrt64\bin;$env:Path"
+          $env:CARGO_TARGET_DIR = 'C:\tc-rs-build'
+          $output = & cargo +stable-x86_64-pc-windows-gnu test --locked --bin spidervpn uninstall_safety::launcher_executor::tests::d2_core_actual_same_object_executor -- --exact --nocapture --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) { exit $code }
+          if (($output -join [Environment]::NewLine) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored') { throw 'D2 core exact actual executor did not run once' }
+          if (($output -join [Environment]::NewLine) -notmatch 'D2_CORE_COMPLETE real_core=true fixed_launchers=2') { throw 'D2 core actual executor evidence missing' }

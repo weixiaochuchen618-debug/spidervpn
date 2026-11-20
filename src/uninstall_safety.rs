@@ -1147,3 +1147,6 @@ mod tests {
         }
     }
 }
+
+// D2 core is private and has no production caller until maintenance authorization.
+mod launcher_executor;
