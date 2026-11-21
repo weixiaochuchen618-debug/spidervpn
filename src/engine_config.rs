@@ -1790,8 +1790,25 @@ fn trade_probe_rejection_reason(obj: &serde_json::Map<String, Value>) -> Option<
             let endpoint = endpoints.into_iter().flatten()
                 .filter(|v| v.get("tag").and_then(Value::as_str) == Some(tag));
             let found: Vec<_> = outbound.chain(endpoint).collect();
-            if found.len() != 1 {
-                return Err("交易出口包含未知或重复标签，无法确认实际出口");
+            if found.is_empty() {
+                return Err("交易出口包含未知标签，无法确认实际出口");
+            }
+            if found.len() > 1 {
+                // Some imported legacy profiles contain an endpoint and an
+                // outbound with the same tag. They cannot create a false VPN
+                // PASS if *all* resolutions are known tunnel terminals.
+                // A conflicting direct alias or any selector/unknown remains
+                // ambiguous and therefore UNVERIFIED.
+                if found.iter().any(|entry| entry.get("type").and_then(Value::as_str) == Some("direct")) {
+                    return Err("交易出口可能经直连，VPN 出口未验证");
+                }
+                let all_tunnels = found.iter().all(|entry| matches!(
+                    entry.get("type").and_then(Value::as_str),
+                    Some("vless" | "vmess" | "trojan" | "shadowsocks" |
+                         "hysteria" | "hysteria2" | "tuic" | "anytls" | "wireguard")
+                ));
+                return if all_tunnels { Ok(()) }
+                    else { Err("交易出口包含不确定的重复标签，无法确认实际出口") };
             }
             let entry = found[0];
             match entry.get("type").and_then(Value::as_str) {
@@ -2413,6 +2430,31 @@ mod tests {
         assert_eq!(effective["outbounds"][3]["default"], "hk", "do not change user's trade selection");
         assert_eq!(effective["outbounds"][4]["default"], "direct", "daily direct is legitimate");
         assert!(effective["inbounds"].as_array().unwrap().iter().all(|i| i["tag"] != PROBE_TAG));
+        assert!(probe_evidence_skip_reason_from_file(&path).is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trade_probe_conflicting_direct_alias_never_verifies_vpn() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-trade-direct-alias-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("line.json");
+        let runtime = root.join("runtime-engine.json");
+        let mut profile = profile_with_exits();
+        profile["outbounds"].as_array_mut().unwrap().push(
+            json!({"type":"direct","tag":"hk"})
+        );
+        std::fs::write(&line, profile.to_string()).unwrap();
+        let path = prepare_engine_config(
+            &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+            Transport::Udp, Mode::Proxy, &runtime, "",
+            Some(("synthetic-user", "synthetic-password")), Some(18003)
+        ).expect("conflicting alias suppresses evidence rather than user connection");
+        let actual: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(actual["inbounds"].as_array().unwrap().iter().all(|i| i["tag"] != PROBE_TAG));
         assert!(probe_evidence_skip_reason_from_file(&path).is_some());
         let _ = std::fs::remove_dir_all(root);
     }
