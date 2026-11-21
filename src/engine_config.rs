@@ -1771,12 +1771,20 @@ fn enforce_probe_route_invariant(obj: &mut serde_json::Map<String, Value>) -> Re
     if selector_tag_or(obj, TRADE_EXIT).is_none() {
         return Err("tc-check 探测路由缺少 trade-exit 选择器".to_string());
     }
-    let rules = obj
-        .get_mut("route")
-        .and_then(Value::as_object_mut)
-        .and_then(|route| route.get_mut("rules"))
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| "tc-check 探测路由缺少规则数组".to_string())?;
+    // A legacy/minimal line may have no route object at all. Publishing an
+    // authenticated tc-check listener without a routing rule is unsafe, but
+    // rejecting that line also breaks previously supported connections.
+    // Build the missing reserved probe rule; refuse malformed existing types.
+    let route = obj.entry("route").or_insert_with(|| json!({}));
+    let route = route.as_object_mut()
+        .ok_or_else(|| "tc-check 探测路由的 route 类型不合法".to_string())?;
+    let rules = route.entry("rules").or_insert_with(|| json!([]));
+    let rules = rules.as_array_mut()
+        .ok_or_else(|| "tc-check 探测路由规则数组类型不合法".to_string())?;
+    if rules.is_empty() {
+        rules.push(json!({ "inbound": [PROBE_TAG], "outbound": TRADE_EXIT }));
+        return Ok(true);
+    }
     let mut probe_indices = Vec::new();
     for (index, rule) in rules.iter().enumerate() {
         let inbounds = rule.get("inbound").and_then(Value::as_array);
@@ -2189,6 +2197,34 @@ mod tests {
         assert_eq!(rules[1]["outbound"], DAILY_EXIT, "catch-all rule remains after probe");
         assert_eq!(rules[2]["inbound"], json!([MIXED_TAG]));
         assert_eq!(rules[2]["outbound"], DAILY_EXIT, "mixed still uses daily exit");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tc_check_missing_route_in_legacy_minimal_line_gets_safe_rule() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-tc-check-missing-route-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("line.json");
+        let runtime = root.join("runtime-engine.json");
+        let mut profile = profile_with_exits();
+        profile.as_object_mut().unwrap().remove("route");
+        profile["inbounds"] = json!([
+            { "type": "mixed", "tag": MIXED_TAG, "listen": "127.0.0.1", "listen_port": 18000 }
+        ]);
+        std::fs::write(&line, profile.to_string()).unwrap();
+        let path = prepare_engine_config(
+            &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+            Transport::Udp, Mode::Proxy, &runtime, "",
+            Some(("synthetic-user", "synthetic-password")), Some(18003)
+        ).expect("minimal legacy line must create a safe probe route");
+        let eff: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let rules = eff["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["inbound"], json!([PROBE_TAG]));
+        assert_eq!(rules[0]["outbound"], TRADE_EXIT);
+        assert_eq!(rules.len(), 1, "missing route must not add competing rules: {rules:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 
