@@ -1,6 +1,6 @@
 # SpiderVPN 安全修复任务账本（唯一状态清单）
 
-> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.98 与 [任务分配表](./TASK_ASSIGNMENTS.md) §34 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
+> 版本 v1.0 · 初始基准 2026-11-17；**最新状态看 D.99 与 [任务分配表](./TASK_ASSIGNMENTS.md) §35 及后续增量，以下早期快照保留历史，不作为当前HEAD。文档提交不是修复完成证明**。  
 > **主方案**：[SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) · **交接入口**：[AGENT_HANDOFF.md](./AGENT_HANDOFF.md)。  
 > [仓库](https://github.com/weixiaochuchen618-debug/spidervpn) · [PR #3](https://github.com/weixiaochuchen618-debug/spidervpn/pull/3) · [既有 WFP Issue #2](https://github.com/weixiaochuchen618-debug/spidervpn/issues/2)
 
@@ -957,3 +957,8 @@ PR/commit/CI: ...
 ## D.98 2026-11-20 §34：D3执行补证冻结，转真实供应链及实机前置
 - #30 `1e40fab5b9087c6b1576c29fcba3b22b92874b48` 四workflow MSVC44747303643/GNU-B44747303646/GNU-C44747304092/Linux44747303656五job/80 steps全success，D独立[7041714943](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7041714943)、B停写7041637892；两旧GNU实际共享32失败及MSVC取消保留。双ABI实际held/替换/竞争/PE普通与delay=None/真实模块路径及完整恢复旧回归通过，正式冻结已执行隔离范围，不是生产恢复/维护PASS，非空delay、全递归/签名、恶意同admin映射未验。
 - [§34](https://github.com/weixiaochuchen618-debug/spidervpn/commit/2049e8deb78fd70089ef8c402d4a701ceeee3d98) 撤销§33写权，冻结集成源码/ref，B新只读 COORD-INT-SOURCE-EVIDENCE/R01-008-A1-REAL 实际上游版本/来源/官方校验/签名与外部可信证据，D独立，C只读。四CI artifact列表全空，无本轮安装包；本地LOCAL-02用户确认准备中，LOCAL-01总控记录7041121844，未取得新环境结果。禁止真实维护/生产安装/消费B1；R2/可信锚/外部供应链/旧writer/跨SID/UAC/真实产品/WFP05/Windows/VPS/L2L3仍BLOCKED，D2主动timeout NOT RUN。main及原分支不动。
+
+## D.99 2026-11-21 §35：LOCAL-02环境具备，来源准入与R2实机故障仍BLOCKED
+- [§35](https://github.com/weixiaochuchen618-debug/spidervpn/commit/ed89571028760da934908fcffd1c4bfb78e46cef) 用户转交LOCAL-02本地真实安装记录：GNU MSYS2/UCRT gcc16.2+binutils2.47、MSVC14.44+SDK10.0.26100、Rust1.100.0双ABI、pwsh7.7、双ABI无害Rust probe成功、真实git checkout `1e40fab5b9087c6b1576c29fcba3b22b92874b48`、Cargo离线metadata463包exit0、WFP仅提权只读导出；A未亲自验证本机原始字节/签名。正式产品编译、签发Approval、发布/安装仍NOT RUN/BLOCKED。之前无工具链缺失结论已按本地新证据更新，源码ref未动。
+- B来源矩阵[7042037212](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7042037212)、二进制[7042320287](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7042320287)、Naive[7053788953](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7053788953)及D独立[7053819385](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7053819385)：锁crated WebView2Loader 160880B SHA256 86545b...本地与B/D上游字节一致，但Microsoft SDK/NuGet/本地目标签名/链尚NOT RUN。本地sing-box v1.14.4仅STAGED；历史发行v1.14.2仅优先来源兼容核查非正式选版。上游1.14.2 Windows naive=true需libcronet.dll，固定四件清单缺且导入outbounds可透传Naive，不能默认兼容；官方ZIP/asset attestation/EXE/cronet与许可证真实材料未受信验证。保留B R01-008-A1-REAL ACTIVE_READONLY本地材料对照，D独立，C只读，不擅变engine/UI/清单或出Approval。§34已执行CI范围继续冻结。
+- R2_ENV_PLAN_20261121审查：Hyper-V/Sandbox仍disabled，无可销毁故障卷；离线次VHDX不等同固定ProgramFiles file handle write/flush失败，VM Reset/断电不等同FlushFileBuffers OS失败返回与exit1/残余UNREADY，USB拔出无法可靠证明flush；三者**均未授权执行**。须单独安全隔离Windows环境、对固定OS路径的两个真实独立API错误及native code/ID/邻居/UNREADY/同slot拒绝/环境可恢复提出有界可重复机制，用户单独授权后方能实测，否则NOT RUN。R2两类故障、D2 timeout、生产可信锚/旧writer、跨SID UAC、真实产品/供应链/维护/WFP05/Windows/VPS/L2L3仍BLOCKED_REAL_ACCEPTANCE或NOT RUN。总控[7053899233](https://github.com/weixiaochuchen618-debug/spidervpn/issues/5#issuecomment-7053899233)；#30 Draft冻结HEAD `1e40fab5b9087c6b1576c29fcba3b22b92874b48`，main/#3/#29未改。
