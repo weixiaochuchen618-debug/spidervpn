@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §99、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §38 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.102；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §100、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §39 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.103；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -760,3 +760,7 @@
 
 ## 99. 2026-11-21 §38最新恢复入口：LOCAL签名更正PARTIAL，等待原始可重验材料
 - 权威[TASK_ASSIGNMENTS §38](./TASK_ASSIGNMENTS.md)、[Backlog D.102](./REMEDIATION_BACKLOG.md)。LOCAL-02-SIGNATURE-TIME-CORRECTION已经由用户转交，B 7055152308、D 7055149233/Issue7055152715实际审：四个本机自报RFC3161 genTime落在所报Signer/TSA有效期、原2036系TSA证书NotAfter误标；旧报告文件修改JST09:55:45早于GitHub评论09:58:56在算术上相容，原10:35末时是自报录入错。仅PARTIAL逻辑自洽，D未读本机PE/DLL bytes/完整9258B signtool日志、5618B签名详情、真实DER/token、解析脚本/独立受信吊销；RFC3161 `1.2.840.113549.1.9.16.1.4`是id-ct-TSTInfo而非policy。下一LOCAL仅静态交现有非秘密原始文本/可核日志和证据hash，无下载/产品执行/新安装/环境改动；B只读对照，D独立核，C只读，A唯一全局管理。#30 Draft HEAD `1e40fab5b9087c6b1576c29fcba3b22b92874b48`冻结，未新增CI或实际产品验收；A1整体BLOCKED_REAL_ACCEPTANCE且无Approval/不准build/package/install/真实VM/R2/WFP修改/main合并。
+
+## 100. 2026-11-21 §39最新恢复入口：ZIP DER双独立数学通过、PE真实受信身份未过审
+- [TASK_ASSIGNMENTS §39](./TASK_ASSIGNMENTS.md)、[Backlog D.103](./REMEDIATION_BACKLOG.md)权威；B PR7056043746、D真实独立PR7056124256已分别取得ZIP68221B/13成员，manifest17项实际11项原字节与SHA均吻合；8份CMS/TST SignedAttrs以DER自带叶公钥数学验签8/8通过、内容摘要8/8，时间戳内嵌/独立4/4及对主SignerInfo.signature SHA256 imprint绑定4/4通过。此为新`OFFLINE_CMS_TST_CRYPTO_PASS_SCOPE`，不是本机四PE/厂商受信AuthentiCode通过；完整PE原件、WIN_CERTIFICATE/真实PE映像digest、可信根及吊销/发行身份都未独立核，`VERIFIED_SIGNATURE_INDEPENDENT=0`、`A1-REAL=BLOCKED_REAL_ACCEPTANCE`。
+- ZIP缺manifest中4脚本及2原始日志；ZIP内RAW报告15966B与另次转交19841B、更正报告本地24792B与审查转交32597B版本/交付链待核。LOCAL仅静态交已有脚本/安全脱敏日志、精确hash/版本/交接与只读PE受信验证方案，不授权完整PE外传、下载/在线吊销/产品执行或改变系统。B ACTIVE_READONLY只核真正新增，D独立READ_ONLY，C只读，A独占全局文档；#30仍Draft冻结HEAD`1e40fab5b9087c6b1576c29fcba3b22b92874b48`，§33冻结隔离CI不扩大，无新的Run/正式产品或R2验收，禁止未授权build/package/install/维护/源码/CI/ref/VM/WFP/Approval/main合并。
