@@ -1551,6 +1551,18 @@ pub fn prepare_engine_config(
     // 老线路文件（出口改造前生成）里 mixed 规则与 final 都指向 trade-exit：
     // 不纠正的话，升级上来的用户仍然是「全部走节点」，而界面/说明说的是「默认直连」。
     let exit_changed = normalize_default_exit(obj);
+    // Never publish a runtime with an authenticated tc-check listener whose
+    // first matching route might be daily-exit/direct. Normal split rules
+    // remain unchanged, but probe-only traffic takes precedence at runtime.
+    let probe_route_changed = if probe_creds.is_some()
+        && obj.get("inbounds").and_then(Value::as_array).is_some_and(|inbounds| {
+            inbounds.iter().any(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(PROBE_TAG))
+        })
+    {
+        enforce_probe_route_invariant(obj)?
+    } else {
+        false
+    };
     // 绑网卡放最后：前面几步可能增删出站（兼容连接会多插一条），绑完才不会漏。
     let bind_changed = apply_bind_interface(obj, bind_interface);
     let dns_changed = obj.get("dns") != dns_before.as_ref()
@@ -1561,6 +1573,7 @@ pub fn prepare_engine_config(
     if !dns_changed
         && !split_changed
         && !probe_changed
+        && !probe_route_changed
         && !exit_changed
         && !transport_changed
         && !mode_changed
@@ -1744,6 +1757,58 @@ fn rule_targets_probe(obj: &serde_json::Map<String, Value>) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Runtime-only fail-closed guard for the authenticated probe listener.
+///
+/// A preexisting rule can mention tc-check yet target daily-exit (which may
+/// select direct). The old `ensure_probe_rule` considered that "present",
+/// leaving the probe free to report a false trade-exit success. Refuse any
+/// wrong/ambiguous probe rule, and promote the one valid probe rule ahead of
+/// competing process/domain/catch-all rules without changing their relative
+/// ordering or the mixed/daily path.
+fn enforce_probe_route_invariant(obj: &mut serde_json::Map<String, Value>) -> Result<bool, String> {
+    if selector_tag_or(obj, TRADE_EXIT).is_none() {
+        return Err("tc-check 探测路由缺少 trade-exit 选择器".to_string());
+    }
+    let rules = obj
+        .get_mut("route")
+        .and_then(Value::as_object_mut)
+        .and_then(|route| route.get_mut("rules"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "tc-check 探测路由缺少规则数组".to_string())?;
+    let mut probe_index = None;
+    for (index, rule) in rules.iter().enumerate() {
+        let inbounds = rule.get("inbound").and_then(Value::as_array);
+        let contains_probe = inbounds.is_some_and(|tags| {
+            tags.iter().any(|tag| tag.as_str() == Some(PROBE_TAG))
+        });
+        if !contains_probe {
+            continue;
+        }
+        if probe_index.replace(index).is_some() {
+            return Err("tc-check 探测路由存在多条竞争规则，拒绝启动".to_string());
+        }
+        let exact_inbound = inbounds.is_some_and(|tags| {
+            tags.len() == 1 && tags[0].as_str() == Some(PROBE_TAG)
+        });
+        let allowed_shape = rule.as_object().is_some_and(|fields| {
+            fields.keys().all(|key| matches!(key.as_str(), "inbound" | "outbound" | "action"))
+                && fields.get("action").is_none_or(|a| a.as_str() == Some("route"))
+        });
+        if !exact_inbound || !allowed_shape
+            || rule.get("outbound").and_then(Value::as_str) != Some(TRADE_EXIT)
+        {
+            return Err("tc-check 探测路由不唯一指向 trade-exit，拒绝启动".to_string());
+        }
+    }
+    let index = probe_index.ok_or_else(|| "tc-check 探测路由缺少 trade-exit 规则".to_string())?;
+    if index == 0 {
+        return Ok(false);
+    }
+    let rule = rules.remove(index);
+    rules.insert(0, rule);
+    Ok(true)
 }
 
 /// 把探测入站连同它的路由规则整个摘掉（探测端口被占/算不出来时，连接仍要能起）。
@@ -2079,6 +2144,70 @@ mod tests {
                 );
             }
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tc_check_valid_route_precedes_catch_all_without_changing_daily_path() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-tc-check-route-priority-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("line.json");
+        let runtime = root.join("runtime-engine.json");
+        let mut profile = profile_with_exits();
+        profile["inbounds"] = json!([
+            { "type": "mixed", "tag": MIXED_TAG, "listen": "127.0.0.1", "listen_port": 18000 },
+            { "type": "socks", "tag": PROBE_TAG, "listen": "127.0.0.1", "listen_port": 18003 }
+        ]);
+        profile["route"]["rules"] = json!([
+            { "action": "route", "outbound": DAILY_EXIT },
+            { "inbound": [PROBE_TAG], "outbound": TRADE_EXIT },
+            { "inbound": [MIXED_TAG], "outbound": DAILY_EXIT }
+        ]);
+        std::fs::write(&line, profile.to_string()).unwrap();
+        let path = prepare_engine_config(
+            &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+            Transport::Udp, Mode::Proxy, &runtime, "",
+            Some(("synthetic-user", "synthetic-password")), Some(18003)
+        ).expect("valid probe route must be made first without losing other rules");
+        let effective: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let rules = effective["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["inbound"], json!([PROBE_TAG]));
+        assert_eq!(rules[0]["outbound"], TRADE_EXIT);
+        assert_eq!(rules[1]["outbound"], DAILY_EXIT, "catch-all rule remains after probe");
+        assert_eq!(rules[2]["inbound"], json!([MIXED_TAG]));
+        assert_eq!(rules[2]["outbound"], DAILY_EXIT, "mixed still uses daily exit");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tc_check_duplicate_routes_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-tc-check-route-duplicate-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("line.json");
+        let runtime = root.join("runtime-engine.json");
+        let mut profile = profile_with_exits();
+        profile["inbounds"] = json!([
+            { "type": "mixed", "tag": MIXED_TAG, "listen": "127.0.0.1", "listen_port": 18000 },
+            { "type": "socks", "tag": PROBE_TAG, "listen": "127.0.0.1", "listen_port": 18003 }
+        ]);
+        profile["route"]["rules"] = json!([
+            { "inbound": [PROBE_TAG], "outbound": TRADE_EXIT },
+            { "inbound": [PROBE_TAG], "outbound": DAILY_EXIT }
+        ]);
+        std::fs::write(&line, profile.to_string()).unwrap();
+        let error = prepare_engine_config(
+            &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+            Transport::Udp, Mode::Proxy, &runtime, "",
+            Some(("synthetic-user", "synthetic-password")), Some(18003)
+        ).expect_err("multiple probe routes must fail closed");
+        assert!(error.contains("tc-check"), "{error}");
+        assert!(!runtime.exists(), "unsafe runtime configuration must not be published");
         let _ = std::fs::remove_dir_all(root);
     }
 
