@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §98、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §37 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.101；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §99、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §38 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.102；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -757,3 +757,6 @@
 
 ## 98. 2026-11-21 §37最新恢复入口：先解LOCAL签名与报告完成时刻冲突
 - [TASK_ASSIGNMENTS §37](./TASK_ASSIGNMENTS.md)、[Backlog D.101](./REMEDIATION_BACKLOG.md) 权威。B增量PR#30 7054668141、D独立终审7054832058发现LOCAL四项证书签名时点/有效期矛盾（含未来2036日期）及报告自称10:35 JST已完成却在09:58:56 JST先被B发布；需本地静态只读补真实签发者/TimeStamper各证书、RFC3161/CMS genTime、报告生成/交付时间及既有signtool验证原始输出，不认定伪造或签名已无效，也不能签Approval。#30 Draft HEAD `1e40fab5b9087c6b1576c29fcba3b22b92874b48` 仍冻结；LOCAL只读，B只读增量对照，D独立审，A全局写权。1.14.4仅STAGED，1.14.2官方ZIP/cronet/attestation未验；R2真实mid-write/flush和其余P0阻塞未运行，绝不授权产品编译安装、引擎/清单/UI更改、系统/VM/磁盘故障或main合并。
+
+## 99. 2026-11-21 §38最新恢复入口：LOCAL签名更正PARTIAL，等待原始可重验材料
+- 权威[TASK_ASSIGNMENTS §38](./TASK_ASSIGNMENTS.md)、[Backlog D.102](./REMEDIATION_BACKLOG.md)。LOCAL-02-SIGNATURE-TIME-CORRECTION已经由用户转交，B 7055152308、D 7055149233/Issue7055152715实际审：四个本机自报RFC3161 genTime落在所报Signer/TSA有效期、原2036系TSA证书NotAfter误标；旧报告文件修改JST09:55:45早于GitHub评论09:58:56在算术上相容，原10:35末时是自报录入错。仅PARTIAL逻辑自洽，D未读本机PE/DLL bytes/完整9258B signtool日志、5618B签名详情、真实DER/token、解析脚本/独立受信吊销；RFC3161 `1.2.840.113549.1.9.16.1.4`是id-ct-TSTInfo而非policy。下一LOCAL仅静态交现有非秘密原始文本/可核日志和证据hash，无下载/产品执行/新安装/环境改动；B只读对照，D独立核，C只读，A唯一全局管理。#30 Draft HEAD `1e40fab5b9087c6b1576c29fcba3b22b92874b48`冻结，未新增CI或实际产品验收；A1整体BLOCKED_REAL_ACCEPTANCE且无Approval/不准build/package/install/真实VM/R2/WFP修改/main合并。
