@@ -2017,6 +2017,71 @@ mod tests {
         );
     }
 
+    /// Negative: a legacy or hostile profile already points tc-check at
+    /// daily-exit (whose default is direct). A successful self-check must
+    /// never be possible through that route. No real endpoints or secrets.
+    #[test]
+    fn tc_check_existing_daily_route_cannot_survive_prepare() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-tc-check-route-negative-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("line.json");
+        let runtime = root.join("runtime-engine.json");
+        let mut profile = profile_with_exits();
+        profile["inbounds"] = json!([
+            { "type": "mixed", "tag": MIXED_TAG, "listen": "127.0.0.1", "listen_port": 18000 },
+            { "type": "socks", "tag": PROBE_TAG, "listen": "127.0.0.1", "listen_port": 18003 }
+        ]);
+        profile["route"]["rules"] = json!([
+            { "inbound": [PROBE_TAG], "outbound": DAILY_EXIT },
+            { "inbound": [MIXED_TAG], "outbound": DAILY_EXIT }
+        ]);
+        profile["route"]["final"] = json!(DAILY_EXIT);
+        std::fs::write(&line, profile.to_string()).unwrap();
+
+        let prepared = prepare_engine_config(
+            &line,
+            &SplitConfig::default(),
+            &crate::config::AgentsConfig::default(),
+            Transport::Udp,
+            Mode::Proxy,
+            &runtime,
+            "",
+            Some(("synthetic-user", "synthetic-password")),
+            Some(18003),
+        );
+        match prepared {
+            // A precise fail-closed refusal is safe; unrelated failures are not.
+            Err(reason) => assert!(
+                reason.contains("tc-check") || reason.contains("探测"),
+                "unexpected refusal instead of a probe-route invariant: {reason}"
+            ),
+            Ok(path) => {
+                let effective: Value =
+                    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                let rules = effective["route"]["rules"].as_array().unwrap();
+                let for_probe: Vec<_> = rules
+                    .iter()
+                    .filter(|r| r["inbound"].as_array().is_some_and(|tags| {
+                        tags.iter().any(|tag| tag == PROBE_TAG)
+                    }))
+                    .collect();
+                assert_eq!(for_probe.len(), 1, "ambiguous tc-check routes: {rules:?}");
+                assert_eq!(
+                    for_probe[0]["outbound"], TRADE_EXIT,
+                    "tc-check must never reach daily-exit/direct: {rules:?}"
+                );
+                assert_eq!(
+                    rules[0]["inbound"], json!([PROBE_TAG]),
+                    "tc-check route must precede potentially competing rules: {rules:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn probe_inbound_is_not_added_when_mixed_port_unknown() {
         // 算不出探测端口（没有 mixed 入站）→ 不补入站，**也不能留下指向不存在入站的规则**
