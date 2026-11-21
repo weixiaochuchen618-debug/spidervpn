@@ -2165,6 +2165,106 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A probe routed through the trade-exit *tag* does not prove VPN egress
+    /// when the user's selected trade-exit member is itself direct.
+    /// Synthetic config only: no private keys, live ports or network traffic.
+    #[test]
+    fn tc_check_trade_selector_default_direct_cannot_claim_vpn_egress() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-tc-check-trade-direct-negative-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("line.json");
+        let runtime = root.join("runtime-engine.json");
+        let mut profile = profile_with_exits();
+        profile["outbounds"] = json!([
+            { "type": "direct", "tag": "direct" },
+            { "type": "wireguard", "tag": "hk", "server": "198.51.100.10", "server_port": 51820 },
+            { "type": "selector", "tag": TRADE_EXIT, "outbounds": ["direct", "hk"], "default": "direct" },
+            { "type": "selector", "tag": DAILY_EXIT, "outbounds": ["direct", "hk"], "default": "direct" }
+        ]);
+        profile["inbounds"] = json!([
+            { "type": "mixed", "tag": MIXED_TAG, "listen": "127.0.0.1", "listen_port": 18000 },
+            { "type": "socks", "tag": PROBE_TAG, "listen": "127.0.0.1", "listen_port": 18003 }
+        ]);
+        profile["route"]["rules"] = json!([
+            { "inbound": [PROBE_TAG], "outbound": TRADE_EXIT },
+            { "inbound": [MIXED_TAG], "outbound": DAILY_EXIT }
+        ]);
+        profile["route"]["final"] = json!(DAILY_EXIT);
+        std::fs::write(&line, profile.to_string()).unwrap();
+
+        let prepared = prepare_engine_config(
+            &line,
+            &SplitConfig::default(),
+            &crate::config::AgentsConfig::default(),
+            Transport::Udp,
+            Mode::Proxy,
+            &runtime,
+            "",
+            Some(("synthetic-user", "synthetic-password")),
+            Some(18003),
+        );
+        match prepared {
+            Err(reason) => {
+                assert!(
+                    reason.contains("trade-exit")
+                        || reason.contains("tc-check")
+                        || reason.contains("交易出口")
+                        || reason.contains("探测"),
+                    "unexpected refusal unrelated to trade-direct probe safety: {reason}"
+                );
+            }
+            Ok(path) => {
+                let effective: Value =
+                    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                let outbounds = effective["outbounds"].as_array().unwrap();
+                let trade = outbounds.iter()
+                    .find(|o| o["tag"] == TRADE_EXIT)
+                    .expect("trade-exit selector must be present");
+                let direct = outbounds.iter()
+                    .find(|o| o["tag"] == "direct")
+                    .expect("direct outbound must be present");
+                let daily = outbounds.iter()
+                    .find(|o| o["tag"] == DAILY_EXIT)
+                    .expect("daily selector must be present");
+                let probe_authenticated = effective["inbounds"].as_array()
+                    .is_some_and(|ins| ins.iter().any(|i| {
+                        i["tag"] == PROBE_TAG
+                            && i["type"] == "socks"
+                            && i["users"].as_array().is_some_and(|users| {
+                                users.iter().any(|u| {
+                                    u["username"] == "synthetic-user"
+                                        && u["password"] == "synthetic-password"
+                                })
+                            })
+                    }));
+                let probe_routed_to_trade = effective["route"]["rules"].as_array()
+                    .is_some_and(|rules| rules.iter().any(|r| {
+                        r["outbound"] == TRADE_EXIT
+                            && r["inbound"].as_array().is_some_and(|tags| {
+                                tags.iter().any(|t| t == PROBE_TAG)
+                            })
+                    }));
+                let trade_selects_direct = trade["type"] == "selector"
+                    && trade["default"] == "direct"
+                    && trade["outbounds"].as_array().is_some_and(|members| {
+                        members.iter().any(|member| member == "direct")
+                    })
+                    && direct["type"] == "direct";
+
+                // Daily direct is legitimate; do not "fix" normal user behavior.
+                assert_eq!(daily["default"], "direct");
+                assert!(
+                    !(probe_authenticated && probe_routed_to_trade && trade_selects_direct),
+                    "trade-exit selector defaults to direct: authenticated tc-check can take a direct path while the trade-exit tag appears verified (no actual VPN egress established)"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn tc_check_valid_route_precedes_catch_all_without_changing_daily_path() {
         let root = std::env::temp_dir().join(format!(
