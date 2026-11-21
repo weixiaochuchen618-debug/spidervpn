@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §101、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §40 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.104；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §102、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §41 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.105；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -768,3 +768,6 @@
 ## 101. 2026-11-21 §40最新恢复入口：PE绑定自报4/4，采集脚本实际字节待交
 - [TASK_ASSIGNMENTS §40](./TASK_ASSIGNMENTS.md)、[Backlog D.104](./REMEDIATION_BACKLOG.md) 作为最新恢复入口。B真正读LOCAL PE绑定计划报告21267B/SHA bd83251c81059258a8369037cb6e78921b073a3fa03154190e13f0e0979e33c3（仅报告），D独立核先前ZIP真实manifest缺席6项声明字段与B摘录6/6一致、并非6原件SHA通过；没有拿到报告新原字节。LOCAL声称四本机PE S1–S5 4/4与LocalMachine根5/5均仅REPORTED_LOCAL；无真实PE/采集脚本/原stdout可独立核，WINDOWS_TRUST/PE_BINDING=NOT RUN，R01-008-A1-REAL仍BLOCKED。§39双Agent DER8/8数学与4/4 imprint有限PASS保留。RAW同名报告15966B/19841B与CORRECTION本机24792B/转交32597B实际版本来源未闭环，原因UNKNOWN。
 - 新LOCAL仅静态安全脱敏提供现存四采集脚本和本机PE验证两脚本的**真实可审字节**、原件/脱敏日志对应元数据及报告版本链；禁止运行脚本、未经许可传秘密或完整PE，需完整PE或可信发行源的独立复核必须另请A及用户批准。B ACTIVE_READONLY限新字节核验，D READ_ONLY独立核，C只读，A唯一全局写权。#30 Draft frozenHEAD 1e40fab5b9087c6b1576c29fcba3b22b92874b48，#3/#29未改，原D3四CI不重跑，无新产品/真实R2验收，无源码/CI/ref/清单/UI/系统修改与发布合并。
+
+## 102. 2026-11-21 §41最新恢复入口：真实静态ZIP已双审、实际生成链需补证
+- 以[TASK_ASSIGNMENTS §41](./TASK_ASSIGNMENTS.md)和[Backlog D.105](./REMEDIATION_BACKLOG.md)为权威。B PR7056822502、D独立PR7056929133分别对用户真交ZIP28698B SHA `efff9a8bdc0ac8fdca5f762fb096bdb25a33c40e797b08bbd1dbe2a6e6206e57` 做只读静态核证：manifest13/13实际bytes+SHA，脱敏8件按精确映射只在内存回填可逆原哈希8/8，双份脱敏日志与旧ZIP2/2原字节一致，RAW章节地图16/16真核，**不证明当前LOCAL原文件、信任PE或当时实际生成命令**。6份脚本实读发现make_handoff的BOM/manifest生成格式与现存产物不同、脱敏改变替换变量语义，spc_bind_check2没有独立计算完整PE Authenticode image digest，旧两时间解析脚本曾混用SigningTime/genTime和CMS contentType/TSTInfo policy；这些不抹去已冻DER8/8/4/4，只说明实际生成器/后处理链`UNKNOWN`，脱敏脚本严禁执行。LOCAL下一步只静态交已存在的原生成版本/原stdout与后处理记录及可以安全提供的CORRECTION/DELTA原字节与交接材料；B ACTIVE_READONLY只对新增真bytes审，D独立READ_ONLY，C只读，A唯一全局文档。集成#30 Draft冻结HEAD `1e40fab5b9087c6b1576c29fcba3b22b92874b48`、#3/#29原Draft不变，无新CI。完整PE/Windows信任根/吊销/外部Approval仍未验，A1-REAL BLOCKED；不下载、运行、构建安装、真实R2/WFP/UAC/磁盘/VM/源码CI refs/engine/清单/UI/发布合并。
