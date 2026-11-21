@@ -603,8 +603,23 @@ fn parse_status(line: &str) -> Result<u16, String> {
 /// 按探测计划自检并落盘，返回结论。**永不返回错误**：自检失败不代表连接失败
 /// （可能只是这个域名被用户网络屏蔽），把失败变成 Err 会诱使调用方回滚一次正常的连接。
 pub fn check_and_record(root: &Path, plan: &ProbePlan, timeout_ms: u64) -> Check {
-    // 这是一次新连接的证据采集：无论随后通过、失败或跳过，旧读数都不能留成当前值。
+    // This check belongs to a new connection: never present old IP/latency
+    // evidence as if it were measured by the newly selected trade route.
+    crate::exit_probe::clear(root);
     clear_latency(root);
+    // A plan's credentials alone cannot prove trade egress. Inspect the exact
+    // engine config that was prepared for this session BEFORE any SOCKS dial.
+    // If the selector can reach direct (including cached alternate members),
+    // skip evidence, but do not undo the user's actual connection/selection.
+    let safe_plan = match plan {
+        ProbePlan::Dial { port, .. } if probe_creds(root).is_some() => {
+            crate::engine_config::probe_evidence_skip_reason_from_file(
+                &root.join("runtime-engine.json")
+            ).map(|reason| ProbePlan::Skip { port: Some(*port), reason })
+        }
+        _ => None,
+    };
+    let plan = safe_plan.as_ref().unwrap_or(plan);
     let at = crate::model::now_epoch_secs_u64();
     let mut latency = None;
     let c = match plan {
@@ -701,6 +716,17 @@ pub fn check_and_record(root: &Path, plan: &ProbePlan, timeout_ms: u64) -> Check
             eprintln!("延迟测量结果未能写入：{e}");
         }
     }
+    if c.skipped.is_some() {
+        // An old transport preference must not be interpreted as verification
+        // from this connection when we deliberately could not probe its egress.
+        if let Ok(Some(cfg)) = crate::config::load(&root.join(crate::config::DEFAULT_PATH)) {
+            if let Some(line) = cfg.current_line() {
+                if let Err(e) = crate::config::clear_verified_transport(root, &line.id) {
+                    eprintln!("无法清除旧连接验证状态：{e}");
+                }
+            }
+        }
+    }
     // 落盘失败只影响「下次还能不能看到这条结论」，不影响本次连接结果。
     if let Err(e) = save(root, &c) {
         eprintln!("自检结果未能写入：{e}");
@@ -715,6 +741,12 @@ pub fn measure_latency_and_record(root: &Path, timeout_ms: u64) -> Result<Latenc
     let connection_started_at = runtime_started_at(root).ok_or_else(|| {
         MeasureError::new("environment", "当前连接缺少启动标识，请重新连接后测量")
     })?;
+    if let Some(reason) = crate::engine_config::probe_evidence_skip_reason_from_file(
+        &root.join("runtime-engine.json")
+    ) {
+        clear_latency(root);
+        return Err(MeasureError::new("config", format!("VPN 出口未验证：{reason}")));
+    }
     let port = active_probe_port(root).map_err(|e| MeasureError::new("config", e))?;
     let (user, pass) = probe_creds(root).ok_or_else(|| {
         MeasureError::new("environment", "当前连接没有探测凭据，请重新连接后测量")
@@ -978,6 +1010,14 @@ mod tests {
             r#"{{"SchemaVersion":1,"SupervisorPid":0,"EnginePid":{engine_pid},"StartedAt":"2026-01-01T00:00:00Z","State":"Running","Error":null,"CleanupError":false,"TradingDirectAccessBlocked":false,"BootStartedAt":"2026-01-01T00:00:00Z"}}"#
         );
         std::fs::write(root.join("runtime.json"), body).unwrap();
+        // Existing fake SOCKS tests must explicitly model an eligible trade
+        // selector; production no longer trusts a port/HTTP204 alone.
+        std::fs::write(root.join("runtime-engine.json"),
+            r#"{"outbounds":[{"type":"vless","tag":"hk"},{"type":"selector","tag":"trade-exit","outbounds":["hk"],"default":"hk"}],
+                "inbounds":[{"type":"socks","tag":"tc-check","listen":"127.0.0.1",
+                "users":[{"username":"u","password":"p"}]}],
+                "route":{"rules":[{"inbound":["tc-check"],"outbound":"trade-exit"}]}}"#
+        ).unwrap();
     }
 
     /// 「引擎活着」：拿测试进程自己的 pid 当引擎——它当然活着。
@@ -993,7 +1033,10 @@ mod tests {
         std::fs::write(
             root.join("runtime-engine.json"),
             format!(
-                r#"{{"inbounds":[{{"type":"socks","tag":"tc-check","listen":"127.0.0.1","listen_port":{port}}}]}}"#
+                r#"{{"outbounds":[{{"type":"vless","tag":"hk"}},{{"type":"selector","tag":"trade-exit","outbounds":["hk"],"default":"hk"}}],
+                    "inbounds":[{{"type":"socks","tag":"tc-check","listen":"127.0.0.1","listen_port":{port},
+                    "users":[{{"username":"u","password":"p"}}]}}],
+                    "route":{{"rules":[{{"inbound":["tc-check"],"outbound":"trade-exit"}}]}}}}"#
             ),
         )
         .unwrap();
@@ -1202,6 +1245,30 @@ mod tests {
         assert_ne!(u1, u2, "两次连接的用户名必须不同");
         assert_ne!(p1, p2, "两次连接的密码必须不同");
         assert!(u1.len() >= 8 && p1.len() >= 8, "凭据不能短到可猜：{u1}/{p1}");
+    }
+
+    #[test]
+    fn trade_direct_unsafe_runtime_skips_without_network_and_invalidates_old_latency() {
+        let root = tmp_root("trade-direct-skip");
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        std::fs::write(root.join("runtime-engine.json"),
+            r#"{"outbounds":[{"type":"direct","tag":"direct"},
+                {"type":"vless","tag":"hk"},
+                {"type":"selector","tag":"trade-exit","outbounds":["direct","hk"],"default":"direct"}],
+                "inbounds":[{"type":"socks","tag":"tc-check","listen":"127.0.0.1",
+                    "users":[{"username":"u","password":"p"}]}],
+                "route":{"rules":[{"inbound":["tc-check"],"outbound":"trade-exit"}]}}"#
+        ).unwrap();
+        let _ = std::fs::write(root.join(LATENCY_FILE_NAME), "{}");
+        let c = check_and_record(&root, &dial_plan(closed_port(), "u", "p"), 1);
+        assert!(!c.ok && c.status.is_none() && !c.via_trade_exit.eq(&false));
+        assert!(c.skipped.as_deref().is_some_and(|reason| reason.contains("直连")), "{c:?}");
+        assert!(c.verdict().starts_with("自检跳过："), "{c:?}");
+        assert!(load_current_latency(&root).is_none());
+        assert!(!root.join(LATENCY_FILE_NAME).exists());
+        assert!(measure_latency_and_record(&root, 1).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
