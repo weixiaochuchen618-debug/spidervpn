@@ -1856,15 +1856,20 @@ pub(crate) fn probe_evidence_skip_reason_from_file(path: &std::path::Path) -> Op
         return Some(reason);
     }
     let active = obj.get("inbounds").and_then(Value::as_array).is_some_and(|ins| {
-        ins.iter().filter(|i| i.get("tag").and_then(Value::as_str) == Some(PROBE_TAG))
-            .filter(|i| {
-                i.get("type").and_then(Value::as_str) == Some("socks")
-                && i.get("listen").and_then(Value::as_str) == Some("127.0.0.1")
-                && i.get("users").and_then(Value::as_array).is_some_and(|users| {
-                    users.len() == 1 && users[0].get("username").and_then(Value::as_str).is_some()
-                        && users[0].get("password").and_then(Value::as_str).is_some()
-                })
-            }).count() == 1
+        let probes: Vec<_> = ins.iter()
+            .filter(|i| i.get("tag").and_then(Value::as_str) == Some(PROBE_TAG))
+            .collect();
+        if probes.len() != 1 {
+            return false;
+        }
+        let i = probes[0];
+        i.get("type").and_then(Value::as_str) == Some("socks")
+            && i.get("listen").and_then(Value::as_str) == Some("127.0.0.1")
+            && i.get("users").and_then(Value::as_array).is_some_and(|users| {
+                users.len() == 1
+                    && users[0].get("username").and_then(Value::as_str).is_some()
+                    && users[0].get("password").and_then(Value::as_str).is_some()
+            })
     });
     if !active {
         return Some("本次未启用可验证的认证探测入口，VPN 出口未验证".to_string());
@@ -2466,6 +2471,14 @@ mod tests {
             i["tag"] == PROBE_TAG && i["users"][0]["username"] == "synthetic-user"
         }));
         assert_eq!(probe_evidence_skip_reason_from_file(&path), None);
+        // Runtime postprocessing must never mistake one valid authenticated
+        // listener plus an extra unsafe reserved-tag listener for a valid plan.
+        let mut tampered = effective.clone();
+        tampered["inbounds"].as_array_mut().unwrap().push(json!({
+            "type": "socks", "tag": PROBE_TAG, "listen": "127.0.0.1", "listen_port": 18009
+        }));
+        std::fs::write(&path, tampered.to_string()).unwrap();
+        assert!(probe_evidence_skip_reason_from_file(&path).is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 
