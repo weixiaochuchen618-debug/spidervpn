@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §95、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §34 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.98；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §96、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §35 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.99；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -747,3 +747,7 @@
 ## 95. 2026-11-20 §34最新恢复入口：D3补证已冻结，真实供应链任务与本地环境并行
 - [§34](https://github.com/weixiaochuchen618-debug/spidervpn/commit/2049e8deb78fd70089ef8c402d4a701ceeee3d98)、[Backlog D.98](./REMEDIATION_BACKLOG.md) 生效；#30 Draft HEAD `1e40fab5b9087c6b1576c29fcba3b22b92874b48`，D终审7041714943/B停写7041637892、四workflow五job/80 steps及双ABI真实持有/拒替换/PE/模块快照/恢复完整回归均实核，已执行隔离范围冻结，不是生产维护PASS。旧两GNU失败与MSVC取消保留，四CI artifact实际均空。
 - B新只读 COORD-INT-SOURCE-EVIDENCE/R01-008-A1-REAL，实际查证上游固定版本/资产/官方校验签名/外部信任材料并在PR/Issue记录，D独立，C只读；撤销§33源码/ref写权，不再泛化LAB。用户确认本地LOCAL-02仍准备环境，已接受LOCAL-01报告7041121844，保持本地权限，不授权正式产品编译/安装。R2、外部可信材料/锚部署、真实产品恢复与维护、旧writer/跨SID/UAC、WFP05/Windows/VPS/L2L3继续BLOCKED，D2主动timeout NOT RUN。总控[7041811251](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7041811251)，main/原分支不动。
+
+## 96. 2026-11-21 §35最新恢复入口：本地工具链完成，独立A1信任及R2实机门槛未完成
+- [§35](https://github.com/weixiaochuchen618-debug/spidervpn/commit/ed89571028760da934908fcffd1c4bfb78e46cef)、[Backlog D.99](./REMEDIATION_BACKLOG.md) 生效。#30 Draft HEAD `1e40fab5b9087c6b1576c29fcba3b22b92874b48` 未动；B R01-008-A1-REAL ACTIVE_READONLY、D独立同证据核验、C只读、A唯一全局文档写权，无产品或test源码/ref写权。B真实矩阵7042037212/7042320287/7053788953及D7053819385保留，真实供应链BLOCKED，尤其已证v1.14.2 Windows Naive有条件需libcronet DLL而当前四件未包含、不能私换版本或改功能。
+- 用户LOCAL-02报告为真实本机工具链安装/无害probe及Cargo offline/git checkout/WFP只读的自报证据：GNU/MSVC/Rust1.100/pwsh7工具准备READY，真实产品编译/安装NOT RUN，独立Approval/厂商ZIP/微软SDK实际签名/加载及正式版本未过审；本机暂存sing-box1.14.4不算项目1.14.2来源认可。R2_ENV_PLAN_20261121只是方案，Hyper-V/独立电脑/USB SSD均未授权故障：次VHDX offline与固定ProgramFiles不同、VM Reset不等于FlushFileBuffers失败；真实R2-a/R2-b各自NOT RUN，需更正独立可恢复VM/真实API fault机制及用户明确授权，禁止宿主故障操作。B只读对照本地非秘密来源、D独立，A后续按实证再授权受控非安装构建；L2/L3、WFP05/跨SID UAC/旧writer/真实安装卸载仍阻塞。总控[7053900236](https://github.com/weixiaochuchen618-debug/spidervpn/pull/30#issuecomment-7053900236)，无部署/发布/main合并。
