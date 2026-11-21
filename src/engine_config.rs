@@ -1544,9 +1544,15 @@ pub fn prepare_engine_config(
     let transport_changed = apply_transport_with(obj, transport, compatible.as_ref())?;
     // DNS 放在这之后：只有注入/保留了 `tc-transport` 出站，才谈得上「经隧道解析」。
     normalize_dns_trade(obj, split, agents);
+    // A selector's cached/active member may differ from default; enumerate
+    // every candidate, including nested selectors. If any could be direct or
+    // cannot be resolved, keep the user's chosen connection unchanged but
+    // remove the authenticated probe entry point and its routes.
+    let evidence_suppressed = probe_creds.is_some()
+        && trade_probe_rejection_reason(obj).is_some();
     let probe_changed = match probe_creds {
-        Some((user, pass)) => inject_probe_creds(obj, user, pass, probe_port),
-        None => remove_probe_inbound(obj),
+        Some((user, pass)) if !evidence_suppressed => inject_probe_creds(obj, user, pass, probe_port),
+        _ => remove_probe_inbound(obj),
     };
     // 老线路文件（出口改造前生成）里 mixed 规则与 final 都指向 trade-exit：
     // 不纠正的话，升级上来的用户仍然是「全部走节点」，而界面/说明说的是「默认直连」。
@@ -1573,6 +1579,7 @@ pub fn prepare_engine_config(
     if !dns_changed
         && !split_changed
         && !probe_changed
+        && !evidence_suppressed
         && !probe_route_changed
         && !exit_changed
         && !transport_changed
@@ -1757,6 +1764,120 @@ fn rule_targets_probe(obj: &serde_json::Map<String, Value>) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Whether the trade-exit *selection graph* could lead to direct/unknown egress.
+///
+/// Do not trust the selector's `default`: sing-box can retain a selected member
+/// across starts or switch members at runtime. The probe is eligible only when
+/// **every** possible selector/urltest member terminates in a known tunnel
+/// outbound or WireGuard endpoint. Unknown tags/types, cycles and malformed
+/// members are deliberately UNVERIFIED, never a VPN-egress PASS.
+fn trade_probe_rejection_reason(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    fn traverse(
+        tag: &str,
+        obj: &serde_json::Map<String, Value>,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Result<(), &'static str> {
+        if !seen.insert(tag.to_string()) {
+            return Err("交易出口选择器存在循环，无法确认实际出口");
+        }
+        let result = (|| {
+            let outbounds = obj.get("outbounds").and_then(Value::as_array)
+                .ok_or("交易出口缺少出站列表，无法验证")?;
+            let endpoints = obj.get("endpoints").and_then(Value::as_array);
+            let outbound = outbounds.iter().filter(|v| v.get("tag").and_then(Value::as_str) == Some(tag));
+            let endpoint = endpoints.into_iter().flatten()
+                .filter(|v| v.get("tag").and_then(Value::as_str) == Some(tag));
+            let found: Vec<_> = outbound.chain(endpoint).collect();
+            if found.len() != 1 {
+                return Err("交易出口包含未知或重复标签，无法确认实际出口");
+            }
+            let entry = found[0];
+            match entry.get("type").and_then(Value::as_str) {
+                Some("direct") => Err("交易出口可能经直连，VPN 出口未验证"),
+                Some("selector" | "urltest") => {
+                    let members = entry.get("outbounds").and_then(Value::as_array)
+                        .filter(|a| !a.is_empty())
+                        .ok_or("交易出口选择器没有可确认的成员")?;
+                    let defaults_to_member = entry.get("default").is_none_or(|default| {
+                        default.as_str().is_some_and(|name| {
+                            members.iter().any(|m| m.as_str() == Some(name))
+                        })
+                    });
+                    if !defaults_to_member {
+                        return Err("交易出口默认成员不在选择器中，无法确认");
+                    }
+                    for member in members {
+                        let selected = member.as_str().filter(|s| !s.is_empty())
+                            .ok_or("交易出口包含无效成员，无法确认")?;
+                        traverse(selected, obj, seen)?;
+                    }
+                    Ok(())
+                }
+                Some("vless" | "vmess" | "trojan" | "shadowsocks" |
+                     "hysteria" | "hysteria2" | "tuic" | "anytls" | "wireguard") => Ok(()),
+                _ => Err("交易出口包含未知类型，无法排除直连"),
+            }
+        })();
+        seen.remove(tag);
+        result
+    }
+
+    let is_selector = obj.get("outbounds").and_then(Value::as_array).is_some_and(|outs| {
+        outs.iter().any(|o| {
+            o.get("tag").and_then(Value::as_str) == Some(TRADE_EXIT)
+                && o.get("type").and_then(Value::as_str) == Some("selector")
+        })
+    });
+    if !is_selector {
+        return Some("交易出口不是可确认的选择器，VPN 出口未验证".to_string());
+    }
+    traverse(TRADE_EXIT, obj, &mut std::collections::HashSet::new())
+        .err().map(str::to_string)
+}
+
+/// Validate the exact runtime that the current connection is about to probe.
+/// Absence, malformed JSON, missing authentication or an uncertain selector all
+/// mean SKIP, even if a stale port elsewhere would return HTTP 204.
+pub(crate) fn probe_evidence_skip_reason_from_file(path: &std::path::Path) -> Option<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return Some("无法读取本次引擎配置，VPN 出口未验证".to_string()),
+    };
+    let root: Value = match serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)) {
+        Ok(v) => v,
+        Err(_) => return Some("本次引擎配置格式无法确认，VPN 出口未验证".to_string()),
+    };
+    let Some(obj) = root.as_object() else {
+        return Some("本次引擎配置无法确认，VPN 出口未验证".to_string());
+    };
+    if let Some(reason) = trade_probe_rejection_reason(obj) {
+        return Some(reason);
+    }
+    let active = obj.get("inbounds").and_then(Value::as_array).is_some_and(|ins| {
+        ins.iter().filter(|i| i.get("tag").and_then(Value::as_str) == Some(PROBE_TAG))
+            .filter(|i| {
+                i.get("type").and_then(Value::as_str) == Some("socks")
+                && i.get("listen").and_then(Value::as_str) == Some("127.0.0.1")
+                && i.get("users").and_then(Value::as_array).is_some_and(|users| {
+                    users.len() == 1 && users[0].get("username").and_then(Value::as_str).is_some()
+                        && users[0].get("password").and_then(Value::as_str).is_some()
+                })
+            }).count() == 1
+    });
+    if !active {
+        return Some("本次未启用可验证的认证探测入口，VPN 出口未验证".to_string());
+    }
+    let routed = obj.get("route").and_then(Value::as_object)
+        .and_then(|route| route.get("rules")).and_then(Value::as_array)
+        .and_then(|rules| rules.first())
+        .is_some_and(|first| {
+            first.get("inbound").and_then(Value::as_array)
+                .is_some_and(|tags| tags.len() == 1 && tags[0] == PROBE_TAG)
+                && first.get("outbound").and_then(Value::as_str) == Some(TRADE_EXIT)
+        });
+    (!routed).then(|| "本次认证探测路由无法确认，VPN 出口未验证".to_string())
 }
 
 /// Runtime-only fail-closed guard for the authenticated probe listener.
@@ -2262,6 +2383,89 @@ mod tests {
                 );
             }
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trade_probe_direct_candidate_even_with_safe_default_is_unverified() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-trade-candidate-direct-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("line.json");
+        let runtime = root.join("runtime-engine.json");
+        let mut profile = profile_with_exits();
+        profile["outbounds"][3]["outbounds"] = json!(["hk", "direct"]);
+        profile["outbounds"][3]["default"] = json!("hk");
+        std::fs::write(&line, profile.to_string()).unwrap();
+        let path = prepare_engine_config(
+            &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+            Transport::Udp, Mode::Proxy, &runtime, "",
+            Some(("synthetic-user", "synthetic-password")), Some(18003)
+        ).expect("must keep the user's chosen connection, just not its probe");
+        let effective: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(effective["outbounds"][3]["default"], "hk", "do not change user's trade selection");
+        assert_eq!(effective["outbounds"][4]["default"], "direct", "daily direct is legitimate");
+        assert!(effective["inbounds"].as_array().unwrap().iter().all(|i| i["tag"] != PROBE_TAG));
+        assert!(probe_evidence_skip_reason_from_file(&path).is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trade_probe_nested_direct_cycle_and_unknown_members_skip_without_rewriting_trade() {
+        for (suffix, member) in [
+            ("nested-direct", json!({"type":"selector","tag":"nested","outbounds":["direct","hk"],"default":"hk"})),
+            ("cycle", json!({"type":"selector","tag":"nested","outbounds":[TRADE_EXIT],"default":TRADE_EXIT})),
+            ("missing", json!({"type":"selector","tag":"nested","outbounds":["not-a-tag"],"default":"not-a-tag"})),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "spidervpn-trade-nested-{}-{suffix}", std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let line = root.join("line.json");
+            let runtime = root.join("runtime-engine.json");
+            let mut profile = profile_with_exits();
+            profile["outbounds"][3]["outbounds"] = json!(["nested"]);
+            profile["outbounds"][3]["default"] = json!("nested");
+            profile["outbounds"].as_array_mut().unwrap().push(member);
+            std::fs::write(&line, profile.to_string()).unwrap();
+            let path = prepare_engine_config(
+                &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+                Transport::Udp, Mode::Proxy, &runtime, "",
+                Some(("synthetic-user", "synthetic-password")), Some(18003)
+            ).expect("uncertain trade selection must not prevent connecting");
+            let effective: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(effective["outbounds"][3]["default"], "nested");
+            assert!(effective["inbounds"].as_array().unwrap().iter().all(|i| i["tag"] != PROBE_TAG));
+            assert!(probe_evidence_skip_reason_from_file(&path).is_some());
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn trade_probe_safe_non_direct_selection_keeps_authenticated_probe_and_daily_direct() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-trade-all-safe-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("line.json");
+        let runtime = root.join("runtime-engine.json");
+        let profile = profile_with_exits();
+        std::fs::write(&line, profile.to_string()).unwrap();
+        let path = prepare_engine_config(
+            &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+            Transport::Udp, Mode::Proxy, &runtime, "",
+            Some(("synthetic-user", "synthetic-password")), Some(18003)
+        ).expect("non-direct trade members remain probe-eligible");
+        let effective: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(effective["outbounds"][4]["default"], "direct");
+        assert!(effective["inbounds"].as_array().unwrap().iter().any(|i| {
+            i["tag"] == PROBE_TAG && i["users"][0]["username"] == "synthetic-user"
+        }));
+        assert_eq!(probe_evidence_skip_reason_from_file(&path), None);
         let _ = std::fs::remove_dir_all(root);
     }
 
