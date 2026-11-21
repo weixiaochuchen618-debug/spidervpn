@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §97、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §36 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.100；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §98、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §37 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.101；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -754,3 +754,6 @@
 
 ## 97. 2026-11-21 §36最新恢复入口：A1发行来源与Naive依赖缺口，等LOCAL增量证据
 - [TASK_ASSIGNMENTS §36](./TASK_ASSIGNMENTS.md)、[Backlog D.100](./REMEDIATION_BACKLOG.md) 为最新裁定。#30 Draft HEAD `1e40fab5b9087c6b1576c29fcba3b22b92874b48` 两次不动；#3/#29仍Draft，main未动。A通过官方sing-box v1.14.2 Release API核对Windows ZIP asset size/digest**仅元数据**；结合固定tag官方Naive文档与冻结`package.ps1`/engine_config确定条件性`libcronet.dll`打包缺口，不等于已验真实ZIP、签名或真实运行失败。A1-REAL保持BLOCKED，不批准版本、DLL、生产源码/安装/编译或包外Approval，B只读提交A1-LOCAL-DELTA矩阵、D独立核、C只读；无新CI/真实运行。R2真实write/flush、真实跨SID UAC、历史writer、恢复来源、WFP05/Windows/VPS/L2L3等仍BLOCKED；只有总控在取得新证据与用户后续明确授权后另行调度。
+
+## 98. 2026-11-21 §37最新恢复入口：先解LOCAL签名与报告完成时刻冲突
+- [TASK_ASSIGNMENTS §37](./TASK_ASSIGNMENTS.md)、[Backlog D.101](./REMEDIATION_BACKLOG.md) 权威。B增量PR#30 7054668141、D独立终审7054832058发现LOCAL四项证书签名时点/有效期矛盾（含未来2036日期）及报告自称10:35 JST已完成却在09:58:56 JST先被B发布；需本地静态只读补真实签发者/TimeStamper各证书、RFC3161/CMS genTime、报告生成/交付时间及既有signtool验证原始输出，不认定伪造或签名已无效，也不能签Approval。#30 Draft HEAD `1e40fab5b9087c6b1576c29fcba3b22b92874b48` 仍冻结；LOCAL只读，B只读增量对照，D独立审，A全局写权。1.14.4仅STAGED，1.14.2官方ZIP/cronet/attestation未验；R2真实mid-write/flush和其余P0阻塞未运行，绝不授权产品编译安装、引擎/清单/UI更改、系统/VM/磁盘故障或main合并。
