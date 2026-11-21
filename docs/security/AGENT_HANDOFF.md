@@ -1,6 +1,6 @@
 # SpiderVPN 新对话 / 新 Agent 交接说明（从这里开始）
 
-> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §100、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §39 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.103；前述历史SHA/CI状态不得当作实时指令。**  
+> **交接快照**：初始 2026-11-17，Asia/Singapore。**最新恢复入口见 §101、[TASK_ASSIGNMENTS.md](./TASK_ASSIGNMENTS.md) §40 及后续授权、[REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) D.104；前述历史SHA/CI状态不得当作实时指令。**  
 > **必须先读**：  
 > 1. [REMEDIATION_BACKLOG.md](./REMEDIATION_BACKLOG.md) —— **唯一任务状态来源**，含 9 项原审查 + 2 项补充 + 5 项 WFP P0；  
 > 2. [SECURITY_REMEDIATION_PLAN.md](./SECURITY_REMEDIATION_PLAN.md) —— 逐项 Rust 实施技术方案、测试与发布门槛；  
@@ -764,3 +764,7 @@
 ## 100. 2026-11-21 §39最新恢复入口：ZIP DER双独立数学通过、PE真实受信身份未过审
 - [TASK_ASSIGNMENTS §39](./TASK_ASSIGNMENTS.md)、[Backlog D.103](./REMEDIATION_BACKLOG.md)权威；B PR7056043746、D真实独立PR7056124256已分别取得ZIP68221B/13成员，manifest17项实际11项原字节与SHA均吻合；8份CMS/TST SignedAttrs以DER自带叶公钥数学验签8/8通过、内容摘要8/8，时间戳内嵌/独立4/4及对主SignerInfo.signature SHA256 imprint绑定4/4通过。此为新`OFFLINE_CMS_TST_CRYPTO_PASS_SCOPE`，不是本机四PE/厂商受信AuthentiCode通过；完整PE原件、WIN_CERTIFICATE/真实PE映像digest、可信根及吊销/发行身份都未独立核，`VERIFIED_SIGNATURE_INDEPENDENT=0`、`A1-REAL=BLOCKED_REAL_ACCEPTANCE`。
 - ZIP缺manifest中4脚本及2原始日志；ZIP内RAW报告15966B与另次转交19841B、更正报告本地24792B与审查转交32597B版本/交付链待核。LOCAL仅静态交已有脚本/安全脱敏日志、精确hash/版本/交接与只读PE受信验证方案，不授权完整PE外传、下载/在线吊销/产品执行或改变系统。B ACTIVE_READONLY只核真正新增，D独立READ_ONLY，C只读，A独占全局文档；#30仍Draft冻结HEAD`1e40fab5b9087c6b1576c29fcba3b22b92874b48`，§33冻结隔离CI不扩大，无新的Run/正式产品或R2验收，禁止未授权build/package/install/维护/源码/CI/ref/VM/WFP/Approval/main合并。
+
+## 101. 2026-11-21 §40最新恢复入口：PE绑定自报4/4，采集脚本实际字节待交
+- [TASK_ASSIGNMENTS §40](./TASK_ASSIGNMENTS.md)、[Backlog D.104](./REMEDIATION_BACKLOG.md) 作为最新恢复入口。B真正读LOCAL PE绑定计划报告21267B/SHA bd83251c81059258a8369037cb6e78921b073a3fa03154190e13f0e0979e33c3（仅报告），D独立核先前ZIP真实manifest缺席6项声明字段与B摘录6/6一致、并非6原件SHA通过；没有拿到报告新原字节。LOCAL声称四本机PE S1–S5 4/4与LocalMachine根5/5均仅REPORTED_LOCAL；无真实PE/采集脚本/原stdout可独立核，WINDOWS_TRUST/PE_BINDING=NOT RUN，R01-008-A1-REAL仍BLOCKED。§39双Agent DER8/8数学与4/4 imprint有限PASS保留。RAW同名报告15966B/19841B与CORRECTION本机24792B/转交32597B实际版本来源未闭环，原因UNKNOWN。
+- 新LOCAL仅静态安全脱敏提供现存四采集脚本和本机PE验证两脚本的**真实可审字节**、原件/脱敏日志对应元数据及报告版本链；禁止运行脚本、未经许可传秘密或完整PE，需完整PE或可信发行源的独立复核必须另请A及用户批准。B ACTIVE_READONLY限新字节核验，D READ_ONLY独立核，C只读，A唯一全局写权。#30 Draft frozenHEAD 1e40fab5b9087c6b1576c29fcba3b22b92874b48，#3/#29未改，原D3四CI不重跑，无新产品/真实R2验收，无源码/CI/ref/清单/UI/系统修改与发布合并。
