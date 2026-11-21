@@ -10666,13 +10666,29 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::write(
-            root.join("runtime-engine.json"),
-            format!(
-                r#"{{"inbounds":[{{"type":"socks","tag":"tc-check","listen":"127.0.0.1","listen_port":{probe_port}}}]}}"#
-            ),
-        )
-        .unwrap();
+        // T-13 measures a *valid* trade probe, not a bare untrusted local
+        // SOCKS listener. The original helper omitted outbounds, selector,
+        // routing and users, which correctly fails the production evidence
+        // guard; restore the complete safe synthetic runtime contract here.
+        let engine = serde_json::json!({
+            "inbounds": [{
+                "type": "socks", "tag": "tc-check", "listen": "127.0.0.1",
+                "listen_port": probe_port,
+                "users": [{ "username": "u", "password": "p" }]
+            }],
+            "outbounds": [
+                { "type": "vless", "tag": "hk" },
+                { "type": "direct", "tag": "direct" },
+                { "type": "selector", "tag": "trade-exit",
+                    "outbounds": ["hk"], "default": "hk" },
+                { "type": "selector", "tag": "daily-exit",
+                    "outbounds": ["direct", "hk"], "default": "direct" }
+            ],
+            "route": { "rules": [
+                { "inbound": ["tc-check"], "outbound": "trade-exit" }
+            ] }
+        });
+        std::fs::write(root.join("runtime-engine.json"), engine.to_string()).unwrap();
     }
 
     /// 单次认证的假 tc-check 入站；只用于临时根上的 IPC 测量测试。
