@@ -1777,7 +1777,7 @@ fn enforce_probe_route_invariant(obj: &mut serde_json::Map<String, Value>) -> Re
         .and_then(|route| route.get_mut("rules"))
         .and_then(Value::as_array_mut)
         .ok_or_else(|| "tc-check 探测路由缺少规则数组".to_string())?;
-    let mut probe_index = None;
+    let mut probe_indices = Vec::new();
     for (index, rule) in rules.iter().enumerate() {
         let inbounds = rule.get("inbound").and_then(Value::as_array);
         let contains_probe = inbounds.is_some_and(|tags| {
@@ -1785,9 +1785,6 @@ fn enforce_probe_route_invariant(obj: &mut serde_json::Map<String, Value>) -> Re
         });
         if !contains_probe {
             continue;
-        }
-        if probe_index.replace(index).is_some() {
-            return Err("tc-check 探测路由存在多条竞争规则，拒绝启动".to_string());
         }
         let exact_inbound = inbounds.is_some_and(|tags| {
             tags.len() == 1 && tags[0].as_str() == Some(PROBE_TAG)
@@ -1801,12 +1798,25 @@ fn enforce_probe_route_invariant(obj: &mut serde_json::Map<String, Value>) -> Re
         {
             return Err("tc-check 探测路由不唯一指向 trade-exit，拒绝启动".to_string());
         }
+        probe_indices.push(index);
     }
-    let index = probe_index.ok_or_else(|| "tc-check 探测路由缺少 trade-exit 规则".to_string())?;
-    if index == 0 {
+    let first = *probe_indices.first()
+        .ok_or_else(|| "tc-check 探测路由缺少 trade-exit 规则".to_string())?;
+    // Older imported profiles can contain two equivalent tc-check -> trade-exit
+    // rules (one imported, one generated). Deduplicate only fully validated,
+    // identical-purpose reserved-tag rules; any wrong destination has already
+    // been refused above. Preserve every unrelated rule in original order.
+    if probe_indices.len() > 1 {
+        for index in probe_indices.iter().rev() {
+            rules.remove(*index);
+        }
+        rules.insert(0, json!({ "inbound": [PROBE_TAG], "outbound": TRADE_EXIT }));
+        return Ok(true);
+    }
+    if first == 0 {
         return Ok(false);
     }
-    let rule = rules.remove(index);
+    let rule = rules.remove(first);
     rules.insert(0, rule);
     Ok(true)
 }
@@ -2179,6 +2189,44 @@ mod tests {
         assert_eq!(rules[1]["outbound"], DAILY_EXIT, "catch-all rule remains after probe");
         assert_eq!(rules[2]["inbound"], json!([MIXED_TAG]));
         assert_eq!(rules[2]["outbound"], DAILY_EXIT, "mixed still uses daily exit");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tc_check_legacy_duplicate_trade_routes_are_safely_deduplicated() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-tc-check-legacy-duplicates-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = root.join("line.json");
+        let runtime = root.join("runtime-engine.json");
+        let mut profile = profile_with_exits();
+        profile["inbounds"] = json!([
+            { "type": "mixed", "tag": MIXED_TAG, "listen": "127.0.0.1", "listen_port": 18000 },
+            { "type": "socks", "tag": PROBE_TAG, "listen": "127.0.0.1", "listen_port": 18003 }
+        ]);
+        profile["route"]["rules"] = json!([
+            { "inbound": [PROBE_TAG], "outbound": TRADE_EXIT },
+            { "action": "route", "inbound": [MIXED_TAG], "outbound": DAILY_EXIT },
+            { "action": "route", "inbound": [PROBE_TAG], "outbound": TRADE_EXIT }
+        ]);
+        std::fs::write(&line, profile.to_string()).unwrap();
+        let path = prepare_engine_config(
+            &line, &SplitConfig::default(), &crate::config::AgentsConfig::default(),
+            Transport::Udp, Mode::Proxy, &runtime, "",
+            Some(("synthetic-user", "synthetic-password")), Some(18003)
+        ).expect("equivalent legacy duplicate probe rules must not break connection");
+        let eff: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let rules = eff["route"]["rules"].as_array().unwrap();
+        let probes: Vec<_> = rules.iter().filter(|r| {
+            r["inbound"].as_array().is_some_and(|tags| tags.iter().any(|tag| tag == PROBE_TAG))
+        }).collect();
+        assert_eq!(probes.len(), 1, "only one canonical probe route remains: {rules:?}");
+        assert_eq!(rules[0]["inbound"], json!([PROBE_TAG]));
+        assert_eq!(rules[0]["outbound"], TRADE_EXIT);
+        assert_eq!(rules[1]["inbound"], json!([MIXED_TAG]), "mixed route preserved");
+        assert_eq!(rules[1]["outbound"], DAILY_EXIT);
         let _ = std::fs::remove_dir_all(root);
     }
 
