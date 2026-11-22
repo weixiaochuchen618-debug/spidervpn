@@ -2319,12 +2319,16 @@ fn main() -> ExitCode {
                                 // 「自动」的依据：这条线路**真的**用当前方式连通过了。记不下来只写
                                 // 日志，连接结论与退出码都不受影响（自检结论已落在 last-check.json）。
                                 let id = line.id.clone();
-                                if let Err(e) = config::record_verified_transport(
-                                    &layout.root,
-                                    &id,
-                                    line.effective_transport(),
-                                ) {
-                                    eprintln!("记录已验证的连接方式失败：{e}");
+                                // The returned c.ok is a cached snapshot, not
+                                // write authority after a session/route change.
+                                if selfcheck::current_qualified_trade_pass(&layout.root) {
+                                    if let Err(e) = config::record_verified_transport(
+                                        &layout.root,
+                                        &id,
+                                        line.effective_transport(),
+                                    ) {
+                                        eprintln!("记录已验证的连接方式失败：{e}");
+                                    }
                                 }
                                 if let Some(rec) = exit_probe::probe_and_record(
                                     &layout.root,

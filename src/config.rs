@@ -1140,6 +1140,29 @@ pub fn load_readonly(path: &Path) -> Result<Option<AppConfig>, ConfigError> {
     Ok(load_with_migration(path, false)?.map(|l| l.cfg))
 }
 
+// Keep the existing offline config API semantics, but an observed running
+// session (including a half-written/orphaned record) requires live qualified
+// self-check evidence at the actual config write boundary. A daily direct
+// default is normal; only the authenticated tc-check trade path is gated.
+fn verified_transport_write_allowed(
+    root: &Path,
+    cfg: &AppConfig,
+    line_id: &str,
+    transport: Transport,
+) -> bool {
+    let runtime = root.join("runtime.json");
+    let engine = root.join("runtime-engine.json");
+    if !runtime.exists() && !engine.exists() {
+        return true; // legacy offline config/idempotence tests and callers
+    }
+    if !runtime.is_file() || !engine.is_file() {
+        return false; // never fall back to "offline" for a partial live state
+    }
+    cfg.current_line().is_some_and(|line| {
+        line.id == line_id && line.effective_transport() == transport
+    }) && crate::selfcheck::current_qualified_trade_pass(root)
+}
+
 /// 记下「这条线路用这种方式真的连通过」（「自动」档的唯一依据）。
 ///
 /// **幂等**：连接每次成功都会调用它，所以同值时必须直接返回 `Ok(false)` 且**不写盘**——
@@ -1158,13 +1181,21 @@ pub fn record_verified_transport(
         Some(c) => c,
         None => return Err("找不到配置文件（config.json）".to_string()),
     };
-    let Some(line) = cfg.lines.iter_mut().find(|l| l.id == line_id) else {
+    let Some(index) = cfg.lines.iter().position(|line| line.id == line_id) else {
         return Err(format!("配置里没有这条线路：{line_id}"));
     };
-    if line.verified_transport == Some(transport) {
+    if cfg.lines[index].verified_transport == Some(transport) {
         return Ok(false);
     }
-    line.verified_transport = Some(transport);
+    if !verified_transport_write_allowed(root, &cfg, line_id, transport) {
+        return Ok(false);
+    }
+    cfg.lines[index].verified_transport = Some(transport);
+    // Last feasible check before the existing atomic config rename. This is
+    // not a cross-file transaction: independent writers may still race or ABA.
+    if !verified_transport_write_allowed(root, &cfg, line_id, transport) {
+        return Ok(false);
+    }
     save_with_origin(&path, &cfg, &crate::events::Origin::auto()).map_err(|e| e.to_string())?;
     Ok(true)
 }

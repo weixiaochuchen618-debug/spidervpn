@@ -5748,12 +5748,16 @@ fn connect_json(ctx: &Ctx) -> String {
                     // 「自动」的依据：这条线路**真的**用当前方式连通过了。记不下来只写日志，
                     // 连接结论与退出码都不受影响（自检结论已经落在 last-check.json）。
                     let id = line.id.clone();
-                    if let Err(e) = crate::config::record_verified_transport(
-                        &ctx.root,
-                        &id,
-                        transport,
-                    ) {
-                        eprintln!("记录已验证的连接方式失败：{e}");
+                    // A cached successful return is not sufficient to write
+                    // transport evidence for a subsequently changed session.
+                    if crate::selfcheck::current_qualified_trade_pass(&ctx.root) {
+                        if let Err(e) = crate::config::record_verified_transport(
+                            &ctx.root,
+                            &id,
+                            transport,
+                        ) {
+                            eprintln!("记录已验证的连接方式失败：{e}");
+                        }
                     }
                     let _ = crate::exit_probe::probe_and_record(
                         &ctx.root,
