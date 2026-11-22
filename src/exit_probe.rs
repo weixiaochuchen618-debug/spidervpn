@@ -164,7 +164,7 @@ pub fn probe_and_record(
         // the HTTP exchange ran, retain the raw IP on disk UNATTRIBUTED.
         let after = current_binding(root, &line.id, *port, Some((username, password)));
         let binding = before.clone().filter(|snapshot| after.as_ref() == Some(snapshot));
-        let mut rec = Record {
+        let rec = Record {
             at: crate::model::now_epoch_secs_u64(),
             ip: ip.clone(),
             endpoint: (*host).to_string(),
@@ -173,17 +173,32 @@ pub fn probe_and_record(
             started_at: started_at.clone(),
             binding,
         };
-        let _ = save(root, &rec);
-        // The read boundary independently revalidates the original binding;
-        // downgrade the return value too, so CLI cannot echo stale "verified".
-        if !belongs_to_current_connection(&rec, root) {
-            rec.attributed = false;
-            rec.binding = None;
-            let _ = save(root, &rec);
-        }
-        return Some(rec);
+        // There must never be an earlier attributed JSON visible before the
+        // final live qualification. Persist the FINAL observation only once.
+        // Failed writes cannot authorize a current verified return value.
+        return Some(persist_final_observation(root, rec));
     }
     None
+}
+
+/// Last qualification precedes the one persistence attempt. The caller still
+/// receives the real observed IP on failure, but never a verified attribution.
+/// This is not a cross-file atomic transaction: IPC/readers must independently
+/// validate the original binding against the live session and route.
+fn persist_final_observation(root: &Path, mut rec: Record) -> Record {
+    if !belongs_to_current_connection(&rec, root) {
+        rec.attributed = false;
+        rec.binding = None;
+    }
+    if let Err(e) = save(root, &rec) {
+        // A failed rename may leave an older record. Try to invalidate it,
+        // without claiming that deletion can defeat another local writer.
+        clear(root);
+        rec.attributed = false;
+        rec.binding = None;
+        eprintln!("出口观测写盘失败，不能视为当前已核验出口：{e}");
+    }
+    rec
 }
 
 /// 线路服务器地址（只取**公网字面 IP**）。
@@ -517,6 +532,148 @@ mod tests {
         std::fs::remove_file(root.join("runtime-engine.json")).unwrap();
         assert!(!belongs_to_current_connection(&loaded, &root));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    /// Prepare the SAME authenticated trade route/session/line needed by the
+    /// production check reader. Test traffic remains on loopback; 8.8.8.8 is
+    /// only a synthetic local HTTP response body.
+    fn qualified_probe_fixture(root: &Path, port: u16) -> crate::config::LineConfig {
+        let line = line_with(root, "hk",
+            serde_json::json!([{"type":"vless","server":"8.8.8.8","server_port":8443}]));
+        let cfg = crate::config::parse(
+            r#"{"schema":2,"selected":"hk","lines":[{"id":"hk","name":"香港 01","proxy_endpoint":"127.0.0.1:17891"}]}"#
+        ).unwrap();
+        crate::config::save(&root.join(crate::config::DEFAULT_PATH), &cfg).unwrap();
+        std::fs::write(root.join("runtime.json"), format!(
+            r#"{{"SchemaVersion":1,"SupervisorPid":0,"EnginePid":{},"StartedAt":"2026-11-06T02:00:00Z","State":"Running"}}"#,
+            std::process::id()
+        )).unwrap();
+        crate::selfcheck::record_probe_creds(&root.join("runtime.json"), "u", "p").unwrap();
+        std::fs::write(root.join("runtime-engine.json"), format!(
+            r#"{{"outbounds":[{{"type":"vless","tag":"hk"}},{{"type":"selector","tag":"trade-exit","outbounds":["hk"],"default":"hk"}}],
+                "inbounds":[{{"type":"socks","tag":"tc-check","listen":"127.0.0.1","listen_port":{port},
+                  "users":[{{"username":"u","password":"p"}}]}}],
+                "route":{{"rules":[{{"inbound":["tc-check"],"outbound":"trade-exit"}}]}}}}"#
+        )).unwrap();
+        line
+    }
+
+    fn qualified_plan(port: u16) -> crate::selfcheck::ProbePlan {
+        crate::selfcheck::ProbePlan::Dial {
+            port, username: "u".into(), password: "p".into(),
+        }
+    }
+
+    #[test]
+    fn failed_final_exit_save_returns_raw_ip_without_verified_attribution() {
+        let root = tmp_root("failed-final-save");
+        let port = fake_socks5("8.8.8.8\n", "u", "p");
+        let line = qualified_probe_fixture(&root, port);
+        let plan = qualified_plan(port);
+        let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
+        assert!(check.ok && crate::selfcheck::current_qualified_trade_pass(&root),
+            "must fail at actual final save, not at the qualified check: {check:?}");
+        // Directory-as-file reliably prevents rename on Windows and Unix.
+        std::fs::create_dir(root.join(FILE_NAME)).unwrap();
+        let observed = probe_and_record(&root, &line, &plan, 2_000)
+            .expect("real local SOCKS response must still be parsed");
+        assert_eq!(observed.ip, "8.8.8.8");
+        assert!(!observed.attributed);
+        assert!(observed.binding.is_none());
+        assert_eq!(load(&root), None, "failed final rename must not create a verified record");
+        assert!(!belongs_to_current_connection(&observed, &root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two-phase authenticated local SOCKS server: the second HTTP response is
+    /// withheld until the test has changed the runtime route. No sleeps/races.
+    fn gated_two_phase_socks() -> (
+        u16, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (at_response_tx, at_response_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for n in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut greet = [0u8; 4];
+                s.read_exact(&mut greet).unwrap();
+                assert_eq!(greet, [0x05, 0x01, 0x02, 0x00]);
+                s.write_all(&[0x05, 0x02]).unwrap();
+                let mut auth = [0u8; 2];
+                s.read_exact(&mut auth).unwrap();
+                assert_eq!(auth[0], 0x01);
+                let mut user = vec![0u8; usize::from(auth[1])];
+                s.read_exact(&mut user).unwrap();
+                assert_eq!(user, b"u");
+                let mut plen = [0u8; 1];
+                s.read_exact(&mut plen).unwrap();
+                let mut pass = vec![0u8; usize::from(plen[0])];
+                s.read_exact(&mut pass).unwrap();
+                assert_eq!(pass, b"p");
+                s.write_all(&[0x01, 0x00]).unwrap();
+                let mut connect = [0u8; 5];
+                s.read_exact(&mut connect).unwrap();
+                let mut rest = vec![0u8; usize::from(connect[4]) + 2];
+                s.read_exact(&mut rest).unwrap();
+                s.write_all(&[0x05, 0, 0, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+                let mut req = [0u8; 512];
+                s.read(&mut req).unwrap();
+                if n == 1 {
+                    at_response_tx.send(()).unwrap();
+                    continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                let (status, body) = if n == 0 {
+                    ("204 No Content", "")
+                } else {
+                    ("200 OK", "8.8.8.8\n")
+                };
+                s.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).unwrap();
+            }
+        });
+        (port, at_response_rx, continue_tx, server)
+    }
+
+    #[test]
+    fn route_changed_while_exit_http_in_flight_persists_one_unattributed_record() {
+        let root = tmp_root("in-flight-final-save");
+        let (port, at_response, proceed, server) = gated_two_phase_socks();
+        let line = qualified_probe_fixture(&root, port);
+        let plan = qualified_plan(port);
+        let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
+        assert!(check.ok && check.status == Some(204), "{check:?}");
+        let worker_root = root.clone();
+        let probe = std::thread::spawn(move ||
+            probe_and_record(&worker_root, &line, &plan, 2_500)
+        );
+        at_response.recv_timeout(Duration::from_secs(10))
+            .expect("second authenticated SOCKS HTTP request must reach server");
+        // Occurs AFTER producer captured its initial binding and issued HTTP,
+        // but BEFORE it gets the final body/qualification/persistence.
+        let engine_path = root.join("runtime-engine.json");
+        let mut runtime: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&engine_path).unwrap()).unwrap();
+        runtime["route"]["rules"][0]["outbound"] = serde_json::json!("direct");
+        std::fs::write(&engine_path, runtime.to_string()).unwrap();
+        assert!(!crate::selfcheck::current_qualified_trade_pass(&root));
+        proceed.send(()).unwrap();
+        let observed = probe.join().unwrap().expect("local HTTP200 IP must be preserved");
+        server.join().unwrap();
+        let disk = load(&root);
+        assert_eq!(disk, Some(observed.clone()), "exact one final observation persisted");
+        assert_eq!(observed.ip, "8.8.8.8");
+        assert!(!observed.attributed);
+        assert!(observed.binding.is_none());
+        assert!(!belongs_to_current_connection(&observed, &root));
+        assert!(!root.join("exit-probe.json.tmp").exists(),
+            "no second downgrade-save/temporary intermediate file");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
