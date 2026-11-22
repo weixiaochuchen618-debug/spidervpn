@@ -601,7 +601,7 @@ mod tests {
                 let (mut s, _) = listener.accept().unwrap();
                 let mut greet = [0u8; 4];
                 s.read_exact(&mut greet).unwrap();
-                assert_eq!(greet, [0x05, 0x01, 0x02, 0x00]);
+                assert_eq!(greet, [0x05, 0x02, 0x00, 0x02]);
                 s.write_all(&[0x05, 0x02]).unwrap();
                 let mut auth = [0u8; 2];
                 s.read_exact(&mut auth).unwrap();
