@@ -35,6 +35,20 @@ pub struct Record {
     pub line_id: String,
     /// 观测时 runtime 的 `started_at`：用来判断这条记录还属不属于当前连接。
     pub started_at: String,
+    /// Original nonsecret identity captured around the actual SOCKS request.
+    /// Old exit JSON remains readable but cannot be current-verified without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<AttributionBinding>,
+}
+
+/// Not an authentication MAC; these digests only detect ordinary session,
+/// route and line-file changes between observation and later consumption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributionBinding {
+    session_fingerprint: String,
+    engine_fingerprint: String,
+    port: u16,
+    line_fingerprint: String,
 }
 
 /// 出口 IP 服务（明文 HTTP、端口 80）：`(host, path)`。
@@ -68,15 +82,47 @@ pub fn clear(root: &Path) {
     let _ = std::fs::remove_file(root.join(FILE_NAME));
 }
 
-/// 这条记录还属不属于**当前**连接。
-///
-/// 两个条件都要：`runtime-engine.json` 存在（= 连接正在运行），且记录的 `started_at`
-/// 与 runtime 一字不差。少了第一个，断开后会把上一条连接的出口 IP 当成现在的。
+/// Capture a qualified ORIGINAL session/route + selected line from disk.
+/// The route and credentials must match the current pinned automatic Check,
+/// never a new fingerprint fabricated after the HTTP request.
+fn current_binding(
+    root: &Path, line_id: &str, port: u16,
+    expected_credentials: Option<(&str, &str)>,
+) -> Option<AttributionBinding> {
+    let cfg = crate::config::load_readonly(&root.join(crate::config::DEFAULT_PATH))
+        .ok()??;
+    let line = cfg.current_line()?;
+    if line.id != line_id {
+        return None;
+    }
+    let (session_fingerprint, engine_fingerprint) =
+        crate::selfcheck::current_exit_probe_binding(root, port, expected_credentials)?;
+    // A server-address change cannot relabel an old observed IP as belonging
+    // to a different line file, even when line ID and StartedAt are reused.
+    use sha2::Digest;
+    let bytes = std::fs::read(line.engine_config_path(root)).ok()?;
+    let mut hash = sha2::Sha256::new();
+    hash.update(b"spidervpn/exit-line-config/v1\0");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(&bytes);
+    let line_fingerprint = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Some(AttributionBinding {
+        session_fingerprint, engine_fingerprint, port, line_fingerprint,
+    })
+}
+
+/// An old observation may still be read via load() for historical context,
+/// but only an exact original binding, live qualified trade Check and current
+/// selected line can authorize it as evidence for the running connection.
 pub fn belongs_to_current_connection(rec: &Record, root: &Path) -> bool {
-    if !root.join("runtime-engine.json").exists() {
+    let Some(bound) = rec.binding.as_ref() else { return false };
+    if !root.join("runtime-engine.json").is_file()
+        || crate::selfcheck::runtime_started_at(root).as_deref()
+            != Some(rec.started_at.as_str())
+    {
         return false;
     }
-    crate::selfcheck::runtime_started_at(root).is_some_and(|at| at == rec.started_at)
+    current_binding(root, &rec.line_id, bound.port, None).as_ref() == Some(bound)
 }
 
 /// 观测一次出口 IP 并落盘。**失败不写、不覆盖、不报错给用户**——它只是证据采集，
@@ -95,6 +141,9 @@ pub fn probe_and_record(
     };
     let started_at = crate::selfcheck::runtime_started_at(root)?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    // Never skip collecting actual SOCKS observations merely because the
+    // caller's prior Check.ok became stale. Capture the *pre-request* proof.
+    let before = current_binding(root, &line.id, *port, Some((username, password)));
     let targets = server_ips(root, line);
     for (host, path) in ENDPOINTS {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -111,15 +160,27 @@ pub fn probe_and_record(
             continue;
         }
         let Some(ip) = parse_ip(&body) else { continue };
-        let rec = Record {
+        // If route, credentials, line selection or server file moved while
+        // the HTTP exchange ran, retain the raw IP on disk UNATTRIBUTED.
+        let after = current_binding(root, &line.id, *port, Some((username, password)));
+        let binding = before.clone().filter(|snapshot| after.as_ref() == Some(snapshot));
+        let mut rec = Record {
             at: crate::model::now_epoch_secs_u64(),
             ip: ip.clone(),
             endpoint: (*host).to_string(),
-            attributed: targets.iter().any(|t| t == &ip),
+            attributed: binding.is_some() && targets.iter().any(|t| t == &ip),
             line_id: line.id.clone(),
             started_at: started_at.clone(),
+            binding,
         };
         let _ = save(root, &rec);
+        // The read boundary independently revalidates the original binding;
+        // downgrade the return value too, so CLI cannot echo stale "verified".
+        if !belongs_to_current_connection(&rec, root) {
+            rec.attributed = false;
+            rec.binding = None;
+            let _ = save(root, &rec);
+        }
         return Some(rec);
     }
     None
@@ -370,14 +431,25 @@ mod tests {
             "hk",
             serde_json::json!([{"type":"vless","server":"8.8.8.8","server_port":8443}]),
         );
-        std::fs::write(
-            root.join("runtime.json"),
-            r#"{"SchemaVersion":1,"StartedAt":"2026-11-06T02:00:00Z"}"#,
-        )
-        .unwrap();
-        // 连接活着才有「当前连接」可言：`runtime-engine.json` 是它的存在标记。
-        std::fs::write(root.join("runtime-engine.json"), r#"{"inbounds":[]}"#).unwrap();
+        // This positive test must model a REAL current authenticated trade
+        // session and valid pinned auto-Check, not just StartedAt + {}.
+        let cfg = crate::config::parse(
+            r#"{"schema":2,"selected":"hk","lines":[{"id":"hk","name":"香港 01","proxy_endpoint":"127.0.0.1:17891"}]}"#
+        ).unwrap();
+        crate::config::save(&root.join(crate::config::DEFAULT_PATH), &cfg).unwrap();
+        let runtime = format!(
+            r#"{{"SchemaVersion":1,"SupervisorPid":0,"EnginePid":{},"StartedAt":"2026-11-06T02:00:00Z","State":"Running"}}"#,
+            std::process::id()
+        );
+        std::fs::write(root.join("runtime.json"), runtime).unwrap();
+        crate::selfcheck::record_probe_creds(&root.join("runtime.json"), "u", "p").unwrap();
         let port = fake_socks5("8.8.8.8\n", "u", "p");
+        std::fs::write(root.join("runtime-engine.json"), format!(
+            r#"{{"outbounds":[{{"type":"vless","tag":"hk"}},{{"type":"selector","tag":"trade-exit","outbounds":["hk"],"default":"hk"}}],
+                "inbounds":[{{"type":"socks","tag":"tc-check","listen":"127.0.0.1","listen_port":{port},
+                  "users":[{{"username":"u","password":"p"}}]}}],
+                "route":{{"rules":[{{"inbound":["tc-check"],"outbound":"trade-exit"}}]}}}}"#
+        )).unwrap();
         // 先钉住底层两件事：runtime 读得出 started_at，握手+正文读得回。缺一条，
         // 下面「观测不到」就说明不了任何事。
         assert_eq!(
@@ -394,6 +466,11 @@ mod tests {
             username: "u".to_string(),
             password: "p".to_string(),
         };
+        // The second synthetic SOCKS response is the real successful 2xx
+        // automatic check, including original port/session/engine bindings.
+        let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
+        assert!(check.ok && check.via_trade_exit && check.status == Some(200), "{check:?}");
+        assert_eq!(crate::selfcheck::load(&root), Some(check));
         let rec = probe_and_record(&root, &line, &plan, 2_000).expect("假服务必须能观测到");
         assert_eq!(rec.ip, "8.8.8.8");
         assert!(rec.attributed, "与线路服务器地址一致时必须判为已归属");
@@ -401,6 +478,34 @@ mod tests {
         // 落盘且能读回：界面读的是这份文件，不是内存里的返回值。
         let loaded = load(&root).expect("必须落盘");
         assert_eq!(loaded, rec);
+        assert!(belongs_to_current_connection(&loaded, &root));
+        // Same StartedAt with rotated credentials is a NEW authenticated
+        // session, even if both the IP and saved Check were once successful.
+        let original_runtime = std::fs::read(root.join("runtime.json")).unwrap();
+        crate::selfcheck::record_probe_creds(&root.join("runtime.json"), "new-u", "new-p").unwrap();
+        assert!(!belongs_to_current_connection(&loaded, &root));
+        std::fs::write(root.join("runtime.json"), original_runtime).unwrap();
+        assert!(belongs_to_current_connection(&loaded, &root));
+        // Changing a current route to direct must revoke the original proof.
+        let engine_path = root.join("runtime-engine.json");
+        let original_engine = std::fs::read(&engine_path).unwrap();
+        let mut engine: serde_json::Value = serde_json::from_slice(&original_engine).unwrap();
+        engine["route"]["rules"][0]["outbound"] = serde_json::json!("direct");
+        std::fs::write(&engine_path, engine.to_string()).unwrap();
+        assert!(!belongs_to_current_connection(&loaded, &root));
+        std::fs::write(&engine_path, original_engine).unwrap();
+        assert!(belongs_to_current_connection(&loaded, &root));
+        // Switching the selected line cannot award this IP to a different one.
+        let config_path = root.join(crate::config::DEFAULT_PATH);
+        let mut cfg = crate::config::load_readonly(&config_path).unwrap().unwrap();
+        let original_cfg = cfg.clone();
+        let mut other = cfg.lines[0].clone();
+        other.id = "another-line".into();
+        cfg.lines.push(other);
+        cfg.selected = "another-line".into();
+        crate::config::save(&config_path, &cfg).unwrap();
+        assert!(!belongs_to_current_connection(&loaded, &root));
+        crate::config::save(&config_path, &original_cfg).unwrap();
         assert!(belongs_to_current_connection(&loaded, &root));
         // runtime 变了（换了一次连接）就不再属于当前连接。
         std::fs::write(root.join("runtime.json"), r#"{"SchemaVersion":1,"StartedAt":"2026-11-06T03:00:00Z"}"#)
@@ -412,6 +517,25 @@ mod tests {
         std::fs::remove_file(root.join("runtime-engine.json")).unwrap();
         assert!(!belongs_to_current_connection(&loaded, &root));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_exit_json_is_readable_but_never_promoted_to_current_verified() {
+        let root = tmp_root("legacy-unbound");
+        std::fs::write(root.join(FILE_NAME), r#"{
+            "at":42,"ip":"8.8.8.8","endpoint":"checkip.amazonaws.com",
+            "attributed":true,"line_id":"hk","started_at":"same-started-at"
+        }"#).unwrap();
+        std::fs::write(root.join("runtime.json"),
+            r#"{"SchemaVersion":1,"StartedAt":"same-started-at"}"#).unwrap();
+        std::fs::write(root.join("runtime-engine.json"), "{}").unwrap();
+        let previous = load(&root).expect("old exit JSON must remain readable");
+        assert_eq!(previous.ip, "8.8.8.8");
+        assert!(previous.attributed, "historical observation retained unmodified");
+        assert!(previous.binding.is_none());
+        assert!(!belongs_to_current_connection(&previous, &root),
+            "StartedAt-only old JSON must not upgrade to current verified");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

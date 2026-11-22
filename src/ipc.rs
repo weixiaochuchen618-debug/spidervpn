@@ -5377,7 +5377,8 @@ fn shortcut_json() -> String {
     }
 }
 
-/// 当前连接下的出口观测记录：`started_at` 对不上就当没有。
+/// 当前连接下的出口观测记录：必须有原始认证会话、交易路由和当前线路绑定；
+/// 旧 JSON 仍可读取，但无绑定时不可显示为当前已验证出口。
 fn exit_probe_fresh(ctx: &Ctx) -> Option<crate::exit_probe::Record> {
     let rec = crate::exit_probe::load(&ctx.root)?;
     crate::exit_probe::belongs_to_current_connection(&rec, &ctx.root).then_some(rec)
@@ -5759,6 +5760,9 @@ fn connect_json(ctx: &Ctx) -> String {
                             eprintln!("记录已验证的连接方式失败：{e}");
                         }
                     }
+                    // Always keep a real returned-IP observation; the
+                    // producer independently refuses stale current attribution.
+                    // A cached check.ok is not sufficient after a reconnect.
                     let _ = crate::exit_probe::probe_and_record(
                         &ctx.root,
                         line,
@@ -13087,6 +13091,7 @@ mod tests {
             attributed,
             line_id: "hk".to_string(),
             started_at: "t".to_string(),
+            binding: None,
         };
         // 自检没过：有观测记录（哪怕归属成立）也不许说已核验。
         assert_eq!(super::exit_evidence(false, Some(&rec(true))), "unverified");

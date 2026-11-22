@@ -2336,7 +2336,13 @@ fn main() -> ExitCode {
                                     plan,
                                     2_500,
                                 ) {
-                                    println!("  {}", exit_probe_line(&rec));
+                                    // The cached response is not write/read
+                                    // authority if route/session changed again.
+                                    let mut display = rec;
+                                    if !exit_probe::belongs_to_current_connection(&display, &layout.root) {
+                                        display.attributed = false;
+                                    }
+                                    println!("  {}", exit_probe_line(&display));
                                 }
                             }
                         }
