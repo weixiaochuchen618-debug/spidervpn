@@ -5384,6 +5384,30 @@ fn exit_probe_fresh(ctx: &Ctx) -> Option<crate::exit_probe::Record> {
     crate::exit_probe::belongs_to_current_connection(&rec, &ctx.root).then_some(rec)
 }
 
+/// One validated read produces all four exit status projections. This
+/// prevents a single response from mixing multiple disk/session generations.
+/// No guarantee is made about concurrent writers after this read.
+struct ExitStatusSnapshot {
+    evidence: &'static str,
+    observed_ip: Option<String>,
+    attribution: &'static str,
+    probe_at_utc: Option<String>,
+}
+
+fn exit_status_snapshot(
+    check_ok: bool,
+    probe: Option<&crate::exit_probe::Record>,
+) -> ExitStatusSnapshot {
+    ExitStatusSnapshot {
+        evidence: exit_evidence(check_ok, probe),
+        observed_ip: probe.map(|r| r.ip.clone()),
+        attribution: probe
+            .map(|r| if r.attributed { "LineServer" } else { "Other" })
+            .unwrap_or("Unknown"),
+        probe_at_utc: probe.and_then(|r| crate::selfcheck::at_rfc3339(r.at)),
+    }
+}
+
 /// 出口证据三档（界面按这个字符串选标签，见 `app.js::exitView`）。
 ///
 /// 纯函数：输入只有「自检过没过」与「有没有一条属于当前连接的观测记录」，便于逐档钉住。
@@ -5459,6 +5483,13 @@ fn status_json(ctx: &Ctx) -> String {
     );
     // 线路页的「交易名单」区块读它：只读投影，界面不自己从配置里拼。
     let trade_list = trade_list_payload(cfg.as_ref());
+    // A single qualified disk record feeds the complete exit quartet.
+    // Do not re-read exit-probe.json inside individual JSON fields.
+    let exit_record = exit_probe_fresh(ctx);
+    let exit_snapshot = exit_status_snapshot(
+        check.as_ref().is_some_and(|c| c.ok),
+        exit_record.as_ref(),
+    );
     let mut out = serde_json::json!({
         "ok": true,
         "state": pres.key.as_str(),
@@ -5526,18 +5557,12 @@ fn status_json(ctx: &Ctx) -> String {
         // 只有当前连接才投影测量；完成时间非法时保留真实毫秒数但不伪造相对时间。
         "latencyMs": latency.as_ref().map(|m| m.latency_ms),
         "measuredAtUtc": latency.as_ref().and_then(|m| crate::selfcheck::at_rfc3339(m.at)),
-        // 出口证据分两层：自检只证明「转发通了」，**归属**要另一次观测（`exit_probe`，B1）。
-        // 记录跟着 runtime 的 `started_at` 走：换一条连接，上一条的出口 IP 立刻作废。
-        "exitEvidence": exit_evidence(
-            check.as_ref().is_some_and(|c| c.ok),
-            exit_probe_fresh(ctx).as_ref(),
-        ),
-        "exitObservedIp": exit_probe_fresh(ctx).map(|r| r.ip),
-        "exitAttribution": exit_probe_fresh(ctx)
-            .map(|r| if r.attributed { "LineServer" } else { "Other" })
-            .unwrap_or("Unknown"),
-        "exitProbeAtUtc": exit_probe_fresh(ctx)
-            .and_then(|r| crate::selfcheck::at_rfc3339(r.at)),
+        // All four fields describe precisely the SAME previously validated
+        // exit record; no independent disk reads per field.
+        "exitEvidence": exit_snapshot.evidence,
+        "exitObservedIp": exit_snapshot.observed_ip,
+        "exitAttribution": exit_snapshot.attribution,
+        "exitProbeAtUtc": exit_snapshot.probe_at_utc,
         "isAdmin": crate::probe::elevated(),
         // 引擎程序：设置页要显示「已经选了哪一个 / 还没选」并给一个选择按钮。
         // **显示的是生效路径**（配置的那份存在就用它，否则是自带副本），因为这里要说的是
@@ -13082,6 +13107,77 @@ mod tests {
 
     /// B1 的三档判定：**只有「自检通过 + 观测到出口 IP + 归属到线路服务器」才叫已核验**。
     /// 少任何一条都只能说到「转发已通」或「尚未核验」——这三格之间差一次假话。
+
+    #[test]
+    fn exit_status_quartet_comes_from_one_snapshot_even_if_disk_changes() {
+        let root = tmp_root("exit-one-snapshot");
+        let first = crate::exit_probe::Record {
+            at: 1_700_000_000,
+            ip: "8.8.8.8".into(),
+            endpoint: "checkip.amazonaws.com".into(),
+            attributed: true,
+            line_id: "L1".into(),
+            started_at: "t".into(),
+            binding: None,
+        };
+        crate::exit_probe::save(&root, &first).unwrap();
+        // The real IPC path validates a record BEFORE taking this snapshot;
+        // this pure projection test isolates the four-field consistency.
+        let captured = crate::exit_probe::load(&root).unwrap();
+        let later = crate::exit_probe::Record {
+            ip: "1.1.1.1".into(), attributed: false, at: 1_600_000_000,
+            ..first
+        };
+        crate::exit_probe::save(&root, &later).unwrap();
+        let fields = super::exit_status_snapshot(true, Some(&captured));
+        assert_eq!(fields.evidence, "verified");
+        assert_eq!(fields.observed_ip.as_deref(), Some("8.8.8.8"));
+        assert_eq!(fields.attribution, "LineServer");
+        assert!(fields.probe_at_utc.as_deref().unwrap_or("").starts_with("2023-"));
+        let missing = super::exit_status_snapshot(true, None);
+        assert_eq!(missing.evidence, "Passed");
+        assert_eq!(missing.observed_ip, None);
+        assert_eq!(missing.attribution, "Unknown");
+        assert_eq!(missing.probe_at_utc, None);
+        let failed_check = super::exit_status_snapshot(false, Some(&captured));
+        assert_eq!(failed_check.evidence, "unverified",
+            "old status semantics: failing check never verifies");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_legacy_unbound_exit_is_never_mixed_into_current_quartet() {
+        let root = tmp_root("status-legacy-exit-quartet");
+        write_cfg(&root, "L1");
+        // An online Check must carry its original session identity, even
+        // though this synthetic fixture is NOT eligible for trade attribution.
+        std::fs::write(root.join("runtime.json"),
+            r#"{"SchemaVersion":1,"StartedAt":"same-started-at","ProbeUser":"u","ProbePass":"p"}"#)
+            .unwrap();
+        std::fs::write(root.join("runtime-engine.json"), "{}").unwrap();
+        let check = crate::selfcheck::Check {
+            ok: true, status: Some(204), via_trade_exit: false,
+            at: 1_700_000_000, ..Default::default()
+        };
+        crate::selfcheck::save(&root, &check).unwrap();
+        let legacy = crate::exit_probe::Record {
+            at: 1_700_000_000, ip: "8.8.8.8".into(),
+            endpoint: "checkip.amazonaws.com".into(),
+            attributed: true, line_id: "L1".into(),
+            started_at: "same-started-at".into(), binding: None,
+        };
+        crate::exit_probe::save(&root, &legacy).unwrap();
+        assert!(crate::exit_probe::load(&root).is_some(), "legacy history retained");
+        assert!(crate::selfcheck::load(&root).is_some_and(|c| c.ok),
+            "nontrade Check remains readable; only exit attribution fails closed");
+        let v = call(r#"{"cmd":"status"}"#, &ctx_with(None, &root));
+        assert_eq!(v["exitEvidence"], "Passed", "{v}");
+        assert_eq!(v["exitObservedIp"], serde_json::Value::Null, "{v}");
+        assert_eq!(v["exitAttribution"], "Unknown", "{v}");
+        assert_eq!(v["exitProbeAtUtc"], serde_json::Value::Null, "{v}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn exit_evidence_never_upgrades_without_an_attributed_observation() {
         let rec = |attributed: bool| crate::exit_probe::Record {
