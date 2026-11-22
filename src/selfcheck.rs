@@ -1086,6 +1086,51 @@ pub fn clear_latency(root: &Path) {
     let _ = std::fs::remove_file(root.join(LATENCY_FILE_NAME));
 }
 
+// Fingerprint-only legacy trade PASS has NO original port/route snapshot.
+// Never backfill one from the new runtime: only decide if the CURRENT live
+// session still has a uniquely identified authenticated, non-direct tc-check.
+// This is current-eligibility screening, NOT proof of the historical egress.
+fn legacy_online_trade_eligible(root: &Path, stored_session: &str) -> bool {
+    let engine_path = root.join("runtime-engine.json");
+    let Some(before_engine) = auto_engine_fingerprint(root) else {
+        return false;
+    };
+    let Some((user, pass)) = probe_creds(root) else {
+        return false;
+    };
+    let port = (|| -> Option<u16> {
+        let bytes = std::fs::read(&engine_path).ok()?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let inbounds = json.get("inbounds")?.as_array()?;
+        let mut probes = inbounds.iter().filter(|inbound| {
+            inbound.get("tag").and_then(serde_json::Value::as_str)
+                == Some(crate::engine_config::PROBE_TAG)
+        });
+        let probe = probes.next()?;
+        if probes.next().is_some() {
+            return None; // ambiguous live entrance: cannot infer a unique port
+        }
+        let port = u16::try_from(probe.get("listen_port")?.as_u64()?).ok()?;
+        (port != 0).then_some(port)
+    })();
+    let Some(port) = port else {
+        return false; // no trustworthy CURRENT port, not a fabricated old one
+    };
+    if check_session_fingerprint(root).as_deref() != Some(stored_session)
+        || crate::engine_config::probe_evidence_skip_reason_for_session(
+            &engine_path, port, &user, &pass,
+        ).is_some()
+    {
+        return false;
+    }
+    // Recheck after the strict gate: an independent writer may replace the
+    // engine/config or runtime during the read; fail closed on observed change.
+    engine_alive(root)
+        && check_session_fingerprint(root).as_deref() == Some(stored_session)
+        && probe_creds(root).as_ref() == Some(&(user, pass))
+        && auto_engine_fingerprint(root).as_deref() == Some(&before_engine)
+}
+
 /// 读上次连接留下的结论。文件不存在或坏掉都当「未检测」：展示用的证据缺失，
 /// 不该变成一条错误，更不该让 `--status` 打不开。
 pub fn load(root: &Path) -> Option<Check> {
@@ -1126,6 +1171,13 @@ pub fn load(root: &Path) -> Option<Check> {
                 engine_fingerprint,
             };
             if !proof.still_current(root) || !engine_alive(root) {
+                return None;
+            }
+        } else if check.via_trade_exit {
+            // A valid old session digest alone cannot vouch for a route
+            // that changed to direct or an unknown tc-check entrance.
+            // Do NOT make up its historical port/route and re-stamp JSON.
+            if !legacy_online_trade_eligible(root, stored) {
                 return None;
             }
         }
@@ -2192,6 +2244,9 @@ mod tests {
         let root = tmp_root("mvp03-check-fingerprint");
         live_engine(&root);
         with_creds(&root, "fixture-user", "fixture-pass");
+        // A CURRENT trade PASS requires a real, uniquely qualified probe
+        // entrance. This older fingerprint test originally omitted the port.
+        runtime_probe_with_creds(&root, closed_port(), "fixture-user", "fixture-pass");
         let prior = Check {
             ok: true, status: Some(204), at: 42,
             via_trade_exit: true, ..Default::default()
@@ -2277,6 +2332,9 @@ mod tests {
         let root = tmp_root("mvp03-composite-cross-process");
         live_engine(&root);
         with_creds(&root, "old-synthetic-user", "old-synthetic-password");
+        // The preceding PASS must be initially legitimate under the new
+        // strict gate; the OS-child/stale-write assertions stay unchanged.
+        runtime_probe_with_creds(&root, closed_port(), "old-synthetic-user", "old-synthetic-password");
         let old_started = runtime_started_at(&root).unwrap();
         let prior = Check {
             ok: true, status: Some(204), via_trade_exit: true,
@@ -2864,6 +2922,63 @@ mod tests {
     fn mvp03_b2_stable_exit_attribution_local_socks_control() {
         mvp03_b2_exit_attribution_after_return_case(
             "mvp03-b2-exit-control", "none");
+    }
+
+    #[test]
+    fn mvp03_b1_legacy_online_trade_requires_unique_qualified_current_probe() {
+        for mutation in ["missing_port", "duplicate_probe", "wrong_users",
+                         "unknown_route", "extra_condition", "missing_engine"] {
+            let root = tmp_root(&format!("mvp03-b1-current-{mutation}"));
+            live_engine(&root);
+            with_creds(&root, "u", "p");
+            let port = closed_port();
+            runtime_probe(&root, port);
+            let prior = Check {
+                ok: true, status: Some(204), via_trade_exit: true, at: 1,
+                ..Default::default()
+            };
+            save(&root, &prior).unwrap();
+            assert_eq!(load(&root), Some(prior.clone()),
+                "{mutation}: qualified starting legacy check must be readable");
+            let path = root.join("runtime-engine.json");
+            if mutation == "missing_engine" {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                let mut engine: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                match mutation {
+                    "missing_port" => {
+                        engine["inbounds"][0].as_object_mut().unwrap()
+                            .remove("listen_port");
+                    }
+                    "duplicate_probe" => {
+                        let same = engine["inbounds"][0].clone();
+                        engine["inbounds"].as_array_mut().unwrap().push(same);
+                    }
+                    "wrong_users" => {
+                        engine["inbounds"][0]["users"][0]["password"] =
+                            serde_json::json!("not-the-live-session");
+                    }
+                    "unknown_route" => {
+                        engine["route"]["rules"][0]["outbound"] =
+                            serde_json::json!("unknown-egress");
+                    }
+                    "extra_condition" => {
+                        engine["route"]["rules"][0]["domain_suffix"] =
+                            serde_json::json!(["never-matches.invalid"]);
+                    }
+                    _ => unreachable!(),
+                }
+                std::fs::write(&path, engine.to_string()).unwrap();
+            }
+            assert!(!load(&root).as_ref().is_some_and(|c| c.ok && c.via_trade_exit),
+                "{mutation}: legacy online trade PASS must fail-closed");
+            // No deletion/rewriting of the historical JSON by the reader.
+            std::fs::remove_file(root.join("runtime.json")).unwrap();
+            assert_eq!(load(&root), Some(prior),
+                "{mutation}: ordinary disconnect must preserve old Check history");
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
 }
