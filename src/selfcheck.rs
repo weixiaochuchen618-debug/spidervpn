@@ -749,15 +749,21 @@ pub fn measure_latency_and_record(root: &Path, timeout_ms: u64) -> Result<Latenc
     let connection_started_at = runtime_started_at(root).ok_or_else(|| {
         MeasureError::new("environment", "当前连接缺少启动标识，请重新连接后测量")
     })?;
-    if let Some(reason) = crate::engine_config::probe_evidence_skip_reason_from_file(
-        &root.join("runtime-engine.json")
+    // Manual measurement has no independent ProbePlan. Read the live probe
+    // port first, then validate that unique SOCKS inbound's users and first
+    // trade route against this runtime.json's actual session credentials.
+    let port = active_probe_port(root).map_err(|e| MeasureError::new("config", e))?;
+    let (user, pass) = probe_creds(root).ok_or_else(|| {
+        MeasureError::new("environment", "当前连接没有探测凭据，请重新连接后测量")
+    })?;
+    if let Some(reason) = crate::engine_config::probe_evidence_skip_reason_for_session(
+        &root.join("runtime-engine.json"), port, &user, &pass,
     ) {
         clear_latency(root);
         return Err(MeasureError::new("config", format!("VPN 出口未验证：{reason}")));
     }
-    let port = active_probe_port(root).map_err(|e| MeasureError::new("config", e))?;
-    let (user, pass) = probe_creds(root).ok_or_else(|| {
-        MeasureError::new("environment", "当前连接没有探测凭据，请重新连接后测量")
+    let session_before = check_session_fingerprint(root).ok_or_else(|| {
+        MeasureError::new("environment", "当前连接没有可验证的探测会话，请重新连接后测量")
     })?;
     let started = Instant::now();
     let result = socks5_get(port, &user, &pass, HOST, PATH, timeout_ms);
@@ -794,6 +800,18 @@ pub fn measure_latency_and_record(root: &Path, timeout_ms: u64) -> Result<Latenc
     if !engine_alive(root) {
         note_failure(root, &line_id, &profile, "ControllerUnavailable");
         return Err(MeasureError::new("network", "测量期间引擎退出，本次读数无效"));
+    }
+    // The process may restart or its runtime files may change during the
+    // SOCKS/HTTP exchange. Do not persist a successful latency/perf sample
+    // for a different connection from the one we qualified before dialing.
+    if check_session_fingerprint(root).as_deref() != Some(&session_before)
+        || runtime_started_at(root).as_deref() != Some(&connection_started_at)
+        || crate::engine_config::probe_evidence_skip_reason_for_session(
+            &root.join("runtime-engine.json"), port, &user, &pass,
+        ).is_some()
+    {
+        clear_latency(root);
+        return Err(MeasureError::new("config", "测量期间探测会话或交易路由已改变，本次读数无效"));
     }
     let measured = Latency { latency_ms, at, connection_started_at };
     save_latency(root, &measured).map_err(|e| MeasureError::new("config", e))?;
@@ -873,10 +891,41 @@ fn note_failed_check_write(root: &Path, failed: bool) {
 }
 
 /// 写结论。原本的原子替换语义不变；失败时立即废弃当前进程中旧PASS的读取资格。
+/// A non-secret, domain-separated identity for a single authenticated probe
+/// session. The random credentials are regenerated per connection, and neither
+/// their plaintext nor their reversible encoding is persisted in last-check.
+/// StartedAt alone is insufficient (test fixtures and fast reconnects collide).
+fn check_session_fingerprint(root: &Path) -> Option<String> {
+    use sha2::Digest;
+    let rec = crate::model::load_runtime(&root.join("runtime.json")).ok()??;
+    let started = rec.started_at;
+    let user = rec.probe_user?;
+    let pass = rec.probe_pass?;
+    if started.trim().is_empty() || user.is_empty() || pass.is_empty() {
+        return None;
+    }
+    let mut hash = sha2::Sha256::new();
+    hash.update(b"spidervpn/check-session/v1\0");
+    for field in [started.as_bytes(), user.as_bytes(), pass.as_bytes()] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    Some(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 pub fn save(root: &Path, c: &Check) -> Result<(), String> {
     let result = (|| -> Result<(), String> {
         let path = root.join(FILE_NAME);
-        let text = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
+        // Keep the old Check Rust/JSON shape readable. An optional extension
+        // is written only for PASS, and contains a SHA-256 digest, never the
+        // runtime username/password. Legacy readers ignore unknown JSON keys.
+        let mut value = serde_json::to_value(c).map_err(|e| e.to_string())?;
+        if c.ok {
+            if let Some(fingerprint) = check_session_fingerprint(root) {
+                value["session_fingerprint"] = serde_json::Value::String(fingerprint);
+            }
+        }
+        let text = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
         std::fs::rename(&tmp, &path).map_err(|e| format!("{}：{e}", path.display()))
@@ -912,16 +961,29 @@ pub fn clear_latency(root: &Path) {
 /// 读上次连接留下的结论。文件不存在或坏掉都当「未检测」：展示用的证据缺失，
 /// 不该变成一条错误，更不该让 `--status` 打不开。
 pub fn load(root: &Path) -> Option<Check> {
-    // An unfinished temp write (including a blocked .tmp directory) cannot
-    // coexist with a trusted PASS. Same-host write failures also retain a
-    // process-local deny marker if the file system could not create .tmp.
+    // The existing same-process denial and disk .tmp guard remain in force.
     if root.join(FILE_NAME).with_extension("json.tmp").exists()
         || failed_check_writes().lock().map(|paths| paths.contains(root)).unwrap_or(true)
     {
         return None;
     }
     let text = std::fs::read_to_string(root.join(FILE_NAME)).ok()?;
-    serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)).ok()
+    let value: serde_json::Value =
+        serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)).ok()?;
+    let check: Check = serde_json::from_value(value.clone()).ok()?;
+    // No runtime record means this is an offline/disconnected historical
+    // check: keep the long-standing "（上次）" and legacy JSON read behavior.
+    // With ANY runtime record present, an unbound/old PASS is never eligible
+    // as current VPN evidence, including after OS-process restart without
+    // either a failed-write memory marker or a residual .tmp file.
+    if check.ok && root.join("runtime.json").exists() {
+        let stored = value.get("session_fingerprint").and_then(serde_json::Value::as_str)?;
+        let current = check_session_fingerprint(root)?;
+        if stored != current {
+            return None;
+        }
+    }
+    Some(check)
 }
 
 /// 清掉失败连接留下的结论与测量。断开后保留上次自检是独立行为，不在这里处理。
@@ -1975,6 +2037,56 @@ mod tests {
         assert!(failure.message.contains("HTTP 502"), "{failure:?}");
         assert!(load_latency(&bad).is_none(), "HTTP502 must not save latency");
         let _ = std::fs::remove_dir_all(bad);
+    }
+
+
+    #[test]
+    fn mvp03_check_pass_fingerprint_binds_current_runtime_and_preserves_offline_history() {
+        let root = tmp_root("mvp03-check-fingerprint");
+        live_engine(&root);
+        with_creds(&root, "fixture-user", "fixture-pass");
+        let prior = Check {
+            ok: true, status: Some(204), at: 42,
+            via_trade_exit: true, ..Default::default()
+        };
+        save(&root, &prior).expect("save authenticated synthetic PASS");
+        assert_eq!(load(&root), Some(prior.clone()),
+            "same runtime session must still load its own PASS");
+        let on_disk = std::fs::read_to_string(root.join(FILE_NAME)).unwrap();
+        assert!(on_disk.contains("session_fingerprint"),
+            "new successful Check must carry a non-secret session binding");
+        assert!(!on_disk.contains("fixture-user") && !on_disk.contains("fixture-pass"),
+            "last-check must never persist raw probe credentials");
+
+        // Keep StartedAt identical: a timestamp-only comparison would be
+        // falsely green. New runtime credentials represent another session.
+        with_creds(&root, "next-user", "next-pass");
+        assert!(load(&root).is_none(),
+            "same StartedAt must not allow earlier authenticated PASS");
+
+        // After disconnect the unchanged Check record remains available for
+        // the previous-session label. No live runtime means historical only.
+        std::fs::remove_file(root.join("runtime.json")).unwrap();
+        assert_eq!(load(&root), Some(prior),
+            "disconnect must not delete the readable historical PASS");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mvp03_legacy_pass_is_readable_offline_but_not_current_without_binding() {
+        let root = tmp_root("mvp03-legacy-fingerprint");
+        std::fs::write(root.join(FILE_NAME),
+            r#"{"ok":true,"status":204,"error":null,"at":1}"#).unwrap();
+        assert!(load(&root).is_some_and(|c| c.ok),
+            "old JSON without a fingerprint remains readable as history");
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        assert!(load(&root).is_none(),
+            "legacy PASS without a binding is not proof of a new live session");
+        std::fs::remove_file(root.join("runtime.json")).unwrap();
+        assert!(load(&root).is_some_and(|c| c.ok && c.status == Some(204)),
+            "historical legacy JSON must stay readable after disconnect");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
 }
