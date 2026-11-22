@@ -2089,4 +2089,289 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+
+    // Issue #45: strict TEST-ONLY composite and in-flight auto-check races.
+    // Only synthetic temporary files and 127.0.0.1 SOCKS are involved.
+    #[test]
+    fn mvp03_composite_fingerprinted_pass_failed_skip_no_tmp_new_os_process() {
+        const CHILD_ROOT: &str = "SPIDERVPN_MVP03_COMPOSITE_CHILD_ROOT";
+        const CHILD_STAGE: &str = "SPIDERVPN_MVP03_COMPOSITE_CHILD_STAGE";
+        if let Some(path) = std::env::var_os(CHILD_ROOT) {
+            let root = std::path::PathBuf::from(path);
+            let stage = std::env::var(CHILD_STAGE).expect("child stage supplied");
+            assert!(!root.join("last-check.json.tmp").exists(),
+                "fresh OS process cannot rely on a leftover temporary file");
+            let raw = std::fs::read(root.join(FILE_NAME)).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            let previous = v["session_fingerprint"].as_str().unwrap();
+            assert_eq!(previous.len(), 64, "old PASS must have a real digest");
+            let observed = load(&root);
+            match stage.as_str() {
+                "current" => {
+                    assert!(root.join("runtime.json").exists());
+                    assert_ne!(check_session_fingerprint(&root).as_deref(), Some(previous),
+                        "same StartedAt but new probe credentials must change the digest");
+                    assert!(!observed.as_ref().is_some_and(|c| c.ok),
+                        "NEW PROCESS reused previously valid old fingerprint as current PASS: {observed:?}");
+                }
+                "history" => {
+                    assert!(!root.join("runtime.json").exists(),
+                        "the historical read is after simulated successful disconnect");
+                    let historical = observed.expect("disconnected history must remain readable");
+                    assert!(historical.ok && historical.status == Some(204)
+                        && historical.via_trade_exit,
+                        "old fingerprinted PASS must still be available as history: {historical:?}");
+                }
+                _ => panic!("invalid composite subprocess stage"),
+            }
+            return;
+        }
+
+        let root = tmp_root("mvp03-composite-cross-process");
+        live_engine(&root);
+        with_creds(&root, "old-synthetic-user", "old-synthetic-password");
+        let old_started = runtime_started_at(&root).unwrap();
+        let prior = Check {
+            ok: true, status: Some(204), via_trade_exit: true,
+            at: crate::model::now_epoch_secs_u64(), ..Default::default()
+        };
+        save(&root, &prior).expect("persist a previously eligible PASS");
+        assert_eq!(load(&root), Some(prior.clone()),
+            "old fingerprint must be truly valid in the first session");
+        let old_bytes = std::fs::read(root.join(FILE_NAME)).unwrap();
+        let old_value: serde_json::Value = serde_json::from_slice(&old_bytes).unwrap();
+        let old_fp = old_value["session_fingerprint"].as_str().unwrap();
+        assert_eq!(old_fp.len(), 64);
+        assert!(!String::from_utf8_lossy(&old_bytes).contains("old-synthetic-password"),
+            "no probe credentials may enter last-check");
+
+        with_creds(&root, "new-synthetic-user", "new-synthetic-password");
+        assert_eq!(runtime_started_at(&root), Some(old_started),
+            "timestamp collision must be intentional");
+        assert_ne!(check_session_fingerprint(&root).as_deref(), Some(old_fp));
+        let temporary = root.join("last-check.json.tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        let skipped = check_and_record(&root, &ProbePlan::Skip {
+            port: Some(17_893), reason: "synthetic new session was not verified".into(),
+        }, 1);
+        assert!(!skipped.ok && skipped.skipped.is_some(), "{skipped:?}");
+        assert_eq!(std::fs::read(root.join(FILE_NAME)).unwrap(), old_bytes,
+            "SKIP write failure must leave the OLD valid fingerprinted PASS on disk");
+        std::fs::remove_dir(&temporary).unwrap();
+        assert!(!temporary.exists(), "no .tmp remains before process restart");
+        assert!(load(&root).is_none(),
+            "same-process failed-write guard should still reject the stale PASS");
+
+        let run_child = |stage: &str| {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "selfcheck::tests::mvp03_composite_fingerprinted_pass_failed_skip_no_tmp_new_os_process",
+                    "--nocapture", "--test-threads=1",
+                ])
+                .env(CHILD_ROOT, &root)
+                .env(CHILD_STAGE, stage)
+                .output().expect("launch an independent test OS process");
+            assert!(out.status.success(),
+                "{stage} fresh-process check FAILED; stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr));
+        };
+        run_child("current");
+        // Ordinary disconnect deletes runtime.json, not last-check.json:
+        // the original PASS remains readable as "previous", not current.
+        std::fs::remove_file(root.join("runtime.json")).unwrap();
+        assert_eq!(std::fs::read(root.join(FILE_NAME)).unwrap(), old_bytes);
+        run_child("history");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A deterministic real loopback SOCKS5 server pauses only AFTER reading
+    /// the HTTP request, so the production pre-dial guard already ran and
+    /// the client cannot receive 204/502 until the test explicitly releases it.
+    fn mvp03_gated_auto_socks(
+        status: u16,
+    ) -> (
+        u16,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("loopback auto-check connects");
+            stream.set_read_timeout(Some(Duration::from_secs(12))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(12))).unwrap();
+            let mut greeting = [0u8; 4];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [0x05, 0x02, 0x00, 0x02]);
+            stream.write_all(&[0x05, 0x02]).unwrap();
+            let mut header = [0u8; 2];
+            stream.read_exact(&mut header).unwrap();
+            assert_eq!(header[0], 0x01);
+            let mut username = vec![0; header[1] as usize];
+            stream.read_exact(&mut username).unwrap();
+            let mut n = [0u8; 1];
+            stream.read_exact(&mut n).unwrap();
+            let mut password = vec![0; n[0] as usize];
+            stream.read_exact(&mut password).unwrap();
+            // Only harmless fixed fixture credentials. Never relay a request.
+            assert_eq!(username, b"u");
+            assert_eq!(password, b"p");
+            stream.write_all(&[0x01, 0x00]).unwrap();
+
+            let mut connect = [0u8; 5];
+            stream.read_exact(&mut connect).unwrap();
+            assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x03]);
+            let mut target = vec![0; connect[4] as usize + 2];
+            stream.read_exact(&mut target).unwrap();
+            stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("get first HTTP line");
+            assert_eq!(line, "GET /generate_204 HTTP/1.1\r\n");
+            loop {
+                line.clear();
+                reader.read_line(&mut line).expect("read synthetic HTTP headers");
+                if line == "\r\n" { break; }
+                assert!(!line.is_empty(), "HTTP request must be complete");
+            }
+            // The production HTTP client has sent a real request but MUST
+            // wait here: no sleeps, guesswork, or production-only test hook.
+            arrived_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10))
+                .expect("coordinator must release the held HTTP response");
+            let response = if status == 204 {
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+            } else {
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (port, arrived_rx, release_tx, server)
+    }
+
+    fn mvp03_auto_race_fixture(
+        tag: &str, status: u16,
+    ) -> (
+        std::path::PathBuf,
+        u16,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let root = tmp_root(tag);
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        let (port, arrived, release, server) = mvp03_gated_auto_socks(status);
+        runtime_probe(&root, port);
+        // Explicit user-like daily direct fallback; trade remains a distinct
+        // non-direct selector, exactly as the older positive regressions demand.
+        let path = root.join("runtime-engine.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["outbounds"].as_array_mut().unwrap().push(
+            serde_json::json!({"type":"direct","tag":"direct"}));
+        value["outbounds"].as_array_mut().unwrap().push(serde_json::json!({
+            "type":"selector","tag":"daily-exit",
+            "outbounds":["direct","hk"],"default":"direct"
+        }));
+        std::fs::write(&path, value.to_string()).unwrap();
+        (root, port, arrived, release, server)
+    }
+
+    fn mvp03_auto_inflight_case(tag: &str, change: &str, status: u16) {
+        let (root, port, arrived, release, server) = mvp03_auto_race_fixture(tag, status);
+        let client_root = root.clone();
+        let client = std::thread::spawn(move ||
+            check_and_record(&client_root, &dial_plan(port, "u", "p"), 15_000));
+        arrived.recv_timeout(Duration::from_secs(10))
+            .expect("real authenticated SOCKS precheck and HTTP request must reach barrier");
+
+        match change {
+            "new_session" => {
+                let old_started = runtime_started_at(&root);
+                // Keep the timestamp identical to expose stale-session
+                // attribution even on a same-second fast reconnect.
+                with_creds(&root, "u-new", "p-new");
+                let path = root.join("runtime-engine.json");
+                let mut engine: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                engine["inbounds"][0]["users"][0]["username"] = serde_json::json!("u-new");
+                engine["inbounds"][0]["users"][0]["password"] = serde_json::json!("p-new");
+                std::fs::write(path, engine.to_string()).unwrap();
+                assert_eq!(runtime_started_at(&root), old_started);
+            }
+            "trade_direct" => {
+                let path = root.join("runtime-engine.json");
+                let mut engine: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                engine["route"]["rules"][0]["outbound"] = serde_json::json!("direct");
+                std::fs::write(path, engine.to_string()).unwrap();
+            }
+            "none" => {}
+            _ => panic!("invalid race variation"),
+        }
+        // A production-path precheck now has stale information. Release the
+        // synthetic HTTP response only after all file mutations committed.
+        release.send(()).unwrap();
+        let result = client.join().expect("auto-check client completes");
+        server.join().expect("synthetic SOCKS handler completes");
+        let on_disk = load(&root);
+        if change == "none" && status == 204 {
+            assert!(result.ok && result.status == Some(204) && result.via_trade_exit,
+                "stable authenticated trade route must PASS normally: {result:?}");
+            assert!(on_disk.as_ref().is_some_and(|c| c.ok && c.status == Some(204)),
+                "stable HTTP204 must persist a current fingerprinted PASS: {on_disk:?}");
+        } else {
+            assert!(!result.ok && !on_disk.as_ref().is_some_and(|c| c.ok),
+                "{tag}: in-flight change={change}, HTTP{status}: OLD request was attributed as current VPN PASS; result={result:?}, stored={on_disk:?}");
+            if status == 502 {
+                assert_eq!(result.status, Some(502),
+                    "true HTTP502 must remain a non-PASS error without rewriting semantics");
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mvp03_auto_inflight_runtime_session_switch_must_not_pass() {
+        mvp03_auto_inflight_case("mvp03-auto-runtime-race", "new_session", 204);
+    }
+
+    #[test]
+    fn mvp03_auto_inflight_trade_route_switch_must_not_pass() {
+        mvp03_auto_inflight_case("mvp03-auto-route-race", "trade_direct", 204);
+    }
+
+    #[test]
+    fn mvp03_auto_inflight_stable_204_and_502_controls() {
+        mvp03_auto_inflight_case("mvp03-auto-control204", "none", 204);
+        mvp03_auto_inflight_case("mvp03-auto-control502", "none", 502);
+    }
+
+    #[test]
+    fn mvp03_stale_engine_runtime_check_is_observed_not_falsely_verified() {
+        let root = tmp_root("mvp03-stale-engine-observation");
+        runtime_with_engine(&root, -1);
+        with_creds(&root, "fixture-only-user", "fixture-only-password");
+        assert!(!engine_alive(&root),
+            "negative PID is a deterministic synthetic dead-engine record");
+        let prior = Check {
+            ok: true, status: Some(204), via_trade_exit: true, at: 7,
+            ..Default::default()
+        };
+        save(&root, &prior).unwrap();
+        // Characterize rather than declare a new product requirement: status
+        // also applies its existing independent live-engine evidence.
+        let observed = load(&root);
+        assert!(observed.is_none() || observed == Some(prior),
+            "only characterize the stale-runtime reader; do not alter its policy");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
 }
