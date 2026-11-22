@@ -1678,4 +1678,82 @@ mod tests {
         assert_eq!(port_from_endpoint("127.0.0.1:0"), None);
         assert_eq!(port_from_endpoint("127.0.0.1:abc"), None);
     }
+
+    // MVP-03 Issue #39: TEST ONLY, loopback synthetic SOCKS, never real VPN.
+    #[test]
+    fn mvp03_session_probe_runtime_mutations_must_not_claim_vpn() {
+        for case in ["wrong_port", "wrong_users", "non_route_action", "extra_route_condition"] {
+            let root = tmp_root(&format!("mvp03-session-{case}"));
+            live_engine(&root);
+            with_creds(&root, "u", "p");
+            let port = fake_socks5("pass", "u", "p");
+            runtime_probe(&root, port);
+            let path = root.join("runtime-engine.json");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            match case {
+                "wrong_port" => {
+                    let other = if port == u16::MAX { port - 1 } else { port + 1 };
+                    value["inbounds"][0]["listen_port"] = serde_json::json!(other);
+                }
+                "wrong_users" => {
+                    value["inbounds"][0]["users"][0]["password"] = serde_json::json!("other");
+                }
+                "non_route_action" => {
+                    value["route"]["rules"][0]["action"] = serde_json::json!("reject");
+                }
+                "extra_route_condition" => {
+                    value["route"]["rules"][0]["domain_suffix"] =
+                        serde_json::json!(["never-matches.invalid"]);
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            let c = check_and_record(&root, &dial_plan(port, "u", "p"), 1_000);
+            assert!(!c.ok && c.status.is_none(), "{case}: unsafe probe yielded response: {c:?}");
+            assert!(c.skipped.is_some(), "{case}: must explicitly SKIP/UNVERIFIED: {c:?}");
+            assert!(!load(&root).is_some_and(|saved| saved.ok), "{case}: persisted PASS");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // Exact port+credentials, non-direct trade and explicit action=route remain valid.
+        let root = tmp_root("mvp03-session-positive");
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        let port = fake_socks5("pass", "u", "p");
+        runtime_probe(&root, port);
+        let path = root.join("runtime-engine.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["route"]["rules"][0]["action"] = serde_json::json!("route");
+        std::fs::write(&path, value.to_string()).unwrap();
+        let c = check_and_record(&root, &dial_plan(port, "u", "p"), 2_000);
+        assert!(c.ok && c.status == Some(204), "valid authenticated probe regressed: {c:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mvp03_skip_save_failure_must_not_reload_stale_pass() {
+        let root = tmp_root("mvp03-save-failure");
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        save(&root, &Check {
+            ok: true, status: Some(204), at: crate::model::now_epoch_secs_u64(),
+            via_trade_exit: true, ..Default::default()
+        }).unwrap();
+        // Directory at temp-file path rejects the new SKIP write on every target.
+        std::fs::create_dir(root.join("last-check.json.tmp")).unwrap();
+        let original = std::fs::read(root.join(FILE_NAME)).unwrap();
+        let now = check_and_record(&root, &ProbePlan::Skip {
+            port: Some(17_893), reason: "本次交易出口无法确认".to_string(),
+        }, 1);
+        assert!(!now.ok && now.skipped.is_some(), "current decision must SKIP: {now:?}");
+        assert_eq!(std::fs::read(root.join(FILE_NAME)).unwrap(), original,
+            "old PASS must truly survive failed SKIP write for this regression");
+        // IPC status_json consumes the same selfcheck::load reader.
+        let displayed = load(&root);
+        assert!(!displayed.as_ref().is_some_and(|check| check.ok),
+            "status reader cannot report stale PASS: {displayed:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
 }
