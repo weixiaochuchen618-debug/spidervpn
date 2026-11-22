@@ -1086,6 +1086,51 @@ pub fn clear_latency(root: &Path) {
     let _ = std::fs::remove_file(root.join(LATENCY_FILE_NAME));
 }
 
+// Fingerprint-only legacy trade PASS has NO original port/route snapshot.
+// Never backfill one from the new runtime: only decide if the CURRENT live
+// session still has a uniquely identified authenticated, non-direct tc-check.
+// This is current-eligibility screening, NOT proof of the historical egress.
+fn legacy_online_trade_eligible(root: &Path, stored_session: &str) -> bool {
+    let engine_path = root.join("runtime-engine.json");
+    let Some(before_engine) = auto_engine_fingerprint(root) else {
+        return false;
+    };
+    let Some((user, pass)) = probe_creds(root) else {
+        return false;
+    };
+    let port = (|| -> Option<u16> {
+        let bytes = std::fs::read(&engine_path).ok()?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let inbounds = json.get("inbounds")?.as_array()?;
+        let mut probes = inbounds.iter().filter(|inbound| {
+            inbound.get("tag").and_then(serde_json::Value::as_str)
+                == Some(crate::engine_config::PROBE_TAG)
+        });
+        let probe = probes.next()?;
+        if probes.next().is_some() {
+            return None; // ambiguous live entrance: cannot infer a unique port
+        }
+        let port = u16::try_from(probe.get("listen_port")?.as_u64()?).ok()?;
+        (port != 0).then_some(port)
+    })();
+    let Some(port) = port else {
+        return false; // no trustworthy CURRENT port, not a fabricated old one
+    };
+    if check_session_fingerprint(root).as_deref() != Some(stored_session)
+        || crate::engine_config::probe_evidence_skip_reason_for_session(
+            &engine_path, port, &user, &pass,
+        ).is_some()
+    {
+        return false;
+    }
+    // Recheck after the strict gate: an independent writer may replace the
+    // engine/config or runtime during the read; fail closed on observed change.
+    engine_alive(root)
+        && check_session_fingerprint(root).as_deref() == Some(stored_session)
+        && probe_creds(root).as_ref() == Some(&(user, pass))
+        && auto_engine_fingerprint(root).as_deref() == Some(&before_engine)
+}
+
 /// 读上次连接留下的结论。文件不存在或坏掉都当「未检测」：展示用的证据缺失，
 /// 不该变成一条错误，更不该让 `--status` 打不开。
 pub fn load(root: &Path) -> Option<Check> {
@@ -1126,6 +1171,13 @@ pub fn load(root: &Path) -> Option<Check> {
                 engine_fingerprint,
             };
             if !proof.still_current(root) || !engine_alive(root) {
+                return None;
+            }
+        } else if check.via_trade_exit {
+            // A valid old session digest alone cannot vouch for a route
+            // that changed to direct or an unknown tc-check entrance.
+            // Do NOT make up its historical port/route and re-stamp JSON.
+            if !legacy_online_trade_eligible(root, stored) {
                 return None;
             }
         }
@@ -2192,6 +2244,9 @@ mod tests {
         let root = tmp_root("mvp03-check-fingerprint");
         live_engine(&root);
         with_creds(&root, "fixture-user", "fixture-pass");
+        // A CURRENT trade PASS requires a real, uniquely qualified probe
+        // entrance. This older fingerprint test originally omitted the port.
+        runtime_probe_with_creds(&root, closed_port(), "fixture-user", "fixture-pass");
         let prior = Check {
             ok: true, status: Some(204), at: 42,
             via_trade_exit: true, ..Default::default()
@@ -2277,6 +2332,9 @@ mod tests {
         let root = tmp_root("mvp03-composite-cross-process");
         live_engine(&root);
         with_creds(&root, "old-synthetic-user", "old-synthetic-password");
+        // The preceding PASS must be initially legitimate under the new
+        // strict gate; the OS-child/stale-write assertions stay unchanged.
+        runtime_probe_with_creds(&root, closed_port(), "old-synthetic-user", "old-synthetic-password");
         let old_started = runtime_started_at(&root).unwrap();
         let prior = Check {
             ok: true, status: Some(204), via_trade_exit: true,
@@ -2558,6 +2616,369 @@ mod tests {
         assert_eq!(load(&root), Some(proof),
             "disconnected previous-session Check must remain readable");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+
+    // Issue #49 B1/B2: TEST-ONLY offline evidence, no public endpoint, no
+    // real connect_json, HKCU proxy edits, engine/WFP/VPS, or production hooks.
+    fn mvp03_b1_fixture(tag: &str) -> (std::path::PathBuf, u16) {
+        let root = tmp_root(tag);
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        let port = closed_port();
+        runtime_probe(&root, port);
+        let path = root.join("runtime-engine.json");
+        let mut engine: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        engine["outbounds"].as_array_mut().unwrap()
+            .push(serde_json::json!({"type":"direct","tag":"direct"}));
+        engine["outbounds"].as_array_mut().unwrap().push(serde_json::json!({
+            "type":"selector","tag":"daily-exit",
+            "outbounds":["direct","hk"],"default":"direct"
+        }));
+        std::fs::write(&path, engine.to_string()).unwrap();
+        assert!(crate::engine_config::probe_evidence_skip_reason_for_session(
+            &path, port, "u", "p",
+        ).is_none(), "old trade PASS must start with genuinely qualified route");
+        (root, port)
+    }
+
+    fn mvp03_b1_unsafe_direct_route(root: &Path) {
+        let path = root.join("runtime-engine.json");
+        let mut engine: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        engine["route"]["rules"][0]["outbound"] = serde_json::json!("direct");
+        std::fs::write(&path, engine.to_string()).unwrap();
+    }
+
+    #[test]
+    fn mvp03_b1_old_online_trade_fingerprint_only_route_direct_must_not_pass() {
+        let (root, port) = mvp03_b1_fixture("mvp03-b1-legacy-online-direct");
+        let original = Check {
+            ok: true, status: Some(204), via_trade_exit: true, at: 42,
+            ..Default::default()
+        };
+        // Use the real legacy PUBLIC save path, not handcrafted JSON:
+        // the OLD online trade success is an actual valid session-bound PASS.
+        save(&root, &original).unwrap();
+        let disk = std::fs::read_to_string(root.join(FILE_NAME)).unwrap();
+        let rec: serde_json::Value = serde_json::from_str(&disk).unwrap();
+        assert_eq!(rec["session_fingerprint"].as_str().map(str::len), Some(64));
+        assert!(rec.get("auto_probe_port").is_none()
+            && rec.get("auto_engine_fingerprint").is_none(),
+            "this MUST exercise fingerprint-only legacy success, not the new auto format");
+        assert!(!disk.contains(r#""ProbeUser""#) && !disk.contains(r#""ProbePass""#),
+            "last-check must not store authentication credentials");
+        assert_eq!(load(&root), Some(original.clone()),
+            "old session-bound PASS was genuinely current and readable before change");
+        assert!(crate::engine_config::probe_evidence_skip_reason_for_session(
+            &root.join("runtime-engine.json"), port, "u", "p",
+        ).is_none());
+        let unchanged_session = check_session_fingerprint(&root);
+        mvp03_b1_unsafe_direct_route(&root);
+        assert_eq!(check_session_fingerprint(&root), unchanged_session,
+            "B1 must change ONLY routing, not the runtime session");
+        assert!(crate::engine_config::probe_evidence_skip_reason_for_session(
+            &root.join("runtime-engine.json"), port, "u", "p",
+        ).is_some(), "new route is genuinely disqualified");
+        let observed = load(&root);
+        assert!(!observed.as_ref().is_some_and(|c| c.ok && c.via_trade_exit),
+            "B1: fingerprint-only OLD trade PASS was accepted CURRENT after route changed to direct; observed={observed:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mvp03_b1_safe_legacy_trade_nontrade_and_offline_history_controls() {
+        let (root, _) = mvp03_b1_fixture("mvp03-b1-safe-controls");
+        let trade = Check {
+            ok: true, status: Some(204), via_trade_exit: true, at: 15,
+            ..Default::default()
+        };
+        save(&root, &trade).unwrap();
+        assert_eq!(load(&root), Some(trade.clone()),
+            "qualified old format trade PASS must remain valid online");
+        std::fs::remove_file(root.join("runtime.json")).unwrap();
+        assert_eq!(load(&root), Some(trade),
+            "disconnected old success is still readable as historical");
+        // Re-establish a fresh synthetic runtime for the separate nontrade
+        // online positive control; record_probe_creds requires runtime.json.
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        let nontrade = Check {
+            ok: true, status: Some(204), via_trade_exit: false, at: 16,
+            ..Default::default()
+        };
+        save(&root, &nontrade).unwrap();
+        assert_eq!(load(&root), Some(nontrade.clone()),
+            "explicit nontrade old Check is not an authenticated trade assertion");
+        mvp03_b1_unsafe_direct_route(&root);
+        assert_eq!(load(&root), Some(nontrade.clone()),
+            "route-specific B1 gate must not rewrite legacy nontrade semantics");
+        std::fs::remove_file(root.join("runtime.json")).unwrap();
+        assert_eq!(load(&root), Some(nontrade),
+            "nontrade historical JSON also remains readable offline");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn mvp03_b2_config_fixture(root: &Path) -> crate::config::LineConfig {
+        let cfg = crate::config::parse(
+            r#"{"schema":2,"selected":"L1","lines":[{"id":"L1","name":"offline-fixture","proxy_endpoint":"127.0.0.1:17891"}]}"#
+        ).unwrap();
+        crate::config::save(&root.join(crate::config::DEFAULT_PATH), &cfg).unwrap();
+        cfg.current_line().unwrap().clone()
+    }
+
+    fn mvp03_b2_after_return_mutation(root: &Path, change: &str) {
+        match change {
+            "route" => mvp03_b1_unsafe_direct_route(root),
+            "session" => {
+                let before = runtime_started_at(root);
+                with_creds(root, "new-u", "new-p");
+                let path = root.join("runtime-engine.json");
+                let mut engine: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                engine["inbounds"][0]["users"][0]["username"] = serde_json::json!("new-u");
+                engine["inbounds"][0]["users"][0]["password"] = serde_json::json!("new-p");
+                std::fs::write(path, engine.to_string()).unwrap();
+                assert_eq!(runtime_started_at(root), before,
+                    "the fast reconnect uses the SAME StartedAt, by construction");
+            }
+            "none" => (),
+            _ => panic!("unknown mutation fixture"),
+        }
+    }
+
+    fn mvp03_b2_verified_transport_returned_check_case(tag: &str, change: &str) {
+        let root = tmp_root(tag);
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        let line = mvp03_b2_config_fixture(&root);
+        assert_eq!(line.verified_transport, None);
+        let port = fake_socks5("pass", "u", "p");
+        runtime_probe(&root, port);
+        let plan = dial_plan(port, "u", "p");
+        // Real production auto-check finishes AND its own current disk
+        // evidence is accepted BEFORE caller-stage mutation.
+        let returned = check_and_record(&root, &plan, 2_000);
+        assert!(returned.ok && returned.status == Some(204), "valid first phase: {returned:?}");
+        assert_eq!(load(&root), Some(returned.clone()), "real persisted auto PASS");
+        mvp03_b2_after_return_mutation(&root, change);
+        if change != "none" {
+            assert!(!load(&root).is_some_and(|c| c.ok),
+                "new shared reader already recognizes that cached PASS is now stale");
+        }
+        // Exact production caller condition + actual production persistence
+        // function from main.rs and ipc.rs; NOT the proxy-mutating handler.
+        let wrote = if returned.ok {
+            crate::config::record_verified_transport(
+                &root, &line.id, line.effective_transport(),
+            ).expect("actual local config write path")
+        } else { false };
+        let saved = crate::config::load(&root.join(crate::config::DEFAULT_PATH))
+            .unwrap().unwrap();
+        let consumed = saved.current_line().unwrap();
+        if change == "none" {
+            assert!(wrote && consumed.verified_transport == Some(line.effective_transport()),
+                "stable caller control must really persist a verified transport");
+        } else {
+            assert!(!wrote && consumed.verified_transport.is_none(),
+                "B2 verified_transport: stale returned Check.ok=true was consumed AFTER {change} mutation; actual production write={wrote}, on-disk verified_transport={:?}, effective_transport={:?}",
+                consumed.verified_transport, consumed.effective_transport());
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mvp03_b2_post_return_route_change_must_not_persist_verified_transport() {
+        mvp03_b2_verified_transport_returned_check_case(
+            "mvp03-b2-return-route", "route");
+    }
+
+    #[test]
+    fn mvp03_b2_post_return_session_change_must_not_persist_verified_transport() {
+        mvp03_b2_verified_transport_returned_check_case(
+            "mvp03-b2-return-session", "session");
+    }
+
+    #[test]
+    fn mvp03_b2_stable_caller_verified_transport_control() {
+        mvp03_b2_verified_transport_returned_check_case(
+            "mvp03-b2-stable-caller", "none");
+    }
+
+    /// All exit-probe HTTP bytes are generated by this 127.0.0.1 server;
+    /// 8.8.8.8 appears in a synthetic body and local fixture file ONLY.
+    /// Neither the SOCKS CONNECT host nor the IP literal is contacted.
+    fn mvp03_b2_two_phase_loopback_socks() -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for phase in 0..2 {
+                let (mut stream, _) = listener.accept().expect("only loopback SOCKS peer");
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut greeting = [0u8; 4];
+                stream.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting, [5, 2, 0, 2]);
+                stream.write_all(&[5, 2]).unwrap();
+                let mut auth = [0u8; 2];
+                stream.read_exact(&mut auth).unwrap();
+                let mut username = vec![0u8; auth[1] as usize];
+                stream.read_exact(&mut username).unwrap();
+                let mut n = [0u8; 1];
+                stream.read_exact(&mut n).unwrap();
+                let mut password = vec![0u8; n[0] as usize];
+                stream.read_exact(&mut password).unwrap();
+                assert_eq!(username, b"u");
+                assert_eq!(password, b"p");
+                stream.write_all(&[1, 0]).unwrap();
+                let mut connect = [0u8; 5];
+                stream.read_exact(&mut connect).unwrap();
+                assert_eq!(&connect[..4], &[5, 1, 0, 3]);
+                let mut rest = vec![0u8; connect[4] as usize + 2];
+                stream.read_exact(&mut rest).unwrap();
+                stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                assert!(first.starts_with("GET /"), "{first:?}");
+                loop {
+                    first.clear();
+                    reader.read_line(&mut first).unwrap();
+                    if first == "\r\n" { break; }
+                    assert!(!first.is_empty(), "complete HTTP headers required");
+                }
+                drop(reader);
+                if phase == 0 {
+                    stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").unwrap();
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\n8.8.8.8\n").unwrap();
+                }
+            }
+        });
+        (port, server)
+    }
+
+    fn mvp03_b2_exit_attribution_after_return_case(tag: &str, change: &str) {
+        let root = tmp_root(tag);
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        let line = mvp03_b2_config_fixture(&root);
+        std::fs::create_dir_all(root.join("lines")).unwrap();
+        // Documentation-only fake server address: only used for comparing a
+        // SYNTHETIC local HTTP response; never reached over the network.
+        std::fs::write(line.engine_config_path(&root),
+            r#"{"outbounds":[{"type":"vless","tag":"hk","server":"8.8.8.8"}]}"#
+        ).unwrap();
+        let (port, server) = mvp03_b2_two_phase_loopback_socks();
+        runtime_probe(&root, port);
+        let plan = dial_plan(port, "u", "p");
+        let returned = check_and_record(&root, &plan, 3_000);
+        assert!(returned.ok && returned.status == Some(204),
+            "first real auto-check must finish before mutation: {returned:?}");
+        assert_eq!(load(&root), Some(returned.clone()));
+        mvp03_b2_after_return_mutation(&root, change);
+        if change != "none" {
+            assert!(!load(&root).is_some_and(|c| c.ok),
+                "shared selfcheck reader must reject new caller context");
+        }
+        // This is the REAL production exit_probe function invoked with the
+        // same cached Check.ok caller condition and original ProbePlan. No
+        // main.rs/ipc.rs connect handler, public IP service or proxy switch.
+        let observed = if returned.ok {
+            crate::exit_probe::probe_and_record(&root, &line, &plan, 2_500)
+        } else { None };
+        server.join().expect("both local synthetic HTTP calls finished");
+        let disk = crate::exit_probe::load(&root);
+        assert_eq!(disk, observed, "must inspect real exit-probe.json disk write");
+        assert!(disk.is_some(), "loopback 200 IP body must exercise real parser and recorder");
+        let rec = disk.as_ref().unwrap();
+        assert_eq!(rec.ip, "8.8.8.8", "synthetic response only, not real exit IP");
+        if change == "none" {
+            assert!(rec.attributed
+                && crate::exit_probe::belongs_to_current_connection(rec, &root),
+                "stable exit-probe parsing/recording control must be accepted");
+        } else {
+            assert!(!(rec.attributed
+                && crate::exit_probe::belongs_to_current_connection(rec, &root)),
+                "B2 exit attribution: old cached Check.ok after {change} change caused real exit-probe.json to contain a CURRENT attributed IP, despite only local synthetic SOCKS bytes: {rec:?}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mvp03_b2_post_return_route_change_must_not_consume_exit_attribution() {
+        mvp03_b2_exit_attribution_after_return_case(
+            "mvp03-b2-exit-route", "route");
+    }
+
+    #[test]
+    fn mvp03_b2_post_return_same_started_at_new_session_must_not_attrib_exit() {
+        mvp03_b2_exit_attribution_after_return_case(
+            "mvp03-b2-exit-new-session", "session");
+    }
+
+    #[test]
+    fn mvp03_b2_stable_exit_attribution_local_socks_control() {
+        mvp03_b2_exit_attribution_after_return_case(
+            "mvp03-b2-exit-control", "none");
+    }
+
+    #[test]
+    fn mvp03_b1_legacy_online_trade_requires_unique_qualified_current_probe() {
+        for mutation in ["missing_port", "duplicate_probe", "wrong_users",
+                         "unknown_route", "extra_condition", "missing_engine"] {
+            let root = tmp_root(&format!("mvp03-b1-current-{mutation}"));
+            live_engine(&root);
+            with_creds(&root, "u", "p");
+            let port = closed_port();
+            runtime_probe(&root, port);
+            let prior = Check {
+                ok: true, status: Some(204), via_trade_exit: true, at: 1,
+                ..Default::default()
+            };
+            save(&root, &prior).unwrap();
+            assert_eq!(load(&root), Some(prior.clone()),
+                "{mutation}: qualified starting legacy check must be readable");
+            let path = root.join("runtime-engine.json");
+            if mutation == "missing_engine" {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                let mut engine: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                match mutation {
+                    "missing_port" => {
+                        engine["inbounds"][0].as_object_mut().unwrap()
+                            .remove("listen_port");
+                    }
+                    "duplicate_probe" => {
+                        let same = engine["inbounds"][0].clone();
+                        engine["inbounds"].as_array_mut().unwrap().push(same);
+                    }
+                    "wrong_users" => {
+                        engine["inbounds"][0]["users"][0]["password"] =
+                            serde_json::json!("not-the-live-session");
+                    }
+                    "unknown_route" => {
+                        engine["route"]["rules"][0]["outbound"] =
+                            serde_json::json!("unknown-egress");
+                    }
+                    "extra_condition" => {
+                        engine["route"]["rules"][0]["domain_suffix"] =
+                            serde_json::json!(["never-matches.invalid"]);
+                    }
+                    _ => unreachable!(),
+                }
+                std::fs::write(&path, engine.to_string()).unwrap();
+            }
+            assert!(!load(&root).as_ref().is_some_and(|c| c.ok && c.via_trade_exit),
+                "{mutation}: legacy online trade PASS must fail-closed");
+            // No deletion/rewriting of the historical JSON by the reader.
+            std::fs::remove_file(root.join("runtime.json")).unwrap();
+            assert_eq!(load(&root), Some(prior),
+                "{mutation}: ordinary disconnect must preserve old Check history");
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
 }
