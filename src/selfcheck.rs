@@ -1822,4 +1822,159 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+
+    // Issue #41: TEST ONLY. All failure injection is confined to a temp root.
+    // No user's real proxy, WFP, VPN, or public endpoint is contacted.
+    #[test]
+    fn mvp03_restart_without_tmp_cannot_reuse_stale_pass() {
+        const CHILD_ROOT: &str = "SPIDERVPN_MVP03_RESTART_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            // The test binary itself is a new process, with a fresh OnceLock.
+            let root = std::path::PathBuf::from(root);
+            assert!(!root.join("last-check.json.tmp").exists(),
+                "child must not inherit a blocked/pending temp-file marker");
+            let observed = load(&root);
+            assert!(!observed.as_ref().is_some_and(|check| check.ok),
+                "new IPC-like reader must not call the old PASS current: {observed:?}");
+            return;
+        }
+
+        let root = tmp_root("mvp03-restart-without-tmp");
+        live_engine(&root);
+        save(&root, &Check {
+            ok: true,
+            status: Some(204),
+            at: crate::model::now_epoch_secs_u64(),
+            via_trade_exit: true,
+            ..Default::default()
+        }).unwrap();
+        // A directory at the ordinary .tmp write target forces a real
+        // filesystem write error. The preexisting PASS must stay on disk.
+        let temp = root.join("last-check.json.tmp");
+        std::fs::create_dir(&temp).unwrap();
+        let current = check_and_record(&root, &ProbePlan::Skip {
+            port: Some(17_893),
+            reason: "本次会话无法验证交易出口".to_string(),
+        }, 1);
+        assert!(!current.ok && current.skipped.is_some(), "{current:?}");
+        let old: Check =
+            serde_json::from_slice(&std::fs::read(root.join(FILE_NAME)).unwrap()).unwrap();
+        assert!(old.ok && old.status == Some(204),
+            "fixture must truly preserve a previous PASS on disk");
+        // Simulate an error that did not leave a .tmp at recovery time.
+        std::fs::remove_dir(&temp).unwrap();
+        assert!(!temp.exists());
+        assert!(load(&root).is_none(),
+            "same-process in-memory failure marker must still deny the PASS");
+
+        // This is a real separate OS process using the existing Rust test
+        // binary. No artificial clearing of the protected in-memory marker.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "selfcheck::tests::mvp03_restart_without_tmp_cannot_reuse_stale_pass",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ROOT, &root)
+            .output()
+            .expect("isolated Rust test child must be launchable");
+        assert!(output.status.success(),
+            "fresh-process stale-PASS check FAILED; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A real local SOCKS responder is used, never a real VPN server.
+    /// The trade selector cannot choose direct while daily-exit defaults direct.
+    fn mvp03_manual_fixture(tag: &str, status: &'static str) -> std::path::PathBuf {
+        let root = tmp_root(&format!("mvp03-manual-{tag}"));
+        live_engine(&root);
+        with_creds(&root, "u", "p");
+        let port = fake_socks5(status, "u", "p");
+        runtime_probe(&root, port);
+        let path = root.join("runtime-engine.json");
+        let mut runtime: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let outbounds = runtime["outbounds"].as_array_mut().unwrap();
+        outbounds.push(serde_json::json!({"type":"direct","tag":"direct"}));
+        outbounds.push(serde_json::json!({
+            "type":"selector", "tag":"daily-exit",
+            "outbounds":["direct","hk"], "default":"direct"
+        }));
+        std::fs::write(path, runtime.to_string()).unwrap();
+        let cfg = crate::config::parse(
+            r#"{"schema":2,"selected":"L1","lines":[{"id":"L1","name":"synthetic","proxy_endpoint":"127.0.0.1:17901"}]}"#
+        ).unwrap();
+        crate::config::save(&root.join(crate::config::DEFAULT_PATH), &cfg).unwrap();
+        root
+    }
+
+    fn mvp03_manual_mutation_must_not_measure(kind: &str) {
+        let root = mvp03_manual_fixture(kind, "pass");
+        let path = root.join("runtime-engine.json");
+        let mut runtime: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        match kind {
+            "wrong_users" => {
+                // Runtime record still belongs to this connection, but the
+                // runtime SOCKS listener names a different authentication user.
+                runtime["inbounds"][0]["users"][0]["password"] =
+                    serde_json::json!("unrelated-fixture");
+            }
+            "reject_action" => {
+                runtime["route"]["rules"][0]["action"] = serde_json::json!("reject");
+            }
+            "extra_condition" => {
+                runtime["route"]["rules"][0]["domain_suffix"] =
+                    serde_json::json!(["never-matches.invalid"]);
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(&path, runtime.to_string()).unwrap();
+        assert!(load_latency(&root).is_none(), "fixture must have no prior latency");
+        let measured = measure_latency_and_record(&root, 2_000);
+        let stored = load_latency(&root);
+        let at = crate::model::now_epoch_secs_u64() as i64;
+        let samples = crate::perf::load(&root, "L1", at - 30, at + 30);
+        assert!(measured.is_err() && stored.is_none() && samples.is_empty(),
+            "{kind}: invalid current runtime produced measurement={measured:?}, saved={stored:?}, perf_samples={samples:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mvp03_manual_wrong_runtime_users_cannot_record_latency() {
+        mvp03_manual_mutation_must_not_measure("wrong_users");
+    }
+
+    #[test]
+    fn mvp03_manual_reject_action_cannot_record_latency() {
+        mvp03_manual_mutation_must_not_measure("reject_action");
+    }
+
+    #[test]
+    fn mvp03_manual_extra_route_condition_cannot_record_latency() {
+        mvp03_manual_mutation_must_not_measure("extra_condition");
+    }
+
+    #[test]
+    fn mvp03_manual_valid_204_and_502_controls() {
+        let good = mvp03_manual_fixture("good-204", "pass");
+        let measured = measure_latency_and_record(&good, 2_000)
+            .expect("matching authenticated local 204 must remain measurable");
+        assert_eq!(load_current_latency(&good), Some(measured.clone()));
+        let at = measured.at as i64;
+        assert_eq!(crate::perf::load(&good, "L1", at - 5, at + 5).len(), 1,
+            "valid HTTP204 must still create one real measurement sample");
+        let _ = std::fs::remove_dir_all(&good);
+
+        let bad = mvp03_manual_fixture("bad-502", "pass502");
+        let failure = measure_latency_and_record(&bad, 2_000)
+            .expect_err("HTTP502 must not become a successful measurement");
+        assert!(failure.message.contains("HTTP 502"), "{failure:?}");
+        assert!(load_latency(&bad).is_none(), "HTTP502 must not save latency");
+        let _ = std::fs::remove_dir_all(bad);
+    }
+
 }
