@@ -676,6 +676,122 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+
+    /// Three REAL authenticated loopback SOCKS HTTP exchanges, all on the
+    /// original qualified Check port: initial Check 204, old exit 8.8.8.8,
+    /// and new exit 1.1.1.1. Neither public IP is ever contacted.
+    #[cfg(windows)]
+    fn three_sequential_windows_socks_observations() -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for n in 0..3 {
+                let (mut s, _) = listener.accept().unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut greeting = [0u8; 4];
+                s.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting, [0x05, 0x02, 0x00, 0x02]);
+                s.write_all(&[0x05, 0x02]).unwrap();
+                let mut auth = [0u8; 2];
+                s.read_exact(&mut auth).unwrap();
+                assert_eq!(auth[0], 0x01);
+                let mut user = vec![0u8; usize::from(auth[1])];
+                s.read_exact(&mut user).unwrap();
+                let mut plen = [0u8; 1];
+                s.read_exact(&mut plen).unwrap();
+                let mut pass = vec![0u8; usize::from(plen[0])];
+                s.read_exact(&mut pass).unwrap();
+                assert_eq!(user, b"u");
+                assert_eq!(pass, b"p");
+                s.write_all(&[0x01, 0x00]).unwrap();
+                let mut connect = [0u8; 5];
+                s.read_exact(&mut connect).unwrap();
+                assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x03]);
+                let mut target = vec![0u8; usize::from(connect[4]) + 2];
+                s.read_exact(&mut target).unwrap();
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+                let mut request = [0u8; 512];
+                assert!(s.read(&mut request).unwrap() > 0);
+                let (status, body) = match n {
+                    0 => ("204 No Content", ""),
+                    1 => ("200 OK", "8.8.8.8\n"),
+                    _ => ("200 OK", "1.1.1.1\n"),
+                };
+                s.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).unwrap();
+            }
+        });
+        (port, server)
+    }
+
+    /// RED FIRST: A *real* readable, current-qualified old JSON survives a
+    /// failed Windows rename AND failed delete, not the directory-as-file
+    /// shortcut in the existing test. File-share mode denies DELETE only.
+    #[cfg(windows)]
+    #[test]
+    fn windows_failed_save_locked_old_current_exit_must_fail_closed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tmp_root("win-locked-old-current");
+        let (port, server) = three_sequential_windows_socks_observations();
+        let line = qualified_probe_fixture(&root, port);
+        // Both responses match legitimate configured public literal servers.
+        // A successful latest save would be current-attributed, so testing a
+        // new differently observed IP is meaningful.
+        std::fs::write(line.engine_config_path(&root), serde_json::json!({
+            "outbounds": [
+                {"type":"vless","server":"8.8.8.8","server_port":8443},
+                {"type":"vless","server":"1.1.1.1","server_port":8443}
+            ]
+        }).to_string()).unwrap();
+        let plan = qualified_plan(port);
+        let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
+        assert!(check.ok && check.via_trade_exit && check.status == Some(204),
+            "real authenticated auto-Check must pass: {check:?}");
+        let old = probe_and_record(&root, &line, &plan, 2_000)
+            .expect("original authenticated SOCKS IP must be observed");
+        assert_eq!(old.ip, "8.8.8.8");
+        assert!(old.attributed && old.binding.is_some());
+        assert_eq!(load(&root), Some(old.clone()));
+        assert!(belongs_to_current_connection(&old, &root),
+            "original disk JSON must genuinely qualify as current");
+
+        let path = root.join(FILE_NAME);
+        // Windows FILE_SHARE_READ | FILE_SHARE_WRITE, intentionally omit
+        // FILE_SHARE_DELETE (0x4). This is a real OS file-handle share denial,
+        // with the old file still readable; no error mocking or directory swap.
+        let locked_old = std::fs::OpenOptions::new().read(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(&path).expect("old current JSON must be opened without DELETE sharing");
+        assert_eq!(load(&root), Some(old.clone()));
+        assert!(belongs_to_current_connection(&old, &root));
+
+        let latest = probe_and_record(&root, &line, &plan, 2_000)
+            .expect("third real authenticated SOCKS HTTP200 must return an IP");
+        server.join().expect("all three authentic loopback SOCKS sessions");
+        assert_eq!(latest.ip, "1.1.1.1", "newly observed IP must differ from old evidence");
+        assert!(!latest.attributed && latest.binding.is_none(),
+            "failed save may return observation but never new verified attribution");
+        let pending = std::fs::read_to_string(path.with_extension("json.tmp"))
+            .expect("actual failed Windows replace must leave the new temp JSON");
+        assert!(pending.contains("1.1.1.1"), "new IP must have reached the real disk temp file");
+        let original_disk = load(&root)
+            .expect("old JSON must remain genuinely readable despite failed replace/delete");
+        assert_eq!(original_disk, old, "new save failed and old file was not replaced");
+        let delete_err = std::fs::remove_file(&path)
+            .expect_err("real Windows file-share violation must refuse removing old JSON");
+        eprintln!(
+            "WINDOWS_LOCKED_OLD_RED: latest_ip={}, persisted_old_ip={}, delete_error={delete_err}, tmp_exists={}",
+            latest.ip, original_disk.ip, path.with_extension("json.tmp").exists(),
+        );
+        assert!(!belongs_to_current_connection(&original_disk, &root),
+            "STALE CURRENT EVIDENCE: newest exit save and clear BOTH failed, but independently read original old attributed JSON still qualifies as CURRENT");
+        drop(locked_old);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn legacy_exit_json_is_readable_but_never_promoted_to_current_verified() {
         let root = tmp_root("legacy-unbound");
