@@ -13149,6 +13149,12 @@ mod tests {
     fn status_legacy_unbound_exit_is_never_mixed_into_current_quartet() {
         let root = tmp_root("status-legacy-exit-quartet");
         write_cfg(&root, "L1");
+        // An online Check must carry its original session identity, even
+        // though this synthetic fixture is NOT eligible for trade attribution.
+        std::fs::write(root.join("runtime.json"),
+            r#"{"SchemaVersion":1,"StartedAt":"same-started-at","ProbeUser":"u","ProbePass":"p"}"#)
+            .unwrap();
+        std::fs::write(root.join("runtime-engine.json"), "{}").unwrap();
         let check = crate::selfcheck::Check {
             ok: true, status: Some(204), via_trade_exit: false,
             at: 1_700_000_000, ..Default::default()
@@ -13161,10 +13167,9 @@ mod tests {
             started_at: "same-started-at".into(), binding: None,
         };
         crate::exit_probe::save(&root, &legacy).unwrap();
-        std::fs::write(root.join("runtime.json"),
-            r#"{"SchemaVersion":1,"StartedAt":"same-started-at"}"#).unwrap();
-        std::fs::write(root.join("runtime-engine.json"), "{}").unwrap();
         assert!(crate::exit_probe::load(&root).is_some(), "legacy history retained");
+        assert!(crate::selfcheck::load(&root).is_some_and(|c| c.ok),
+            "nontrade Check remains readable; only exit attribution fails closed");
         let v = call(r#"{"cmd":"status"}"#, &ctx_with(None, &root));
         assert_eq!(v["exitEvidence"], "Passed", "{v}");
         assert_eq!(v["exitObservedIp"], serde_json::Value::Null, "{v}");
