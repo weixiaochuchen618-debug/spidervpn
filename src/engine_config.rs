@@ -1858,6 +1858,24 @@ fn trade_probe_rejection_reason(obj: &serde_json::Map<String, Value>) -> Option<
 /// Absence, malformed JSON, missing authentication or an uncertain selector all
 /// mean SKIP, even if a stale port elsewhere would return HTTP 204.
 pub(crate) fn probe_evidence_skip_reason_from_file(path: &std::path::Path) -> Option<String> {
+    probe_evidence_skip_reason_with_session(path, None)
+}
+
+/// Revalidate the *same* runtime snapshot against this connection's planned
+/// loopback port and authentication. Never put credentials in error messages.
+pub(crate) fn probe_evidence_skip_reason_for_session(
+    path: &std::path::Path,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> Option<String> {
+    probe_evidence_skip_reason_with_session(path, Some((port, username, password)))
+}
+
+fn probe_evidence_skip_reason_with_session(
+    path: &std::path::Path,
+    session: Option<(u16, &str, &str)>,
+) -> Option<String> {
     let text = match std::fs::read_to_string(path) {
         Ok(v) => v,
         Err(_) => return Some("无法读取本次引擎配置，VPN 出口未验证".to_string()),
@@ -1891,12 +1909,34 @@ pub(crate) fn probe_evidence_skip_reason_from_file(path: &std::path::Path) -> Op
     if !active {
         return Some("本次未启用可验证的认证探测入口，VPN 出口未验证".to_string());
     }
+    if let Some((port, username, password)) = session {
+        let matches_session = obj.get("inbounds").and_then(Value::as_array)
+            .and_then(|inbounds| inbounds.iter().find(|entry| {
+                entry.get("tag").and_then(Value::as_str) == Some(PROBE_TAG)
+            }))
+            .is_some_and(|probe| {
+                probe.get("listen_port").and_then(Value::as_u64) == Some(u64::from(port))
+                    && probe.get("users").and_then(Value::as_array).is_some_and(|users| {
+                        users.len() == 1
+                            && users[0].get("username").and_then(Value::as_str) == Some(username)
+                            && users[0].get("password").and_then(Value::as_str) == Some(password)
+                    })
+            });
+        if !matches_session {
+            return Some("本次探测端口或认证会话与运行时引擎配置不匹配，VPN 出口未验证".to_string());
+        }
+    }
     let routed = obj.get("route").and_then(Value::as_object)
         .and_then(|route| route.get("rules")).and_then(Value::as_array)
-        .and_then(|rules| rules.first())
+        .and_then(|rules| rules.first()).and_then(Value::as_object)
         .is_some_and(|first| {
-            first.get("inbound").and_then(Value::as_array)
-                .is_some_and(|tags| tags.len() == 1 && tags[0] == PROBE_TAG)
+            // The probe's first route must match unconditionally. An extra
+            // domain/process/protocol condition can silently fall through to
+            // the user's daily direct exit despite a trade-exit tag here.
+            first.keys().all(|key| matches!(key.as_str(), "inbound" | "outbound" | "action"))
+                && first.get("action").is_none_or(|v| v.as_str() == Some("route"))
+                && first.get("inbound").and_then(Value::as_array)
+                    .is_some_and(|tags| tags.len() == 1 && tags[0] == PROBE_TAG)
                 && first.get("outbound").and_then(Value::as_str) == Some(TRADE_EXIT)
         });
     (!routed).then(|| "本次认证探测路由无法确认，VPN 出口未验证".to_string())

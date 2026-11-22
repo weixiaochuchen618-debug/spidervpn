@@ -611,11 +611,19 @@ pub fn check_and_record(root: &Path, plan: &ProbePlan, timeout_ms: u64) -> Check
     // engine config that was prepared for this session BEFORE any SOCKS dial.
     // If the selector can reach direct (including cached alternate members),
     // skip evidence, but do not undo the user's actual connection/selection.
+    let current_creds = probe_creds(root);
     let safe_plan = match plan {
-        ProbePlan::Dial { port, .. } if probe_creds(root).is_some() => {
-            crate::engine_config::probe_evidence_skip_reason_from_file(
-                &root.join("runtime-engine.json")
-            ).map(|reason| ProbePlan::Skip { port: Some(*port), reason })
+        ProbePlan::Dial { port, username, password } => {
+            let reason = match current_creds.as_ref() {
+                None => None, // preserve the preexisting missing-credentials error
+                Some((user, pass)) if user == username && pass == password => {
+                    crate::engine_config::probe_evidence_skip_reason_for_session(
+                        &root.join("runtime-engine.json"), *port, user, pass
+                    )
+                }
+                Some(_) => Some("本次探测计划与运行时认证凭据不一致，VPN 出口未验证".to_string()),
+            };
+            reason.map(|reason| ProbePlan::Skip { port: Some(*port), reason })
         }
         _ => None,
     };
@@ -632,7 +640,7 @@ pub fn check_and_record(root: &Path, plan: &ProbePlan, timeout_ms: u64) -> Check
             via_trade_exit: true,
             skipped: Some(reason.clone()),
         },
-        ProbePlan::Dial { port, .. } => match probe_creds(root) {
+        ProbePlan::Dial { port, .. } => match current_creds.as_ref() {
             None => Check {
                 ok: false,
                 status: None,
@@ -844,13 +852,37 @@ fn engine_alive(root: &Path) -> bool {
     }
 }
 
-/// 写结论。与配置文件同样先写临时文件再替换：断在半路会留下半截 JSON。
+// A failed check write must not cause the IPC host's next status read to
+// project an older PASS. Keep only root paths, never credentials or evidence.
+// The on-disk .tmp presence below additionally guards cross-process reads of
+// interrupted rename attempts. Storage failures are still reported honestly.
+fn failed_check_writes() -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static FAILED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        std::sync::OnceLock::new();
+    FAILED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn note_failed_check_write(root: &Path, failed: bool) {
+    if let Ok(mut paths) = failed_check_writes().lock() {
+        if failed {
+            paths.insert(root.to_path_buf());
+        } else {
+            paths.remove(root);
+        }
+    }
+}
+
+/// 写结论。原本的原子替换语义不变；失败时立即废弃当前进程中旧PASS的读取资格。
 pub fn save(root: &Path, c: &Check) -> Result<(), String> {
-    let path = root.join(FILE_NAME);
-    let text = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("{}：{e}", path.display()))
+    let result = (|| -> Result<(), String> {
+        let path = root.join(FILE_NAME);
+        let text = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("{}：{e}", path.display()))
+    })();
+    note_failed_check_write(root, result.is_err());
+    result
 }
 
 pub fn save_latency(root: &Path, measured: &Latency) -> Result<(), String> {
@@ -880,13 +912,25 @@ pub fn clear_latency(root: &Path) {
 /// 读上次连接留下的结论。文件不存在或坏掉都当「未检测」：展示用的证据缺失，
 /// 不该变成一条错误，更不该让 `--status` 打不开。
 pub fn load(root: &Path) -> Option<Check> {
+    // An unfinished temp write (including a blocked .tmp directory) cannot
+    // coexist with a trusted PASS. Same-host write failures also retain a
+    // process-local deny marker if the file system could not create .tmp.
+    if root.join(FILE_NAME).with_extension("json.tmp").exists()
+        || failed_check_writes().lock().map(|paths| paths.contains(root)).unwrap_or(true)
+    {
+        return None;
+    }
     let text = std::fs::read_to_string(root.join(FILE_NAME)).ok()?;
     serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)).ok()
 }
 
 /// 清掉失败连接留下的结论与测量。断开后保留上次自检是独立行为，不在这里处理。
 pub fn clear(root: &Path) {
-    let _ = std::fs::remove_file(root.join(FILE_NAME));
+    let removed = std::fs::remove_file(root.join(FILE_NAME));
+    // If even deleting the old evidence is denied, status must not read it
+    // as if it belonged to a later connection in this IPC process.
+    note_failed_check_write(root, matches!(removed, Err(ref e)
+        if e.kind() != std::io::ErrorKind::NotFound));
     clear_latency(root);
 }
 
@@ -1040,6 +1084,18 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    // Existing synthetic SOCKS tests now declare their actual probe port
+    // and credentials, instead of relying on a fake runtime with no port.
+    fn runtime_probe_with_creds(root: &Path, port: u16, user: &str, pass: &str) {
+        runtime_probe(root, port);
+        let path = root.join("runtime-engine.json");
+        let mut runtime: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        runtime["inbounds"][0]["users"][0]["username"] = serde_json::json!(user);
+        runtime["inbounds"][0]["users"][0]["password"] = serde_json::json!(pass);
+        std::fs::write(path, runtime.to_string()).unwrap();
     }
 
     /// 最小的假探测入站：按脚本走完 SOCKS5 认证 / CONNECT / HTTP。
@@ -1207,6 +1263,7 @@ mod tests {
 
         // 拨号超时 = 未通过，同样不许混进「跳过」
         let silent = fake_socks5("silent", "u", "p");
+        runtime_probe(&root, silent);
         let c = check_and_record(&root, &dial_plan(silent, "u", "p"), 300);
         assert!(!c.sentence().contains("跳过"), "超时不是跳过：{}", c.sentence());
         let _ = std::fs::remove_dir_all(&root);
@@ -1221,6 +1278,7 @@ mod tests {
         live_engine(&root);
         with_creds(&root, "u", "p");
         let free = closed_port();
+        runtime_probe(&root, free);
         let c = check_and_record(&root, &dial_plan(free, "u", "p"), 2_000);
         assert!(!c.ok, "{c:?}");
         let s = c.sentence();
@@ -1295,6 +1353,7 @@ mod tests {
         live_engine(&root);
         with_creds(&root, "probe-u", "probe-p");
         let port = fake_socks5("pass", "probe-u", "probe-p");
+        runtime_probe_with_creds(&root, port, "probe-u", "probe-p");
         let c = check_and_record(&root, &dial_plan(port, "probe-u", "probe-p"), 2_000);
         assert!(c.ok, "{c:?}");
         assert_eq!(c.status, Some(204));
@@ -1389,6 +1448,7 @@ mod tests {
         live_engine(&root);
         with_creds(&root, "right-user", "right-pass");
         let port = fake_socks5("pass", "other-user", "other-pass");
+        runtime_probe_with_creds(&root, port, "right-user", "right-pass");
         let c = check_and_record(&root, &dial_plan(port, "right-user", "right-pass"), 2_000);
         assert!(!c.ok, "{c:?}");
         let s = c.sentence();
@@ -1404,6 +1464,7 @@ mod tests {
         live_engine(&root);
         with_creds(&root, "u", "p");
         let port = fake_socks5("connectfail", "u", "p");
+        runtime_probe(&root, port);
         let c = check_and_record(&root, &dial_plan(port, "u", "p"), 2_000);
         assert!(!c.ok, "{c:?}");
         let s = c.sentence();
@@ -1422,6 +1483,7 @@ mod tests {
         live_engine(&root);
         with_creds(&root, "u", "p");
         let port = fake_socks5("silent", "u", "p");
+        runtime_probe(&root, port);
         let c = check_and_record(&root, &dial_plan(port, "u", "p"), 300);
         assert!(!c.ok, "{c:?}");
         let s = c.sentence();
@@ -1440,6 +1502,7 @@ mod tests {
         live_engine(&root);
         with_creds(&root, "u", "p");
         let port = fake_socks5("noauth", "u", "p");
+        runtime_probe(&root, port);
         let c = check_and_record(&root, &dial_plan(port, "u", "p"), 2_000);
         assert!(!c.ok, "{c:?}");
         assert!(c.sentence().contains("没有要求认证"), "{}", c.sentence());
@@ -1452,6 +1515,7 @@ mod tests {
         live_engine(&root);
         with_creds(&root, "u", "p");
         let port = fake_socks5("pass502", "u", "p");
+        runtime_probe(&root, port);
         let c = check_and_record(&root, &dial_plan(port, "u", "p"), 2_000);
         assert!(!c.ok, "5xx 是出口自己失败了，不能算通过");
         assert_eq!(c.status, Some(502));
@@ -1473,6 +1537,7 @@ mod tests {
         runtime_with_engine(&root, 0x7FFF_FFFE);
         with_creds(&root, "u", "p");
 
+        runtime_probe(&root, port);
         let c = check_and_record(&root, &dial_plan(port, "u", "p"), 2_000);
         assert!(!c.ok, "引擎不在就不能给出「通过」，哪怕端口上有人回 204：{c:?}");
         assert!(c.sentence().starts_with("通道自检（经交易出口）未通过："), "{}", c.sentence());
@@ -1533,6 +1598,7 @@ mod tests {
             }
         });
 
+        runtime_probe(&root, port);
         let c = check_and_record(&root, &dial_plan(port, "u", "p"), 2_000);
         assert!(!c.ok, "引擎在自检期间退出，这句「通过」不能留");
         assert_eq!(c.status, Some(204), "状态码是当时的真实观察，照实留下：{c:?}");
