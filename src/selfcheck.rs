@@ -2642,6 +2642,9 @@ mod tests {
         std::fs::remove_file(root.join("runtime.json")).unwrap();
         assert_eq!(load(&root), Some(trade),
             "disconnected old success is still readable as historical");
+        // Re-establish a fresh synthetic runtime for the separate nontrade
+        // online positive control; record_probe_creds requires runtime.json.
+        live_engine(&root);
         with_creds(&root, "u", "p");
         let nontrade = Check {
             ok: true, status: Some(204), via_trade_exit: false, at: 16,
