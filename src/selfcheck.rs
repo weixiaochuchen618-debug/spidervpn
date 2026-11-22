@@ -1202,6 +1202,38 @@ pub(crate) fn current_qualified_trade_pass(root: &Path) -> bool {
     })
 }
 
+/// Return the ORIGINAL qualified auto-check session/route identity for a
+/// later exit observation. A legacy fingerprint-only Check remains readable
+/// but cannot confer *current* exit attribution: it has no original route
+/// digest or unique probe port to bind to. No secrets leave this module.
+pub(crate) fn current_exit_probe_binding(
+    root: &Path,
+    port: u16,
+    expected_credentials: Option<(&str, &str)>,
+) -> Option<(String, String)> {
+    if !current_qualified_trade_pass(root) {
+        return None;
+    }
+    let (user, pass) = probe_creds(root)?;
+    if let Some((expected_user, expected_pass)) = expected_credentials {
+        if user != expected_user || pass != expected_pass {
+            return None;
+        }
+    }
+    let proof = AutoProbeBinding::capture(root, port, &user, &pass)?;
+    let text = std::fs::read_to_string(root.join(FILE_NAME)).ok()?;
+    let disk: serde_json::Value =
+        serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)).ok()?;
+    if disk.get("session_fingerprint")?.as_str()? != proof.session_fingerprint
+        || disk.get("auto_engine_fingerprint")?.as_str()? != proof.engine_fingerprint
+        || disk.get("auto_probe_port")?.as_u64()? != u64::from(port)
+    {
+        return None;
+    }
+    (proof.still_current(root) && current_qualified_trade_pass(root))
+        .then_some((proof.session_fingerprint, proof.engine_fingerprint))
+}
+
 /// 清掉失败连接留下的结论与测量。断开后保留上次自检是独立行为，不在这里处理。
 pub fn clear(root: &Path) {
     let removed = std::fs::remove_file(root.join(FILE_NAME));
