@@ -62,6 +62,37 @@ const ENDPOINTS: [(&str, &str); 3] = [
     ("ip-api.com", "/line/?fields=query"),
 ];
 
+// Track an unfinished or failed exit write in THIS process. A failed write
+// may leave an older, still-readable and formerly valid JSON if Windows
+// refuses both replacement and deletion (Issue #60's real MSVC RED).
+// The on-disk .tmp check below independently fails closed for another reader
+// while a failed rename's temp file remains. Neither is an interprocess lock
+// or an all-filesystem-denied crash-proof tombstone.
+fn uncommitted_exit_writes() -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static PENDING: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>
+    > = std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn note_uncommitted_exit_write(root: &Path, pending: bool) {
+    if let Ok(mut roots) = uncommitted_exit_writes().lock() {
+        if pending {
+            roots.insert(root.to_path_buf());
+        } else {
+            roots.remove(root);
+        }
+    }
+}
+
+fn exit_write_uncommitted(root: &Path) -> bool {
+    root.join(FILE_NAME).with_extension("json.tmp").exists()
+        || uncommitted_exit_writes()
+            .lock()
+            .map(|roots| roots.contains(root))
+            .unwrap_or(true) // A poisoned guard must never authorize current proof.
+}
+
 /// 把记录读回来。坏文件当作没有：宁可显示「尚未核验」，也不要显示一个读不懂的东西。
 pub fn load(root: &Path) -> Option<Record> {
     let text = std::fs::read_to_string(root.join(FILE_NAME)).ok()?;
@@ -70,11 +101,21 @@ pub fn load(root: &Path) -> Option<Record> {
 
 /// 写记录。与自检结论同样先写临时文件再替换：断在半路会留下半截 JSON。
 pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
-    let path = root.join(FILE_NAME);
-    let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("{}：{e}", path.display()))
+    // Deny current attribution from the beginning of a write through its
+    // commit. If either temp creation or rename fails, keep the guard until
+    // a later genuinely successful save; a best-effort clear() is not proof.
+    note_uncommitted_exit_write(root, true);
+    let result = (|| -> Result<(), String> {
+        let path = root.join(FILE_NAME);
+        let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("{}：{e}", path.display()))
+    })();
+    if result.is_ok() {
+        note_uncommitted_exit_write(root, false);
+    }
+    result
 }
 
 /// 清掉记录（断开、连接失败、换线路都算「这条证据过期了」）。
@@ -115,6 +156,12 @@ fn current_binding(
 /// but only an exact original binding, live qualified trade Check and current
 /// selected line can authorize it as evidence for the running connection.
 pub fn belongs_to_current_connection(rec: &Record, root: &Path) -> bool {
+    // Historical JSON may remain readable, but a failed/pending newer write
+    // revokes its CURRENT authority even if deletion was refused by Windows.
+    !exit_write_uncommitted(root) && original_exit_binding_still_current(rec, root)
+}
+
+fn original_exit_binding_still_current(rec: &Record, root: &Path) -> bool {
     let Some(bound) = rec.binding.as_ref() else { return false };
     if !root.join("runtime-engine.json").is_file()
         || crate::selfcheck::runtime_started_at(root).as_deref()
@@ -186,7 +233,10 @@ pub fn probe_and_record(
 /// This is not a cross-file atomic transaction: IPC/readers must independently
 /// validate the original binding against the live session and route.
 fn persist_final_observation(root: &Path, mut rec: Record) -> Record {
-    if !belongs_to_current_connection(&rec, root) {
+    // Requalify the NEW authenticated observation independently of a
+    // previous failed-save guard. Readers must remain denied until this
+    // attempt actually completes its only successful rename.
+    if !original_exit_binding_still_current(&rec, root) {
         rec.attributed = false;
         rec.binding = None;
     }
@@ -730,6 +780,43 @@ mod tests {
     /// RED FIRST: A *real* readable, current-qualified old JSON survives a
     /// failed Windows rename AND failed delete, not the directory-as-file
     /// shortcut in the existing test. File-share mode denies DELETE only.
+
+    #[test]
+    fn failed_exit_tmp_write_without_tmp_still_denies_current_and_recovers_on_success() {
+        let root = tmp_root("failed-exit-no-temp-marker");
+        let port = fake_socks5("8.8.8.8\n", "u", "p");
+        let line = qualified_probe_fixture(&root, port);
+        let plan = qualified_plan(port);
+        let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
+        assert!(check.ok && check.via_trade_exit, "{check:?}");
+        let old = probe_and_record(&root, &line, &plan, 2_000)
+            .expect("real authenticated loopback exit positive");
+        assert!(old.attributed && belongs_to_current_connection(&old, &root));
+        assert_eq!(load(&root), Some(old.clone()));
+
+        // Actual filesystem error BEFORE a new temp file is written: remove
+        // the blocking directory afterward so the path itself no longer
+        // supplies the fail-closed guard. The same-process marker must.
+        let tmp = root.join(FILE_NAME).with_extension("json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(save(&root, &old).is_err(), "directory-as-temp must refuse real write");
+        assert_eq!(load(&root), Some(old.clone()), "old history must survive");
+        std::fs::remove_dir(&tmp).unwrap();
+        assert!(!tmp.exists(), "no residual temp path to help the reader");
+        assert!(!belongs_to_current_connection(&old, &root),
+            "a same-process failed write without any temp must revoke old current evidence");
+        assert_eq!(load(&root), Some(old.clone()), "historic JSON remains readable");
+
+        // A later truly successful save is the ONLY action that clears the
+        // pending-failure guard and permits renewed qualified current reads.
+        save(&root, &old).expect("save should succeed after removing obstruction");
+        assert!(!tmp.exists(), "success must consume the temp file");
+        assert_eq!(load(&root), Some(old.clone()));
+        assert!(belongs_to_current_connection(&old, &root),
+            "successful atomic record save must restore the legitimate positive");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_failed_save_locked_old_current_exit_must_fail_closed() {
