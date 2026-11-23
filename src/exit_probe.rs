@@ -84,7 +84,11 @@ fn uncommitted_exit_writes() -> &'static std::sync::Mutex<
 // RAII also records an abandoned/panicking write as failed. A previous
 // failed group remains dirty until a new group really finishes successfully.
 struct ExitWriteGuard {
+    // The resolved identity of the actual directory shared by path aliases.
     root: std::path::PathBuf,
+    // Keep the caller's spelling to clear a previous unresolved-root failure
+    // only after a later genuinely successful group completion.
+    requested_root: std::path::PathBuf,
     committed: bool,
     // Only the first active writer uses legacy exit-probe.json.tmp.
     // Every overlapping writer must own a distinct temporary pathname.
@@ -93,10 +97,24 @@ struct ExitWriteGuard {
 
 impl ExitWriteGuard {
     fn begin(root: &Path) -> Result<Self, String> {
+        // A raw PathBuf is not a directory identity: child/.. and symlink
+        // paths can address exactly the same on-disk exit-probe.json.
+        let key = match std::fs::canonicalize(root) {
+            Ok(key) => key,
+            Err(e) => {
+                // Never silently lose #62's failed-write denial if an old
+                // qualified JSON becomes readable after a transient error.
+                let mut roots = uncommitted_exit_writes()
+                    .lock()
+                    .map_err(|_| "exit pending-write lock poisoned".to_string())?;
+                roots.entry(root.to_path_buf()).or_default().failed_in_group = true;
+                return Err(format!("exit root identity {}：{e}", root.display()));
+            }
+        };
         let mut roots = uncommitted_exit_writes()
             .lock()
             .map_err(|_| "exit pending-write lock poisoned".to_string())?;
-        let state = roots.entry(root.to_path_buf()).or_default();
+        let state = roots.entry(key.clone()).or_default();
         if state.active_writers == 0 {
             // Beginning a new recovery group does not grant CURRENT: the
             // entry remains present until its final successful completion.
@@ -105,7 +123,10 @@ impl ExitWriteGuard {
         let isolated_tmp = state.active_writers != 0;
         state.active_writers = state.active_writers.checked_add(1)
             .ok_or_else(|| "exit pending writer count overflow".to_string())?;
-        Ok(Self { root: root.to_path_buf(), committed: false, isolated_tmp })
+        Ok(Self {
+            root: key, requested_root: root.to_path_buf(),
+            committed: false, isolated_tmp,
+        })
     }
 }
 
@@ -121,16 +142,30 @@ impl Drop for ExitWriteGuard {
         state.active_writers = state.active_writers.saturating_sub(1);
         if self.committed && state.active_writers == 0 && !state.failed_in_group {
             roots.remove(&self.root);
+            // Recovery via the same caller path can retire a prior failed
+            // canonicalization marker. Never remove any active writer.
+            if self.requested_root != self.root
+                && roots.get(&self.requested_root).is_some_and(|other| {
+                    other.active_writers == 0 && other.failed_in_group
+                })
+            {
+                roots.remove(&self.requested_root);
+            }
         }
     }
 }
 
 fn exit_write_uncommitted(root: &Path) -> bool {
-    root.join(FILE_NAME).with_extension("json.tmp").exists()
-        || uncommitted_exit_writes()
-            .lock()
-            .map(|roots| roots.contains_key(root))
-            .unwrap_or(true) // Poisoned guard must never authorize current.
+    if root.join(FILE_NAME).with_extension("json.tmp").exists() {
+        return true;
+    }
+    // Unresolvable identity cannot authorize CURRENT; a later readable
+    // path also consults any failed canonicalization marker under its raw key.
+    let Ok(key) = std::fs::canonicalize(root) else { return true };
+    uncommitted_exit_writes()
+        .lock()
+        .map(|roots| roots.contains_key(&key) || roots.contains_key(root))
+        .unwrap_or(true) // Poisoned guard must never authorize current.
 }
 
 /// 把记录读回来。坏文件当作没有：宁可显示「尚未核验」，也不要显示一个读不懂的东西。
@@ -1104,6 +1139,155 @@ mod tests {
         } else {
             assert!(belongs_to_current_connection(&persisted, &root),
                 "two committed writes restore a genuinely qualified CURRENT");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #66 TEST-ONLY: distinct PathBuf spellings of one proven physical root
+    /// must share temp ownership and pending/failure-group authority.
+    /// Both writers use the real production save() and real filesystem IO.
+    #[test]
+    fn physical_root_alias_overlapping_saves_preserve_record_ownership_and_current_denial() {
+        use std::sync::mpsc;
+        let root = tmp_root("physical-root-alias-red");
+        let child = root.join("alias-child");
+        std::fs::create_dir(&child).expect("create real alias-child first");
+        let alias = child.join("..");
+        assert_ne!(root, alias, "PathBuf keys must truly differ (not root/.)");
+        assert_eq!(
+            std::fs::canonicalize(&root).expect("original physical directory"),
+            std::fs::canonicalize(&alias).expect("alias physical directory"),
+            "different PathBuf spellings must resolve to one real directory",
+        );
+        assert!(alias.is_dir(), "Windows must be able to traverse real child/..");
+
+        let port = fake_socks5("8.8.8.8\n", "u", "p");
+        let line = qualified_probe_fixture(&root, port);
+        let plan = qualified_plan(port);
+        let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
+        assert!(check.ok && check.via_trade_exit
+            && crate::selfcheck::current_qualified_trade_pass(&root),
+            "real authenticated local SOCKS qualified Check required: {check:?}");
+        let record_a = probe_and_record(&root, &line, &plan, 2_000)
+            .expect("real authenticated SOCKS observation");
+        assert!(record_a.attributed && record_a.binding.is_some());
+        assert_eq!(load(&root), Some(record_a.clone()));
+        assert_eq!(load(&alias), Some(record_a.clone()),
+            "the alias must read the same genuine old physical JSON");
+        assert_eq!(
+            std::fs::canonicalize(root.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(alias.join(FILE_NAME)).unwrap(),
+            "actual JSON files must be one physical file, not duplicated copies",
+        );
+        assert_eq!(
+            std::fs::read(root.join(FILE_NAME)).unwrap(),
+            std::fs::read(alias.join(FILE_NAME)).unwrap(),
+            "Windows actual file reads must agree across both paths",
+        );
+        assert!(belongs_to_current_connection(&record_a, &root),
+            "old normal path genuinely CURRENT before any overlap");
+        assert!(belongs_to_current_connection(&record_a, &alias),
+            "old alias path genuinely CURRENT before any overlap");
+
+        let mut record_b = record_a.clone();
+        record_b.at = record_b.at.checked_add(1).unwrap();
+        record_b.endpoint = "physical-alias-writer-b.test".into();
+        assert_ne!(record_a, record_b);
+
+        let (a_written_tx, a_written_rx) = mpsc::channel::<()>();
+        let (release_a_tx, release_a_rx) = mpsc::channel::<()>();
+        let a_root = root.clone();
+        let a_rec = record_a.clone();
+        let writer_a = std::thread::spawn(move || {
+            AFTER_TMP_WRITE_BEFORE_RENAME_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    a_written_tx.send(()).unwrap();
+                    release_a_rx.recv_timeout(Duration::from_secs(20))
+                        .expect("A must be explicitly released for actual rename");
+                }));
+            });
+            save(&a_root, &a_rec)
+        });
+        a_written_rx.recv_timeout(Duration::from_secs(20))
+            .expect("A must complete real tmp write before B begins");
+        assert!(exit_write_uncommitted(&root));
+        assert!(root.join(FILE_NAME).with_extension("json.tmp").is_file());
+
+        let (b_written_tx, b_written_rx) = mpsc::channel::<()>();
+        let (release_b_tx, release_b_rx) = mpsc::channel::<()>();
+        let b_alias = alias.clone();
+        let b_rec = record_b.clone();
+        let writer_b = std::thread::spawn(move || {
+            AFTER_TMP_WRITE_BEFORE_RENAME_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    b_written_tx.send(()).unwrap();
+                    release_b_rx.recv_timeout(Duration::from_secs(20))
+                        .expect("B must be explicitly released for actual rename");
+                }));
+            });
+            save(&b_alias, &b_rec)
+        });
+        b_written_rx.recv_timeout(Duration::from_secs(20))
+            .expect("B must complete genuine tmp write before A renames");
+
+        let a_tmp = root.join(FILE_NAME).with_extension("json.tmp");
+        let b_fixed_tmp = alias.join(FILE_NAME).with_extension("json.tmp");
+        assert_eq!(
+            std::fs::canonicalize(&a_tmp).expect("A's on-disk fixed temp"),
+            std::fs::canonicalize(&b_fixed_tmp).expect("same file through B alias"),
+            "two paths must resolve to one physical fixed-temp file",
+        );
+        let staged_a: Record = serde_json::from_slice(&std::fs::read(&a_tmp).unwrap()).unwrap();
+        let staged_b: Record = serde_json::from_slice(&std::fs::read(&b_fixed_tmp).unwrap()).unwrap();
+        assert_eq!(staged_a, staged_b, "both real file paths must see the same staged bytes");
+        assert!(staged_a == record_a || staged_a == record_b,
+            "one complete record must be staged, not torn JSON");
+        let a_pending_before = belongs_to_current_connection(&record_a, &root);
+        let b_pending_before = belongs_to_current_connection(&record_a, &alias);
+        eprintln!(
+            "ROOT_ALIAS_STAGE: raw_path_unequal={}; physical_root_equal=true; fixed_tmp_same=true; staged={:?}; current_root={a_pending_before}; current_alias={b_pending_before}",
+            root != alias, staged_a.endpoint
+        );
+
+        release_a_tx.send(()).unwrap();
+        let a_result = writer_a.join().expect("A real save must finish");
+        let current_root_while_b_pending = belongs_to_current_connection(&record_a, &root);
+        let current_alias_while_b_pending = belongs_to_current_connection(&record_a, &alias);
+        release_b_tx.send(()).unwrap();
+        let b_result = writer_b.join().expect("B real save must finish");
+        let persisted = load(&root).expect("real durable full JSON");
+        assert_eq!(load(&alias), Some(persisted.clone()),
+            "actual disk JSON read must agree across aliases after rename");
+        let current_root_after = belongs_to_current_connection(&persisted, &root);
+        let current_alias_after = belongs_to_current_connection(&persisted, &alias);
+        eprintln!(
+            "ROOT_ALIAS_RESULTS: A={a_result:?}; B={b_result:?}; disk={:?}; A_expected={:?}; B_expected={:?}; root_while_B={current_root_while_b_pending}; alias_while_B={current_alias_while_b_pending}; root_after={current_root_after}; alias_after={current_alias_after}",
+            persisted.endpoint, record_a.endpoint, record_b.endpoint
+        );
+        match (&a_result, &b_result) {
+            (Ok(()), Err(_)) => assert_eq!(persisted, record_a,
+                "A returned Ok and alias B Err: disk must be A, never failed B"),
+            (Err(_), Ok(())) => assert_eq!(persisted, record_b,
+                "alias B returned Ok and A Err: disk must be B"),
+            (Ok(()), Ok(())) => assert_eq!(persisted, record_b,
+                "B's actual rename follows A's: disk must be B"),
+            (Err(a), Err(b)) => panic!(
+                "both saves failed despite verified writable physical directory: A={a}; B={b}"),
+        }
+        assert!(!a_pending_before && !b_pending_before,
+            "both path aliases must deny CURRENT during overlapping real writes");
+        assert!(!current_root_while_b_pending && !current_alias_while_b_pending,
+            "A success must not promote either alias while B is still pending");
+        if a_result.is_err() || b_result.is_err() {
+            assert!(!current_root_after && !current_alias_after,
+                "failed overlapping group must deny CURRENT through both aliases");
+            save(&root, &record_a).expect("later real successful save restores current");
+            assert_eq!(load(&alias), Some(record_a.clone()));
+            assert!(belongs_to_current_connection(&record_a, &root));
+            assert!(belongs_to_current_connection(&record_a, &alias));
+        } else {
+            assert!(current_root_after && current_alias_after,
+                "both successful complete saves restore CURRENT for each alias");
         }
         let _ = std::fs::remove_dir_all(root);
     }
