@@ -86,6 +86,9 @@ fn uncommitted_exit_writes() -> &'static std::sync::Mutex<
 struct ExitWriteGuard {
     root: std::path::PathBuf,
     committed: bool,
+    // Only the first active writer uses legacy exit-probe.json.tmp.
+    // Every overlapping writer must own a distinct temporary pathname.
+    isolated_tmp: bool,
 }
 
 impl ExitWriteGuard {
@@ -99,9 +102,10 @@ impl ExitWriteGuard {
             // entry remains present until its final successful completion.
             state.failed_in_group = false;
         }
+        let isolated_tmp = state.active_writers != 0;
         state.active_writers = state.active_writers.checked_add(1)
             .ok_or_else(|| "exit pending writer count overflow".to_string())?;
-        Ok(Self { root: root.to_path_buf(), committed: false })
+        Ok(Self { root: root.to_path_buf(), committed: false, isolated_tmp })
     }
 }
 
@@ -146,9 +150,43 @@ pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
     let result = (|| -> Result<(), String> {
         let path = root.join(FILE_NAME);
         let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("{}：{e}", path.display()))
+        // Concurrent same-root writers may overlap through rename, but must
+        // never write one another's staged bytes. Keep the legacy fixed tmp
+        // for the first writer and old single-writer Windows failure tests.
+        let tmp = if pending.isolated_tmp {
+            static NEXT_TMP_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            path.with_extension(format!("json.tmp.{}-{id}", std::process::id()))
+        } else {
+            path.with_extension("json.tmp")
+        };
+        if pending.isolated_tmp {
+            // No stale filename may be silently overwritten (even if a PID
+            // and sequence repeat after a process restart). An existing
+            // file must fail closed instead of stealing another writer's IO.
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+                .open(&tmp).map_err(|e| format!("{}：{e}", tmp.display()))?;
+            let written = file.write_all(text.as_bytes());
+            drop(file); // Windows rename must not race our own open handle.
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("{}：{e}", tmp.display()));
+            }
+        } else {
+            std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
+        }
+        #[cfg(test)]
+        tests::after_tmp_write_before_rename_test_hook();
+        let renamed = std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("{}：{e}", path.display()));
+        if renamed.is_err() && pending.isolated_tmp {
+            // On a failed overlapping rename keep the #62 failure group
+            // pending, but best-effort remove this writer's orphaned tmp.
+            let _ = std::fs::remove_file(&tmp);
+        }
+        renamed
     })();
     if result.is_ok() {
         pending.committed = true;
@@ -408,6 +446,23 @@ mod tests {
 
     pub(super) fn after_pending_save_test_hook() {
         AFTER_PENDING_SAVE_HOOK.with(|slot| {
+            let callback = slot.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
+    }
+
+    // #64 TEST-ONLY: reached only after the REAL production fs::write
+    // returned successfully, and before that same save() invokes rename.
+    std::thread_local! {
+        static AFTER_TMP_WRITE_BEFORE_RENAME_HOOK:
+            std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn after_tmp_write_before_rename_test_hook() {
+        AFTER_TMP_WRITE_BEFORE_RENAME_HOOK.with(|slot| {
             let callback = slot.borrow_mut().take();
             if let Some(callback) = callback {
                 callback();
@@ -940,6 +995,116 @@ mod tests {
         assert!(!current_after_b_failed,
             "STALE CURRENT: B failed real IO with no tmp, but old current evidence was accepted");
         assert!(recovered_current, "a later successful save restores qualified CURRENT");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #64 strict TEST-ONLY: two genuine concurrent save() calls use one
+    /// PathBuf root but distinct Records. Channel ordering proves the second
+    /// write completes before the first rename, without sleep or mocked IO.
+    #[test]
+    fn same_root_overlapping_saves_commit_only_the_successful_writer_record() {
+        use std::sync::mpsc;
+        let root = tmp_root("same-root-shared-tmp-collision");
+        let port = fake_socks5("8.8.8.8\n", "u", "p");
+        let line = qualified_probe_fixture(&root, port);
+        let plan = qualified_plan(port);
+        let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
+        assert!(check.ok && check.via_trade_exit
+            && crate::selfcheck::current_qualified_trade_pass(&root),
+            "real authenticated loopback Check required: {check:?}");
+        let record_a = probe_and_record(&root, &line, &plan, 2_000)
+            .expect("real authenticated SOCKS exit observation");
+        assert!(record_a.attributed && record_a.binding.is_some());
+        assert_eq!(load(&root), Some(record_a.clone()));
+        assert!(belongs_to_current_connection(&record_a, &root),
+            "qualified original disk JSON must be CURRENT before the collision");
+
+        let mut record_b = record_a.clone();
+        record_b.at = record_b.at.checked_add(1).unwrap();
+        record_b.endpoint = "second-concurrent-writer.test".into();
+        assert_ne!(record_a, record_b, "two real saves need distinct records");
+
+        let (a_written_tx, a_written_rx) = mpsc::channel::<()>();
+        let (release_a_tx, release_a_rx) = mpsc::channel::<()>();
+        let a_root = root.clone();
+        let a_rec = record_a.clone();
+        let writer_a = std::thread::spawn(move || {
+            AFTER_TMP_WRITE_BEFORE_RENAME_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    a_written_tx.send(()).unwrap();
+                    release_a_rx.recv_timeout(Duration::from_secs(20))
+                        .expect("A must be released for its real rename");
+                }));
+            });
+            save(&a_root, &a_rec)
+        });
+        a_written_rx.recv_timeout(Duration::from_secs(20))
+            .expect("A must finish its actual disk tmp write");
+        assert!(exit_write_uncommitted(&root));
+
+        let (b_written_tx, b_written_rx) = mpsc::channel::<()>();
+        let (release_b_tx, release_b_rx) = mpsc::channel::<()>();
+        let b_root = root.clone();
+        let b_rec = record_b.clone();
+        let writer_b = std::thread::spawn(move || {
+            AFTER_TMP_WRITE_BEFORE_RENAME_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    b_written_tx.send(()).unwrap();
+                    release_b_rx.recv_timeout(Duration::from_secs(20))
+                        .expect("B must be released for its real rename");
+                }));
+            });
+            save(&b_root, &b_rec)
+        });
+        b_written_rx.recv_timeout(Duration::from_secs(20))
+            .expect("B must finish its actual disk tmp write before A renames");
+
+        // This is the REAL filesystem's shared temp content, not a mocked
+        // rename failure. On the original source B has overwritten A's tmp.
+        let shared_tmp = root.join(FILE_NAME).with_extension("json.tmp");
+        let staged: Record = serde_json::from_slice(&std::fs::read(&shared_tmp)
+            .expect("A's real shared tmp must exist before its rename")).unwrap();
+        assert!(staged == record_a || staged == record_b,
+            "intermediate tmp must contain one complete serialized Record");
+        assert!(!belongs_to_current_connection(&record_a, &root),
+            "overlapping writers must deny CURRENT before either rename");
+        eprintln!(
+            "SAME_ROOT_SHARED_TMP_STAGE: A={:?}, B={:?}, staged_shared_tmp={:?}",
+            record_a.endpoint, record_b.endpoint, staged.endpoint
+        );
+
+        release_a_tx.send(()).unwrap();
+        let a_result = writer_a.join().expect("A real save must complete");
+        // B stays after its genuine tmp write; its rename MUST follow A.
+        assert!(!belongs_to_current_connection(&record_a, &root),
+            "B is still pending after A's completed rename");
+        release_b_tx.send(()).unwrap();
+        let b_result = writer_b.join().expect("B real save must complete");
+        let persisted = load(&root).expect("a complete successful Record on disk");
+        eprintln!(
+            "SAME_ROOT_SHARED_TMP_RESULTS: A={a_result:?}; B={b_result:?}; disk={:?}; A_expected={:?}; B_expected={:?}",
+            persisted.endpoint, record_a.endpoint, record_b.endpoint
+        );
+        match (&a_result, &b_result) {
+            (Ok(()), Err(_)) => assert_eq!(persisted, record_a,
+                "A returned Ok and B Err: disk must be A, not failed writer B"),
+            (Err(_), Ok(())) => assert_eq!(persisted, record_b,
+                "B returned Ok and A Err: disk must be B"),
+            (Ok(()), Ok(())) => assert_eq!(persisted, record_b,
+                "B's successful rename strictly follows A's: disk must be B"),
+            (Err(a), Err(b)) => panic!(
+                "both real saves failed on a writable root: A={a}; B={b}"),
+        }
+        if b_result.is_err() || a_result.is_err() {
+            assert!(!belongs_to_current_connection(&persisted, &root),
+                "a failed member of overlapping group keeps CURRENT denied");
+            save(&root, &record_a).expect("real later save must restore CURRENT");
+            assert_eq!(load(&root), Some(record_a.clone()));
+            assert!(belongs_to_current_connection(&record_a, &root));
+        } else {
+            assert!(belongs_to_current_connection(&persisted, &root),
+                "two committed writes restore a genuinely qualified CURRENT");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
