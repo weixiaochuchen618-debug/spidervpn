@@ -1403,12 +1403,53 @@ mod tests {
     /// There are no mocks, sleeps, direct pending-map edits or production hooks.
     #[test]
     fn recovered_physical_alias_after_real_canonicalization_failure_accepts_new_committed_record() {
-        let root = tmp_root("canonicalization-alias-cross-recovery-red");
-        let child = root.join("alias-child");
-        std::fs::create_dir(&child).expect("real alias-child must exist");
-        let alias_a = child.join("..");
+        // Test-only real directory aliases; NEVER manipulate writer-state maps.
+        // The junction and its target are siblings inside one isolated sandbox,
+        // so removing the link cannot recursively delete the target directory.
+        fn create_alias(link: &Path, target: &Path) {
+            #[cfg(windows)]
+            {
+                let output = std::process::Command::new("cmd.exe")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link).arg(target).output()
+                    .expect("execute native Windows mklink /J");
+                assert!(output.status.success(),
+                    "native junction creation failed: status={}; stdout={}; stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr));
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, link)
+                .expect("create real on-disk directory symlink for Unix testing");
+        }
+        fn remove_alias(link: &Path) {
+            #[cfg(windows)]
+            {
+                // Windows rmdir <junction> WITHOUT /S removes only the link.
+                let output = std::process::Command::new("cmd.exe")
+                    .args(["/C", "rmdir"]).arg(link).output()
+                    .expect("execute native Windows junction-only rmdir");
+                assert!(output.status.success(),
+                    "junction-only rmdir failed: status={}; stdout={}; stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr));
+            }
+            #[cfg(unix)]
+            std::fs::remove_file(link)
+                .expect("unlink directory symlink without touching target");
+        }
+
+        let sandbox = tmp_root("canonicalization-alias-cross-recovery-red");
+        let root = sandbox.join("data");
+        std::fs::create_dir(&root).expect("real qualified data directory");
+        let child = sandbox.join("alias-junction");
+        assert!(!child.exists(), "junction must not preexist");
+        create_alias(&child, &root);
+        let alias_a = child.clone();
         let alias_b = root.clone();
-        assert_ne!(alias_a, alias_b, "not an invalid root/. PathBuf fixture");
+        assert_ne!(alias_a, alias_b, "junction path must differ from physical target");
         let physical = std::fs::canonicalize(&alias_b).expect("existing B root");
         assert_eq!(std::fs::canonicalize(&alias_a).unwrap(), physical);
         assert!(alias_a.is_dir() && alias_b.is_dir());
@@ -1435,12 +1476,14 @@ mod tests {
         assert!(belongs_to_current_connection(&old, &alias_a));
         assert!(belongs_to_current_connection(&old, &alias_b));
 
-        // Remove ONLY the truly existing empty child. B remains a usable
-        // physical root; real OS path traversal for child/.. must now fail.
-        std::fs::remove_dir(&child).expect("remove real empty alias child");
+        // Remove ONLY the Windows junction (no /S and no recursion), never
+        // its physical target. The real OS must now refuse A, while B works.
+        remove_alias(&child);
+        assert!(std::fs::symlink_metadata(&child).is_err(),
+            "junction itself must actually be gone");
         assert!(alias_b.is_dir() && !child.exists());
         let canonical_error = std::fs::canonicalize(&alias_a)
-            .expect_err("real OS must refuse missing child/.. path");
+            .expect_err("real OS must refuse removed junction alias");
         assert!(std::fs::canonicalize(&alias_b).is_ok());
         let attempted = save(&alias_a, &old);
         assert!(attempted.is_err(),
@@ -1452,9 +1495,9 @@ mod tests {
         assert!(!alias_b.join(FILE_NAME).with_extension("json.tmp").exists(),
             "no temp file should be created before identity failure");
 
-        // Restore the same physical alias. A is now provably identical to B;
+        // Restore the real junction. A again resolves to the physical B root;
         // no recovered CURRENT is allowed before a genuine new B commit.
-        std::fs::create_dir(&child).expect("restore real alias traversal");
+        create_alias(&child, &root);
         assert_eq!(std::fs::canonicalize(&alias_a).unwrap(), physical);
         assert_eq!(std::fs::canonicalize(&alias_b).unwrap(), physical);
         assert_eq!(load(&alias_a), Some(old.clone()));
@@ -1497,6 +1540,7 @@ mod tests {
             "stale line/engine binding must revoke B CURRENT");
         assert!(!belongs_to_current_connection(&committed, &alias_a),
             "stale line/engine binding must revoke A CURRENT");
-        let _ = std::fs::remove_dir_all(root);
+        remove_alias(&child); // link-only removal before sandbox cleanup.
+        let _ = std::fs::remove_dir_all(sandbox);
     }
 }
