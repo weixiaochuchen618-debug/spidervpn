@@ -86,6 +86,9 @@ fn uncommitted_exit_writes() -> &'static std::sync::Mutex<
 struct ExitWriteGuard {
     root: std::path::PathBuf,
     committed: bool,
+    // Only the first active writer uses legacy exit-probe.json.tmp.
+    // Every overlapping writer must own a distinct temporary pathname.
+    isolated_tmp: bool,
 }
 
 impl ExitWriteGuard {
@@ -99,9 +102,10 @@ impl ExitWriteGuard {
             // entry remains present until its final successful completion.
             state.failed_in_group = false;
         }
+        let isolated_tmp = state.active_writers != 0;
         state.active_writers = state.active_writers.checked_add(1)
             .ok_or_else(|| "exit pending writer count overflow".to_string())?;
-        Ok(Self { root: root.to_path_buf(), committed: false })
+        Ok(Self { root: root.to_path_buf(), committed: false, isolated_tmp })
     }
 }
 
@@ -146,11 +150,43 @@ pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
     let result = (|| -> Result<(), String> {
         let path = root.join(FILE_NAME);
         let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
+        // Concurrent same-root writers may overlap through rename, but must
+        // never write one another's staged bytes. Keep the legacy fixed tmp
+        // for the first writer and old single-writer Windows failure tests.
+        let tmp = if pending.isolated_tmp {
+            static NEXT_TMP_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            path.with_extension(format!("json.tmp.{}-{id}", std::process::id()))
+        } else {
+            path.with_extension("json.tmp")
+        };
+        if pending.isolated_tmp {
+            // No stale filename may be silently overwritten (even if a PID
+            // and sequence repeat after a process restart). An existing
+            // file must fail closed instead of stealing another writer's IO.
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+                .open(&tmp).map_err(|e| format!("{}：{e}", tmp.display()))?;
+            let written = file.write_all(text.as_bytes());
+            drop(file); // Windows rename must not race our own open handle.
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("{}：{e}", tmp.display()));
+            }
+        } else {
+            std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
+        }
         #[cfg(test)]
         tests::after_tmp_write_before_rename_test_hook();
-        std::fs::rename(&tmp, &path).map_err(|e| format!("{}：{e}", path.display()))
+        let renamed = std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("{}：{e}", path.display()));
+        if renamed.is_err() && pending.isolated_tmp {
+            // On a failed overlapping rename keep the #62 failure group
+            // pending, but best-effort remove this writer's orphaned tmp.
+            let _ = std::fs::remove_file(&tmp);
+        }
+        renamed
     })();
     if result.is_ok() {
         pending.committed = true;
