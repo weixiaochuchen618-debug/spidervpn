@@ -969,7 +969,7 @@ mod tests {
     fn same_root_overlapping_saves_commit_only_the_successful_writer_record() {
         use std::sync::mpsc;
         let root = tmp_root("same-root-shared-tmp-collision");
-        let port = fake_socks5("8.8.8.8\\n", "u", "p");
+        let port = fake_socks5("8.8.8.8\n", "u", "p");
         let line = qualified_probe_fixture(&root, port);
         let plan = qualified_plan(port);
         let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
