@@ -62,25 +62,61 @@ const ENDPOINTS: [(&str, &str); 3] = [
     ("ip-api.com", "/line/?fields=query"),
 ];
 
-// Track an unfinished or failed exit write in THIS process. A failed write
-// may leave an older, still-readable and formerly valid JSON if Windows
-// refuses both replacement and deletion (Issue #60's real MSVC RED).
-// The on-disk .tmp check below independently fails closed for another reader
-// while a failed rename's temp file remains. Neither is an interprocess lock
-// or an all-filesystem-denied crash-proof tombstone.
-fn uncommitted_exit_writes() -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
-    static PENDING: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>
-    > = std::sync::OnceLock::new();
-    PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+// Same-process, same-root writers are tracked by lifetime, not a single
+// HashSet bit. An overlapping writer's successful rename may NOT revoke
+// another active writer or a failure in the same overlapping group (#62).
+// This is NOT an interprocess lock/crash-proof on-disk tombstone.
+#[derive(Default)]
+struct ExitWriteState {
+    active_writers: usize,
+    failed_in_group: bool,
 }
 
-fn note_uncommitted_exit_write(root: &Path, pending: bool) {
-    if let Ok(mut roots) = uncommitted_exit_writes().lock() {
-        if pending {
-            roots.insert(root.to_path_buf());
-        } else {
-            roots.remove(root);
+fn uncommitted_exit_writes() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, ExitWriteState>
+> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, ExitWriteState>
+    >> = std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+// RAII also records an abandoned/panicking write as failed. A previous
+// failed group remains dirty until a new group really finishes successfully.
+struct ExitWriteGuard {
+    root: std::path::PathBuf,
+    committed: bool,
+}
+
+impl ExitWriteGuard {
+    fn begin(root: &Path) -> Result<Self, String> {
+        let mut roots = uncommitted_exit_writes()
+            .lock()
+            .map_err(|_| "exit pending-write lock poisoned".to_string())?;
+        let state = roots.entry(root.to_path_buf()).or_default();
+        if state.active_writers == 0 {
+            // Beginning a new recovery group does not grant CURRENT: the
+            // entry remains present until its final successful completion.
+            state.failed_in_group = false;
+        }
+        state.active_writers = state.active_writers.checked_add(1)
+            .ok_or_else(|| "exit pending writer count overflow".to_string())?;
+        Ok(Self { root: root.to_path_buf(), committed: false })
+    }
+}
+
+impl Drop for ExitWriteGuard {
+    fn drop(&mut self) {
+        let Ok(mut roots) = uncommitted_exit_writes().lock() else {
+            return; // Poisoned readers fail closed, never authorize CURRENT.
+        };
+        let Some(state) = roots.get_mut(&self.root) else { return };
+        if !self.committed {
+            state.failed_in_group = true;
+        }
+        state.active_writers = state.active_writers.saturating_sub(1);
+        if self.committed && state.active_writers == 0 && !state.failed_in_group {
+            roots.remove(&self.root);
         }
     }
 }
@@ -89,8 +125,8 @@ fn exit_write_uncommitted(root: &Path) -> bool {
     root.join(FILE_NAME).with_extension("json.tmp").exists()
         || uncommitted_exit_writes()
             .lock()
-            .map(|roots| roots.contains(root))
-            .unwrap_or(true) // A poisoned guard must never authorize current proof.
+            .map(|roots| roots.contains_key(root))
+            .unwrap_or(true) // Poisoned guard must never authorize current.
 }
 
 /// 把记录读回来。坏文件当作没有：宁可显示「尚未核验」，也不要显示一个读不懂的东西。
@@ -104,7 +140,7 @@ pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
     // Deny current attribution from the beginning of a write through its
     // commit. If either temp creation or rename fails, keep the guard until
     // a later genuinely successful save; a best-effort clear() is not proof.
-    note_uncommitted_exit_write(root, true);
+    let mut pending = ExitWriteGuard::begin(root)?;
     #[cfg(test)]
     tests::after_pending_save_test_hook();
     let result = (|| -> Result<(), String> {
@@ -115,7 +151,7 @@ pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
         std::fs::rename(&tmp, &path).map_err(|e| format!("{}：{e}", path.display()))
     })();
     if result.is_ok() {
-        note_uncommitted_exit_write(root, false);
+        pending.committed = true;
     }
     result
 }
