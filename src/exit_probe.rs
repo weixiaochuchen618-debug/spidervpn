@@ -1397,4 +1397,106 @@ mod tests {
         assert_eq!(probe_and_record(&root, &line, &plan, 500), None);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// #68 TEST-ONLY RED: a real failed canonicalization under alias A must
+    /// not permanently veto a later proven successful save through B.
+    /// There are no mocks, sleeps, direct pending-map edits or production hooks.
+    #[test]
+    fn recovered_physical_alias_after_real_canonicalization_failure_accepts_new_committed_record() {
+        let root = tmp_root("canonicalization-alias-cross-recovery-red");
+        let child = root.join("alias-child");
+        std::fs::create_dir(&child).expect("real alias-child must exist");
+        let alias_a = child.join("..");
+        let alias_b = root.clone();
+        assert_ne!(alias_a, alias_b, "not an invalid root/. PathBuf fixture");
+        let physical = std::fs::canonicalize(&alias_b).expect("existing B root");
+        assert_eq!(std::fs::canonicalize(&alias_a).unwrap(), physical);
+        assert!(alias_a.is_dir() && alias_b.is_dir());
+
+        // Actual qualified, authenticated loopback SOCKS Check, not a forged
+        // binding or a mocked successful save.
+        let port = fake_socks5("8.8.8.8\n", "u", "p");
+        let line = qualified_probe_fixture(&root, port);
+        let plan = qualified_plan(port);
+        let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
+        assert!(check.ok && check.via_trade_exit
+            && crate::selfcheck::current_qualified_trade_pass(&root),
+            "original actual authenticated Check must succeed: {check:?}");
+        let old = probe_and_record(&root, &line, &plan, 2_000)
+            .expect("original real authenticated SOCKS exit observation");
+        assert!(old.attributed && old.binding.is_some());
+        assert_eq!(load(&alias_b), Some(old.clone()));
+        assert_eq!(load(&alias_a), Some(old.clone()));
+        assert_eq!(
+            std::fs::canonicalize(alias_a.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(alias_b.join(FILE_NAME)).unwrap(),
+            "the historical disk record must be one real physical file"
+        );
+        assert!(belongs_to_current_connection(&old, &alias_a));
+        assert!(belongs_to_current_connection(&old, &alias_b));
+
+        // Remove ONLY the truly existing empty child. B remains a usable
+        // physical root; real OS path traversal for child/.. must now fail.
+        std::fs::remove_dir(&child).expect("remove real empty alias child");
+        assert!(alias_b.is_dir() && !child.exists());
+        let canonical_error = std::fs::canonicalize(&alias_a)
+            .expect_err("real OS must refuse missing child/.. path");
+        assert!(std::fs::canonicalize(&alias_b).is_ok());
+        let attempted = save(&alias_a, &old);
+        assert!(attempted.is_err(),
+            "actual save through unresolved A must fail, got {attempted:?}");
+        assert_eq!(load(&alias_b), Some(old.clone()),
+            "failed identity lookup must not overwrite original disk JSON");
+        assert!(!belongs_to_current_connection(&old, &alias_a),
+            "while identity resolution is broken CURRENT must fail closed");
+        assert!(!alias_b.join(FILE_NAME).with_extension("json.tmp").exists(),
+            "no temp file should be created before identity failure");
+
+        // Restore the same physical alias. A is now provably identical to B;
+        // no recovered CURRENT is allowed before a genuine new B commit.
+        std::fs::create_dir(&child).expect("restore real alias traversal");
+        assert_eq!(std::fs::canonicalize(&alias_a).unwrap(), physical);
+        assert_eq!(std::fs::canonicalize(&alias_b).unwrap(), physical);
+        assert_eq!(load(&alias_a), Some(old.clone()));
+        assert!(!belongs_to_current_connection(&old, &alias_a),
+            "restoring a path alone cannot clear an unresolved failed save");
+
+        // This new record preserves the actual observed IP, line, session
+        // and original binding; only its timestamp identifies a new commit.
+        // A real save(B) must be the recovery boundary, not marker deletion.
+        let mut committed = old.clone();
+        committed.at = old.at.checked_add(1).expect("distinct new record time");
+        assert_ne!(committed, old);
+        assert!(original_exit_binding_still_current(&committed, &alias_b),
+            "current original session/line binding required before new commit");
+        save(&alias_b, &committed).expect("real B writer must complete on writable root");
+        assert_eq!(load(&alias_b), Some(committed.clone()));
+        assert_eq!(load(&alias_a), Some(committed.clone()),
+            "both spellings must read the exact newly committed disk JSON");
+        assert_eq!(
+            std::fs::canonicalize(alias_a.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(alias_b.join(FILE_NAME)).unwrap(),
+            "new JSON remains a single physical file"
+        );
+        assert!(!alias_b.join(FILE_NAME).with_extension("json.tmp").exists());
+        let b_current = belongs_to_current_connection(&committed, &alias_b);
+        let a_current = belongs_to_current_connection(&committed, &alias_a);
+        eprintln!(
+            "CANONICAL_ALIAS_RECOVERY: raw_unequal={}; physical_equal=true; actual_canon_err={canonical_error}; actual_save_a={attempted:?}; committed_new_at={}; disk_at={}; A_current={a_current}; B_current={b_current}; binding_valid={}",
+            alias_a != alias_b, committed.at, load(&alias_b).unwrap().at,
+            original_exit_binding_still_current(&committed, &alias_b)
+        );
+        assert!(b_current, "B positive CURRENT control after real successful save");
+        assert!(a_current,
+            "A must recover only after B's completed save of a valid record to the same physical root");
+
+        // Reopening CURRENT must never bypass live session/engine binding.
+        std::fs::write(root.join("runtime-engine.json"), "{}")
+            .expect("change real engine binding after successful recovery");
+        assert!(!belongs_to_current_connection(&committed, &alias_b),
+            "stale line/engine binding must revoke B CURRENT");
+        assert!(!belongs_to_current_connection(&committed, &alias_a),
+            "stale line/engine binding must revoke A CURRENT");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
