@@ -84,7 +84,11 @@ fn uncommitted_exit_writes() -> &'static std::sync::Mutex<
 // RAII also records an abandoned/panicking write as failed. A previous
 // failed group remains dirty until a new group really finishes successfully.
 struct ExitWriteGuard {
+    // The resolved identity of the actual directory shared by path aliases.
     root: std::path::PathBuf,
+    // Keep the caller's spelling to clear a previous unresolved-root failure
+    // only after a later genuinely successful group completion.
+    requested_root: std::path::PathBuf,
     committed: bool,
     // Only the first active writer uses legacy exit-probe.json.tmp.
     // Every overlapping writer must own a distinct temporary pathname.
@@ -93,10 +97,24 @@ struct ExitWriteGuard {
 
 impl ExitWriteGuard {
     fn begin(root: &Path) -> Result<Self, String> {
+        // A raw PathBuf is not a directory identity: child/.. and symlink
+        // paths can address exactly the same on-disk exit-probe.json.
+        let key = match std::fs::canonicalize(root) {
+            Ok(key) => key,
+            Err(e) => {
+                // Never silently lose #62's failed-write denial if an old
+                // qualified JSON becomes readable after a transient error.
+                let mut roots = uncommitted_exit_writes()
+                    .lock()
+                    .map_err(|_| "exit pending-write lock poisoned".to_string())?;
+                roots.entry(root.to_path_buf()).or_default().failed_in_group = true;
+                return Err(format!("exit root identity {}：{e}", root.display()));
+            }
+        };
         let mut roots = uncommitted_exit_writes()
             .lock()
             .map_err(|_| "exit pending-write lock poisoned".to_string())?;
-        let state = roots.entry(root.to_path_buf()).or_default();
+        let state = roots.entry(key.clone()).or_default();
         if state.active_writers == 0 {
             // Beginning a new recovery group does not grant CURRENT: the
             // entry remains present until its final successful completion.
@@ -105,7 +123,10 @@ impl ExitWriteGuard {
         let isolated_tmp = state.active_writers != 0;
         state.active_writers = state.active_writers.checked_add(1)
             .ok_or_else(|| "exit pending writer count overflow".to_string())?;
-        Ok(Self { root: root.to_path_buf(), committed: false, isolated_tmp })
+        Ok(Self {
+            root: key, requested_root: root.to_path_buf(),
+            committed: false, isolated_tmp,
+        })
     }
 }
 
@@ -121,16 +142,30 @@ impl Drop for ExitWriteGuard {
         state.active_writers = state.active_writers.saturating_sub(1);
         if self.committed && state.active_writers == 0 && !state.failed_in_group {
             roots.remove(&self.root);
+            // Recovery via the same caller path can retire a prior failed
+            // canonicalization marker. Never remove any active writer.
+            if self.requested_root != self.root
+                && roots.get(&self.requested_root).is_some_and(|other| {
+                    other.active_writers == 0 && other.failed_in_group
+                })
+            {
+                roots.remove(&self.requested_root);
+            }
         }
     }
 }
 
 fn exit_write_uncommitted(root: &Path) -> bool {
-    root.join(FILE_NAME).with_extension("json.tmp").exists()
-        || uncommitted_exit_writes()
-            .lock()
-            .map(|roots| roots.contains_key(root))
-            .unwrap_or(true) // Poisoned guard must never authorize current.
+    if root.join(FILE_NAME).with_extension("json.tmp").exists() {
+        return true;
+    }
+    // Unresolvable identity cannot authorize CURRENT; a later readable
+    // path also consults any failed canonicalization marker under its raw key.
+    let Ok(key) = std::fs::canonicalize(root) else { return true };
+    uncommitted_exit_writes()
+        .lock()
+        .map(|roots| roots.contains_key(&key) || roots.contains_key(root))
+        .unwrap_or(true) // Poisoned guard must never authorize current.
 }
 
 /// 把记录读回来。坏文件当作没有：宁可显示「尚未核验」，也不要显示一个读不懂的东西。
