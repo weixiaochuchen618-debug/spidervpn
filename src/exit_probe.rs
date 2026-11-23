@@ -105,6 +105,8 @@ pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
     // commit. If either temp creation or rename fails, keep the guard until
     // a later genuinely successful save; a best-effort clear() is not proof.
     note_uncommitted_exit_write(root, true);
+    #[cfg(test)]
+    tests::after_pending_save_test_hook();
     let result = (|| -> Result<(), String> {
         let path = root.join(FILE_NAME);
         let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
@@ -359,6 +361,23 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    // Thread-local test hook: pause a REAL save after the production pending
+    // mark and before its filesystem writes. Release code remains unchanged.
+    std::thread_local! {
+        static AFTER_PENDING_SAVE_HOOK:
+            std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn after_pending_save_test_hook() {
+        AFTER_PENDING_SAVE_HOOK.with(|slot| {
+            let callback = slot.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
+    }
 
     fn tmp_root(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("tcrs-exitprobe-{tag}-{}", std::process::id()));
@@ -814,6 +833,77 @@ mod tests {
         assert_eq!(load(&root), Some(old.clone()));
         assert!(belongs_to_current_connection(&old, &root),
             "successful atomic record save must restore the legitimate positive");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #62 TEST-ONLY RED: two actual overlapping production save() calls.
+    /// No sleep, mock save result, or release-build behavior changes.
+    #[test]
+    fn overlapping_same_root_save_cannot_clear_another_writer_pending_or_failed() {
+        use std::sync::mpsc;
+        let root = tmp_root("same-root-overlap-red");
+        let port = fake_socks5("8.8.8.8\n", "u", "p");
+        let line = qualified_probe_fixture(&root, port);
+        let plan = qualified_plan(port);
+        let check = crate::selfcheck::check_and_record(&root, &plan, 2_000);
+        assert!(check.ok && check.via_trade_exit
+            && crate::selfcheck::current_qualified_trade_pass(&root),
+            "real authenticated loopback trade Check required: {check:?}");
+        let old = probe_and_record(&root, &line, &plan, 2_000)
+            .expect("real authenticated SOCKS exit observation");
+        assert!(old.attributed && old.binding.is_some());
+        assert_eq!(load(&root), Some(old.clone()));
+        assert!(belongs_to_current_connection(&old, &root),
+            "original old JSON must be CURRENT before overlap");
+
+        let (pending_tx, pending_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let b_root = root.clone();
+        let b_record = old.clone();
+        let b = std::thread::spawn(move || {
+            AFTER_PENDING_SAVE_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    pending_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(20))
+                        .expect("writer B must be explicitly released");
+                }));
+            });
+            save(&b_root, &b_record)
+        });
+        pending_rx.recv_timeout(Duration::from_secs(20))
+            .expect("writer B must enter actual save after pending mark");
+        assert!(exit_write_uncommitted(&root));
+        let tmp = root.join(FILE_NAME).with_extension("json.tmp");
+        assert!(!tmp.exists(), "writer B is blocked before temp creation");
+
+        // A genuinely commits the old qualified record while B is unfinished.
+        save(&root, &old).expect("concurrent writer A must succeed");
+        assert_eq!(load(&root), Some(old.clone()));
+        assert!(!tmp.exists(), "A consumed its temp on rename");
+        let current_while_b_pending = belongs_to_current_connection(&old, &root);
+
+        // B now encounters a REAL std::fs::write OS error, not a mock.
+        std::fs::create_dir(&tmp).unwrap();
+        release_tx.send(()).unwrap();
+        let b_error = b.join().expect("writer B must finish")
+            .expect_err("directory-as-temp must cause actual filesystem failure");
+        assert!(tmp.is_dir());
+        std::fs::remove_dir(&tmp).unwrap();
+        assert!(!tmp.exists(), "no temp residue may hide root-marker defect");
+        assert_eq!(load(&root), Some(old.clone()), "old JSON remains readable");
+        let current_after_b_failed = belongs_to_current_connection(&old, &root);
+
+        save(&root, &old).expect("later real successful save restores CURRENT");
+        assert_eq!(load(&root), Some(old.clone()));
+        let recovered_current = belongs_to_current_connection(&old, &root);
+        eprintln!(
+            "SAME_ROOT_OVERLAP_RED: real_B_error={b_error}; in_flight_old_current={current_while_b_pending}; failed_no_tmp_old_current={current_after_b_failed}; recovered_current={recovered_current}"
+        );
+        assert!(!current_while_b_pending,
+            "STALE CURRENT: A cleared B's root pending while writer B remained unfinished");
+        assert!(!current_after_b_failed,
+            "STALE CURRENT: B failed real IO with no tmp, but old current evidence was accepted");
+        assert!(recovered_current, "a later successful save restores qualified CURRENT");
         let _ = std::fs::remove_dir_all(root);
     }
 
