@@ -70,6 +70,9 @@ const ENDPOINTS: [(&str, &str); 3] = [
 struct ExitWriteState {
     active_writers: usize,
     failed_in_group: bool,
+    // Distinguish an unresolved raw path from an ordinary canonical write
+    // failure: only the former can be retired by a different verified alias.
+    failed_identity_resolution: bool,
 }
 
 fn uncommitted_exit_writes() -> &'static std::sync::Mutex<
@@ -107,7 +110,9 @@ impl ExitWriteGuard {
                 let mut roots = uncommitted_exit_writes()
                     .lock()
                     .map_err(|_| "exit pending-write lock poisoned".to_string())?;
-                roots.entry(root.to_path_buf()).or_default().failed_in_group = true;
+                let failed = roots.entry(root.to_path_buf()).or_default();
+                failed.failed_in_group = true;
+                failed.failed_identity_resolution = true;
                 return Err(format!("exit root identity {}：{e}", root.display()));
             }
         };
@@ -142,6 +147,17 @@ impl Drop for ExitWriteGuard {
         state.active_writers = state.active_writers.saturating_sub(1);
         if self.committed && state.active_writers == 0 && !state.failed_in_group {
             roots.remove(&self.root);
+            // A real, fully successful writer group is the only recovery
+            // boundary. Retire only failed *identity lookups* whose raw paths
+            // NOW resolve to this exact physical directory; preserve all
+            // unresolved, different-root, active and ordinary write failures.
+            // Readers still recheck the live original session/line binding.
+            roots.retain(|raw, other| {
+                !other.failed_identity_resolution
+                    || other.active_writers != 0
+                    || !other.failed_in_group
+                    || std::fs::canonicalize(raw).ok().as_ref() != Some(&self.root)
+            });
             // Recovery via the same caller path can retire a prior failed
             // canonicalization marker. Never remove any active writer.
             if self.requested_root != self.root
