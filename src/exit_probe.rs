@@ -89,9 +89,6 @@ fn uncommitted_exit_writes() -> &'static std::sync::Mutex<
 struct ExitWriteGuard {
     // The resolved identity of the actual directory shared by path aliases.
     root: std::path::PathBuf,
-    // Keep the caller's spelling to clear a previous unresolved-root failure
-    // only after a later genuinely successful group completion.
-    requested_root: std::path::PathBuf,
     committed: bool,
     // Only the first active writer uses legacy exit-probe.json.tmp.
     // Every overlapping writer must own a distinct temporary pathname.
@@ -129,7 +126,7 @@ impl ExitWriteGuard {
         state.active_writers = state.active_writers.checked_add(1)
             .ok_or_else(|| "exit pending writer count overflow".to_string())?;
         Ok(Self {
-            root: key, requested_root: root.to_path_buf(),
+            root: key,
             committed: false, isolated_tmp,
         })
     }
@@ -158,15 +155,8 @@ impl Drop for ExitWriteGuard {
                     || !other.failed_in_group
                     || std::fs::canonicalize(raw).ok().as_ref() != Some(&self.root)
             });
-            // Recovery via the same caller path can retire a prior failed
-            // canonicalization marker. Never remove any active writer.
-            if self.requested_root != self.root
-                && roots.get(&self.requested_root).is_some_and(|other| {
-                    other.active_writers == 0 && other.failed_in_group
-                })
-            {
-                roots.remove(&self.requested_root);
-            }
+            // The identity-checked retirement above also covers a recovered
+            // caller spelling. Do not separately clear a mutable raw alias.
         }
     }
 }
@@ -199,7 +189,10 @@ pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
     #[cfg(test)]
     tests::after_pending_save_test_hook();
     let result = (|| -> Result<(), String> {
-        let path = root.join(FILE_NAME);
+        // Stage, rename and clean up under the same resolved path registered
+        // by the guard. A caller junction may now point at another directory.
+        // This fixes alias retargeting, not replacement of the resolved root.
+        let path = pending.root.join(FILE_NAME);
         let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
         // Concurrent same-root writers may overlap through rename, but must
         // never write one another's staged bytes. Keep the legacy fixed tmp
