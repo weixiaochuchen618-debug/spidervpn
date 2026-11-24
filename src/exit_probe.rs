@@ -1559,4 +1559,187 @@ mod tests {
         remove_alias(&child); // link-only removal before sandbox cleanup.
         let _ = std::fs::remove_dir_all(sandbox);
     }
+
+    /// #70 TEST-ONLY: a successful B commit must not retire a raw A
+    /// identity-failure marker when A now resolves to a different root C.
+    /// This is an ordered real-filesystem regression, not a TOCTOU proof.
+    #[test]
+    fn retargeted_junction_to_distinct_root_keeps_failed_alias_dirty_after_b_commit() {
+        fn create_alias(link: &Path, target: &Path) {
+            #[cfg(windows)]
+            {
+                let output = std::process::Command::new("cmd.exe")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link).arg(target).output()
+                    .expect("execute real Windows mklink /J");
+                assert!(output.status.success(),
+                    "junction creation failed: status={}; stdout={}; stderr={}",
+                    output.status, String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr));
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, link)
+                .expect("create real Unix directory alias");
+        }
+
+        fn remove_alias(link: &Path) {
+            #[cfg(windows)]
+            {
+                // rmdir without /S removes only the directory junction.
+                let output = std::process::Command::new("cmd.exe")
+                    .args(["/C", "rmdir"]).arg(link).output()
+                    .expect("execute native junction-only rmdir");
+                assert!(output.status.success(),
+                    "junction-only removal failed: status={}; stdout={}; stderr={}",
+                    output.status, String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr));
+            }
+            #[cfg(unix)]
+            std::fs::remove_file(link).expect("unlink alias only");
+            assert!(std::fs::symlink_metadata(link).is_err(),
+                "the alias itself must be gone");
+        }
+
+        let sandbox = tmp_root("cross-root-retarget-dirty-marker");
+        let b = sandbox.join("data-b");
+        let c = sandbox.join("data-c");
+        let a = sandbox.join("alias-a");
+        std::fs::create_dir(&b).expect("create actual physical B");
+        std::fs::create_dir(&c).expect("create actual physical C");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        let physical_b = std::fs::canonicalize(&b).unwrap();
+        let physical_c = std::fs::canonicalize(&c).unwrap();
+        assert_ne!(physical_b, physical_c, "B and C must be different physical roots");
+
+        // Independently qualified authenticated SOCKS observations in both
+        // roots. C is deliberately otherwise CURRENT so the negative test
+        // cannot pass merely because its JSON or original binding is invalid.
+        let port_b = fake_socks5("8.8.8.8\n", "u", "p");
+        let port_c = fake_socks5("8.8.8.8\n", "u", "p");
+        assert_ne!(port_b, port_c, "distinct live probe bindings");
+        let line_b = qualified_probe_fixture(&b, port_b);
+        let line_c = qualified_probe_fixture(&c, port_c);
+        let plan_b = qualified_plan(port_b);
+        let plan_c = qualified_plan(port_c);
+        let check_b = crate::selfcheck::check_and_record(&b, &plan_b, 2_000);
+        let check_c = crate::selfcheck::check_and_record(&c, &plan_c, 2_000);
+        assert!(check_b.ok && check_b.via_trade_exit
+            && crate::selfcheck::current_qualified_trade_pass(&b), "{check_b:?}");
+        assert!(check_c.ok && check_c.via_trade_exit
+            && crate::selfcheck::current_qualified_trade_pass(&c), "{check_c:?}");
+        let old_b = probe_and_record(&b, &line_b, &plan_b, 2_000)
+            .expect("actual authenticated B observation");
+        let old_c = probe_and_record(&c, &line_c, &plan_c, 2_000)
+            .expect("actual authenticated C observation");
+        assert!(old_b.attributed && old_b.binding.is_some());
+        assert!(old_c.attributed && old_c.binding.is_some());
+        assert_ne!(old_b.binding, old_c.binding, "independent engine/probe bindings");
+        assert!(belongs_to_current_connection(&old_b, &b));
+        assert!(belongs_to_current_connection(&old_c, &c));
+        assert!(!original_exit_binding_still_current(&old_b, &c));
+        assert!(!original_exit_binding_still_current(&old_c, &b));
+        assert_eq!(load(&b), Some(old_b.clone()));
+        assert_eq!(load(&c), Some(old_c.clone()));
+        let c_disk = std::fs::read(c.join(FILE_NAME)).unwrap();
+        assert_ne!(std::fs::canonicalize(b.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(c.join(FILE_NAME)).unwrap());
+
+        create_alias(&a, &b);
+        assert_eq!(std::fs::canonicalize(&a).unwrap(), physical_b);
+        assert_eq!(std::fs::canonicalize(a.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(b.join(FILE_NAME)).unwrap());
+        assert_eq!(load(&a), Some(old_b.clone()));
+        assert!(belongs_to_current_connection(&old_b, &a),
+            "A starts genuinely CURRENT through B");
+
+        remove_alias(&a);
+        let canonical_error = std::fs::canonicalize(&a)
+            .expect_err("removed junction must cause a real OS identity error");
+        assert_eq!(std::fs::canonicalize(&b).unwrap(), physical_b);
+        assert_eq!(std::fs::canonicalize(&c).unwrap(), physical_c);
+        let failed = save(&a, &old_b);
+        assert!(failed.is_err(), "actual save through missing A must fail");
+        assert!(exit_write_uncommitted(&a));
+        assert!(!belongs_to_current_connection(&old_b, &a));
+        assert_eq!(load(&b), Some(old_b.clone()));
+        assert_eq!(load(&c), Some(old_c.clone()));
+        assert_eq!(std::fs::read(c.join(FILE_NAME)).unwrap(), c_disk);
+        assert!(!b.join(FILE_NAME).with_extension("json.tmp").exists());
+        assert!(!c.join(FILE_NAME).with_extension("json.tmp").exists());
+
+        // The same raw alias now resolves to C, NOT the root B which will
+        // commit. C's real current record must not become CURRENT through A
+        // merely because its original binding and historical JSON are valid.
+        create_alias(&a, &c);
+        assert_eq!(std::fs::canonicalize(&a).unwrap(), physical_c);
+        assert_ne!(std::fs::canonicalize(&a).unwrap(), physical_b);
+        assert_eq!(std::fs::canonicalize(a.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(c.join(FILE_NAME)).unwrap());
+        assert_eq!(load(&a), Some(old_c.clone()));
+        assert!(original_exit_binding_still_current(&old_c, &a),
+            "retargeted C binding must itself be valid, isolating the dirty guard");
+        assert!(belongs_to_current_connection(&old_c, &c));
+        assert!(exit_write_uncommitted(&a), "restoring another target must not retire raw A");
+        assert!(!belongs_to_current_connection(&old_c, &a));
+        assert!(!a.join(FILE_NAME).with_extension("json.tmp").exists());
+
+        let mut committed_b = old_b.clone();
+        committed_b.at = old_b.at.checked_add(1).expect("distinct new B record");
+        assert_ne!(committed_b, old_b);
+        assert!(original_exit_binding_still_current(&committed_b, &b));
+        save(&b, &committed_b).expect("genuine successful B commit");
+        assert_eq!(std::fs::canonicalize(&a).unwrap(), physical_c);
+        assert_eq!(std::fs::canonicalize(&b).unwrap(), physical_b);
+        assert_eq!(load(&b), Some(committed_b.clone()));
+        assert_eq!(load(&a), Some(old_c.clone()));
+        assert_eq!(load(&c), Some(old_c.clone()));
+        assert_eq!(std::fs::read(c.join(FILE_NAME)).unwrap(), c_disk);
+        assert!(!b.join(FILE_NAME).with_extension("json.tmp").exists());
+        assert!(!a.join(FILE_NAME).with_extension("json.tmp").exists());
+        let b_current = belongs_to_current_connection(&committed_b, &b);
+        let c_current = belongs_to_current_connection(&old_c, &c);
+        let a_binding_valid = original_exit_binding_still_current(&old_c, &a);
+        let a_dirty = exit_write_uncommitted(&a);
+        let a_current = belongs_to_current_connection(&old_c, &a);
+        eprintln!(
+            "CROSS_ROOT_RETARGET: raw_A={a:?}; physical_B={physical_b:?}; physical_C={physical_c:?}; canonical_err={canonical_error}; save_A={failed:?}; B_disk_at={}; C_disk_at={}; B_current={b_current}; C_current={c_current}; A_binding_valid={a_binding_valid}; A_dirty={a_dirty}; A_current={a_current}",
+            load(&b).unwrap().at, load(&c).unwrap().at
+        );
+        assert!(b_current && c_current && a_binding_valid,
+            "B success and C's independent live binding must remain valid");
+        assert!(a_dirty, "successful B commit must not clear raw A dirty at different physical C");
+        assert!(!a_current, "retargeted A must fail closed despite otherwise valid C evidence");
+        assert!(!belongs_to_current_connection(&committed_b, &a),
+            "B record must not authorize CURRENT through physical C");
+
+        // Retargeting back by itself cannot repair the old failed write.
+        // Only a new successful same-physical-root B group may recover A.
+        remove_alias(&a);
+        create_alias(&a, &b);
+        assert_eq!(std::fs::canonicalize(&a).unwrap(), physical_b);
+        assert_eq!(load(&a), Some(committed_b.clone()));
+        assert!(original_exit_binding_still_current(&committed_b, &a));
+        assert!(exit_write_uncommitted(&a));
+        assert!(!belongs_to_current_connection(&committed_b, &a));
+        let mut recovered_b = committed_b.clone();
+        recovered_b.at = committed_b.at.checked_add(1).unwrap();
+        save(&b, &recovered_b).expect("new same-root B commit to recover A");
+        assert_eq!(load(&a), Some(recovered_b.clone()));
+        assert_eq!(load(&b), Some(recovered_b.clone()));
+        assert_eq!(std::fs::read(c.join(FILE_NAME)).unwrap(), c_disk);
+        assert!(!exit_write_uncommitted(&a));
+        assert!(belongs_to_current_connection(&recovered_b, &b));
+        assert!(belongs_to_current_connection(&recovered_b, &a));
+        assert!(belongs_to_current_connection(&old_c, &c));
+
+        std::fs::write(b.join("runtime-engine.json"), "{}")
+            .expect("invalidate actual B engine binding");
+        assert!(!belongs_to_current_connection(&recovered_b, &a));
+        assert!(!belongs_to_current_connection(&recovered_b, &b));
+        assert!(belongs_to_current_connection(&old_c, &c),
+            "B binding invalidation must not affect independent C");
+        remove_alias(&a);
+        std::fs::remove_dir_all(&sandbox).expect("clean isolated sandbox after link removal");
+    }
 }
