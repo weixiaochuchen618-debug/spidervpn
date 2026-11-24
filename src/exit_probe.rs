@@ -2787,20 +2787,22 @@ mod tests {
             worker: Option<std::thread::JoinHandle<usize>>,
         }
         impl Loopback {
-            fn start(bodies: Vec<&'static str>) -> Self {
+            fn start(label: String, bodies: Vec<&'static str>) -> Self {
                 let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
                 let active = listener.try_clone().unwrap();
                 let stop = Arc::new(AtomicBool::new(false));
                 let worker_stop = Arc::clone(&stop);
                 let worker = std::thread::spawn(move || {
                     let mut completed = 0;
-                    for body in bodies {
+                    for (phase, body) in bodies.into_iter().enumerate() {
                         let (mut s, _) = active.accept().expect("fixture: loopback accept");
                         if worker_stop.load(Ordering::SeqCst) {
                             break;
                         }
                         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
                         s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_nodelay(true).unwrap();
+                        eprintln!("PRODUCER_FIXTURE {label} phase={phase}: accepted");
                         let mut greet = [0u8; 4];
                         s.read_exact(&mut greet).unwrap();
                         assert_eq!(greet, [0x05, 0x02, 0x00, 0x02]);
@@ -2817,26 +2819,46 @@ mod tests {
                         assert_eq!(user, b"u");
                         assert_eq!(pass, b"p");
                         s.write_all(&[0x01, 0x00]).unwrap();
+                        eprintln!("PRODUCER_FIXTURE {label} phase={phase}: authenticated");
                         let mut connect = [0u8; 5];
                         s.read_exact(&mut connect).unwrap();
                         assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x03]);
                         let mut target = vec![0u8; usize::from(connect[4]) + 2];
                         s.read_exact(&mut target).unwrap();
+                        let (host, path) = if body.is_empty() {
+                            ("www.gstatic.com", "/generate_204")
+                        } else {
+                            ("checkip.amazonaws.com", "/")
+                        };
+                        assert_eq!(&target[..target.len() - 2], host.as_bytes(),
+                            "fixture {label} phase={phase}: expected SOCKS host");
+                        assert_eq!(&target[target.len() - 2..], &80u16.to_be_bytes());
                         s.write_all(&[0x05, 0, 0, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+                        // Consume the complete bounded origin-form HTTP request.
                         let mut req = Vec::new();
+                        let mut chunk = [0u8; 512];
                         while !req.ends_with(b"\r\n\r\n") {
-                            let mut byte = [0u8; 1];
-                            s.read_exact(&mut byte).unwrap();
-                            req.push(byte[0]);
+                            let n = s.read(&mut chunk).expect("fixture: HTTP request read");
+                            assert_ne!(n, 0, "fixture: premature HTTP request EOF");
+                            req.extend_from_slice(&chunk[..n]);
                             assert!(req.len() <= 8192, "fixture: bounded HTTP header");
                         }
-                        assert!(req.starts_with(b"GET ") || req.starts_with(b"HEAD "));
+                        assert!(req.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()),
+                            "fixture {label} phase={phase}: origin-form GET");
+                        eprintln!("PRODUCER_FIXTURE {label} phase={phase}: HTTP request complete host={host}");
                         let status = if body.is_empty() { "204 No Content" } else { "200 OK" };
                         s.write_all(format!(
-                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{body}",
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
-                        ).as_bytes()).unwrap();
+                        ).as_bytes()).expect("fixture: HTTP response write");
+                        // socks5_text reads the body through EOF, not only
+                        // Content-Length. Finish the write half explicitly.
+                        if !body.is_empty() {
+                            s.shutdown(std::net::Shutdown::Write)
+                                .expect("fixture: complete response EOF");
+                        }
                         completed += 1;
+                        eprintln!("PRODUCER_FIXTURE {label} phase={phase}: response completed status={status} body={body:?}");
                     }
                     completed
                 });
@@ -2865,7 +2887,12 @@ mod tests {
         }
         impl Drop for Loopback {
             fn drop(&mut self) {
-                let _ = self.stop_and_join();
+                if let Some(result) = self.stop_and_join() {
+                    match result {
+                        Ok(count) => eprintln!("PRODUCER_FIXTURE cleanup: completed={count}"),
+                        Err(_) => eprintln!("PRODUCER_FIXTURE cleanup: server thread panicked (see actual panic above)"),
+                    }
+                }
             }
         }
 
@@ -2889,7 +2916,7 @@ mod tests {
         // file, so an unverified new return cannot be explained by an
         // unmatched IP or deliberately stale Check before the save gate.
         let observe = |dir: &Path, bodies: Vec<&'static str>| {
-            let server = Loopback::start(bodies);
+            let mut server = Loopback::start(dir.display().to_string(), bodies);
             let line = qualified_probe_fixture(dir, server.port());
             let plan = qualified_plan(server.port());
             std::fs::write(line.engine_config_path(dir), serde_json::json!({
@@ -2903,8 +2930,15 @@ mod tests {
             assert!(check.ok && check.via_trade_exit && check.status == Some(204)
                 && crate::selfcheck::current_qualified_trade_pass(dir),
                 "fixture: authenticated qualified Check: {check:?}");
-            let old = probe_and_record(dir, &line, &plan, 2_000)
-                .expect("fixture: real initial authenticated observation");
+            let old = match probe_and_record(dir, &line, &plan, 2_000) {
+                Some(record) => record,
+                None => {
+                    let joined = server.stop_and_join();
+                    eprintln!("PRODUCER_FIXTURE initial observation absent: root={}; server_result={joined:?}",
+                        dir.display());
+                    panic!("fixture: real initial authenticated observation for {}", dir.display());
+                }
+            };
             assert_eq!(old.ip, "8.8.8.8");
             assert!(old.attributed && old.binding.is_some());
             assert_eq!(load(dir), Some(old.clone()));
