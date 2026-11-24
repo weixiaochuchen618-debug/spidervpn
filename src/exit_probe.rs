@@ -62,73 +62,178 @@ const ENDPOINTS: [(&str, &str); 3] = [
     ("ip-api.com", "/line/?fields=query"),
 ];
 
-// Same-process, same-root writers are tracked by lifetime, not a single
-// HashSet bit. An overlapping writer's successful rename may NOT revoke
-// another active writer or a failure in the same overlapping group (#62).
-// This is NOT an interprocess lock/crash-proof on-disk tombstone.
+// Same-process writers are grouped by the actual directory object, not
+// its spelling or current location. This is not an interprocess lock,
+// crash-proof tombstone or protection against arbitrary file-ID reuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ExitDirectoryId(u64, u64);
+
+#[cfg(windows)]
+fn open_exit_directory(path: &Path, pin: bool) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE,
+    };
+    // Registration/lookup permits directory movement. Only the actual IO
+    // phase denies delete sharing, so a direct root rename/replacement
+    // cannot occur while this matching directory handle is held.
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE
+        | if pin { 0 } else { FILE_SHARE_DELETE };
+    std::fs::OpenOptions::new().read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .share_mode(share)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_exit_directory(path: &Path, _pin: bool) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(windows)]
+fn exit_directory_id(dir: &std::fs::File) -> std::io::Result<ExitDirectoryId> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: dir owns a live handle; info is valid writable SDK storage.
+    if unsafe { GetFileInformationByHandle(dir.as_raw_handle() as _, &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 || index == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            "exit root has no usable native directory identity"));
+    }
+    Ok(ExitDirectoryId(u64::from(info.dwVolumeSerialNumber), index))
+}
+
+#[cfg(unix)]
+fn exit_directory_id(dir: &std::fs::File) -> std::io::Result<ExitDirectoryId> {
+    use std::os::unix::fs::MetadataExt;
+    let md = dir.metadata()?;
+    if !md.is_dir() || md.ino() == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            "exit root has no usable native directory identity"));
+    }
+    Ok(ExitDirectoryId(md.dev(), md.ino()))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn exit_directory_id(_dir: &std::fs::File) -> std::io::Result<ExitDirectoryId> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+        "native exit directory identity unavailable"))
+}
+
+fn read_exit_directory_id(path: &Path) -> std::io::Result<ExitDirectoryId> {
+    exit_directory_id(&open_exit_directory(path, false)?)
+}
+
+fn resolve_exit_directory(root: &Path) -> std::io::Result<(std::path::PathBuf, ExitDirectoryId)> {
+    let path = std::fs::canonicalize(root)?;
+    let id = read_exit_directory_id(&path)?;
+    Ok((path, id))
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum ExitWriteKey {
+    Directory(ExitDirectoryId),
+    // An actual failed identity lookup cannot be attributed to an object.
+    // Preserve the old raw-alias failure semantics separately.
+    Unresolved(std::path::PathBuf),
+}
+
 #[derive(Default)]
 struct ExitWriteState {
     active_writers: usize,
     failed_in_group: bool,
-    // Distinguish an unresolved raw path from an ordinary canonical write
-    // failure: only the former can be retired by a different verified alias.
-    failed_identity_resolution: bool,
 }
 
-fn uncommitted_exit_writes() -> &'static std::sync::Mutex<
-    std::collections::HashMap<std::path::PathBuf, ExitWriteState>
-> {
-    static PENDING: std::sync::OnceLock<std::sync::Mutex<
-        std::collections::HashMap<std::path::PathBuf, ExitWriteState>
-    >> = std::sync::OnceLock::new();
+type ExitWriteMap = std::collections::HashMap<ExitWriteKey, ExitWriteState>;
+
+fn uncommitted_exit_writes() -> &'static std::sync::Mutex<ExitWriteMap> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<ExitWriteMap>> =
+        std::sync::OnceLock::new();
     PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-// RAII also records an abandoned/panicking write as failed. A previous
-// failed group remains dirty until a new group really finishes successfully.
+// RAII records abandoned/panicking writes as failed. A successful group
+// cannot retire another object's active or failed state.
 struct ExitWriteGuard {
-    // The resolved identity of the actual directory shared by path aliases.
     root: std::path::PathBuf,
+    identity: ExitDirectoryId,
     committed: bool,
-    // Only the first active writer uses legacy exit-probe.json.tmp.
-    // Every overlapping writer must own a distinct temporary pathname.
     isolated_tmp: bool,
 }
 
 impl ExitWriteGuard {
     fn begin(root: &Path) -> Result<Self, String> {
-        // A raw PathBuf is not a directory identity: child/.. and symlink
-        // paths can address exactly the same on-disk exit-probe.json.
-        let key = match std::fs::canonicalize(root) {
-            Ok(key) => key,
+        let (path, identity) = match resolve_exit_directory(root) {
+            Ok(resolved) => resolved,
             Err(e) => {
-                // Never silently lose #62's failed-write denial if an old
-                // qualified JSON becomes readable after a transient error.
                 let mut roots = uncommitted_exit_writes()
                     .lock()
                     .map_err(|_| "exit pending-write lock poisoned".to_string())?;
-                let failed = roots.entry(root.to_path_buf()).or_default();
+                let failed = roots.entry(ExitWriteKey::Unresolved(root.to_path_buf()))
+                    .or_default();
                 failed.failed_in_group = true;
-                failed.failed_identity_resolution = true;
                 return Err(format!("exit root identity {}：{e}", root.display()));
             }
         };
         let mut roots = uncommitted_exit_writes()
             .lock()
             .map_err(|_| "exit pending-write lock poisoned".to_string())?;
-        let state = roots.entry(key.clone()).or_default();
+        let state = roots.entry(ExitWriteKey::Directory(identity)).or_default();
         if state.active_writers == 0 {
-            // Beginning a new recovery group does not grant CURRENT: the
-            // entry remains present until its final successful completion.
+            // A recovery group remains dirty until its final real commit.
             state.failed_in_group = false;
         }
         let isolated_tmp = state.active_writers != 0;
         state.active_writers = state.active_writers.checked_add(1)
             .ok_or_else(|| "exit pending writer count overflow".to_string())?;
         Ok(Self {
-            root: key,
-            committed: false, isolated_tmp,
+            root: path, identity, committed: false, isolated_tmp,
         })
+    }
+
+    fn verify_io_root(&self, path: &Path) -> Result<(), String> {
+        let id = read_exit_directory_id(path)
+            .map_err(|e| format!("exit IO directory identity {}：{e}", path.display()))?;
+        if id != self.identity {
+            return Err(format!("exit registered directory replaced: {}", path.display()));
+        }
+        Ok(())
+    }
+
+    fn open_io_root(&self) -> Result<(std::fs::File, std::path::PathBuf), String> {
+        // Reopen AFTER registration: the original object may have moved.
+        // A same-name replacement is rejected before any temp-file IO.
+        let dir = open_exit_directory(&self.root, true)
+            .map_err(|e| format!("exit IO directory {}：{e}", self.root.display()))?;
+        let id = exit_directory_id(&dir).map_err(|e| e.to_string())?;
+        if id != self.identity {
+            return Err(format!("exit registered directory replaced: {}", self.root.display()));
+        }
+        #[cfg(windows)]
+        let path = self.root.clone();
+        #[cfg(target_os = "linux")]
+        let path = {
+            use std::os::fd::AsRawFd;
+            // File operations stay relative to the opened directory even
+            // if its pathname moves during IO. Missing procfs fails closed.
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+        };
+        #[cfg(not(any(windows, target_os = "linux")))]
+        return Err("exit directory IO pinning unavailable on this platform".into());
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            // Windows still uses the canonical path under a no-delete
+            // directory handle. Ancestor replacement/reparse races are
+            // not a general guarantee of this bounded direct-root fix.
+            self.verify_io_root(&path)?;
+            Ok((dir, path))
+        }
     }
 }
 
@@ -137,26 +242,23 @@ impl Drop for ExitWriteGuard {
         let Ok(mut roots) = uncommitted_exit_writes().lock() else {
             return; // Poisoned readers fail closed, never authorize CURRENT.
         };
-        let Some(state) = roots.get_mut(&self.root) else { return };
+        let key = ExitWriteKey::Directory(self.identity);
+        let Some(state) = roots.get_mut(&key) else { return };
         if !self.committed {
             state.failed_in_group = true;
         }
         state.active_writers = state.active_writers.saturating_sub(1);
         if self.committed && state.active_writers == 0 && !state.failed_in_group {
-            roots.remove(&self.root);
-            // A real, fully successful writer group is the only recovery
-            // boundary. Retire only failed *identity lookups* whose raw paths
-            // NOW resolve to this exact physical directory; preserve all
-            // unresolved, different-root, active and ordinary write failures.
-            // Readers still recheck the live original session/line binding.
-            roots.retain(|raw, other| {
-                !other.failed_identity_resolution
-                    || other.active_writers != 0
+            roots.remove(&key);
+            // Retire only unresolved raw aliases that NOW resolve to this
+            // committed directory object. Never retire a different object's
+            // ordinary failed write, even if it occupies the same pathname.
+            roots.retain(|key, other| {
+                let ExitWriteKey::Unresolved(raw) = key else { return true };
+                other.active_writers != 0
                     || !other.failed_in_group
-                    || std::fs::canonicalize(raw).ok().as_ref() != Some(&self.root)
+                    || resolve_exit_directory(raw).ok().map(|(_, id)| id) != Some(self.identity)
             });
-            // The identity-checked retirement above also covers a recovered
-            // caller spelling. Do not separately clear a mutable raw alias.
         }
     }
 }
@@ -165,13 +267,13 @@ fn exit_write_uncommitted(root: &Path) -> bool {
     if root.join(FILE_NAME).with_extension("json.tmp").exists() {
         return true;
     }
-    // Unresolvable identity cannot authorize CURRENT; a later readable
-    // path also consults any failed canonicalization marker under its raw key.
-    let Ok(key) = std::fs::canonicalize(root) else { return true };
+    let Ok((path, identity)) = resolve_exit_directory(root) else { return true };
     uncommitted_exit_writes()
         .lock()
-        .map(|roots| roots.contains_key(&key) || roots.contains_key(root))
-        .unwrap_or(true) // Poisoned guard must never authorize current.
+        .map(|roots| roots.contains_key(&ExitWriteKey::Directory(identity))
+            || roots.contains_key(&ExitWriteKey::Unresolved(root.to_path_buf()))
+            || roots.contains_key(&ExitWriteKey::Unresolved(path)))
+        .unwrap_or(true)
 }
 
 /// 把记录读回来。坏文件当作没有：宁可显示「尚未核验」，也不要显示一个读不懂的东西。
@@ -182,6 +284,10 @@ pub fn load(root: &Path) -> Option<Record> {
 
 /// 写记录。与自检结论同样先写临时文件再替换：断在半路会留下半截 JSON。
 pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
+    save_record(root, rec, false)
+}
+
+fn save_record(root: &Path, rec: &Record, invalidate_on_failure: bool) -> Result<(), String> {
     // Deny current attribution from the beginning of a write through its
     // commit. If either temp creation or rename fails, keep the guard until
     // a later genuinely successful save; a best-effort clear() is not proof.
@@ -189,48 +295,63 @@ pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
     #[cfg(test)]
     tests::after_pending_save_test_hook();
     let result = (|| -> Result<(), String> {
-        // Stage, rename and clean up under the same resolved path registered
-        // by the guard. A caller junction may now point at another directory.
-        // This fixes alias retargeting, not replacement of the resolved root.
-        let path = pending.root.join(FILE_NAME);
-        let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
-        // Concurrent same-root writers may overlap through rename, but must
-        // never write one another's staged bytes. Keep the legacy fixed tmp
-        // for the first writer and old single-writer Windows failure tests.
-        let tmp = if pending.isolated_tmp {
-            static NEXT_TMP_ID: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let id = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            path.with_extension(format!("json.tmp.{}-{id}", std::process::id()))
-        } else {
-            path.with_extension("json.tmp")
-        };
-        if pending.isolated_tmp {
-            // No stale filename may be silently overwritten (even if a PID
-            // and sequence repeat after a process restart). An existing
-            // file must fail closed instead of stealing another writer's IO.
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
-                .open(&tmp).map_err(|e| format!("{}：{e}", tmp.display()))?;
-            let written = file.write_all(text.as_bytes());
-            drop(file); // Windows rename must not race our own open handle.
-            if let Err(e) = written {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(format!("{}：{e}", tmp.display()));
+        // Pin only during actual IO, not during the after-registration gate.
+        // An identity mismatch returns before staging or cleanup.
+        let (_directory, io_root) = pending.open_io_root()?;
+        let path = io_root.join(FILE_NAME);
+        let written = (|| -> Result<(), String> {
+            let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
+            // Concurrent same-root writers may overlap through rename, but must
+            // never write one another's staged bytes. Keep the legacy fixed tmp
+            // for the first writer and old single-writer Windows failure tests.
+            let tmp = if pending.isolated_tmp {
+                static NEXT_TMP_ID: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let id = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                path.with_extension(format!("json.tmp.{}-{id}", std::process::id()))
+            } else {
+                path.with_extension("json.tmp")
+            };
+            pending.verify_io_root(&io_root)?;
+            if pending.isolated_tmp {
+                // No stale filename may be silently overwritten (even if a PID
+                // and sequence repeat after a process restart). An existing
+                // file must fail closed instead of stealing another writer's IO.
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+                    .open(&tmp).map_err(|e| format!("{}：{e}", tmp.display()))?;
+                let written = file.write_all(text.as_bytes());
+                drop(file); // Windows rename must not race our own open handle.
+                if let Err(e) = written {
+                    if pending.verify_io_root(&io_root).is_ok() {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                    return Err(format!("{}：{e}", tmp.display()));
+                }
+            } else {
+                std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
             }
-        } else {
-            std::fs::write(&tmp, text).map_err(|e| format!("{}：{e}", tmp.display()))?;
+            #[cfg(test)]
+            tests::after_tmp_write_before_rename_test_hook();
+            pending.verify_io_root(&io_root)?;
+            let renamed = std::fs::rename(&tmp, &path)
+                .map_err(|e| format!("{}：{e}", path.display()));
+            if renamed.is_err() && pending.isolated_tmp
+                && pending.verify_io_root(&io_root).is_ok() {
+                // On a failed overlapping rename keep the #62 failure group
+                // pending, but best-effort remove this writer's orphaned tmp.
+                let _ = std::fs::remove_file(&tmp);
+            }
+            renamed
+        })();
+        // Preserve the existing producer's best-effort invalidation for
+        // ordinary write failures, but only inside the matching IO root.
+        // Failure to open/verify the registered object never reaches here.
+        if written.is_err() && invalidate_on_failure
+            && pending.verify_io_root(&io_root).is_ok() {
+            let _ = std::fs::remove_file(&path);
         }
-        #[cfg(test)]
-        tests::after_tmp_write_before_rename_test_hook();
-        let renamed = std::fs::rename(&tmp, &path)
-            .map_err(|e| format!("{}：{e}", path.display()));
-        if renamed.is_err() && pending.isolated_tmp {
-            // On a failed overlapping rename keep the #62 failure group
-            // pending, but best-effort remove this writer's orphaned tmp.
-            let _ = std::fs::remove_file(&tmp);
-        }
-        renamed
+        written
     })();
     if result.is_ok() {
         pending.committed = true;
@@ -360,10 +481,10 @@ fn persist_final_observation(root: &Path, mut rec: Record) -> Record {
         rec.attributed = false;
         rec.binding = None;
     }
-    if let Err(e) = save(root, &rec) {
-        // A failed rename may leave an older record. Try to invalidate it,
-        // without claiming that deletion can defeat another local writer.
-        clear(root);
+    if let Err(e) = save_record(root, &rec, true) {
+        // Never clear a mutable caller pathname after a failed save.
+        // Any ordinary best-effort invalidation is limited to the verified
+        // IO directory inside save_record; identity rejection does no IO.
         rec.attributed = false;
         rec.binding = None;
         eprintln!("出口观测写盘失败，不能视为当前已核验出口：{e}");
