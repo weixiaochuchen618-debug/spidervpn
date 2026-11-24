@@ -2707,4 +2707,420 @@ mod tests {
         eprintln!("RESOLVED_ROOT_REPLACEMENT_RECOVERY: original_identity_restored=true; later_B_commit=true; stale_binding_denied=true; C_healthy=true; D_healthy=true");
         drop(cleanup);
     }
+
+    /// #78 TEST-ONLY: exercise the real producer (including its failure
+    /// invalidation), not just public save(), after registration of B.
+    #[test]
+    fn producer_identity_rejection_preserves_raw_ip_and_physical_records() {
+        use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
+
+        // Native identity independent of the production identity helper.
+        #[cfg(windows)]
+        fn dir_id(path: &Path) -> (u64, u64) {
+            use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_SHARE_DELETE,
+            };
+            let dir = std::fs::OpenOptions::new().read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(path).expect("fixture: open native directory");
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            assert_ne!(unsafe { GetFileInformationByHandle(dir.as_raw_handle() as _, &mut info) },
+                0, "fixture: native directory identity: {}", std::io::Error::last_os_error());
+            let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+            assert_ne!(index, 0);
+            (u64::from(info.dwVolumeSerialNumber), index)
+        }
+
+        #[cfg(unix)]
+        fn dir_id(path: &Path) -> (u64, u64) {
+            use std::os::unix::fs::MetadataExt;
+            let md = std::fs::metadata(path).expect("fixture: native directory identity");
+            assert!(md.is_dir());
+            assert_ne!(md.ino(), 0);
+            (md.dev(), md.ino())
+        }
+
+        // Include directories as well as file bytes so foreign staging,
+        // deletion or an unexpected empty directory cannot hide in load().
+        type Snapshot = std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>;
+        fn snapshot(root: &Path) -> Snapshot {
+            fn walk(base: &Path, dir: &Path, out: &mut Snapshot) {
+                for entry in std::fs::read_dir(dir).expect("fixture: read directory") {
+                    let path = entry.unwrap().path();
+                    let md = std::fs::symlink_metadata(&path).unwrap();
+                    assert!(!md.file_type().is_symlink());
+                    let relative = path.strip_prefix(base).unwrap().to_path_buf();
+                    if md.is_dir() {
+                        out.insert(relative, None);
+                        walk(base, &path, out);
+                    } else {
+                        assert!(md.is_file());
+                        out.insert(relative, Some(std::fs::read(&path).unwrap()));
+                    }
+                }
+            }
+            let mut out = Snapshot::new();
+            walk(root, root, &mut out);
+            out
+        }
+
+        struct Sandbox(std::path::PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                    eprintln!("PRODUCER_IDENTITY fixture cleanup failed: {e}");
+                }
+            }
+        }
+
+        // Real authenticated SOCKS5 and synthetic HTTP, exclusively on
+        // loopback. Keep each listener reserved so control bindings cannot
+        // accidentally share an ephemeral port. A cancellation connection
+        // wakes accept on fixture failure; all accepted IO is time-bounded.
+        struct Loopback {
+            listener: TcpListener,
+            stop: Arc<AtomicBool>,
+            worker: Option<std::thread::JoinHandle<usize>>,
+        }
+        impl Loopback {
+            fn start(bodies: Vec<&'static str>) -> Self {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let active = listener.try_clone().unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker_stop = Arc::clone(&stop);
+                let worker = std::thread::spawn(move || {
+                    let mut completed = 0;
+                    for body in bodies {
+                        let (mut s, _) = active.accept().expect("fixture: loopback accept");
+                        if worker_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                        let mut greet = [0u8; 4];
+                        s.read_exact(&mut greet).unwrap();
+                        assert_eq!(greet, [0x05, 0x02, 0x00, 0x02]);
+                        s.write_all(&[0x05, 0x02]).unwrap();
+                        let mut auth = [0u8; 2];
+                        s.read_exact(&mut auth).unwrap();
+                        assert_eq!(auth[0], 0x01);
+                        let mut user = vec![0u8; usize::from(auth[1])];
+                        s.read_exact(&mut user).unwrap();
+                        let mut plen = [0u8; 1];
+                        s.read_exact(&mut plen).unwrap();
+                        let mut pass = vec![0u8; usize::from(plen[0])];
+                        s.read_exact(&mut pass).unwrap();
+                        assert_eq!(user, b"u");
+                        assert_eq!(pass, b"p");
+                        s.write_all(&[0x01, 0x00]).unwrap();
+                        let mut connect = [0u8; 5];
+                        s.read_exact(&mut connect).unwrap();
+                        assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x03]);
+                        let mut target = vec![0u8; usize::from(connect[4]) + 2];
+                        s.read_exact(&mut target).unwrap();
+                        s.write_all(&[0x05, 0, 0, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+                        let mut req = Vec::new();
+                        while !req.ends_with(b"\r\n\r\n") {
+                            let mut byte = [0u8; 1];
+                            s.read_exact(&mut byte).unwrap();
+                            req.push(byte[0]);
+                            assert!(req.len() <= 8192, "fixture: bounded HTTP header");
+                        }
+                        assert!(req.starts_with(b"GET ") || req.starts_with(b"HEAD "));
+                        let status = if body.is_empty() { "204 No Content" } else { "200 OK" };
+                        s.write_all(format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{body}",
+                            body.len()
+                        ).as_bytes()).unwrap();
+                        completed += 1;
+                    }
+                    completed
+                });
+                Self { listener, stop, worker: Some(worker) }
+            }
+
+            fn port(&self) -> u16 {
+                self.listener.local_addr().unwrap().port()
+            }
+
+            fn stop_and_join(&mut self) -> Option<std::thread::Result<usize>> {
+                let worker = self.worker.take()?;
+                self.stop.store(true, Ordering::SeqCst);
+                if !worker.is_finished() {
+                    // Only an isolated local listener; no remote connection.
+                    let addr = self.listener.local_addr().unwrap();
+                    let _ = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+                }
+                Some(worker.join())
+            }
+
+            fn finish(&mut self, expected: usize) {
+                let completed = self.stop_and_join().unwrap().expect("fixture: authenticated server");
+                assert_eq!(completed, expected, "fixture: exact real HTTP exchange count");
+            }
+        }
+        impl Drop for Loopback {
+            fn drop(&mut self) {
+                let _ = self.stop_and_join();
+            }
+        }
+
+        let root = tmp_root("producer-identity-rejection");
+        let cleanup = Sandbox(root.clone());
+        let b = root.join("registered-b");
+        let c = root.join("replacement-c");
+        let d = root.join("unaffected-d");
+        let parked = root.join("parked-original-b");
+        for dir in [&b, &c, &d] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let (id_b, id_c, id_d) = (dir_id(&b), dir_id(&c), dir_id(&d));
+        assert_ne!(id_b, id_c);
+        assert_ne!(id_b, id_d);
+        assert_ne!(id_c, id_d);
+        let registered = std::fs::canonicalize(&b).unwrap();
+        assert_ne!(registered, std::fs::canonicalize(&c).unwrap());
+
+        // All three B answers are target IPs in the SAME unchanged line
+        // file, so an unverified new return cannot be explained by an
+        // unmatched IP or deliberately stale Check before the save gate.
+        let observe = |dir: &Path, bodies: Vec<&'static str>| {
+            let server = Loopback::start(bodies);
+            let line = qualified_probe_fixture(dir, server.port());
+            let plan = qualified_plan(server.port());
+            std::fs::write(line.engine_config_path(dir), serde_json::json!({
+                "outbounds": [
+                    {"type":"vless","server":"8.8.8.8","server_port":8443},
+                    {"type":"vless","server":"1.1.1.1","server_port":8443},
+                    {"type":"vless","server":"9.9.9.9","server_port":8443}
+                ]
+            }).to_string()).unwrap();
+            let check = crate::selfcheck::check_and_record(dir, &plan, 2_000);
+            assert!(check.ok && check.via_trade_exit && check.status == Some(204)
+                && crate::selfcheck::current_qualified_trade_pass(dir),
+                "fixture: authenticated qualified Check: {check:?}");
+            let old = probe_and_record(dir, &line, &plan, 2_000)
+                .expect("fixture: real initial authenticated observation");
+            assert_eq!(old.ip, "8.8.8.8");
+            assert!(old.attributed && old.binding.is_some());
+            assert_eq!(load(dir), Some(old.clone()));
+            assert!(original_exit_binding_still_current(&old, dir));
+            assert!(belongs_to_current_connection(&old, dir));
+            (server, line, plan, old)
+        };
+        let (mut server_b, line_b, plan_b, old_b) =
+            observe(&b, vec!["", "8.8.8.8\n", "1.1.1.1\n", "9.9.9.9\n"]);
+        let (mut server_c, _, _, old_c) = observe(&c, vec!["", "8.8.8.8\n"]);
+        let (mut server_d, _, _, old_d) = observe(&d, vec!["", "8.8.8.8\n"]);
+        server_c.finish(2);
+        server_d.finish(2);
+        assert_ne!(old_b.binding, old_c.binding);
+        assert_ne!(old_b.binding, old_d.binding);
+        assert_ne!(old_c.binding, old_d.binding);
+        assert!(!original_exit_binding_still_current(&old_b, &c));
+        assert!(!original_exit_binding_still_current(&old_b, &d));
+        assert!(server_ips(&b, &line_b).contains(&"1.1.1.1".to_string()));
+        assert_eq!(current_binding(&b, &line_b.id, server_b.port(), Some(("u", "p"))),
+            old_b.binding);
+        std::fs::write(b.join("fixture-provenance"), b"producer-b").unwrap();
+        std::fs::write(c.join("fixture-provenance"), b"replacement-c").unwrap();
+        std::fs::write(d.join("fixture-provenance"), b"control-d").unwrap();
+        let (b_before, c_before, d_before) = (snapshot(&b), snapshot(&c), snapshot(&d));
+        for files in [&b_before, &c_before, &d_before] {
+            assert!(files.keys().all(|path|
+                !path.file_name().unwrap().to_string_lossy().starts_with("exit-probe.json.tmp")));
+        }
+
+        let (pending_tx, pending_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker_root = b.clone();
+        let worker_line = line_b.clone();
+        let worker_plan = qualified_plan(server_b.port());
+        let worker = std::thread::spawn(move || {
+            AFTER_PENDING_SAVE_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    pending_tx.send(()).expect("actual producer registration gate");
+                    release_rx.recv_timeout(Duration::from_secs(30))
+                        .expect("controller must release producer persistence");
+                }));
+            });
+            // REAL HTTP request, before/after binding, final persistence
+            // and returned observation; no direct save or mocked error here.
+            probe_and_record(&worker_root, &worker_line, &worker_plan, 2_000)
+        });
+
+        let stage = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pending_rx.recv_timeout(Duration::from_secs(30))
+                .expect("fixture: producer reached real after-registration gate");
+            assert_eq!(snapshot(&b), b_before);
+            assert_eq!(snapshot(&c), c_before);
+            assert_eq!(snapshot(&d), d_before);
+            assert!(original_exit_binding_still_current(&old_b, &b));
+            let initial_pending = exit_write_uncommitted(&b);
+            let initial_current = belongs_to_current_connection(&old_b, &b);
+            assert!(belongs_to_current_connection(&old_c, &c));
+            assert!(belongs_to_current_connection(&old_d, &d));
+
+            std::fs::rename(&b, &parked).expect("fixture: move actual original B");
+            let missing = std::fs::canonicalize(&b).expect_err("fixture: vacant B path");
+            std::fs::rename(&c, &b).expect("fixture: move actual C to B path");
+            assert!(!c.exists());
+            assert_eq!(dir_id(&parked), id_b);
+            assert_eq!(dir_id(&b), id_c);
+            assert_eq!(dir_id(&d), id_d);
+            assert_eq!(std::fs::canonicalize(&b).unwrap(), registered);
+            assert_ne!(std::fs::canonicalize(&parked).unwrap(), registered);
+            assert_eq!(snapshot(&parked), b_before);
+            assert_eq!(snapshot(&b), c_before);
+            assert_eq!(snapshot(&d), d_before);
+            assert_eq!(load(&parked), Some(old_b.clone()));
+            assert_eq!(load(&b), Some(old_c.clone()));
+            assert!(!original_exit_binding_still_current(&old_b, &b));
+            let moved_binding = original_exit_binding_still_current(&old_b, &parked);
+            let moved_pending = exit_write_uncommitted(&parked);
+            let moved_current = belongs_to_current_connection(&old_b, &parked);
+            let c_binding = original_exit_binding_still_current(&old_c, &b);
+            let c_pending = exit_write_uncommitted(&b);
+            let c_current = belongs_to_current_connection(&old_c, &b);
+            eprintln!("PRODUCER_IDENTITY_STAGE: B={id_b:?}; C={id_c:?}; D={id_d:?}; vacant={missing}; same_path=true; original_registered=true; moved_binding={moved_binding}; moved_pending={moved_pending}; moved_current={moved_current}; C_binding={c_binding}; C_pending={c_pending}; C_current={c_current}");
+            (initial_pending, initial_current, moved_binding, moved_pending, moved_current,
+                c_binding, c_pending, c_current)
+        }));
+        // Always release and join before propagating fixture failures or
+        // cleaning up; even a panic cannot leave a blocked production save.
+        let released = release_tx.send(());
+        let joined = worker.join();
+        let (initial_pending, initial_current, moved_binding, moved_pending, moved_current,
+            c_binding, c_pending, c_current) = match stage {
+            Ok(values) => values,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        released.expect("fixture: deterministic producer release");
+        let observed = joined.expect("actual producer must not panic")
+            .expect("actual authenticated HTTP IP must be returned even on identity rejection");
+
+        assert_eq!(dir_id(&parked), id_b);
+        assert_eq!(dir_id(&b), id_c);
+        assert_eq!(dir_id(&d), id_d);
+        let original_after = snapshot(&parked);
+        let replacement_after = snapshot(&b);
+        let original_disk = load(&parked);
+        let replacement_disk = load(&b);
+        let original_dirty = exit_write_uncommitted(&parked);
+        let original_current = belongs_to_current_connection(&old_b, &parked);
+        let replacement_dirty = exit_write_uncommitted(&b);
+        let rejected = original_after == b_before;
+        eprintln!("PRODUCER_IDENTITY_RESULT: ip={}; attributed={}; binding_present={}; original_unchanged={rejected}; C_unchanged={}; B_dirty={original_dirty}; B_old_current={original_current}; C_dirty={replacement_dirty}; D_unchanged={}",
+            observed.ip, observed.attributed, observed.binding.is_some(),
+            replacement_after == c_before, snapshot(&d) == d_before);
+
+        // The observed IP differs from B's historical record and is a
+        // configured target. Independent C/D bytes must survive ALL producer
+        // failure invalidation and temp handling regardless of qualification.
+        assert_eq!(observed.ip, "1.1.1.1", "SAFETY: retain actual raw observed IP");
+        assert_eq!(observed.endpoint, "checkip.amazonaws.com");
+        assert_eq!(observed.line_id, old_b.line_id);
+        assert_eq!(observed.started_at, old_b.started_at);
+        assert_eq!(replacement_after, c_before,
+            "SAFETY: producer must not overwrite, clear or stage in replacement C");
+        assert_eq!(replacement_disk, Some(old_c.clone()));
+        assert_eq!(snapshot(&d), d_before);
+        assert_eq!(load(&d), Some(old_d.clone()));
+        assert!(belongs_to_current_connection(&old_d, &d));
+        assert!(!belongs_to_current_connection(&observed, &b));
+        assert!(initial_pending && !initial_current);
+        assert!(moved_pending, "SAFETY: pending guard must follow original native B");
+        if moved_binding {
+            assert!(!moved_current, "SAFETY: moved original B cannot become CURRENT while pending");
+        }
+        assert!(!c_pending && !replacement_dirty,
+            "SAFETY: different native C must not inherit B's pending/failed group");
+        if c_binding {
+            assert!(c_current);
+            assert!(belongs_to_current_connection(&old_c, &b));
+        }
+
+        if rejected {
+            assert_eq!(original_disk, Some(old_b.clone()));
+            assert!(!observed.attributed && observed.binding.is_none(),
+                "SAFETY: failed producer persistence must return unverified raw IP without binding");
+            assert!(original_dirty, "SAFETY: identity rejection retains original B failure");
+            assert!(!original_current);
+            assert!(!belongs_to_current_connection(&observed, &parked));
+        } else {
+            // Accept only a genuine alternative commit to the originally
+            // registered object, never a false success or foreign mutation.
+            assert_eq!(original_disk, Some(observed.clone()),
+                "SAFETY: changed B must contain the actual new returned observation");
+            let mut expected = b_before.clone();
+            expected.insert(std::path::PathBuf::from(FILE_NAME),
+                Some(std::fs::read(parked.join(FILE_NAME)).unwrap()));
+            assert_eq!(original_after, expected, "only B's committed record may change");
+            assert!(!original_dirty);
+            if observed.attributed {
+                assert_eq!(observed.binding, old_b.binding);
+                if original_exit_binding_still_current(&observed, &parked) {
+                    assert!(belongs_to_current_connection(&observed, &parked));
+                }
+            } else {
+                assert!(observed.binding.is_none());
+                assert!(!belongs_to_current_connection(&observed, &parked));
+            }
+        }
+
+        std::fs::rename(&b, &c).expect("fixture: restore distinct C");
+        std::fs::rename(&parked, &b).expect("fixture: restore original B identity");
+        assert_eq!(dir_id(&b), id_b);
+        assert_eq!(dir_id(&c), id_c);
+        assert_eq!(dir_id(&d), id_d);
+        assert_eq!(std::fs::canonicalize(&b).unwrap(), registered);
+        assert!(original_exit_binding_still_current(&old_b, &b),
+            "fixture: restored B has valid original binding independently of failure guard");
+        assert_eq!(snapshot(&c), c_before);
+        assert_eq!(snapshot(&d), d_before);
+        assert!(belongs_to_current_connection(&old_c, &c));
+        assert!(belongs_to_current_connection(&old_d, &d));
+        if rejected {
+            assert_eq!(snapshot(&b), b_before);
+            assert_eq!(load(&b), Some(old_b.clone()));
+            assert!(exit_write_uncommitted(&b));
+            assert!(!belongs_to_current_connection(&old_b, &b),
+                "SAFETY: restoring pathname alone cannot clear failed B denial");
+        }
+
+        // A new REAL authenticated producer observation under the restored
+        // matching identity must succeed, not merely erase a guard.
+        let recovered = probe_and_record(&b, &line_b, &plan_b, 2_000)
+            .expect("fixture: real authenticated recovery observation");
+        server_b.finish(4);
+        assert_eq!(recovered.ip, "9.9.9.9");
+        assert!(recovered.attributed);
+        assert_eq!(recovered.binding, old_b.binding);
+        assert_eq!(load(&b), Some(recovered.clone()));
+        assert_eq!(dir_id(&b), id_b);
+        assert!(!exit_write_uncommitted(&b));
+        assert!(belongs_to_current_connection(&recovered, &b));
+        let mut expected = b_before.clone();
+        expected.insert(std::path::PathBuf::from(FILE_NAME),
+            Some(std::fs::read(b.join(FILE_NAME)).unwrap()));
+        assert_eq!(snapshot(&b), expected);
+        assert_eq!(snapshot(&c), c_before);
+        assert_eq!(snapshot(&d), d_before);
+        assert!(belongs_to_current_connection(&old_c, &c));
+        assert!(belongs_to_current_connection(&old_d, &d));
+
+        std::fs::write(b.join("runtime-engine.json"), "{}").unwrap();
+        assert!(!original_exit_binding_still_current(&recovered, &b));
+        assert!(!belongs_to_current_connection(&recovered, &b));
+        assert_eq!(snapshot(&c), c_before);
+        assert_eq!(snapshot(&d), d_before);
+        assert!(belongs_to_current_connection(&old_c, &c));
+        assert!(belongs_to_current_connection(&old_d, &d));
+        eprintln!("PRODUCER_IDENTITY_RECOVERY: rejected={rejected}; original_identity_restored=true; genuine_producer_commit=true; stale_binding_denied=true; C_healthy=true; D_healthy=true");
+        drop(cleanup);
+    }
 }
