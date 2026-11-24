@@ -3495,4 +3495,429 @@ mod tests {
             && recovered_current && recovery_clean,
             "SAFETY: genuine same-session producer commit must restore new CURRENT evidence");
     }
+
+    /// #82: native direct clear overlapping a real registered save must
+    /// preserve the failed group; a clean clear must not retire active work.
+    /// This is controlled same-process API coverage, not a product race proof.
+    #[cfg(windows)]
+    #[test]
+    fn windows_clear_overlapping_active_save_preserves_failed_group_and_recovers() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        struct Sandbox(std::path::PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                    eprintln!("OVERLAP_FIXTURE cleanup failed: {e}");
+                }
+            }
+        }
+
+        // Same authenticated, bounded loopback transport pattern as the
+        // native-passing #78 fixture, with finite cancellation and joining.
+        struct Loopback {
+            listener: TcpListener,
+            stop: Arc<AtomicBool>,
+            worker: Option<std::thread::JoinHandle<usize>>,
+        }
+        impl Loopback {
+            fn start(label: String, bodies: Vec<&'static str>) -> Self {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let active = listener.try_clone().unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker_stop = Arc::clone(&stop);
+                let worker = std::thread::spawn(move || {
+                    let mut completed = 0;
+                    for (phase, body) in bodies.into_iter().enumerate() {
+                        let (mut s, _) = active.accept().expect("fixture: loopback accept");
+                        if worker_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_nodelay(true).unwrap();
+                        eprintln!("OVERLAP_FIXTURE {label} phase={phase}: accepted");
+                        let mut greet = [0u8; 4];
+                        s.read_exact(&mut greet).unwrap();
+                        assert_eq!(greet, [0x05, 0x02, 0x00, 0x02]);
+                        s.write_all(&[0x05, 0x02]).unwrap();
+                        let mut auth = [0u8; 2];
+                        s.read_exact(&mut auth).unwrap();
+                        assert_eq!(auth[0], 0x01);
+                        let mut user = vec![0u8; usize::from(auth[1])];
+                        s.read_exact(&mut user).unwrap();
+                        let mut plen = [0u8; 1];
+                        s.read_exact(&mut plen).unwrap();
+                        let mut pass = vec![0u8; usize::from(plen[0])];
+                        s.read_exact(&mut pass).unwrap();
+                        assert_eq!(user, b"u");
+                        assert_eq!(pass, b"p");
+                        s.write_all(&[0x01, 0x00]).unwrap();
+                        eprintln!("OVERLAP_FIXTURE {label} phase={phase}: authenticated");
+                        let mut connect = [0u8; 5];
+                        s.read_exact(&mut connect).unwrap();
+                        assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x03]);
+                        let mut target = vec![0u8; usize::from(connect[4]) + 2];
+                        s.read_exact(&mut target).unwrap();
+                        let (host, path) = if body.is_empty() {
+                            ("www.gstatic.com", "/generate_204")
+                        } else {
+                            ("checkip.amazonaws.com", "/")
+                        };
+                        assert_eq!(&target[..target.len() - 2], host.as_bytes(),
+                            "fixture {label} phase={phase}: expected SOCKS host");
+                        assert_eq!(&target[target.len() - 2..], &80u16.to_be_bytes());
+                        s.write_all(&[0x05, 0, 0, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+                        // Consume the complete bounded origin-form HTTP request.
+                        let mut req = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while !req.ends_with(b"\r\n\r\n") {
+                            let n = s.read(&mut chunk).expect("fixture: HTTP request read");
+                            assert_ne!(n, 0, "fixture: premature HTTP request EOF");
+                            req.extend_from_slice(&chunk[..n]);
+                            assert!(req.len() <= 8192, "fixture: bounded HTTP header");
+                        }
+                        assert!(req.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()),
+                            "fixture {label} phase={phase}: origin-form GET");
+                        eprintln!("OVERLAP_FIXTURE {label} phase={phase}: HTTP request complete host={host}");
+                        let status = if body.is_empty() { "204 No Content" } else { "200 OK" };
+                        s.write_all(format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ).as_bytes()).expect("fixture: HTTP response write");
+                        // socks5_text reads the body through EOF, not only
+                        // Content-Length. Finish the write half explicitly.
+                        if !body.is_empty() {
+                            s.shutdown(std::net::Shutdown::Write)
+                                .expect("fixture: complete response EOF");
+                        }
+                        completed += 1;
+                        eprintln!("OVERLAP_FIXTURE {label} phase={phase}: response completed status={status} body={body:?}");
+                    }
+                    completed
+                });
+                Self { listener, stop, worker: Some(worker) }
+            }
+
+            fn port(&self) -> u16 {
+                self.listener.local_addr().unwrap().port()
+            }
+
+            fn stop_and_join(&mut self) -> Option<std::thread::Result<usize>> {
+                let worker = self.worker.take()?;
+                self.stop.store(true, Ordering::SeqCst);
+                if !worker.is_finished() {
+                    // Only an isolated local listener; no remote connection.
+                    let addr = self.listener.local_addr().unwrap();
+                    let _ = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+                }
+                Some(worker.join())
+            }
+
+            fn finish(&mut self, expected: usize) {
+                let completed = self.stop_and_join().unwrap().expect("fixture: authenticated server");
+                assert_eq!(completed, expected, "fixture: exact real HTTP exchange count");
+            }
+        }
+        impl Drop for Loopback {
+            fn drop(&mut self) {
+                if let Some(result) = self.stop_and_join() {
+                    match result {
+                        Ok(count) => eprintln!("OVERLAP_FIXTURE cleanup: completed={count}"),
+                        Err(_) => eprintln!("OVERLAP_FIXTURE cleanup: server thread panicked (see actual panic above)"),
+                    }
+                }
+            }
+        }
+
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn walk(base: &Path, dir: &Path,
+                out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let md = std::fs::symlink_metadata(&path).unwrap();
+                    assert!(!md.file_type().is_symlink());
+                    if md.is_dir() {
+                        walk(base, &path, out);
+                    } else {
+                        assert!(md.is_file());
+                        out.insert(path.strip_prefix(base).unwrap().to_path_buf(),
+                            std::fs::read(&path).unwrap());
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            walk(root, root, &mut out);
+            out
+        }
+
+        fn no_staging(root: &Path) {
+            for entry in std::fs::read_dir(root).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(!name.to_string_lossy().starts_with("exit-probe.json.tmp"),
+                    "unexpected exit staging: {name:?}");
+            }
+        }
+
+        // Own the release sender and worker together. Even if a fixture
+        // assertion panics, release the real after-registration gate and
+        // join before deleting the sandbox. No new hooks or state injection.
+        struct GatedSave {
+            release: Option<mpsc::Sender<()>>,
+            worker: Option<std::thread::JoinHandle<Result<(), String>>>,
+        }
+        impl GatedSave {
+            fn start(root: &Path, record: &Record) -> Self {
+                let (entered_tx, entered_rx) = mpsc::channel::<()>();
+                let (release_tx, release_rx) = mpsc::channel::<()>();
+                let root = root.to_path_buf();
+                let record = record.clone();
+                let worker = std::thread::spawn(move || {
+                    AFTER_PENDING_SAVE_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            entered_tx.send(()).expect("fixture: gate entry receiver");
+                            release_rx.recv_timeout(Duration::from_secs(20))
+                                .expect("fixture: registered writer explicitly released");
+                        }));
+                    });
+                    save(&root, &record)
+                });
+                let gate = Self { release: Some(release_tx), worker: Some(worker) };
+                entered_rx.recv_timeout(Duration::from_secs(20))
+                    .expect("fixture: real save registered before staging");
+                gate
+            }
+            fn finish(&mut self) -> Result<(), String> {
+                let sent = self.release.take().unwrap().send(());
+                let result = self.worker.take().unwrap().join()
+                    .expect("fixture: registered save worker completed");
+                sent.expect("fixture: release reached registered save");
+                result
+            }
+        }
+        impl Drop for GatedSave {
+            fn drop(&mut self) {
+                if let Some(release) = self.release.take() {
+                    let _ = release.send(());
+                }
+                if let Some(worker) = self.worker.take() {
+                    eprintln!("OVERLAP_FIXTURE cleanup: save worker joined: {:?}", worker.join());
+                }
+            }
+        }
+
+        fn absent(path: &Path) -> bool {
+            matches!(std::fs::symlink_metadata(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        }
+
+        let sandbox = tmp_root("clear-active-save-overlap");
+        let cleanup = Sandbox(sandbox.clone());
+        let root = sandbox.join("target");
+        let control = sandbox.join("independent-control");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&control).unwrap();
+        assert_ne!(read_exit_directory_id(&root).unwrap(),
+            read_exit_directory_id(&control).unwrap());
+
+        let observe = |dir: &Path, bodies: Vec<&'static str>| {
+            let mut server = Loopback::start(dir.display().to_string(), bodies);
+            let line = qualified_probe_fixture(dir, server.port());
+            // The old and new response IPs both match the unchanged line.
+            std::fs::write(line.engine_config_path(dir), serde_json::json!({
+                "outbounds": [
+                    {"type":"vless","server":"8.8.8.8","server_port":8443},
+                    {"type":"vless","server":"1.1.1.1","server_port":8443}
+                ]
+            }).to_string()).unwrap();
+            let plan = qualified_plan(server.port());
+            let check = crate::selfcheck::check_and_record(dir, &plan, 2_000);
+            assert!(check.ok && check.via_trade_exit && check.status == Some(204)
+                && crate::selfcheck::current_qualified_trade_pass(dir),
+                "fixture: genuinely qualified Check {dir:?}: {check:?}");
+            let old = match probe_and_record(dir, &line, &plan, 2_000) {
+                Some(record) => record,
+                None => {
+                    let joined = server.stop_and_join();
+                    panic!("fixture: initial real observation absent for {dir:?}; server={joined:?}");
+                }
+            };
+            assert_eq!(old.ip, "8.8.8.8");
+            assert!(old.attributed && old.binding.is_some());
+            assert_eq!(load(dir), Some(old.clone()));
+            assert!(original_exit_binding_still_current(&old, dir));
+            assert!(belongs_to_current_connection(&old, dir));
+            assert!(!exit_write_uncommitted(dir));
+            no_staging(dir);
+            (server, line, plan, old, check)
+        };
+        let (mut target_server, line, plan, old, check) =
+            observe(&root, vec!["", "8.8.8.8\n", "1.1.1.1\n"]);
+        let (mut control_server, _, _, independent, control_check) =
+            observe(&control, vec!["", "8.8.8.8\n"]);
+        control_server.finish(2);
+        assert_ne!(old.binding, independent.binding);
+        assert!(!original_exit_binding_still_current(&old, &control));
+        assert!(!original_exit_binding_still_current(&independent, &root));
+        let control_before = snapshot(&control);
+        let path = root.join(FILE_NAME);
+        let original_bytes = std::fs::read(&path).unwrap();
+        let original_before = snapshot(&root);
+        let live = |record: &Record| {
+            crate::selfcheck::load(&root) == Some(check.clone())
+                && crate::selfcheck::current_qualified_trade_pass(&root)
+                && original_exit_binding_still_current(record, &root)
+        };
+        let control_healthy = || {
+            snapshot(&control) == control_before
+                && load(&control).as_ref() == Some(&independent)
+                && crate::selfcheck::load(&control) == Some(control_check.clone())
+                && crate::selfcheck::current_qualified_trade_pass(&control)
+                && original_exit_binding_still_current(&independent, &control)
+                && belongs_to_current_connection(&independent, &control)
+                && !exit_write_uncommitted(&control)
+        };
+        assert!(live(&old) && control_healthy());
+        assert!(belongs_to_current_connection(&old, &root));
+        assert!(!exit_write_uncommitted(&root));
+        no_staging(&root);
+
+        // Resave the genuinely observed record, not a fabricated binding.
+        // The existing gate witnesses registration before actual file IO.
+        let mut failed_group_writer = GatedSave::start(&root, &old);
+        let initial_pending = exit_write_uncommitted(&root);
+        let initial_denied = !belongs_to_current_connection(&old, &root);
+        assert!(live(&old), "fixture: binding live at active save gate");
+        assert_eq!(snapshot(&root), original_before);
+        no_staging(&root);
+        let control_at_gate = control_healthy();
+
+        // Native share denial while the save is definitely still active.
+        // This handle is declared after the gate owner so unwind drops
+        // the lock before releasing/joining the blocked writer.
+        let mut locked = std::fs::OpenOptions::new().read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path).expect("fixture: readable file without delete sharing");
+        let mut handle_bytes = Vec::new();
+        locked.read_to_end(&mut handle_bytes).unwrap();
+        assert_eq!(handle_bytes, original_bytes);
+        let delete_error = std::fs::remove_file(&path)
+            .expect_err("fixture: native deletion must actually be refused");
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(load(&root), Some(old.clone()));
+        assert!(live(&old));
+        no_staging(&root);
+
+        clear(&root);
+        let refused_bytes_unchanged = std::fs::read(&path).ok().as_ref() == Some(&original_bytes);
+        let refused_disk_exact = load(&root).as_ref() == Some(&old);
+        let refused_pending = exit_write_uncommitted(&root);
+        let refused_denied = !belongs_to_current_connection(&old, &root);
+        let control_after_refusal = control_healthy();
+        assert!(live(&old), "fixture: clear cannot manufacture denial by changing binding");
+        no_staging(&root);
+        eprintln!("CLEAR_OVERLAP_REFUSAL: delete_error={delete_error}; raw_os_error={:?}; registered_pending={initial_pending}; registered_denied={initial_denied}; old_bytes_unchanged={refused_bytes_unchanged}; old_disk_exact={refused_disk_exact}; pending_after_refusal={refused_pending}; denied_after_refusal={refused_denied}; control_healthy={control_after_refusal}; live_binding=true; no_staging=true",
+            delete_error.raw_os_error());
+
+        drop(locked);
+        // The active save must really commit after unlocking; a second IO
+        // failure or a stale binding cannot be used to manufacture denial.
+        let overlap_save = failed_group_writer.finish();
+        assert!(overlap_save.is_ok(), "fixture: overlapping actual save must succeed: {overlap_save:?}");
+        let overlap_disk_exact = load(&root).as_ref() == Some(&old);
+        let overlap_disk_bytes_exact = std::fs::read(&path).ok().as_ref()
+            == Some(&serde_json::to_string_pretty(&old).unwrap().into_bytes());
+        assert!(live(&old), "fixture: original binding still independently live after real save");
+        no_staging(&root);
+        let overlap_dirty = exit_write_uncommitted(&root);
+        let overlap_denied = !belongs_to_current_connection(&old, &root);
+        let control_after_save = control_healthy();
+        eprintln!("CLEAR_OVERLAP_SAVE: actual_save_ok=true; disk_exact={overlap_disk_exact}; disk_bytes_exact={overlap_disk_bytes_exact}; failed_group_dirty={overlap_dirty}; denied={overlap_denied}; control_healthy={control_after_save}; live_binding=true; no_staging=true");
+
+        // The existing readable record must actually be removed by clear.
+        // A later absent-file clear must also leave the failure marker.
+        // Check the held qualified record directly, rather than mistaking
+        // load(None) or a missing file for loss of its binding authority.
+        clear(&root);
+        let removed = absent(&path) && load(&root).is_none();
+        let after_success_dirty = exit_write_uncommitted(&root);
+        let after_success_denied = !belongs_to_current_connection(&old, &root);
+        assert!(live(&old));
+        no_staging(&root);
+        let control_after_success = control_healthy();
+        clear(&root);
+        let still_absent = absent(&path) && load(&root).is_none();
+        let after_absent_dirty = exit_write_uncommitted(&root);
+        let after_absent_denied = !belongs_to_current_connection(&old, &root);
+        assert!(live(&old));
+        no_staging(&root);
+        let control_after_absent = control_healthy();
+        eprintln!("CLEAR_OVERLAP_LATER_CLEAR: removed={removed}; success_dirty={after_success_dirty}; success_denied={after_success_denied}; still_absent={still_absent}; absent_dirty={after_absent_dirty}; absent_denied={after_absent_denied}; control_success={control_after_success}; control_absent={control_after_absent}; live_binding=true; no_staging=true");
+
+        // A real authenticated same-session new producer commit is recovery,
+        // not a map edit, prior failed save or IP-only stale-binding claim.
+        let recovered = match probe_and_record(&root, &line, &plan, 2_000) {
+            Some(record) => record,
+            None => {
+                let joined = target_server.stop_and_join();
+                panic!("fixture: real recovery observation absent; server={joined:?}");
+            }
+        };
+        target_server.finish(3);
+        assert_eq!(recovered.ip, "1.1.1.1");
+        assert!(live(&old), "fixture: original binding remains live, not IP-based denial");
+        let recovered_ok = recovered.attributed && recovered.binding == old.binding
+            && live(&recovered) && load(&root).as_ref() == Some(&recovered)
+            && belongs_to_current_connection(&recovered, &root)
+            && !exit_write_uncommitted(&root);
+        no_staging(&root);
+        let control_after_recovery = control_healthy();
+        eprintln!("CLEAR_OVERLAP_RECOVERY: observed_ip={}; recovered={recovered_ok}; control_healthy={control_after_recovery}", recovered.ip);
+
+        // Also exercise the clean-success overlap: successful deletion must
+        // not retire the still-active save's pending group. This second save
+        // uses the genuinely recovered record with no other writer or lock.
+        let mut clean_writer = GatedSave::start(&root, &recovered);
+        let clean_initial_pending = exit_write_uncommitted(&root);
+        let clean_initial_denied = !belongs_to_current_connection(&recovered, &root);
+        no_staging(&root);
+        clear(&root);
+        let clean_removed = absent(&path) && load(&root).is_none();
+        let clean_still_pending = exit_write_uncommitted(&root);
+        let clean_still_denied = !belongs_to_current_connection(&recovered, &root);
+        let clean_binding_live = live(&recovered);
+        let clean_control_during = control_healthy();
+        no_staging(&root);
+        let clean_save = clean_writer.finish();
+        let clean_final_ok = clean_save.is_ok()
+            && load(&root).as_ref() == Some(&recovered)
+            && live(&recovered)
+            && belongs_to_current_connection(&recovered, &root)
+            && !exit_write_uncommitted(&root);
+        no_staging(&root);
+        let clean_control_after = control_healthy();
+        no_staging(&control);
+        eprintln!("CLEAR_OVERLAP_CLEAN: initial_pending={clean_initial_pending}; initial_denied={clean_initial_denied}; removed={clean_removed}; still_pending={clean_still_pending}; still_denied={clean_still_denied}; binding_live={clean_binding_live}; save={clean_save:?}; final_current={clean_final_ok}; control_during={clean_control_during}; control_after={clean_control_after}");
+
+        // All real workers joined and handles released before primary verdict.
+        drop(cleanup);
+        assert!(!sandbox.exists(), "fixture: sandbox cleanup");
+        assert!(initial_pending && initial_denied && refused_bytes_unchanged
+            && refused_disk_exact && refused_pending && refused_denied
+            && overlap_disk_exact && overlap_disk_bytes_exact && overlap_dirty && overlap_denied,
+            "CLEAR_OVERLAP_CONTRACT_RED: failed direct clear must survive a real overlapping successful save");
+        assert!(removed && after_success_dirty && after_success_denied
+            && still_absent && after_absent_dirty && after_absent_denied,
+            "CLEAR_OVERLAP_CONTRACT_RED: successful or absent clear must not recover a failed group");
+        assert!(recovered_ok, "CLEAR_OVERLAP_CONTRACT_RED: matching real producer must recover CURRENT");
+        assert!(clean_initial_pending && clean_initial_denied && clean_removed
+            && clean_still_pending && clean_still_denied && clean_binding_live && clean_final_ok,
+            "CLEAR_OVERLAP_CONTRACT_RED: clean clear must not retire active save, real commit must recover");
+        assert!(control_at_gate && control_after_refusal && control_after_save
+            && control_after_success && control_after_absent && control_after_recovery
+            && clean_control_during && clean_control_after,
+            "CLEAR_OVERLAP_CONTRACT_RED: independent physical control must remain intact and CURRENT");
+    }
 }
