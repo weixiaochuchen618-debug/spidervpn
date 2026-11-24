@@ -3157,4 +3157,316 @@ mod tests {
         eprintln!("PRODUCER_IDENTITY_RECOVERY: rejected={rejected}; original_identity_restored=true; genuine_producer_commit=true; stale_binding_denied=true; C_healthy=true; D_healthy=true");
         drop(cleanup);
     }
+
+    /// #80: direct clear() must revoke old CURRENT authority even if the
+    /// Windows filesystem refuses deletion. This is a same-session API
+    /// contract, not proof of reachability in a normal GUI/CLI lifecycle.
+    #[cfg(windows)]
+    #[test]
+    fn windows_direct_clear_delete_refusal_revokes_current_and_recovers() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        struct Sandbox(std::path::PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                    eprintln!("CLEAR_FIXTURE cleanup failed: {e}");
+                }
+            }
+        }
+
+        // Same authenticated, bounded loopback transport pattern as the
+        // native-passing #78 fixture, with finite cancellation and joining.
+        struct Loopback {
+            listener: TcpListener,
+            stop: Arc<AtomicBool>,
+            worker: Option<std::thread::JoinHandle<usize>>,
+        }
+        impl Loopback {
+            fn start(label: String, bodies: Vec<&'static str>) -> Self {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let active = listener.try_clone().unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker_stop = Arc::clone(&stop);
+                let worker = std::thread::spawn(move || {
+                    let mut completed = 0;
+                    for (phase, body) in bodies.into_iter().enumerate() {
+                        let (mut s, _) = active.accept().expect("fixture: loopback accept");
+                        if worker_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_nodelay(true).unwrap();
+                        eprintln!("CLEAR_FIXTURE {label} phase={phase}: accepted");
+                        let mut greet = [0u8; 4];
+                        s.read_exact(&mut greet).unwrap();
+                        assert_eq!(greet, [0x05, 0x02, 0x00, 0x02]);
+                        s.write_all(&[0x05, 0x02]).unwrap();
+                        let mut auth = [0u8; 2];
+                        s.read_exact(&mut auth).unwrap();
+                        assert_eq!(auth[0], 0x01);
+                        let mut user = vec![0u8; usize::from(auth[1])];
+                        s.read_exact(&mut user).unwrap();
+                        let mut plen = [0u8; 1];
+                        s.read_exact(&mut plen).unwrap();
+                        let mut pass = vec![0u8; usize::from(plen[0])];
+                        s.read_exact(&mut pass).unwrap();
+                        assert_eq!(user, b"u");
+                        assert_eq!(pass, b"p");
+                        s.write_all(&[0x01, 0x00]).unwrap();
+                        eprintln!("CLEAR_FIXTURE {label} phase={phase}: authenticated");
+                        let mut connect = [0u8; 5];
+                        s.read_exact(&mut connect).unwrap();
+                        assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x03]);
+                        let mut target = vec![0u8; usize::from(connect[4]) + 2];
+                        s.read_exact(&mut target).unwrap();
+                        let (host, path) = if body.is_empty() {
+                            ("www.gstatic.com", "/generate_204")
+                        } else {
+                            ("checkip.amazonaws.com", "/")
+                        };
+                        assert_eq!(&target[..target.len() - 2], host.as_bytes(),
+                            "fixture {label} phase={phase}: expected SOCKS host");
+                        assert_eq!(&target[target.len() - 2..], &80u16.to_be_bytes());
+                        s.write_all(&[0x05, 0, 0, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+                        // Consume the complete bounded origin-form HTTP request.
+                        let mut req = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while !req.ends_with(b"\r\n\r\n") {
+                            let n = s.read(&mut chunk).expect("fixture: HTTP request read");
+                            assert_ne!(n, 0, "fixture: premature HTTP request EOF");
+                            req.extend_from_slice(&chunk[..n]);
+                            assert!(req.len() <= 8192, "fixture: bounded HTTP header");
+                        }
+                        assert!(req.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()),
+                            "fixture {label} phase={phase}: origin-form GET");
+                        eprintln!("CLEAR_FIXTURE {label} phase={phase}: HTTP request complete host={host}");
+                        let status = if body.is_empty() { "204 No Content" } else { "200 OK" };
+                        s.write_all(format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ).as_bytes()).expect("fixture: HTTP response write");
+                        // socks5_text reads the body through EOF, not only
+                        // Content-Length. Finish the write half explicitly.
+                        if !body.is_empty() {
+                            s.shutdown(std::net::Shutdown::Write)
+                                .expect("fixture: complete response EOF");
+                        }
+                        completed += 1;
+                        eprintln!("CLEAR_FIXTURE {label} phase={phase}: response completed status={status} body={body:?}");
+                    }
+                    completed
+                });
+                Self { listener, stop, worker: Some(worker) }
+            }
+
+            fn port(&self) -> u16 {
+                self.listener.local_addr().unwrap().port()
+            }
+
+            fn stop_and_join(&mut self) -> Option<std::thread::Result<usize>> {
+                let worker = self.worker.take()?;
+                self.stop.store(true, Ordering::SeqCst);
+                if !worker.is_finished() {
+                    // Only an isolated local listener; no remote connection.
+                    let addr = self.listener.local_addr().unwrap();
+                    let _ = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+                }
+                Some(worker.join())
+            }
+
+            fn finish(&mut self, expected: usize) {
+                let completed = self.stop_and_join().unwrap().expect("fixture: authenticated server");
+                assert_eq!(completed, expected, "fixture: exact real HTTP exchange count");
+            }
+        }
+        impl Drop for Loopback {
+            fn drop(&mut self) {
+                if let Some(result) = self.stop_and_join() {
+                    match result {
+                        Ok(count) => eprintln!("CLEAR_FIXTURE cleanup: completed={count}"),
+                        Err(_) => eprintln!("CLEAR_FIXTURE cleanup: server thread panicked (see actual panic above)"),
+                    }
+                }
+            }
+        }
+
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn walk(base: &Path, dir: &Path,
+                out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let md = std::fs::symlink_metadata(&path).unwrap();
+                    assert!(!md.file_type().is_symlink());
+                    if md.is_dir() {
+                        walk(base, &path, out);
+                    } else {
+                        assert!(md.is_file());
+                        out.insert(path.strip_prefix(base).unwrap().to_path_buf(),
+                            std::fs::read(&path).unwrap());
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            walk(root, root, &mut out);
+            out
+        }
+
+        fn no_staging(root: &Path) {
+            for entry in std::fs::read_dir(root).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(!name.to_string_lossy().starts_with("exit-probe.json.tmp"),
+                    "unexpected exit staging: {name:?}");
+            }
+        }
+
+        let sandbox = tmp_root("direct-clear-delete-refusal");
+        let cleanup = Sandbox(sandbox.clone());
+        let root = sandbox.join("target");
+        let control = sandbox.join("independent-control");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&control).unwrap();
+        assert_ne!(read_exit_directory_id(&root).unwrap(),
+            read_exit_directory_id(&control).unwrap());
+
+        let observe = |dir: &Path, bodies: Vec<&'static str>| {
+            let mut server = Loopback::start(dir.display().to_string(), bodies);
+            let line = qualified_probe_fixture(dir, server.port());
+            // The old and new response IPs both match the unchanged line.
+            std::fs::write(line.engine_config_path(dir), serde_json::json!({
+                "outbounds": [
+                    {"type":"vless","server":"8.8.8.8","server_port":8443},
+                    {"type":"vless","server":"1.1.1.1","server_port":8443}
+                ]
+            }).to_string()).unwrap();
+            let plan = qualified_plan(server.port());
+            let check = crate::selfcheck::check_and_record(dir, &plan, 2_000);
+            assert!(check.ok && check.via_trade_exit && check.status == Some(204)
+                && crate::selfcheck::current_qualified_trade_pass(dir),
+                "fixture: genuinely qualified Check {dir:?}: {check:?}");
+            let old = match probe_and_record(dir, &line, &plan, 2_000) {
+                Some(record) => record,
+                None => {
+                    let joined = server.stop_and_join();
+                    panic!("fixture: initial real observation absent for {dir:?}; server={joined:?}");
+                }
+            };
+            assert_eq!(old.ip, "8.8.8.8");
+            assert!(old.attributed && old.binding.is_some());
+            assert_eq!(load(dir), Some(old.clone()));
+            assert!(original_exit_binding_still_current(&old, dir));
+            assert!(belongs_to_current_connection(&old, dir));
+            assert!(!exit_write_uncommitted(dir));
+            no_staging(dir);
+            (server, line, plan, old, check)
+        };
+        let (mut target_server, line, plan, old, check) =
+            observe(&root, vec!["", "8.8.8.8\n", "1.1.1.1\n"]);
+        let (mut control_server, _, _, independent, control_check) =
+            observe(&control, vec!["", "8.8.8.8\n"]);
+        control_server.finish(2);
+        assert_ne!(old.binding, independent.binding);
+        assert!(!original_exit_binding_still_current(&old, &control));
+        assert!(!original_exit_binding_still_current(&independent, &root));
+        let control_before = snapshot(&control);
+        let original_before = snapshot(&root);
+        let path = root.join(FILE_NAME);
+        let original_bytes = std::fs::read(&path).unwrap();
+
+        // Real readable Win32 file handle without FILE_SHARE_DELETE.
+        // RAII releases it even if any prerequisite fails. No save() call,
+        // pending-map edit, forced session change or mocked filesystem error.
+        let mut locked = std::fs::OpenOptions::new().read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path).expect("fixture: readable file without delete sharing");
+        let mut handle_bytes = Vec::new();
+        locked.read_to_end(&mut handle_bytes).unwrap();
+        assert_eq!(handle_bytes, original_bytes);
+        let delete_error = std::fs::remove_file(&path)
+            .expect_err("fixture: native Windows delete must actually be refused");
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(load(&root), Some(old.clone()));
+        assert_eq!(crate::selfcheck::load(&root), Some(check.clone()));
+        assert!(crate::selfcheck::current_qualified_trade_pass(&root));
+        assert!(original_exit_binding_still_current(&old, &root));
+        assert!(!exit_write_uncommitted(&root));
+        assert!(belongs_to_current_connection(&old, &root),
+            "fixture: direct OS refusal alone must not invalidate the original evidence");
+        no_staging(&root);
+        assert_eq!(snapshot(&root), original_before);
+        assert!(belongs_to_current_connection(&independent, &control));
+
+        // The ONLY attempted production invalidation since the qualified
+        // initial save. It cannot delete the locked file. Capture the target
+        // result instead of panicking before recovery and cleanup.
+        clear(&root);
+        let still_readable = load(&root).expect("fixture: refused deletion leaves readable JSON");
+        assert_eq!(still_readable, old);
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(crate::selfcheck::load(&root), Some(check.clone()));
+        assert!(crate::selfcheck::current_qualified_trade_pass(&root),
+            "fixture: no lifecycle/Check change may manufacture denial");
+        assert!(original_exit_binding_still_current(&still_readable, &root),
+            "fixture: original live binding must independently remain valid");
+        no_staging(&root);
+        let current_while_locked = belongs_to_current_connection(&still_readable, &root);
+        let dirty_after_clear = exit_write_uncommitted(&root);
+        let control_while_locked = belongs_to_current_connection(&independent, &control);
+        let control_bytes_after_clear = snapshot(&control) == control_before;
+        eprintln!("DIRECT_CLEAR_CONTRACT_STAGE: delete_error={delete_error}; raw_os_error={:?}; old_bytes_unchanged=true; old_readable=true; check_live=true; binding_live=true; no_staging=true; current_while_locked={current_while_locked}; dirty_after_clear={dirty_after_clear}; control_current={control_while_locked}; control_bytes_unchanged={control_bytes_after_clear}",
+            delete_error.raw_os_error());
+
+        drop(locked);
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(load(&root), Some(old.clone()));
+        assert!(original_exit_binding_still_current(&old, &root));
+        assert!(crate::selfcheck::current_qualified_trade_pass(&root));
+        let current_after_unlock = belongs_to_current_connection(&old, &root);
+        no_staging(&root);
+
+        // Genuine new authenticated observation on the same session. No
+        // retry, no clear of the map, no fake replacement record.
+        let recovered = match probe_and_record(&root, &line, &plan, 2_000) {
+            Some(record) => record,
+            None => {
+                let joined = target_server.stop_and_join();
+                panic!("fixture: real recovery observation absent; server={joined:?}");
+            }
+        };
+        target_server.finish(3);
+        assert_eq!(recovered.ip, "1.1.1.1");
+        let recovered_binding_same = recovered.binding == old.binding;
+        let recovered_current = belongs_to_current_connection(&recovered, &root);
+        let recovered_disk_exact = load(&root).as_ref() == Some(&recovered);
+        let recovery_clean = !exit_write_uncommitted(&root);
+        no_staging(&root);
+        assert_eq!(crate::selfcheck::load(&root), Some(check));
+        assert!(crate::selfcheck::current_qualified_trade_pass(&root));
+        assert!(original_exit_binding_still_current(&old, &root),
+            "old IP alone is not a stale-binding test");
+        let control_current_after = belongs_to_current_connection(&independent, &control);
+        let control_bytes_after = snapshot(&control) == control_before;
+        let control_disk_exact = load(&control).as_ref() == Some(&independent);
+        assert_eq!(crate::selfcheck::load(&control), Some(control_check));
+        assert!(crate::selfcheck::current_qualified_trade_pass(&control));
+        no_staging(&control);
+        eprintln!("DIRECT_CLEAR_CONTRACT_RECOVERY: current_after_unlock={current_after_unlock}; new_ip={}; attributed={}; same_binding={recovered_binding_same}; new_disk_exact={recovered_disk_exact}; new_current={recovered_current}; clean={recovery_clean}; control_current={control_current_after}; control_bytes_unchanged={control_bytes_after}; control_disk_exact={control_disk_exact}",
+            recovered.ip, recovered.attributed);
+
+        // Cleanup before reporting the target contract verdict. Retain
+        // actual failure diagnostics even when the primary assertion fails.
+        drop(cleanup);
+        assert!(!sandbox.exists(), "fixture: sandbox cleanup");
+        assert!(!current_while_locked && !current_after_unlock,
+            "TRUE_DIRECT_API_CONTRACT_RED: direct clear deletion refused; readable old record with live original binding still qualifies as CURRENT (locked={current_while_locked}, unlocked={current_after_unlock})");
+        assert!(control_while_locked && control_bytes_after_clear && control_current_after
+            && control_bytes_after && control_disk_exact,
+            "SAFETY: direct clear cannot invalidate or change independent control evidence");
+        assert!(recovered.attributed && recovered_binding_same && recovered_disk_exact
+            && recovered_current && recovery_clean,
+            "SAFETY: genuine same-session producer commit must restore new CURRENT evidence");
+    }
 }
