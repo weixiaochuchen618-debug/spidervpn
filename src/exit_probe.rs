@@ -89,9 +89,6 @@ fn uncommitted_exit_writes() -> &'static std::sync::Mutex<
 struct ExitWriteGuard {
     // The resolved identity of the actual directory shared by path aliases.
     root: std::path::PathBuf,
-    // Keep the caller's spelling to clear a previous unresolved-root failure
-    // only after a later genuinely successful group completion.
-    requested_root: std::path::PathBuf,
     committed: bool,
     // Only the first active writer uses legacy exit-probe.json.tmp.
     // Every overlapping writer must own a distinct temporary pathname.
@@ -129,7 +126,7 @@ impl ExitWriteGuard {
         state.active_writers = state.active_writers.checked_add(1)
             .ok_or_else(|| "exit pending writer count overflow".to_string())?;
         Ok(Self {
-            root: key, requested_root: root.to_path_buf(),
+            root: key,
             committed: false, isolated_tmp,
         })
     }
@@ -158,15 +155,8 @@ impl Drop for ExitWriteGuard {
                     || !other.failed_in_group
                     || std::fs::canonicalize(raw).ok().as_ref() != Some(&self.root)
             });
-            // Recovery via the same caller path can retire a prior failed
-            // canonicalization marker. Never remove any active writer.
-            if self.requested_root != self.root
-                && roots.get(&self.requested_root).is_some_and(|other| {
-                    other.active_writers == 0 && other.failed_in_group
-                })
-            {
-                roots.remove(&self.requested_root);
-            }
+            // The identity-checked retirement above also covers a recovered
+            // caller spelling. Do not separately clear a mutable raw alias.
         }
     }
 }
@@ -199,7 +189,10 @@ pub fn save(root: &Path, rec: &Record) -> Result<(), String> {
     #[cfg(test)]
     tests::after_pending_save_test_hook();
     let result = (|| -> Result<(), String> {
-        let path = root.join(FILE_NAME);
+        // Stage, rename and clean up under the same resolved path registered
+        // by the guard. A caller junction may now point at another directory.
+        // This fixes alias retargeting, not replacement of the resolved root.
+        let path = pending.root.join(FILE_NAME);
         let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
         // Concurrent same-root writers may overlap through rename, but must
         // never write one another's staged bytes. Keep the legacy fixed tmp
@@ -1741,5 +1734,245 @@ mod tests {
             "B binding invalidation must not affect independent C");
         remove_alias(&a);
         std::fs::remove_dir_all(&sandbox).expect("clean isolated sandbox after link removal");
+    }
+
+    /// #72 TEST-ONLY: a real in-flight save must never write into a different
+    /// physical root after the existing registration-to-IO gate is released.
+    #[test]
+    fn inflight_save_retargeted_junction_never_commits_to_unregistered_root() {
+        use std::sync::mpsc;
+
+        fn link_dir(link: &Path, target: &Path) {
+            #[cfg(windows)]
+            {
+                let out = std::process::Command::new("cmd.exe")
+                    .args(["/C", "mklink", "/J"]).arg(link).arg(target).output()
+                    .expect("execute real junction creation");
+                assert!(out.status.success(), "fixture mklink failed: {out:?}");
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, link).expect("create real directory symlink");
+        }
+
+        fn unlink_dir(link: &Path) -> std::io::Result<()> {
+            #[cfg(windows)]
+            {
+                // No /S: remove ONLY the disposable junction, never its target.
+                let out = std::process::Command::new("cmd.exe")
+                    .args(["/C", "rmdir"]).arg(link).output()?;
+                if !out.status.success() {
+                    return Err(std::io::Error::other(format!("fixture rmdir failed: {out:?}")));
+                }
+            }
+            #[cfg(unix)]
+            std::fs::remove_file(link)?;
+            Ok(())
+        }
+
+        // Cleanup on both normal completion and assertion unwind. Never
+        // recurse into the sandbox until the alias itself is confirmed absent.
+        struct Sandbox {
+            root: std::path::PathBuf,
+            alias: std::path::PathBuf,
+        }
+        impl Sandbox {
+            fn cleanup(&self) -> std::io::Result<()> {
+                match std::fs::symlink_metadata(&self.alias) {
+                    Ok(_) => unlink_dir(&self.alias)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(e) => return Err(e),
+                }
+                match std::fs::symlink_metadata(&self.alias) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(e) => return Err(e),
+                    Ok(_) => return Err(std::io::Error::other("alias still exists; refusing recursive cleanup")),
+                }
+                match std::fs::remove_dir_all(&self.root) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                }
+            }
+        }
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                if let Err(e) = self.cleanup() {
+                    eprintln!("INFLIGHT_RETARGET fixture cleanup refused or failed: {e}");
+                }
+            }
+        }
+
+        let root = tmp_root("inflight-alias-retarget");
+        let a = root.join("alias-a");
+        let cleanup = Sandbox { root: root.clone(), alias: a.clone() };
+        let b = root.join("data-b");
+        let c = root.join("data-c");
+        std::fs::create_dir(&b).unwrap();
+        std::fs::create_dir(&c).unwrap();
+        let physical_b = std::fs::canonicalize(&b).unwrap();
+        let physical_c = std::fs::canonicalize(&c).unwrap();
+        assert_ne!(physical_b, physical_c, "fixture must have distinct physical roots");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+
+        // Both roots have independent genuine qualified loopback Check and
+        // observed records, not fabricated bindings or missing-data negatives.
+        let observe = |dir: &Path| {
+            let port = fake_socks5("8.8.8.8\n", "u", "p");
+            let line = qualified_probe_fixture(dir, port);
+            let plan = qualified_plan(port);
+            let check = crate::selfcheck::check_and_record(dir, &plan, 2_000);
+            assert!(check.ok && check.via_trade_exit
+                && crate::selfcheck::current_qualified_trade_pass(dir), "{check:?}");
+            let record = probe_and_record(dir, &line, &plan, 2_000)
+                .expect("actual authenticated exit observation");
+            assert!(record.attributed && record.binding.is_some());
+            assert_eq!(load(dir), Some(record.clone()));
+            assert!(belongs_to_current_connection(&record, dir));
+            record
+        };
+        let old_b = observe(&b);
+        let old_c = observe(&c);
+        assert_ne!(old_b.binding, old_c.binding);
+        assert!(!original_exit_binding_still_current(&old_b, &c));
+        assert!(!original_exit_binding_still_current(&old_c, &b));
+        let b_before = std::fs::read(b.join(FILE_NAME)).unwrap();
+        let c_before = std::fs::read(c.join(FILE_NAME)).unwrap();
+        assert_ne!(std::fs::canonicalize(b.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(c.join(FILE_NAME)).unwrap());
+
+        link_dir(&a, &b);
+        assert_eq!(std::fs::canonicalize(&a).unwrap(), physical_b);
+        assert_eq!(std::fs::canonicalize(a.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(b.join(FILE_NAME)).unwrap());
+        assert_eq!(load(&a), Some(old_b.clone()));
+        assert!(belongs_to_current_connection(&old_b, &a));
+
+        let mut proposed = old_b.clone();
+        proposed.at = proposed.at.checked_add(1).unwrap();
+        assert_ne!(proposed, old_b);
+        assert_ne!(proposed, old_c);
+        assert!(original_exit_binding_still_current(&proposed, &a));
+        let tmp_b = b.join(FILE_NAME).with_extension("json.tmp");
+        let tmp_c = c.join(FILE_NAME).with_extension("json.tmp");
+
+        let (pending_tx, pending_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let writer_path = a.clone();
+        let writer_record = proposed.clone();
+        let writer = std::thread::spawn(move || {
+            AFTER_PENDING_SAVE_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    pending_tx.send(()).expect("actual registration gate reached");
+                    release_rx.recv_timeout(Duration::from_secs(30))
+                        .expect("controller must release actual save");
+                }));
+            });
+            save(&writer_path, &writer_record)
+        });
+
+        // Catch any setup/assertion panic in the controller so the real save
+        // always receives a release and is joined BEFORE filesystem cleanup.
+        let stage = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pending_rx.recv_timeout(Duration::from_secs(30))
+                .expect("actual save must register before identity change");
+            assert!(exit_write_uncommitted(&b));
+            assert!(exit_write_uncommitted(&a));
+            assert!(!belongs_to_current_connection(&old_b, &b));
+            assert!(!belongs_to_current_connection(&old_b, &a));
+            assert!(belongs_to_current_connection(&old_c, &c));
+            assert!(!tmp_b.exists() && !tmp_c.exists());
+            assert_eq!(std::fs::read(b.join(FILE_NAME)).unwrap(), b_before);
+            assert_eq!(std::fs::read(c.join(FILE_NAME)).unwrap(), c_before);
+
+            unlink_dir(&a).expect("remove only real in-flight junction");
+            let missing = std::fs::canonicalize(&a)
+                .expect_err("fixture: actual removed alias must not resolve");
+            assert_eq!(std::fs::canonicalize(&b).unwrap(), physical_b);
+            assert_eq!(std::fs::canonicalize(&c).unwrap(), physical_c);
+            link_dir(&a, &c);
+            assert_eq!(std::fs::canonicalize(&a).unwrap(), physical_c);
+            assert_ne!(std::fs::canonicalize(&a).unwrap(), physical_b);
+            assert_eq!(std::fs::canonicalize(a.join(FILE_NAME)).unwrap(),
+                std::fs::canonicalize(c.join(FILE_NAME)).unwrap());
+            assert_eq!(load(&a), Some(old_c.clone()));
+            assert!(original_exit_binding_still_current(&old_c, &a));
+            assert!(!belongs_to_current_connection(&proposed, &a),
+                "B binding cannot authorize a record through physical C");
+            assert!(exit_write_uncommitted(&b));
+            assert!(!belongs_to_current_connection(&old_b, &b));
+            assert!(belongs_to_current_connection(&old_c, &c));
+            assert!(!tmp_b.exists() && !tmp_c.exists());
+            assert_eq!(std::fs::read(b.join(FILE_NAME)).unwrap(), b_before);
+            assert_eq!(std::fs::read(c.join(FILE_NAME)).unwrap(), c_before);
+            eprintln!("INFLIGHT_RETARGET_STAGE: B={physical_b:?}; C={physical_c:?}; removed_err={missing}; A_now_C=true; B_pending=true; B_current=false; C_current=true; before_IO=true");
+        }));
+        let released = release_tx.send(());
+        let joined = writer.join();
+        if let Err(panic) = stage {
+            // Gate has been released (or already terminated) and joined.
+            std::panic::resume_unwind(panic);
+        }
+        released.expect("writer must receive deterministic release");
+        let result = joined.expect("actual save must finish without panic");
+
+        assert_eq!(std::fs::canonicalize(&a).unwrap(), physical_c);
+        let disk_b = load(&b);
+        let disk_c = load(&c);
+        let b_bytes = std::fs::read(b.join(FILE_NAME)).unwrap();
+        let c_bytes = std::fs::read(c.join(FILE_NAME)).unwrap();
+        let b_dirty = exit_write_uncommitted(&b);
+        let b_old_current = belongs_to_current_connection(&old_b, &b);
+        let c_disk_current = disk_c.as_ref()
+            .is_some_and(|rec| belongs_to_current_connection(rec, &c));
+        let a_disk_current = disk_c.as_ref()
+            .is_some_and(|rec| belongs_to_current_connection(rec, &a));
+        eprintln!(
+            "INFLIGHT_RETARGET_RESULT: save_A={result:?}; B_unchanged={}; C_unchanged={}; B_has_proposed={}; C_has_proposed={}; B_dirty={b_dirty}; B_old_current={b_old_current}; C_disk_current={c_disk_current}; A_disk_current={a_disk_current}; C_binding_still_valid={}",
+            b_bytes == b_before, c_bytes == c_before,
+            disk_b.as_ref() == Some(&proposed), disk_c.as_ref() == Some(&proposed),
+            original_exit_binding_still_current(&old_c, &c)
+        );
+
+        // Safety invariant, independent of the implementation's choice:
+        // commit exclusively to registered B or reject without touching C.
+        assert_eq!(c_bytes, c_before,
+            "SAFETY: in-flight save must never overwrite unregistered physical root C");
+        assert_eq!(disk_c, Some(old_c.clone()));
+        assert!(c_disk_current, "independent C must remain healthy");
+        assert!(!tmp_c.exists(), "no foreign-root temporary residue");
+        assert!(!belongs_to_current_connection(&proposed, &a));
+        if result.is_ok() {
+            assert_eq!(disk_b, Some(proposed.clone()),
+                "a successful save must commit to its registered physical B");
+            assert!(!b_dirty);
+            assert!(belongs_to_current_connection(&proposed, &b));
+        } else {
+            assert_eq!(b_bytes, b_before, "rejected save preserves original B JSON");
+            assert!(b_dirty, "rejected in-flight save must leave B fail-closed");
+            assert!(!b_old_current);
+        }
+
+        // Restore original identity and exercise ordinary qualified recovery.
+        unlink_dir(&a).unwrap();
+        link_dir(&a, &b);
+        assert_eq!(std::fs::canonicalize(&a).unwrap(), physical_b);
+        if result.is_err() {
+            assert!(!belongs_to_current_connection(&old_b, &a));
+        }
+        let mut recovered = proposed.clone();
+        recovered.at = proposed.at.checked_add(1).unwrap();
+        assert!(original_exit_binding_still_current(&recovered, &b));
+        save(&b, &recovered).expect("later real B commit restores qualified evidence");
+        assert_eq!(load(&a), Some(recovered.clone()));
+        assert_eq!(load(&b), Some(recovered.clone()));
+        assert!(belongs_to_current_connection(&recovered, &a));
+        assert!(belongs_to_current_connection(&recovered, &b));
+        assert_eq!(std::fs::read(c.join(FILE_NAME)).unwrap(), c_before);
+        assert!(belongs_to_current_connection(&old_c, &c));
+        std::fs::write(b.join("runtime-engine.json"), "{}").unwrap();
+        assert!(!belongs_to_current_connection(&recovered, &a));
+        assert!(!belongs_to_current_connection(&recovered, &b));
+        assert!(belongs_to_current_connection(&old_c, &c));
+        cleanup.cleanup().expect("remove disposable alias before sandbox cleanup");
     }
 }
