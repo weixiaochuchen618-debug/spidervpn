@@ -163,12 +163,17 @@ fn uncommitted_exit_writes() -> &'static std::sync::Mutex<ExitWriteMap> {
 struct ExitWriteGuard {
     root: std::path::PathBuf,
     identity: ExitDirectoryId,
-    committed: bool,
+    completed: bool,
+    is_clear: bool,
     isolated_tmp: bool,
 }
 
 impl ExitWriteGuard {
     fn begin(root: &Path) -> Result<Self, String> {
+        Self::begin_operation(root, false)
+    }
+
+    fn begin_operation(root: &Path, is_clear: bool) -> Result<Self, String> {
         let (path, identity) = match resolve_exit_directory(root) {
             Ok(resolved) => resolved,
             Err(e) => {
@@ -185,15 +190,16 @@ impl ExitWriteGuard {
             .lock()
             .map_err(|_| "exit pending-write lock poisoned".to_string())?;
         let state = roots.entry(ExitWriteKey::Directory(identity)).or_default();
-        if state.active_writers == 0 {
-            // A recovery group remains dirty until its final real commit.
+        if state.active_writers == 0 && !is_clear {
+            // Only a genuine save can start recovery of an earlier failed
+            // group. A clear must preserve its failure even if deletion works.
             state.failed_in_group = false;
         }
         let isolated_tmp = state.active_writers != 0;
         state.active_writers = state.active_writers.checked_add(1)
             .ok_or_else(|| "exit pending writer count overflow".to_string())?;
         Ok(Self {
-            root: path, identity, committed: false, isolated_tmp,
+            root: path, identity, completed: false, is_clear, isolated_tmp,
         })
     }
 
@@ -244,21 +250,26 @@ impl Drop for ExitWriteGuard {
         };
         let key = ExitWriteKey::Directory(self.identity);
         let Some(state) = roots.get_mut(&key) else { return };
-        if !self.committed {
+        if !self.completed {
             state.failed_in_group = true;
         }
         state.active_writers = state.active_writers.saturating_sub(1);
-        if self.committed && state.active_writers == 0 && !state.failed_in_group {
+        if self.completed && state.active_writers == 0 && !state.failed_in_group {
             roots.remove(&key);
-            // Retire only unresolved raw aliases that NOW resolve to this
-            // committed directory object. Never retire a different object's
-            // ordinary failed write, even if it occupies the same pathname.
-            roots.retain(|key, other| {
-                let ExitWriteKey::Unresolved(raw) = key else { return true };
-                other.active_writers != 0
-                    || !other.failed_in_group
-                    || resolve_exit_directory(raw).ok().map(|(_, id)| id) != Some(self.identity)
-            });
+            // A clean clear may retire its completed pending group, but
+            // absence/deletion is not a successful save of new evidence.
+            // Only a genuine save can recover unresolved alias failures.
+            if !self.is_clear {
+                // Retire only unresolved raw aliases that NOW resolve to
+                // this committed directory object. Never retire a different
+                // object's ordinary failed write at the same pathname.
+                roots.retain(|key, other| {
+                    let ExitWriteKey::Unresolved(raw) = key else { return true };
+                    other.active_writers != 0
+                        || !other.failed_in_group
+                        || resolve_exit_directory(raw).ok().map(|(_, id)| id) != Some(self.identity)
+                });
+            }
         }
     }
 }
@@ -354,14 +365,29 @@ fn save_record(root: &Path, rec: &Record, invalidate_on_failure: bool) -> Result
         written
     })();
     if result.is_ok() {
-        pending.committed = true;
+        pending.completed = true;
     }
     result
 }
 
 /// 清掉记录（断开、连接失败、换线路都算「这条证据过期了」）。
 pub fn clear(root: &Path) {
-    let _ = std::fs::remove_file(root.join(FILE_NAME));
+    // A refused deletion may leave readable, still-bound history. Register
+    // invalidation before IO, using the same native object group as save.
+    // Failed lookup records an unresolved alias; failed reopen/verification
+    // marks the registered object failed through the guard, without deleting
+    // anything at an unchecked replacement path.
+    let Ok(mut pending) = ExitWriteGuard::begin_operation(root, true) else { return };
+    let Ok((_directory, io_root)) = pending.open_io_root() else { return };
+    if pending.verify_io_root(&io_root).is_err() {
+        return;
+    }
+    match std::fs::remove_file(io_root.join(FILE_NAME)) {
+        Ok(()) => pending.completed = true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => pending.completed = true,
+        // Guard drop retains the failed marker until genuine save recovery.
+        Err(_) => {}
+    }
 }
 
 /// Capture a qualified ORIGINAL session/route + selected line from disk.
