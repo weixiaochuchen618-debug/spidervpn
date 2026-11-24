@@ -2285,4 +2285,305 @@ mod tests {
         assert!(belongs_to_current_connection(&recovered_b, &b));
         cleanup.cleanup().expect("remove disposable alias before sandbox cleanup");
     }
+
+    /// #76 TEST-ONLY: the already registered real directory itself is moved
+    /// aside and a different real directory takes its exact former pathname.
+    #[test]
+    fn inflight_save_replaced_resolved_root_preserves_physical_ownership() {
+        use std::sync::mpsc;
+
+        // Obtain native object identity independently of the canonical text.
+        // Windows handles are closed before each directory move; the test
+        // itself must not prevent the replacement it is trying to establish.
+        #[cfg(windows)]
+        fn dir_id(path: &Path) -> (u64, u64) {
+            use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_SHARE_DELETE,
+            };
+            let dir = std::fs::OpenOptions::new().read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(path).expect("fixture: open native directory for identity");
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            let ok = unsafe {
+                GetFileInformationByHandle(dir.as_raw_handle() as _, &mut info)
+            };
+            assert_ne!(ok, 0, "fixture: native directory identity: {}",
+                std::io::Error::last_os_error());
+            (u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
+        }
+
+        #[cfg(unix)]
+        fn dir_id(path: &Path) -> (u64, u64) {
+            use std::os::unix::fs::MetadataExt;
+            let md = std::fs::metadata(path).expect("fixture: native directory identity");
+            (md.dev(), md.ino())
+        }
+
+        // Compare all actual fixture file bytes by relative path, not just
+        // load() or the pending map. No links are created in this test.
+        fn snapshot(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn walk(base: &Path, dir: &Path,
+                out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+                for entry in std::fs::read_dir(dir).expect("read isolated fixture directory") {
+                    let path = entry.expect("fixture entry").path();
+                    let md = std::fs::symlink_metadata(&path).unwrap();
+                    assert!(!md.file_type().is_symlink(), "fixture must not contain links");
+                    if md.is_dir() {
+                        walk(base, &path, out);
+                    } else {
+                        assert!(md.is_file());
+                        out.insert(path.strip_prefix(base).unwrap().to_path_buf(),
+                            std::fs::read(&path).expect("read actual fixture bytes"));
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            walk(dir, dir, &mut out);
+            out
+        }
+
+        // Only real sibling directories beneath this disposable sandbox.
+        // No junction, product root, external path or privileged operation.
+        struct Sandbox(std::path::PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                    eprintln!("RESOLVED_ROOT_REPLACEMENT fixture cleanup failed: {e}");
+                }
+            }
+        }
+        let root = tmp_root("resolved-root-replacement");
+        let cleanup = Sandbox(root.clone());
+        let b = root.join("registered-b");
+        let c = root.join("replacement-c");
+        let d = root.join("unaffected-d");
+        let parked = root.join("parked-original-b");
+        for dir in [&b, &c, &d] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let id_b = dir_id(&b);
+        let id_c = dir_id(&c);
+        let id_d = dir_id(&d);
+        assert_ne!(id_b, id_c, "fixture: genuinely distinct native directory IDs");
+        assert_ne!(id_b, id_d);
+        assert_ne!(id_c, id_d);
+        assert!(!parked.exists());
+        let registered_path = std::fs::canonicalize(&b).unwrap();
+        let c_path = std::fs::canonicalize(&c).unwrap();
+        assert_ne!(registered_path, c_path);
+
+        let observe = |dir: &Path| {
+            let port = fake_socks5("8.8.8.8\n", "u", "p");
+            let line = qualified_probe_fixture(dir, port);
+            let plan = qualified_plan(port);
+            let check = crate::selfcheck::check_and_record(dir, &plan, 2_000);
+            assert!(check.ok && check.via_trade_exit
+                && crate::selfcheck::current_qualified_trade_pass(dir), "{check:?}");
+            let record = probe_and_record(dir, &line, &plan, 2_000)
+                .expect("actual authenticated exit observation");
+            assert!(record.attributed && record.binding.is_some());
+            assert_eq!(load(dir), Some(record.clone()));
+            assert!(original_exit_binding_still_current(&record, dir));
+            assert!(belongs_to_current_connection(&record, dir));
+            record
+        };
+        let old_b = observe(&b);
+        let old_c = observe(&c);
+        let old_d = observe(&d);
+        assert_ne!(old_b.binding, old_c.binding);
+        assert_ne!(old_b.binding, old_d.binding);
+        assert_ne!(old_c.binding, old_d.binding);
+        assert!(!original_exit_binding_still_current(&old_b, &c));
+        assert!(!original_exit_binding_still_current(&old_c, &b));
+        assert!(!original_exit_binding_still_current(&old_b, &d));
+        // Independent provenance witnesses move with each physical directory.
+        std::fs::write(b.join("fixture-provenance"), b"original-b").unwrap();
+        std::fs::write(c.join("fixture-provenance"), b"replacement-c").unwrap();
+        std::fs::write(d.join("fixture-provenance"), b"unaffected-d").unwrap();
+        let b_before = snapshot(&b);
+        let c_before = snapshot(&c);
+        let d_before = snapshot(&d);
+        let tmp_name = std::path::PathBuf::from(FILE_NAME).with_extension("json.tmp");
+        assert!(!b_before.contains_key(&tmp_name));
+        assert!(!c_before.contains_key(&tmp_name));
+        assert!(!d_before.contains_key(&tmp_name));
+        let mut proposed = old_b.clone();
+        proposed.at = old_b.at.checked_add(1).unwrap();
+        assert_ne!(proposed, old_b);
+        assert_ne!(proposed, old_c);
+        assert!(original_exit_binding_still_current(&proposed, &b));
+
+        let (pending_tx, pending_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let writer_path = b.clone();
+        let writer_record = proposed.clone();
+        let writer = std::thread::spawn(move || {
+            AFTER_PENDING_SAVE_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    pending_tx.send(()).expect("actual registration gate reached");
+                    release_rx.recv_timeout(Duration::from_secs(30))
+                        .expect("controller must release actual save");
+                }));
+            });
+            save(&writer_path, &writer_record)
+        });
+
+        // Capture the pending observation, but let the actual writer finish
+        // before asserting target safety so disk ownership is also tested.
+        // On any fixture/assertion panic, release and join before cleanup.
+        let stage = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pending_rx.recv_timeout(Duration::from_secs(30))
+                .expect("fixture: actual save registered before replacement");
+            assert!(exit_write_uncommitted(&b));
+            assert!(!belongs_to_current_connection(&old_b, &b));
+            assert!(belongs_to_current_connection(&old_c, &c));
+            assert!(belongs_to_current_connection(&old_d, &d));
+            assert_eq!(snapshot(&b), b_before);
+            assert_eq!(snapshot(&c), c_before);
+            assert_eq!(snapshot(&d), d_before);
+
+            std::fs::rename(&b, &parked)
+                .expect("fixture: move registered physical directory aside");
+            let missing = std::fs::canonicalize(&b)
+                .expect_err("fixture: original pathname actually vacant");
+            std::fs::rename(&c, &b)
+                .expect("fixture: move distinct physical directory to registered pathname");
+            assert!(!c.exists());
+            assert_eq!(dir_id(&parked), id_b);
+            assert_eq!(dir_id(&b), id_c);
+            assert_ne!(dir_id(&b), id_b);
+            assert_eq!(dir_id(&d), id_d);
+            assert_eq!(std::fs::canonicalize(&b).unwrap(), registered_path,
+                "fixture: same canonical pathname, different native identity");
+            assert_ne!(std::fs::canonicalize(&parked).unwrap(), registered_path);
+            assert_eq!(snapshot(&parked), b_before);
+            assert_eq!(snapshot(&b), c_before);
+            assert_eq!(snapshot(&d), d_before);
+            assert_eq!(load(&parked), Some(old_b.clone()));
+            assert_eq!(load(&b), Some(old_c.clone()));
+            assert!(!original_exit_binding_still_current(&proposed, &b),
+                "replacement must not acquire original B binding");
+            assert!(belongs_to_current_connection(&old_d, &d));
+
+            // Legitimate movement may invalidate a path-dependent binding;
+            // record that separately from native identity and actual bytes.
+            let moved_binding = original_exit_binding_still_current(&old_b, &parked);
+            let moved_pending = exit_write_uncommitted(&parked);
+            let moved_current = belongs_to_current_connection(&old_b, &parked);
+            let replacement_binding = original_exit_binding_still_current(&old_c, &b);
+            let replacement_pending = exit_write_uncommitted(&b);
+            eprintln!("RESOLVED_ROOT_REPLACEMENT_STAGE: B_ID={id_b:?}; C_ID={id_c:?}; D_ID={id_d:?}; vacant_error={missing}; same_canonical_path=true; actual_path_is_C=true; B_at_parked=true; bytes_unchanged=true; moved_binding={moved_binding}; moved_pending={moved_pending}; moved_current={moved_current}; replacement_binding={replacement_binding}; replacement_pending={replacement_pending}; D_current=true; before_IO=true");
+            (moved_binding, moved_pending, moved_current)
+        }));
+        let released = release_tx.send(());
+        let joined = writer.join();
+        let (moved_binding, moved_pending, moved_current) = match stage {
+            Ok(values) => values,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        released.expect("writer must receive deterministic release");
+        let result = joined.expect("actual save must complete without panic");
+
+        assert_eq!(dir_id(&parked), id_b);
+        assert_eq!(dir_id(&b), id_c);
+        assert_eq!(dir_id(&d), id_d);
+        let original_disk = load(&parked);
+        let replacement_disk = load(&b);
+        let original_after = snapshot(&parked);
+        let replacement_after = snapshot(&b);
+        let original_dirty = exit_write_uncommitted(&parked);
+        let replacement_dirty = exit_write_uncommitted(&b);
+        let original_live = original_exit_binding_still_current(&old_b, &parked);
+        let original_current = belongs_to_current_connection(&old_b, &parked);
+        let replacement_current = replacement_disk.as_ref()
+            .is_some_and(|rec| belongs_to_current_connection(rec, &b));
+        eprintln!("RESOLVED_ROOT_REPLACEMENT_RESULT: save_B={result:?}; B_bytes_unchanged={}; C_bytes_unchanged={}; B_has_proposed={}; C_has_proposed={}; B_dirty={original_dirty}; B_binding={original_live}; B_old_current={original_current}; C_dirty={replacement_dirty}; C_disk_current={replacement_current}; D_unchanged={}",
+            original_after == b_before, replacement_after == c_before,
+            original_disk.as_ref() == Some(&proposed),
+            replacement_disk.as_ref() == Some(&proposed), snapshot(&d) == d_before);
+
+        // Primary safety assertion independent of binding changes: C is a
+        // different native directory even though its pathname is identical.
+        // All actual C files must be intact, including absence of foreign tmp.
+        assert!(replacement_after == c_before,
+            "SAFETY: save must not alter the distinct replacement physical directory C");
+        assert_eq!(replacement_disk, Some(old_c.clone()));
+        assert!(!belongs_to_current_connection(&proposed, &b));
+        assert_eq!(snapshot(&d), d_before);
+        assert_eq!(load(&d), Some(old_d.clone()));
+        assert!(belongs_to_current_connection(&old_d, &d));
+        if moved_binding {
+            assert!(!moved_current,
+                "SAFETY: original physical directory with valid binding must not authorize CURRENT while its writer is pending");
+        }
+        if result.is_ok() {
+            assert_eq!(original_disk, Some(proposed.clone()),
+                "SAFETY: success requires actual commit to original native directory B");
+            let mut expected = b_before.clone();
+            expected.insert(std::path::PathBuf::from(FILE_NAME),
+                std::fs::read(parked.join(FILE_NAME)).unwrap());
+            assert!(original_after == expected,
+                "successful save must change only original B record");
+            assert!(!original_dirty);
+            if original_exit_binding_still_current(&proposed, &parked) {
+                assert!(belongs_to_current_connection(&proposed, &parked));
+            }
+        } else {
+            assert!(original_after == b_before,
+                "safe rejection preserves original B files");
+            if original_live {
+                assert!(original_dirty,
+                    "SAFETY: failed original B write with valid binding remains dirty");
+                assert!(!original_current);
+            }
+        }
+        // Read the diagnostic even when movement invalidates the binding.
+        eprintln!("RESOLVED_ROOT_REPLACEMENT_PENDING: moved_binding={moved_binding}; moved_pending={moved_pending}; moved_current={moved_current}");
+
+        // Return the two native directory objects to their original paths.
+        // A valid old binding at that point must not bypass a failed save.
+        std::fs::rename(&b, &c).expect("fixture: restore replacement C to its own path");
+        std::fs::rename(&parked, &b).expect("fixture: restore original B identity");
+        assert_eq!(dir_id(&b), id_b);
+        assert_eq!(dir_id(&c), id_c);
+        assert_eq!(dir_id(&d), id_d);
+        assert_eq!(std::fs::canonicalize(&b).unwrap(), registered_path);
+        assert_eq!(snapshot(&c), c_before);
+        assert_eq!(snapshot(&d), d_before);
+        assert!(original_exit_binding_still_current(&old_c, &c));
+        assert!(belongs_to_current_connection(&old_c, &c));
+        assert!(belongs_to_current_connection(&old_d, &d));
+        assert!(original_exit_binding_still_current(&old_b, &b),
+            "fixture: restored original identity must retain its original binding");
+        if result.is_err() {
+            assert_eq!(load(&b), Some(old_b.clone()));
+            assert!(exit_write_uncommitted(&b));
+            assert!(!belongs_to_current_connection(&old_b, &b),
+                "SAFETY: returning failed original B to its path alone cannot recover CURRENT");
+        }
+        let mut recovered = proposed.clone();
+        recovered.at = proposed.at.checked_add(1).unwrap();
+        assert!(original_exit_binding_still_current(&recovered, &b));
+        save(&b, &recovered).expect("later genuine save under restored original identity");
+        assert_eq!(dir_id(&b), id_b);
+        assert_eq!(load(&b), Some(recovered.clone()));
+        assert!(!exit_write_uncommitted(&b));
+        assert!(belongs_to_current_connection(&recovered, &b));
+        assert_eq!(snapshot(&c), c_before);
+        assert_eq!(snapshot(&d), d_before);
+        assert!(belongs_to_current_connection(&old_c, &c));
+        assert!(belongs_to_current_connection(&old_d, &d));
+        std::fs::write(b.join("runtime-engine.json"), "{}").unwrap();
+        assert!(!original_exit_binding_still_current(&recovered, &b));
+        assert!(!belongs_to_current_connection(&recovered, &b));
+        assert!(belongs_to_current_connection(&old_c, &c));
+        assert!(belongs_to_current_connection(&old_d, &d));
+        eprintln!("RESOLVED_ROOT_REPLACEMENT_RECOVERY: original_identity_restored=true; later_B_commit=true; stale_binding_denied=true; C_healthy=true; D_healthy=true");
+        drop(cleanup);
+    }
 }
