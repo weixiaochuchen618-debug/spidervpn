@@ -2804,14 +2804,42 @@ mod tests {
         let line = mvp03_b2_config_fixture(&root);
         assert_eq!(line.verified_transport, None);
         let port = fake_socks5("pass", "u", "p");
-        runtime_probe(&root, port);
+        // Model the selected UDP WireGuard endpoint itself, not a VLESS
+        // placeholder or an unrelated WG endpoint added just for classification.
+        // All keys/addresses are synthetic; only the loopback SOCKS is run.
+        let runtime = root.join("runtime-engine.json");
+        std::fs::write(&runtime, serde_json::json!({
+            "endpoints":[{
+                "type":"wireguard","tag":"hk","address":["10.7.0.2/32"],
+                "private_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                "peers":[{"address":"203.0.113.7","port":51820,
+                    "public_key":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+                    "allowed_ips":["0.0.0.0/0"]}]
+            }],
+            "outbounds":[
+                {"type":"selector","tag":"trade-exit","outbounds":["hk"],"default":"hk"},
+                {"type":"direct","tag":"direct"}
+            ],
+            "inbounds":[{"type":"socks","tag":"tc-check","listen":"127.0.0.1",
+                "listen_port":port,"users":[{"username":"u","password":"p"}]}],
+            "route":{"rules":[{"inbound":["tc-check"],"outbound":"trade-exit"}]}
+        }).to_string()).unwrap();
+        assert_eq!(crate::engine_config::actual_transport(&runtime),
+            Some(crate::config::Transport::Udp), "B2 fixture must identify real UDP shape");
+        assert_eq!(line.effective_transport(), crate::config::Transport::Udp,
+            "B2 caller must request the UDP runtime transport");
         let plan = dial_plan(port, "u", "p");
         // Real production auto-check finishes AND its own current disk
         // evidence is accepted BEFORE caller-stage mutation.
         let returned = check_and_record(&root, &plan, 2_000);
         assert!(returned.ok && returned.status == Some(204), "valid first phase: {returned:?}");
         assert_eq!(load(&root), Some(returned.clone()), "real persisted auto PASS");
+        assert!(current_qualified_trade_pass(&root),
+            "B2 fixture must have a qualified live PASS before caller mutation");
         mvp03_b2_after_return_mutation(&root, change);
+        assert_eq!(crate::engine_config::actual_transport(&runtime),
+            Some(crate::config::Transport::Udp),
+            "B2 mutation must retain identifiable UDP so rejection is not due to unknown transport");
         if change != "none" {
             assert!(!load(&root).is_some_and(|c| c.ok),
                 "new shared reader already recognizes that cached PASS is now stale");
