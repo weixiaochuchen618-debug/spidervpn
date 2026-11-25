@@ -4350,4 +4350,483 @@ mod tests {
             && control_after_absent && control_after_recovery,
             "UNRESOLVED_CLEAR_CONTRACT_RED: independent physical C must remain intact and CURRENT");
     }
+
+    /// #86: a direct clear's unresolved raw alias marker must not be
+    /// retired by a real B commit while A resolves to distinct physical C.
+    /// Ordered same-process direct API contract, not an arbitrary race proof.
+    #[cfg(windows)]
+    #[test]
+    fn windows_clear_retargeted_alias_preserves_failure_until_matching_save() {
+        use std::os::windows::fs::MetadataExt;
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        fn absent(path: &Path) -> bool {
+            matches!(std::fs::symlink_metadata(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        }
+
+        fn create_alias(link: &Path, target: &Path) {
+            assert!(absent(link), "fixture: junction path must be absent");
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/C", "mklink", "/J"])
+                .arg(link).arg(target).output()
+                .expect("fixture: execute native mklink /J");
+            assert!(output.status.success(),
+                "fixture: junction creation failed: status={}; stdout={}; stderr={}",
+                output.status, String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr));
+            assert_ne!(std::fs::symlink_metadata(link).unwrap().file_attributes()
+                & FILE_ATTRIBUTE_REPARSE_POINT, 0,
+                "fixture: actual directory reparse point");
+        }
+
+        // Never recurse through the junction, including on panic. If link
+        // removal fails or its type cannot be verified, leave the isolated
+        // sandbox intact rather than attempting recursive deletion.
+        fn remove_alias(link: &Path) -> Result<(), String> {
+            let md = match std::fs::symlink_metadata(link) {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            };
+            if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                return Err("fixture: refusing removal of non-reparse alias path".into());
+            }
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/C", "rmdir"]).arg(link).output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() || !absent(link) {
+                return Err(format!("fixture: junction-only rmdir failed: status={}; stdout={}; stderr={}",
+                    output.status, String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)));
+            }
+            Ok(())
+        }
+
+        struct Sandbox {
+            root: std::path::PathBuf,
+            alias: std::path::PathBuf,
+        }
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                if let Err(e) = remove_alias(&self.alias) {
+                    eprintln!("RETARGET_CLEAR_FIXTURE refusing recursive cleanup: {e}");
+                    return;
+                }
+                if let Err(e) = std::fs::remove_dir_all(&self.root) {
+                    eprintln!("RETARGET_CLEAR_FIXTURE cleanup failed: {e}");
+                }
+            }
+        }
+
+        // Same authenticated, bounded loopback transport pattern as the
+        // native-passing #78 fixture, with finite cancellation and joining.
+        struct Loopback {
+            listener: TcpListener,
+            stop: Arc<AtomicBool>,
+            worker: Option<std::thread::JoinHandle<usize>>,
+        }
+        impl Loopback {
+            fn start(label: String, bodies: Vec<&'static str>) -> Self {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let active = listener.try_clone().unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker_stop = Arc::clone(&stop);
+                let worker = std::thread::spawn(move || {
+                    let mut completed = 0;
+                    for (phase, body) in bodies.into_iter().enumerate() {
+                        let (mut s, _) = active.accept().expect("fixture: loopback accept");
+                        if worker_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_nodelay(true).unwrap();
+                        eprintln!("RETARGET_CLEAR_FIXTURE {label} phase={phase}: accepted");
+                        let mut greet = [0u8; 4];
+                        s.read_exact(&mut greet).unwrap();
+                        assert_eq!(greet, [0x05, 0x02, 0x00, 0x02]);
+                        s.write_all(&[0x05, 0x02]).unwrap();
+                        let mut auth = [0u8; 2];
+                        s.read_exact(&mut auth).unwrap();
+                        assert_eq!(auth[0], 0x01);
+                        let mut user = vec![0u8; usize::from(auth[1])];
+                        s.read_exact(&mut user).unwrap();
+                        let mut plen = [0u8; 1];
+                        s.read_exact(&mut plen).unwrap();
+                        let mut pass = vec![0u8; usize::from(plen[0])];
+                        s.read_exact(&mut pass).unwrap();
+                        assert_eq!(user, b"u");
+                        assert_eq!(pass, b"p");
+                        s.write_all(&[0x01, 0x00]).unwrap();
+                        eprintln!("RETARGET_CLEAR_FIXTURE {label} phase={phase}: authenticated");
+                        let mut connect = [0u8; 5];
+                        s.read_exact(&mut connect).unwrap();
+                        assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x03]);
+                        let mut target = vec![0u8; usize::from(connect[4]) + 2];
+                        s.read_exact(&mut target).unwrap();
+                        let (host, path) = if body.is_empty() {
+                            ("www.gstatic.com", "/generate_204")
+                        } else {
+                            ("checkip.amazonaws.com", "/")
+                        };
+                        assert_eq!(&target[..target.len() - 2], host.as_bytes(),
+                            "fixture {label} phase={phase}: expected SOCKS host");
+                        assert_eq!(&target[target.len() - 2..], &80u16.to_be_bytes());
+                        s.write_all(&[0x05, 0, 0, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+                        // Consume the complete bounded origin-form HTTP request.
+                        let mut req = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while !req.ends_with(b"\r\n\r\n") {
+                            let n = s.read(&mut chunk).expect("fixture: HTTP request read");
+                            assert_ne!(n, 0, "fixture: premature HTTP request EOF");
+                            req.extend_from_slice(&chunk[..n]);
+                            assert!(req.len() <= 8192, "fixture: bounded HTTP header");
+                        }
+                        assert!(req.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()),
+                            "fixture {label} phase={phase}: origin-form GET");
+                        eprintln!("RETARGET_CLEAR_FIXTURE {label} phase={phase}: HTTP request complete host={host}");
+                        let status = if body.is_empty() { "204 No Content" } else { "200 OK" };
+                        s.write_all(format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ).as_bytes()).expect("fixture: HTTP response write");
+                        // socks5_text reads the body through EOF, not only
+                        // Content-Length. Finish the write half explicitly.
+                        if !body.is_empty() {
+                            s.shutdown(std::net::Shutdown::Write)
+                                .expect("fixture: complete response EOF");
+                        }
+                        completed += 1;
+                        eprintln!("RETARGET_CLEAR_FIXTURE {label} phase={phase}: response completed status={status} body={body:?}");
+                    }
+                    completed
+                });
+                Self { listener, stop, worker: Some(worker) }
+            }
+
+            fn port(&self) -> u16 {
+                self.listener.local_addr().unwrap().port()
+            }
+
+            fn stop_and_join(&mut self) -> Option<std::thread::Result<usize>> {
+                let worker = self.worker.take()?;
+                self.stop.store(true, Ordering::SeqCst);
+                if !worker.is_finished() {
+                    // Only an isolated local listener; no remote connection.
+                    let addr = self.listener.local_addr().unwrap();
+                    let _ = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+                }
+                Some(worker.join())
+            }
+
+            fn finish(&mut self, expected: usize) {
+                let completed = self.stop_and_join().unwrap().expect("fixture: authenticated server");
+                assert_eq!(completed, expected, "fixture: exact real HTTP exchange count");
+            }
+        }
+        impl Drop for Loopback {
+            fn drop(&mut self) {
+                if let Some(result) = self.stop_and_join() {
+                    match result {
+                        Ok(count) => eprintln!("RETARGET_CLEAR_FIXTURE cleanup: completed={count}"),
+                        Err(_) => eprintln!("RETARGET_CLEAR_FIXTURE cleanup: server thread panicked (see actual panic above)"),
+                    }
+                }
+            }
+        }
+
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn walk(base: &Path, dir: &Path,
+                out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let md = std::fs::symlink_metadata(&path).unwrap();
+                    assert!(!md.file_type().is_symlink());
+                    if md.is_dir() {
+                        walk(base, &path, out);
+                    } else {
+                        assert!(md.is_file());
+                        out.insert(path.strip_prefix(base).unwrap().to_path_buf(),
+                            std::fs::read(&path).unwrap());
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            walk(root, root, &mut out);
+            out
+        }
+
+        fn no_staging(root: &Path) {
+            for entry in std::fs::read_dir(root).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(!name.to_string_lossy().starts_with("exit-probe.json.tmp"),
+                    "unexpected exit staging: {name:?}");
+            }
+        }
+
+        let sandbox = tmp_root("clear-retargeted-alias");
+        let root = sandbox.join("physical-b");
+        let control = sandbox.join("independent-c");
+        let alias = sandbox.join("alias-a");
+        let cleanup = Sandbox { root: sandbox.clone(), alias: alias.clone() };
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&control).unwrap();
+        assert_ne!(read_exit_directory_id(&root).unwrap(),
+            read_exit_directory_id(&control).unwrap());
+
+        let observe = |dir: &Path, bodies: Vec<&'static str>| {
+            let mut server = Loopback::start(dir.display().to_string(), bodies);
+            let line = qualified_probe_fixture(dir, server.port());
+            // The old and new response IPs both match the unchanged line.
+            std::fs::write(line.engine_config_path(dir), serde_json::json!({
+                "outbounds": [
+                    {"type":"vless","server":"8.8.8.8","server_port":8443},
+                    {"type":"vless","server":"1.1.1.1","server_port":8443},
+                    {"type":"vless","server":"9.9.9.9","server_port":8443}
+                ]
+            }).to_string()).unwrap();
+            let plan = qualified_plan(server.port());
+            let check = crate::selfcheck::check_and_record(dir, &plan, 2_000);
+            assert!(check.ok && check.via_trade_exit && check.status == Some(204)
+                && crate::selfcheck::current_qualified_trade_pass(dir),
+                "fixture: genuinely qualified Check {dir:?}: {check:?}");
+            let old = match probe_and_record(dir, &line, &plan, 2_000) {
+                Some(record) => record,
+                None => {
+                    let joined = server.stop_and_join();
+                    panic!("fixture: initial real observation absent for {dir:?}; server={joined:?}");
+                }
+            };
+            assert_eq!(old.ip, "8.8.8.8");
+            assert!(old.attributed && old.binding.is_some());
+            assert_eq!(load(dir), Some(old.clone()));
+            assert!(original_exit_binding_still_current(&old, dir));
+            assert!(belongs_to_current_connection(&old, dir));
+            assert!(!exit_write_uncommitted(dir));
+            no_staging(dir);
+            (server, line, plan, old, check)
+        };
+        let (mut target_server, line, plan, old, check) =
+            observe(&root, vec!["", "8.8.8.8\n", "1.1.1.1\n", "9.9.9.9\n"]);
+        let (mut control_server, _, _, independent, control_check) =
+            observe(&control, vec!["", "8.8.8.8\n"]);
+        control_server.finish(2);
+        assert_ne!(old.binding, independent.binding);
+        assert!(!original_exit_binding_still_current(&old, &control));
+        assert!(!original_exit_binding_still_current(&independent, &root));
+        let control_before = snapshot(&control);
+        let b_id = read_exit_directory_id(&root).unwrap();
+        let c_id = read_exit_directory_id(&control).unwrap();
+        let physical_b = std::fs::canonicalize(&root).unwrap();
+        let physical_c = std::fs::canonicalize(&control).unwrap();
+        let path = root.join(FILE_NAME);
+        let original_before = snapshot(&root);
+        let original_bytes = std::fs::read(&path).unwrap();
+        let live = |dir: &Path, record: &Record| {
+            crate::selfcheck::load(dir) == Some(check.clone())
+                && crate::selfcheck::current_qualified_trade_pass(dir)
+                && original_exit_binding_still_current(record, dir)
+        };
+        let control_healthy = || {
+            read_exit_directory_id(&control).ok() == Some(c_id)
+                && snapshot(&control) == control_before
+                && load(&control).as_ref() == Some(&independent)
+                && crate::selfcheck::load(&control) == Some(control_check.clone())
+                && crate::selfcheck::current_qualified_trade_pass(&control)
+                && original_exit_binding_still_current(&independent, &control)
+                && belongs_to_current_connection(&independent, &control)
+                && !exit_write_uncommitted(&control)
+        };
+        let c_live = |dir: &Path| {
+            crate::selfcheck::load(dir) == Some(control_check.clone())
+                && crate::selfcheck::current_qualified_trade_pass(dir)
+                && original_exit_binding_still_current(&independent, dir)
+        };
+        let matching_alias = |target: &Path, physical: &Path, id: ExitDirectoryId| {
+            assert_ne!(alias.as_path(), target);
+            assert_eq!(std::fs::canonicalize(&alias).unwrap(), physical);
+            assert_eq!(std::fs::canonicalize(target).unwrap(), physical);
+            assert_eq!(read_exit_directory_id(&alias).unwrap(), id);
+            assert_eq!(read_exit_directory_id(target).unwrap(), id);
+            assert_eq!(read_exit_directory_id(&root).unwrap(), b_id);
+            assert_eq!(read_exit_directory_id(&control).unwrap(), c_id);
+            assert_ne!(b_id, c_id);
+            assert_ne!(physical_b, physical_c);
+            assert_eq!(std::fs::canonicalize(alias.join(FILE_NAME)).unwrap(),
+                std::fs::canonicalize(target.join(FILE_NAME)).unwrap(),
+                "fixture: A must read the actual selected physical record");
+        };
+        let exact_bytes = |dir: &Path, record: &Record| {
+            std::fs::read(dir.join(FILE_NAME)).ok().as_ref()
+                == Some(&serde_json::to_string_pretty(record).unwrap().into_bytes())
+        };
+        let b_other_before = {
+            let mut files = original_before.clone();
+            assert!(files.remove(Path::new(FILE_NAME)).is_some());
+            files
+        };
+        let b_other_intact = || {
+            let mut files = snapshot(&root);
+            files.remove(Path::new(FILE_NAME));
+            files == b_other_before
+        };
+
+        create_alias(&alias, &root);
+        matching_alias(&root, &physical_b, b_id);
+        assert_eq!(load(&alias), Some(old.clone()));
+        assert!(live(&alias, &old) && live(&root, &old));
+        assert!(belongs_to_current_connection(&old, &alias)
+            && belongs_to_current_connection(&old, &root));
+        assert!(!exit_write_uncommitted(&alias) && !exit_write_uncommitted(&root));
+        assert!(control_healthy());
+        no_staging(&root);
+        no_staging(&control);
+
+        // A real link-only removal creates the actual unresolved raw path;
+        // no save failure, mocked identity result, or pending-map edit.
+        remove_alias(&alias).expect("fixture: remove only original A→B junction");
+        assert!(absent(&alias));
+        let canonical_error = std::fs::canonicalize(&alias)
+            .expect_err("fixture: actual removed junction canonicalization failure");
+        assert_eq!(read_exit_directory_id(&root).unwrap(), b_id);
+        assert_eq!(read_exit_directory_id(&control).unwrap(), c_id);
+        assert_eq!(snapshot(&root), original_before);
+        assert!(live(&root, &old) && control_healthy());
+        assert!(belongs_to_current_connection(&old, &root));
+        clear(&alias);
+        let unresolved_absent = absent(&alias);
+        let b_intact_after_failure = snapshot(&root) == original_before
+            && load(&root).as_ref() == Some(&old)
+            && std::fs::read(&path).ok().as_ref() == Some(&original_bytes);
+        let b_live_after_failure = live(&root, &old);
+        let control_after_failure = control_healthy();
+        let b_current_unresolved = belongs_to_current_connection(&old, &root);
+        no_staging(&root);
+        no_staging(&control);
+        eprintln!("RETARGET_CLEAR_FAILURE: canonical_error={canonical_error}; raw_os_error={:?}; alias_absent={unresolved_absent}; b_intact={b_intact_after_failure}; b_binding_live={b_live_after_failure}; b_current_observed={b_current_unresolved}; control_healthy={control_after_failure}",
+            canonical_error.raw_os_error());
+
+        // Restore the same raw pathname to a DIFFERENT real physical root.
+        // Its genuine C record is independently eligible, so denial through
+        // A must come from the unresolved raw marker, not a stale B binding.
+        create_alias(&alias, &control);
+        matching_alias(&control, &physical_c, c_id);
+        let c_disk_at_retarget = load(&alias).as_ref() == Some(&independent)
+            && exact_bytes(&alias, &independent);
+        assert!(c_live(&alias) && c_live(&control),
+            "fixture: A→C must expose C's independently live original binding");
+        assert!(!original_exit_binding_still_current(&old, &alias));
+        let retarget_dirty = exit_write_uncommitted(&alias);
+        let retarget_denied = !belongs_to_current_connection(&independent, &alias);
+        let c_direct_at_retarget = control_healthy();
+        let b_untouched_at_retarget = snapshot(&root) == original_before;
+        no_staging(&root);
+        no_staging(&control);
+        eprintln!("RETARGET_CLEAR_TO_C: c_disk_exact={c_disk_at_retarget}; alias_dirty={retarget_dirty}; alias_denied={retarget_denied}; c_direct_healthy={c_direct_at_retarget}; b_untouched={b_untouched_at_retarget}; c_binding_live=true");
+
+        // First real NEW authenticated B observation and commit. A still
+        // resolves to C, so this matching-B save must not retire raw A.
+        let first = match probe_and_record(&root, &line, &plan, 2_000) {
+            Some(record) => record,
+            None => {
+                let joined = target_server.stop_and_join();
+                panic!("fixture: first real B observation absent; server={joined:?}");
+            }
+        };
+        assert_eq!(first.ip, "1.1.1.1", "fixture: first actual new observation");
+        matching_alias(&control, &physical_c, c_id);
+        assert!(c_live(&alias) && c_live(&control));
+        assert!(live(&root, &old), "fixture: unchanged B binding");
+        let first_b_exact = load(&root).as_ref() == Some(&first)
+            && exact_bytes(&root, &first) && b_other_intact();
+        let first_b_live = first.attributed && first.binding == old.binding
+            && live(&root, &first);
+        let first_b_current = belongs_to_current_connection(&first, &root)
+            && !exit_write_uncommitted(&root);
+        let first_a_c_exact = load(&alias).as_ref() == Some(&independent)
+            && exact_bytes(&alias, &independent);
+        let first_a_dirty = exit_write_uncommitted(&alias);
+        let first_a_denied = !belongs_to_current_connection(&independent, &alias);
+        let control_after_first = control_healthy();
+        no_staging(&root);
+        no_staging(&control);
+        let first_bytes = std::fs::read(&path).unwrap();
+        eprintln!("RETARGET_CLEAR_NONMATCHING_B_COMMIT: observed_ip={}; b_disk_exact={first_b_exact}; b_binding={first_b_live}; b_current_clean={first_b_current}; a_c_disk_exact={first_a_c_exact}; a_dirty={first_a_dirty}; a_denied={first_a_denied}; c_direct_healthy={control_after_first}; c_binding_live=true", first.ip);
+
+        // Returning A to B does not retrospectively make the earlier B
+        // commit a recovery of A: its raw failure must remain until another
+        // actual matching commit. No extra clear or save before this check.
+        remove_alias(&alias).expect("fixture: remove only A→C junction");
+        assert!(absent(&alias));
+        create_alias(&alias, &root);
+        matching_alias(&root, &physical_b, b_id);
+        let returned_disk_exact = load(&alias).as_ref() == Some(&first)
+            && load(&root).as_ref() == Some(&first)
+            && std::fs::read(alias.join(FILE_NAME)).ok().as_ref() == Some(&first_bytes)
+            && std::fs::read(&path).ok().as_ref() == Some(&first_bytes)
+            && b_other_intact();
+        assert!(live(&alias, &first) && live(&root, &first),
+            "fixture: A→B exposes first B record with independently live binding");
+        let returned_dirty = exit_write_uncommitted(&alias);
+        let returned_denied = !belongs_to_current_connection(&first, &alias);
+        let returned_b_current = belongs_to_current_connection(&first, &root)
+            && !exit_write_uncommitted(&root);
+        let control_after_return = control_healthy();
+        no_staging(&root);
+        no_staging(&control);
+        eprintln!("RETARGET_CLEAR_RETURN_B: disk_exact={returned_disk_exact}; a_dirty={returned_dirty}; a_denied={returned_denied}; b_current_clean={returned_b_current}; c_direct_healthy={control_after_return}; b_binding_live=true");
+
+        // Second distinct actual B producer observation, with A now
+        // resolving to that physical object. This is the recovery boundary.
+        let recovered = match probe_and_record(&root, &line, &plan, 2_000) {
+            Some(record) => record,
+            None => {
+                let joined = target_server.stop_and_join();
+                panic!("fixture: matching B recovery observation absent; server={joined:?}");
+            }
+        };
+        target_server.finish(4);
+        assert_eq!(recovered.ip, "9.9.9.9", "fixture: second actual new observation");
+        matching_alias(&root, &physical_b, b_id);
+        let recovered_disk_exact = load(&alias).as_ref() == Some(&recovered)
+            && load(&root).as_ref() == Some(&recovered)
+            && exact_bytes(&alias, &recovered) && exact_bytes(&root, &recovered)
+            && b_other_intact();
+        let recovered_binding = recovered.attributed && recovered.binding == old.binding
+            && live(&alias, &recovered) && live(&root, &recovered);
+        assert!(live(&alias, &old) && live(&root, &old),
+            "fixture: new observed IP is not itself binding invalidation");
+        let a_current = belongs_to_current_connection(&recovered, &alias);
+        let b_current = belongs_to_current_connection(&recovered, &root);
+        let recovery_clean = !exit_write_uncommitted(&alias) && !exit_write_uncommitted(&root);
+        let control_after_recovery = control_healthy();
+        no_staging(&root);
+        no_staging(&control);
+        eprintln!("RETARGET_CLEAR_MATCHING_B_COMMIT: observed_ip={}; disk_exact={recovered_disk_exact}; binding={recovered_binding}; a_current={a_current}; b_current={b_current}; clean={recovery_clean}; c_direct_healthy={control_after_recovery}", recovered.ip);
+
+        // All genuine loopback workers have joined. Verify link-only
+        // cleanup and both physical objects before the primary verdict.
+        remove_alias(&alias).expect("fixture: final junction-only removal");
+        assert!(absent(&alias));
+        assert_eq!(read_exit_directory_id(&root).unwrap(), b_id);
+        assert_eq!(read_exit_directory_id(&control).unwrap(), c_id);
+        drop(cleanup);
+        assert!(!sandbox.exists(), "fixture: sandbox cleanup");
+        assert!(unresolved_absent && b_intact_after_failure && b_live_after_failure
+            && b_untouched_at_retarget && control_after_failure,
+            "RETARGET_CLEAR_CONTRACT_RED: unresolved direct clear must not alter physical evidence");
+        assert!(c_disk_at_retarget && retarget_dirty && retarget_denied && c_direct_at_retarget,
+            "RETARGET_CLEAR_CONTRACT_RED: raw A must deny valid C through retargeted junction without denying C directly");
+        assert!(first_b_exact && first_b_live && first_b_current
+            && first_a_c_exact && first_a_dirty && first_a_denied && control_after_first,
+            "RETARGET_CLEAR_CONTRACT_RED: real B commit while A→C cannot retire raw A failure or affect C");
+        assert!(returned_disk_exact && returned_dirty && returned_denied
+            && returned_b_current && control_after_return,
+            "RETARGET_CLEAR_CONTRACT_RED: returning A→B must not retrospectively recover raw A");
+        assert!(recovered_disk_exact && recovered_binding && a_current && b_current
+            && recovery_clean && control_after_recovery,
+            "RETARGET_CLEAR_CONTRACT_RED: subsequent genuine matching B commit must recover A/B with C intact");
+    }
 }
