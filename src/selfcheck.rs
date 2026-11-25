@@ -2804,14 +2804,42 @@ mod tests {
         let line = mvp03_b2_config_fixture(&root);
         assert_eq!(line.verified_transport, None);
         let port = fake_socks5("pass", "u", "p");
-        runtime_probe(&root, port);
+        // Model the selected UDP WireGuard endpoint itself, not a VLESS
+        // placeholder or an unrelated WG endpoint added just for classification.
+        // All keys/addresses are synthetic; only the loopback SOCKS is run.
+        let runtime = root.join("runtime-engine.json");
+        std::fs::write(&runtime, serde_json::json!({
+            "endpoints":[{
+                "type":"wireguard","tag":"hk","address":["10.7.0.2/32"],
+                "private_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                "peers":[{"address":"203.0.113.7","port":51820,
+                    "public_key":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+                    "allowed_ips":["0.0.0.0/0"]}]
+            }],
+            "outbounds":[
+                {"type":"selector","tag":"trade-exit","outbounds":["hk"],"default":"hk"},
+                {"type":"direct","tag":"direct"}
+            ],
+            "inbounds":[{"type":"socks","tag":"tc-check","listen":"127.0.0.1",
+                "listen_port":port,"users":[{"username":"u","password":"p"}]}],
+            "route":{"rules":[{"inbound":["tc-check"],"outbound":"trade-exit"}]}
+        }).to_string()).unwrap();
+        assert_eq!(crate::engine_config::actual_transport(&runtime),
+            Some(crate::config::Transport::Udp), "B2 fixture must identify real UDP shape");
+        assert_eq!(line.effective_transport(), crate::config::Transport::Udp,
+            "B2 caller must request the UDP runtime transport");
         let plan = dial_plan(port, "u", "p");
         // Real production auto-check finishes AND its own current disk
         // evidence is accepted BEFORE caller-stage mutation.
         let returned = check_and_record(&root, &plan, 2_000);
         assert!(returned.ok && returned.status == Some(204), "valid first phase: {returned:?}");
         assert_eq!(load(&root), Some(returned.clone()), "real persisted auto PASS");
+        assert!(current_qualified_trade_pass(&root),
+            "B2 fixture must have a qualified live PASS before caller mutation");
         mvp03_b2_after_return_mutation(&root, change);
+        assert_eq!(crate::engine_config::actual_transport(&runtime),
+            Some(crate::config::Transport::Udp),
+            "B2 mutation must retain identifiable UDP so rejection is not due to unknown transport");
         if change != "none" {
             assert!(!load(&root).is_some_and(|c| c.ok),
                 "new shared reader already recognizes that cached PASS is now stale");
@@ -3057,4 +3085,327 @@ mod tests {
         }
     }
 
+
+    /// #88: the auto winner may differ from the old effective transport.
+    /// Model that caller input, then use the real preparation, authenticated
+    /// Check and config writer. No actual autoroute probe, IPC handler,
+    /// sing-box, VPN, system proxy or remote destination is executed.
+    #[test]
+    fn mvp03_autoroute_verified_transport_matches_qualified_runtime_not_old_preference() {
+        use crate::config::{self, Mode, Transport};
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+
+        struct Sandbox(std::path::PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                    eprintln!("AUTOROUTE_TRANSPORT_FIXTURE cleanup failed: {e}");
+                }
+            }
+        }
+
+        struct Loopback {
+            listener: TcpListener,
+            stop: Arc<AtomicBool>,
+            worker: Option<std::thread::JoinHandle<usize>>,
+        }
+        impl Loopback {
+            fn start(label: String, bodies: Vec<&'static str>) -> Self {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let active = listener.try_clone().unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker_stop = Arc::clone(&stop);
+                let worker = std::thread::spawn(move || {
+                    let mut completed = 0;
+                    for (phase, body) in bodies.into_iter().enumerate() {
+                        let (mut s, _) = active.accept().expect("fixture: loopback accept");
+                        if worker_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_nodelay(true).unwrap();
+                        eprintln!("AUTOROUTE_TRANSPORT_FIXTURE {label} phase={phase}: accepted");
+                        let mut greet = [0u8; 4];
+                        s.read_exact(&mut greet).unwrap();
+                        assert_eq!(greet, [0x05, 0x02, 0x00, 0x02]);
+                        s.write_all(&[0x05, 0x02]).unwrap();
+                        let mut auth = [0u8; 2];
+                        s.read_exact(&mut auth).unwrap();
+                        assert_eq!(auth[0], 0x01);
+                        let mut user = vec![0u8; usize::from(auth[1])];
+                        s.read_exact(&mut user).unwrap();
+                        let mut plen = [0u8; 1];
+                        s.read_exact(&mut plen).unwrap();
+                        let mut pass = vec![0u8; usize::from(plen[0])];
+                        s.read_exact(&mut pass).unwrap();
+                        assert_eq!(user, b"u");
+                        assert_eq!(pass, b"p");
+                        s.write_all(&[0x01, 0x00]).unwrap();
+                        eprintln!("AUTOROUTE_TRANSPORT_FIXTURE {label} phase={phase}: authenticated");
+                        let mut connect = [0u8; 5];
+                        s.read_exact(&mut connect).unwrap();
+                        assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x03]);
+                        let mut target = vec![0u8; usize::from(connect[4]) + 2];
+                        s.read_exact(&mut target).unwrap();
+                        let (host, path) = if body.is_empty() {
+                            ("www.gstatic.com", "/generate_204")
+                        } else {
+                            ("checkip.amazonaws.com", "/")
+                        };
+                        assert_eq!(&target[..target.len() - 2], host.as_bytes(),
+                            "fixture {label} phase={phase}: expected SOCKS host");
+                        assert_eq!(&target[target.len() - 2..], &80u16.to_be_bytes());
+                        s.write_all(&[0x05, 0, 0, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+                        // Consume the complete bounded origin-form HTTP request.
+                        let mut req = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while !req.ends_with(b"\r\n\r\n") {
+                            let n = s.read(&mut chunk).expect("fixture: HTTP request read");
+                            assert_ne!(n, 0, "fixture: premature HTTP request EOF");
+                            req.extend_from_slice(&chunk[..n]);
+                            assert!(req.len() <= 8192, "fixture: bounded HTTP header");
+                        }
+                        assert!(req.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()),
+                            "fixture {label} phase={phase}: origin-form GET");
+                        eprintln!("AUTOROUTE_TRANSPORT_FIXTURE {label} phase={phase}: HTTP request complete host={host}");
+                        let status = if body.is_empty() { "204 No Content" } else { "200 OK" };
+                        s.write_all(format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ).as_bytes()).expect("fixture: HTTP response write");
+                        // socks5_text reads the body through EOF, not only
+                        // Content-Length. Finish the write half explicitly.
+                        if !body.is_empty() {
+                            s.shutdown(std::net::Shutdown::Write)
+                                .expect("fixture: complete response EOF");
+                        }
+                        completed += 1;
+                        eprintln!("AUTOROUTE_TRANSPORT_FIXTURE {label} phase={phase}: response completed status={status} body={body:?}");
+                    }
+                    completed
+                });
+                Self { listener, stop, worker: Some(worker) }
+            }
+
+            fn port(&self) -> u16 {
+                self.listener.local_addr().unwrap().port()
+            }
+
+            fn stop_and_join(&mut self) -> Option<std::thread::Result<usize>> {
+                let worker = self.worker.take()?;
+                self.stop.store(true, Ordering::SeqCst);
+                if !worker.is_finished() {
+                    // Only an isolated local listener; no remote connection.
+                    let addr = self.listener.local_addr().unwrap();
+                    let _ = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+                }
+                Some(worker.join())
+            }
+
+            fn finish(&mut self, expected: usize) {
+                let completed = self.stop_and_join().unwrap().expect("fixture: authenticated server");
+                assert_eq!(completed, expected, "fixture: exact real HTTP exchange count");
+            }
+        }
+        impl Drop for Loopback {
+            fn drop(&mut self) {
+                if let Some(result) = self.stop_and_join() {
+                    match result {
+                        Ok(count) => eprintln!("AUTOROUTE_TRANSPORT_FIXTURE cleanup: completed={count}"),
+                        Err(_) => eprintln!("AUTOROUTE_TRANSPORT_FIXTURE cleanup: server thread panicked (see actual panic above)"),
+                    }
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        struct Outcome {
+            wrote: bool,
+            verified: Option<Transport>,
+            exact_expected_config: bool,
+            original_bytes_unchanged: bool,
+            preference_and_selection_unchanged: bool,
+            non_config_evidence_unchanged: bool,
+            live_after: bool,
+            repeat_unchanged: bool,
+        }
+
+        fn run_case(
+            tag: &str,
+            fixed: Option<Transport>,
+            requested: Transport,
+            should_write: bool,
+        ) -> Outcome {
+            let root = tmp_root(tag);
+            let cleanup = Sandbox(root.clone());
+            let path = root.join(config::DEFAULT_PATH);
+            let mut cfg = config::parse(
+                r#"{"schema":2,"selected":"L1","lines":[
+                    {"id":"L1","name":"selected-fixture","proxy_endpoint":"127.0.0.1:17891"},
+                    {"id":"L2","name":"untouched-fixture","proxy_endpoint":"127.0.0.1:17892","transport":"udp"}]}"#
+            ).unwrap();
+            cfg.lines[0].transport = fixed;
+            assert_eq!(cfg.lines[0].verified_transport, None);
+            config::save(&path, &cfg).unwrap();
+            let before = config::load(&path).unwrap().unwrap();
+            let line = before.current_line().unwrap().clone();
+            assert_eq!(before.selected, "L1");
+            assert_eq!(line.id, "L1");
+            assert_eq!(line.transport, fixed);
+            assert_eq!(line.verified_transport, None,
+                "fixture: do not exercise pre-existing verified idempotence");
+            assert_eq!(line.effective_transport(), fixed.unwrap_or(Transport::Udp));
+
+            // Representative, entirely synthetic WireGuard + complete
+            // VLESS/REALITY parameters; reuse the tested parameter shape.
+            // The reserved documentation addresses are never dialed.
+            std::fs::create_dir_all(root.join("lines")).unwrap();
+            let source = line.engine_config_path(&root);
+            std::fs::write(&source, serde_json::json!({
+                "log":{"level":"warn"},
+                "inbounds":[{"type":"mixed","tag":"tc-mixed","listen":"127.0.0.1","listen_port":17891}],
+                "endpoints":[{
+                    "type":"wireguard","tag":"hk","address":["10.7.0.2/32"],
+                    "private_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                    "peers":[{"address":"203.0.113.7","port":51820,
+                        "public_key":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+                        "allowed_ips":["0.0.0.0/0"]}]
+                }],
+                "outbounds":[
+                    {"type":"vless","tag":"provider-a","server":"203.0.113.7","server_port":443,
+                     "uuid":"11111111-2222-3333-4444-555555555555",
+                     "tls":{"enabled":true,"server_name":"cdn.example.com",
+                         "utls":{"enabled":true,"fingerprint":"chrome"},
+                         "reality":{"enabled":true,
+                            "public_key":"A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0Uv1",
+                            "short_id":"ab12"}}},
+                    {"type":"selector","tag":"trade-exit","outbounds":["hk"],"default":"hk"},
+                    {"type":"selector","tag":"daily-exit","outbounds":["direct","hk"],"default":"direct"},
+                    {"type":"direct","tag":"direct"}
+                ],
+                "route":{"rules":[{"inbound":["tc-mixed"],"outbound":"daily-exit"}],
+                    "final":"daily-exit"}
+            }).to_string()).unwrap();
+            assert_eq!(crate::engine_config::actual_transport(&source), Some(Transport::Udp),
+                "fixture: source must have standard WG shape before real derivation");
+
+            // Use the established live-test-process runtime fixture, not an
+            // actual sing-box engine or a fabricated Check. The probe itself
+            // performs the complete real authenticated local exchange.
+            live_engine(&root);
+            with_creds(&root, "u", "p");
+            let mut server = Loopback::start(tag.to_string(), vec![""]);
+            let port = server.port();
+            let runtime = root.join("runtime-engine.json");
+            let prepared = crate::engine_config::prepare_engine_config(
+                &source, &before.split, &before.agents, Transport::Tcp, Mode::Proxy,
+                &runtime, "", Some(("u", "p")), Some(port),
+            ).expect("fixture: real production runtime preparation");
+            assert_eq!(prepared, runtime, "fixture: must use derived runtime file");
+            assert_eq!(crate::engine_config::actual_transport(&runtime), Some(Transport::Tcp),
+                "fixture: complete actual TCP shape, not inferred from requested enum");
+            let shape: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&runtime).unwrap()).unwrap();
+            assert_eq!(shape["endpoints"][0]["type"], "wireguard");
+            assert_eq!(shape["endpoints"][0]["detour"], "tc-transport");
+            assert!(shape["outbounds"].as_array().unwrap().iter().any(|v|
+                v["tag"] == "tc-transport" && v["type"] == "vless"));
+            assert!(crate::engine_config::probe_evidence_skip_reason_for_session(
+                &runtime, port, "u", "p",
+            ).is_none(), "fixture: live authenticated tc-check route must qualify");
+            assert_eq!(probe_creds(&root), Some(("u".to_string(), "p".to_string())));
+            let session = check_session_fingerprint(&root).expect("fixture: live session");
+            let plan = dial_plan(port, "u", "p");
+            let returned = check_and_record(&root, &plan, 2_000);
+            server.finish(1);
+            assert!(returned.ok && returned.status == Some(204)
+                && returned.via_trade_exit && returned.skipped.is_none(),
+                "fixture: actual authenticated Check204 required: {returned:?}");
+            assert_eq!(load(&root), Some(returned.clone()));
+            assert!(current_qualified_trade_pass(&root));
+            assert_eq!(check_session_fingerprint(&root).as_ref(), Some(&session));
+            let check_bytes = std::fs::read(root.join(FILE_NAME)).unwrap();
+            let check_json: serde_json::Value = serde_json::from_slice(&check_bytes).unwrap();
+            assert_eq!(check_json["session_fingerprint"].as_str(), Some(session.as_str()));
+            assert_eq!(check_json["auto_probe_port"].as_u64(), Some(u64::from(port)));
+            assert!(check_json["auto_engine_fingerprint"].as_str().is_some_and(|s| s.len() == 64));
+            let original = std::fs::read(&path).unwrap();
+            let original_source = std::fs::read(&source).unwrap();
+            let original_runtime = std::fs::read(&runtime).unwrap();
+            let original_session = std::fs::read(root.join("runtime.json")).unwrap();
+            assert_eq!(config::load(&path).unwrap().unwrap(), before,
+                "fixture: Check must not pre-write verified_transport");
+
+            // Exact caller-stage predicate and actual config writer. TCP is
+            // a modeled automatic winner, not a claim about real selection.
+            // The negative requests old effective UDP against the SAME
+            // genuinely qualified TCP-shaped runtime on a separate root.
+            let wrote = if returned.ok {
+                config::record_verified_transport(&root, &line.id, requested)
+                    .expect("actual config persistence path")
+            } else { false };
+            let after = config::load(&path).unwrap().unwrap();
+            let bytes_after = std::fs::read(&path).unwrap();
+            let saved = after.current_line().unwrap();
+            let mut expected = before.clone();
+            if should_write {
+                expected.lines[0].verified_transport = Some(requested);
+            }
+            let verified = saved.verified_transport;
+            let exact_expected_config = after == expected;
+            let original_bytes_unchanged = bytes_after == original;
+            let preference_and_selection_unchanged = saved.transport == fixed
+                && saved.id == line.id && after.selected == before.selected;
+            let repeat_unchanged = if should_write {
+                let repeated = config::record_verified_transport(&root, &line.id, requested)
+                    .expect("actual repeated caller persistence");
+                !repeated && std::fs::read(&path).unwrap() == bytes_after
+                    && config::load(&path).unwrap().unwrap() == after
+            } else {
+                true
+            };
+            let non_config_evidence_unchanged =
+                std::fs::read(&source).unwrap() == original_source
+                && std::fs::read(&runtime).unwrap() == original_runtime
+                && std::fs::read(root.join("runtime.json")).unwrap() == original_session
+                && std::fs::read(root.join(FILE_NAME)).unwrap() == check_bytes;
+            let live_after = load(&root) == Some(returned)
+                && current_qualified_trade_pass(&root)
+                && check_session_fingerprint(&root).as_ref() == Some(&session)
+                && crate::engine_config::actual_transport(&runtime) == Some(Transport::Tcp);
+            let result = Outcome { wrote, verified, exact_expected_config,
+                original_bytes_unchanged, preference_and_selection_unchanged,
+                non_config_evidence_unchanged, live_after, repeat_unchanged };
+            eprintln!("AUTOROUTE_TRANSPORT_CASE {tag}: modeled_requested={requested:?}; old_effective={:?}; fixed={fixed:?}; actual_runtime=Tcp; qualified_check_204=true; result={result:?}",
+                line.effective_transport());
+            // Finish every independent case and cleanup before classifying
+            // any target violation. On unwind both server and sandbox have RAII.
+            drop(server);
+            drop(cleanup);
+            assert!(!root.exists(), "fixture: isolated sandbox cleanup");
+            result
+        }
+
+        let positive = run_case("mvp03-auto-winner-tcp", None, Transport::Tcp, true);
+        let wrong = run_case("mvp03-auto-wrong-udp", None, Transport::Udp, false);
+        let fixed = run_case("mvp03-fixed-udp-conflict", Some(Transport::Udp), Transport::Tcp, false);
+        let stable = run_case("mvp03-fixed-tcp-control", Some(Transport::Tcp), Transport::Tcp, true);
+
+        let safe = |o: &Outcome| o.preference_and_selection_unchanged
+            && o.non_config_evidence_unchanged && o.live_after;
+        assert!(stable.wrote && stable.verified == Some(Transport::Tcp)
+            && stable.exact_expected_config && !stable.original_bytes_unchanged
+            && stable.repeat_unchanged && safe(&stable),
+            "AUTOROUTE_TRANSPORT_CONTROL_FAILED: stable fixed TCP actual write/idempotence: {stable:?}");
+        assert!(!fixed.wrote && fixed.verified.is_none()
+            && fixed.exact_expected_config && fixed.original_bytes_unchanged && safe(&fixed),
+            "AUTOROUTE_TRANSPORT_FIXED_CONTRACT_RED: fixed UDP cannot be overridden: {fixed:?}");
+        assert!(positive.wrote && positive.verified == Some(Transport::Tcp)
+            && positive.exact_expected_config && !positive.original_bytes_unchanged
+            && positive.repeat_unchanged && safe(&positive)
+            && !wrong.wrote && wrong.verified.is_none()
+            && wrong.exact_expected_config && wrong.original_bytes_unchanged && safe(&wrong),
+            "AUTOROUTE_TRANSPORT_CONTRACT_RED: selected TCP must persist despite old Auto UDP, and old-effective UDP must not be persisted against actual TCP; positive={positive:?}; wrong_runtime={wrong:?}");
+    }
 }
