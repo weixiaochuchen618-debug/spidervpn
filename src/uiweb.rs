@@ -3406,7 +3406,12 @@ impl WebUi {
             // 取不到（没配交易出口 / 读配置失败）就是空串——「不知道」不该伪装成某个地名。
             "TradeExit": st.get("exitTrade").and_then(Value::as_str).unwrap_or(""),
             "ActiveLineId": selected,
-            "ActiveProfile": st.get("transportActual").and_then(Value::as_str).map(|t| if t == "UDP" { "Udp" } else { "Tcp" }).unwrap_or(""),
+            // IPC emits display labels; keep exact legacy tokens without guessing unknown values.
+            "ActiveProfile": match st.get("transportActual").and_then(Value::as_str) {
+                Some("标准连接" | "UDP") => "Udp",
+                Some("兼容连接" | "TCP") => "Tcp",
+                _ => "",
+            },
             "PreferredLineId": selected,
             "HomeLineId": selected,
             // 交易保护三态：**只来自后端 status 的判定**（`ipc::status_json` → `guard::status`）。
