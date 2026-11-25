@@ -3920,4 +3920,434 @@ mod tests {
             && clean_control_during && clean_control_after,
             "CLEAR_OVERLAP_CONTRACT_RED: independent physical control must remain intact and CURRENT");
     }
+
+    /// #84: a direct clear through a genuinely unresolved junction must
+    /// retain its raw alias failure until a matching physical save commits.
+    /// Ordered same-process contract only; no general path-race claim.
+    #[cfg(windows)]
+    #[test]
+    fn windows_clear_unresolved_alias_preserves_failure_until_matching_save() {
+        use std::os::windows::fs::MetadataExt;
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        fn absent(path: &Path) -> bool {
+            matches!(std::fs::symlink_metadata(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        }
+
+        fn create_alias(link: &Path, target: &Path) {
+            assert!(absent(link), "fixture: junction path must be absent");
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/C", "mklink", "/J"])
+                .arg(link).arg(target).output()
+                .expect("fixture: execute native mklink /J");
+            assert!(output.status.success(),
+                "fixture: junction creation failed: status={}; stdout={}; stderr={}",
+                output.status, String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr));
+            assert_ne!(std::fs::symlink_metadata(link).unwrap().file_attributes()
+                & FILE_ATTRIBUTE_REPARSE_POINT, 0,
+                "fixture: actual directory reparse point");
+        }
+
+        // Never recurse through the junction, including on panic. If link
+        // removal fails or its type cannot be verified, leave the isolated
+        // sandbox intact rather than attempting recursive deletion.
+        fn remove_alias(link: &Path) -> Result<(), String> {
+            let md = match std::fs::symlink_metadata(link) {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            };
+            if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                return Err("fixture: refusing removal of non-reparse alias path".into());
+            }
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/C", "rmdir"]).arg(link).output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() || !absent(link) {
+                return Err(format!("fixture: junction-only rmdir failed: status={}; stdout={}; stderr={}",
+                    output.status, String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)));
+            }
+            Ok(())
+        }
+
+        struct Sandbox {
+            root: std::path::PathBuf,
+            alias: std::path::PathBuf,
+        }
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                if let Err(e) = remove_alias(&self.alias) {
+                    eprintln!("ALIAS_CLEAR_FIXTURE refusing recursive cleanup: {e}");
+                    return;
+                }
+                if let Err(e) = std::fs::remove_dir_all(&self.root) {
+                    eprintln!("ALIAS_CLEAR_FIXTURE cleanup failed: {e}");
+                }
+            }
+        }
+
+        // Same authenticated, bounded loopback transport pattern as the
+        // native-passing #78 fixture, with finite cancellation and joining.
+        struct Loopback {
+            listener: TcpListener,
+            stop: Arc<AtomicBool>,
+            worker: Option<std::thread::JoinHandle<usize>>,
+        }
+        impl Loopback {
+            fn start(label: String, bodies: Vec<&'static str>) -> Self {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let active = listener.try_clone().unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker_stop = Arc::clone(&stop);
+                let worker = std::thread::spawn(move || {
+                    let mut completed = 0;
+                    for (phase, body) in bodies.into_iter().enumerate() {
+                        let (mut s, _) = active.accept().expect("fixture: loopback accept");
+                        if worker_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                        s.set_nodelay(true).unwrap();
+                        eprintln!("ALIAS_CLEAR_FIXTURE {label} phase={phase}: accepted");
+                        let mut greet = [0u8; 4];
+                        s.read_exact(&mut greet).unwrap();
+                        assert_eq!(greet, [0x05, 0x02, 0x00, 0x02]);
+                        s.write_all(&[0x05, 0x02]).unwrap();
+                        let mut auth = [0u8; 2];
+                        s.read_exact(&mut auth).unwrap();
+                        assert_eq!(auth[0], 0x01);
+                        let mut user = vec![0u8; usize::from(auth[1])];
+                        s.read_exact(&mut user).unwrap();
+                        let mut plen = [0u8; 1];
+                        s.read_exact(&mut plen).unwrap();
+                        let mut pass = vec![0u8; usize::from(plen[0])];
+                        s.read_exact(&mut pass).unwrap();
+                        assert_eq!(user, b"u");
+                        assert_eq!(pass, b"p");
+                        s.write_all(&[0x01, 0x00]).unwrap();
+                        eprintln!("ALIAS_CLEAR_FIXTURE {label} phase={phase}: authenticated");
+                        let mut connect = [0u8; 5];
+                        s.read_exact(&mut connect).unwrap();
+                        assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x03]);
+                        let mut target = vec![0u8; usize::from(connect[4]) + 2];
+                        s.read_exact(&mut target).unwrap();
+                        let (host, path) = if body.is_empty() {
+                            ("www.gstatic.com", "/generate_204")
+                        } else {
+                            ("checkip.amazonaws.com", "/")
+                        };
+                        assert_eq!(&target[..target.len() - 2], host.as_bytes(),
+                            "fixture {label} phase={phase}: expected SOCKS host");
+                        assert_eq!(&target[target.len() - 2..], &80u16.to_be_bytes());
+                        s.write_all(&[0x05, 0, 0, 0x01, 127, 0, 0, 1, 0, 0]).unwrap();
+                        // Consume the complete bounded origin-form HTTP request.
+                        let mut req = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while !req.ends_with(b"\r\n\r\n") {
+                            let n = s.read(&mut chunk).expect("fixture: HTTP request read");
+                            assert_ne!(n, 0, "fixture: premature HTTP request EOF");
+                            req.extend_from_slice(&chunk[..n]);
+                            assert!(req.len() <= 8192, "fixture: bounded HTTP header");
+                        }
+                        assert!(req.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()),
+                            "fixture {label} phase={phase}: origin-form GET");
+                        eprintln!("ALIAS_CLEAR_FIXTURE {label} phase={phase}: HTTP request complete host={host}");
+                        let status = if body.is_empty() { "204 No Content" } else { "200 OK" };
+                        s.write_all(format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ).as_bytes()).expect("fixture: HTTP response write");
+                        // socks5_text reads the body through EOF, not only
+                        // Content-Length. Finish the write half explicitly.
+                        if !body.is_empty() {
+                            s.shutdown(std::net::Shutdown::Write)
+                                .expect("fixture: complete response EOF");
+                        }
+                        completed += 1;
+                        eprintln!("ALIAS_CLEAR_FIXTURE {label} phase={phase}: response completed status={status} body={body:?}");
+                    }
+                    completed
+                });
+                Self { listener, stop, worker: Some(worker) }
+            }
+
+            fn port(&self) -> u16 {
+                self.listener.local_addr().unwrap().port()
+            }
+
+            fn stop_and_join(&mut self) -> Option<std::thread::Result<usize>> {
+                let worker = self.worker.take()?;
+                self.stop.store(true, Ordering::SeqCst);
+                if !worker.is_finished() {
+                    // Only an isolated local listener; no remote connection.
+                    let addr = self.listener.local_addr().unwrap();
+                    let _ = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+                }
+                Some(worker.join())
+            }
+
+            fn finish(&mut self, expected: usize) {
+                let completed = self.stop_and_join().unwrap().expect("fixture: authenticated server");
+                assert_eq!(completed, expected, "fixture: exact real HTTP exchange count");
+            }
+        }
+        impl Drop for Loopback {
+            fn drop(&mut self) {
+                if let Some(result) = self.stop_and_join() {
+                    match result {
+                        Ok(count) => eprintln!("ALIAS_CLEAR_FIXTURE cleanup: completed={count}"),
+                        Err(_) => eprintln!("ALIAS_CLEAR_FIXTURE cleanup: server thread panicked (see actual panic above)"),
+                    }
+                }
+            }
+        }
+
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn walk(base: &Path, dir: &Path,
+                out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let md = std::fs::symlink_metadata(&path).unwrap();
+                    assert!(!md.file_type().is_symlink());
+                    if md.is_dir() {
+                        walk(base, &path, out);
+                    } else {
+                        assert!(md.is_file());
+                        out.insert(path.strip_prefix(base).unwrap().to_path_buf(),
+                            std::fs::read(&path).unwrap());
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            walk(root, root, &mut out);
+            out
+        }
+
+        fn no_staging(root: &Path) {
+            for entry in std::fs::read_dir(root).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(!name.to_string_lossy().starts_with("exit-probe.json.tmp"),
+                    "unexpected exit staging: {name:?}");
+            }
+        }
+
+        let sandbox = tmp_root("clear-unresolved-alias");
+        let root = sandbox.join("physical-b");
+        let control = sandbox.join("independent-c");
+        let alias = sandbox.join("alias-a");
+        let cleanup = Sandbox { root: sandbox.clone(), alias: alias.clone() };
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&control).unwrap();
+        assert_ne!(read_exit_directory_id(&root).unwrap(),
+            read_exit_directory_id(&control).unwrap());
+
+        let observe = |dir: &Path, bodies: Vec<&'static str>| {
+            let mut server = Loopback::start(dir.display().to_string(), bodies);
+            let line = qualified_probe_fixture(dir, server.port());
+            // The old and new response IPs both match the unchanged line.
+            std::fs::write(line.engine_config_path(dir), serde_json::json!({
+                "outbounds": [
+                    {"type":"vless","server":"8.8.8.8","server_port":8443},
+                    {"type":"vless","server":"1.1.1.1","server_port":8443}
+                ]
+            }).to_string()).unwrap();
+            let plan = qualified_plan(server.port());
+            let check = crate::selfcheck::check_and_record(dir, &plan, 2_000);
+            assert!(check.ok && check.via_trade_exit && check.status == Some(204)
+                && crate::selfcheck::current_qualified_trade_pass(dir),
+                "fixture: genuinely qualified Check {dir:?}: {check:?}");
+            let old = match probe_and_record(dir, &line, &plan, 2_000) {
+                Some(record) => record,
+                None => {
+                    let joined = server.stop_and_join();
+                    panic!("fixture: initial real observation absent for {dir:?}; server={joined:?}");
+                }
+            };
+            assert_eq!(old.ip, "8.8.8.8");
+            assert!(old.attributed && old.binding.is_some());
+            assert_eq!(load(dir), Some(old.clone()));
+            assert!(original_exit_binding_still_current(&old, dir));
+            assert!(belongs_to_current_connection(&old, dir));
+            assert!(!exit_write_uncommitted(dir));
+            no_staging(dir);
+            (server, line, plan, old, check)
+        };
+        let (mut target_server, line, plan, old, check) =
+            observe(&root, vec!["", "8.8.8.8\n", "1.1.1.1\n"]);
+        let (mut control_server, _, _, independent, control_check) =
+            observe(&control, vec!["", "8.8.8.8\n"]);
+        control_server.finish(2);
+        assert_ne!(old.binding, independent.binding);
+        assert!(!original_exit_binding_still_current(&old, &control));
+        assert!(!original_exit_binding_still_current(&independent, &root));
+        let control_before = snapshot(&control);
+        let b_id = read_exit_directory_id(&root).unwrap();
+        let c_id = read_exit_directory_id(&control).unwrap();
+        let physical = std::fs::canonicalize(&root).unwrap();
+        let path = root.join(FILE_NAME);
+        let original_before = snapshot(&root);
+        let original_bytes = std::fs::read(&path).unwrap();
+        let live = |dir: &Path, record: &Record| {
+            crate::selfcheck::load(dir) == Some(check.clone())
+                && crate::selfcheck::current_qualified_trade_pass(dir)
+                && original_exit_binding_still_current(record, dir)
+        };
+        let control_healthy = || {
+            read_exit_directory_id(&control).ok() == Some(c_id)
+                && snapshot(&control) == control_before
+                && load(&control).as_ref() == Some(&independent)
+                && crate::selfcheck::load(&control) == Some(control_check.clone())
+                && crate::selfcheck::current_qualified_trade_pass(&control)
+                && original_exit_binding_still_current(&independent, &control)
+                && belongs_to_current_connection(&independent, &control)
+                && !exit_write_uncommitted(&control)
+        };
+        let matching_alias = || {
+            assert_ne!(alias, root);
+            assert_eq!(std::fs::canonicalize(&alias).unwrap(), physical);
+            assert_eq!(std::fs::canonicalize(&root).unwrap(), physical);
+            assert_eq!(read_exit_directory_id(&alias).unwrap(), b_id);
+            assert_eq!(read_exit_directory_id(&root).unwrap(), b_id);
+            assert_ne!(b_id, c_id);
+        };
+        create_alias(&alias, &root);
+        matching_alias();
+        assert_eq!(std::fs::canonicalize(alias.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(&path).unwrap());
+        assert_eq!(load(&alias), Some(old.clone()));
+        assert!(live(&alias, &old) && live(&root, &old));
+        assert!(belongs_to_current_connection(&old, &alias)
+            && belongs_to_current_connection(&old, &root));
+        assert!(!exit_write_uncommitted(&alias) && !exit_write_uncommitted(&root));
+        assert!(control_healthy());
+        no_staging(&root);
+        no_staging(&control);
+
+        // Real native link-only removal, not a fake identity failure.
+        remove_alias(&alias).expect("fixture: remove only original junction");
+        assert!(absent(&alias));
+        let canonical_error = std::fs::canonicalize(&alias)
+            .expect_err("fixture: removed junction must actually fail canonicalization");
+        assert_eq!(read_exit_directory_id(&root).unwrap(), b_id);
+        assert_eq!(snapshot(&root), original_before);
+        assert!(live(&root, &old) && control_healthy());
+        assert!(belongs_to_current_connection(&old, &root));
+
+        // No prior failed save or pending-map edit. This is the actual
+        // production clear API through the unresolved raw A path.
+        clear(&alias);
+        let absent_after_failed_clear = absent(&alias);
+        let b_intact_after_failure = snapshot(&root) == original_before
+            && load(&root).as_ref() == Some(&old);
+        let b_current_while_unresolved = belongs_to_current_connection(&old, &root);
+        let control_after_failure = control_healthy();
+        assert_eq!(read_exit_directory_id(&root).unwrap(), b_id);
+        assert!(live(&root, &old));
+        no_staging(&root);
+        eprintln!("UNRESOLVED_CLEAR_FAILURE: canonical_error={canonical_error}; raw_os_error={:?}; alias_absent={absent_after_failed_clear}; b_intact={b_intact_after_failure}; b_current_observed={b_current_while_unresolved}; control_healthy={control_after_failure}",
+            canonical_error.raw_os_error());
+
+        // Restore exactly the original physical target. An unresolved raw
+        // alias failure is not a physical-B failure and need not deny B.
+        create_alias(&alias, &root);
+        matching_alias();
+        assert_eq!(std::fs::canonicalize(alias.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(&path).unwrap());
+        let restored_bytes_exact = std::fs::read(&path).ok().as_ref() == Some(&original_bytes)
+            && std::fs::read(alias.join(FILE_NAME)).ok().as_ref() == Some(&original_bytes);
+        let restored_disk_exact = load(&alias).as_ref() == Some(&old)
+            && load(&root).as_ref() == Some(&old);
+        assert!(live(&alias, &old) && live(&root, &old),
+            "fixture: original binding independently live after restoration");
+        let restored_dirty = exit_write_uncommitted(&alias);
+        let restored_denied = !belongs_to_current_connection(&old, &alias);
+        let b_current_after_restore = belongs_to_current_connection(&old, &root);
+        let control_after_restore = control_healthy();
+        no_staging(&root);
+        eprintln!("UNRESOLVED_CLEAR_RESTORED: old_bytes_exact={restored_bytes_exact}; disk_exact={restored_disk_exact}; alias_dirty={restored_dirty}; alias_denied={restored_denied}; b_current_observed={b_current_after_restore}; live_binding=true; control_healthy={control_after_restore}");
+
+        // Successful and absent clear are not evidence commits. Verify
+        // actual removal on both spellings, and the held old record's
+        // eligibility separately from load(None) and binding validity.
+        let mut expected_after_clear = original_before.clone();
+        assert!(expected_after_clear.remove(Path::new(FILE_NAME)).is_some());
+        clear(&alias);
+        matching_alias();
+        let removed = absent(&path) && absent(&alias.join(FILE_NAME))
+            && load(&root).is_none() && load(&alias).is_none();
+        let b_other_bytes_after_success = snapshot(&root) == expected_after_clear;
+        let success_dirty = exit_write_uncommitted(&alias);
+        let success_denied = !belongs_to_current_connection(&old, &alias);
+        assert!(live(&alias, &old) && live(&root, &old));
+        no_staging(&root);
+        let control_after_success = control_healthy();
+        clear(&alias);
+        matching_alias();
+        let still_absent = absent(&path) && absent(&alias.join(FILE_NAME))
+            && load(&root).is_none() && load(&alias).is_none();
+        let b_other_bytes_after_absent = snapshot(&root) == expected_after_clear;
+        let absent_dirty = exit_write_uncommitted(&alias);
+        let absent_denied = !belongs_to_current_connection(&old, &alias);
+        assert!(live(&alias, &old) && live(&root, &old));
+        no_staging(&root);
+        let control_after_absent = control_healthy();
+        eprintln!("UNRESOLVED_CLEAR_LATER: removed={removed}; b_other_bytes_success={b_other_bytes_after_success}; success_dirty={success_dirty}; success_denied={success_denied}; still_absent={still_absent}; b_other_bytes_absent={b_other_bytes_after_absent}; absent_dirty={absent_dirty}; absent_denied={absent_denied}; control_success={control_after_success}; control_absent={control_after_absent}; live_binding=true; no_staging=true");
+
+        // Genuine new authenticated observation and matching B save must
+        // retire A's now-resolved failure, not a fabricated map change.
+        let recovered = match probe_and_record(&root, &line, &plan, 2_000) {
+            Some(record) => record,
+            None => {
+                let joined = target_server.stop_and_join();
+                panic!("fixture: real recovery observation absent; server={joined:?}");
+            }
+        };
+        target_server.finish(3);
+        assert_eq!(recovered.ip, "1.1.1.1");
+        matching_alias();
+        let recovered_disk_exact = load(&alias).as_ref() == Some(&recovered)
+            && load(&root).as_ref() == Some(&recovered);
+        let recovered_bytes_exact = std::fs::read(alias.join(FILE_NAME)).ok().as_ref()
+            == Some(&serde_json::to_string_pretty(&recovered).unwrap().into_bytes())
+            && std::fs::read(&path).ok().as_ref()
+            == Some(&serde_json::to_string_pretty(&recovered).unwrap().into_bytes());
+        assert_eq!(std::fs::canonicalize(alias.join(FILE_NAME)).unwrap(),
+            std::fs::canonicalize(&path).unwrap());
+        assert!(live(&alias, &old) && live(&root, &old),
+            "fixture: changed observed IP is not itself binding invalidation");
+        let recovered_binding = recovered.attributed && recovered.binding == old.binding
+            && live(&alias, &recovered) && live(&root, &recovered);
+        let a_current = belongs_to_current_connection(&recovered, &alias);
+        let b_current = belongs_to_current_connection(&recovered, &root);
+        let recovery_clean = !exit_write_uncommitted(&alias) && !exit_write_uncommitted(&root);
+        no_staging(&root);
+        no_staging(&control);
+        let control_after_recovery = control_healthy();
+        eprintln!("UNRESOLVED_CLEAR_RECOVERY: new_ip={}; binding={recovered_binding}; disk_exact={recovered_disk_exact}; bytes_exact={recovered_bytes_exact}; a_current={a_current}; b_current={b_current}; clean={recovery_clean}; control_healthy={control_after_recovery}", recovered.ip);
+
+        // Explicit link-only removal before recursive sandbox cleanup.
+        // All bounded authenticated workers have already joined.
+        remove_alias(&alias).expect("fixture: final junction-only removal");
+        assert!(absent(&alias));
+        assert_eq!(read_exit_directory_id(&root).unwrap(), b_id);
+        drop(cleanup);
+        assert!(!sandbox.exists(), "fixture: sandbox cleanup");
+        assert!(absent_after_failed_clear && b_intact_after_failure
+            && restored_bytes_exact && restored_disk_exact && restored_dirty && restored_denied,
+            "UNRESOLVED_CLEAR_CONTRACT_RED: restoring A must not retire failed direct clear while binding remains live");
+        assert!(removed && b_other_bytes_after_success && success_dirty && success_denied
+            && still_absent && b_other_bytes_after_absent && absent_dirty && absent_denied,
+            "UNRESOLVED_CLEAR_CONTRACT_RED: successful or absent clear must preserve raw A failure");
+        assert!(recovered_binding && recovered_disk_exact && recovered_bytes_exact
+            && a_current && b_current && recovery_clean,
+            "UNRESOLVED_CLEAR_CONTRACT_RED: real matching B save must recover A and B");
+        assert!(control_after_failure && control_after_restore && control_after_success
+            && control_after_absent && control_after_recovery,
+            "UNRESOLVED_CLEAR_CONTRACT_RED: independent physical C must remain intact and CURRENT");
+    }
 }
