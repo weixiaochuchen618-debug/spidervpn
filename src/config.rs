@@ -1158,9 +1158,12 @@ fn verified_transport_write_allowed(
     if !runtime.is_file() || !engine.is_file() {
         return false; // never fall back to "offline" for a partial live state
     }
+    // Auto's historical/default preference is not evidence of the runtime.
+    // Respect an explicit fixed choice and require a recognized actual method.
     cfg.current_line().is_some_and(|line| {
-        line.id == line_id && line.effective_transport() == transport
-    }) && crate::selfcheck::current_qualified_trade_pass(root)
+        line.id == line_id && line.transport.is_none_or(|fixed| fixed == transport)
+    }) && crate::engine_config::actual_transport(&engine) == Some(transport)
+        && crate::selfcheck::current_qualified_trade_pass(root)
 }
 
 /// 记下「这条线路用这种方式真的连通过」（「自动」档的唯一依据）。
