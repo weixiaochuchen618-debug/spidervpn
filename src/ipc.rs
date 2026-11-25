@@ -16292,4 +16292,167 @@ mod tests {
         assert!(record_files(&root).is_empty(), "拒绝时不许留下任务记录");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn mvp03_gui_active_profile_follows_actual_ipc_transport() {
+        use crate::config::{Mode, Transport};
+
+        // The only live process is this test process, as in t14. Neither
+        // the engine nor a browser is started, and no proxy is changed.
+        struct Sandbox(PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        struct Outcome {
+            tag: &'static str,
+            expected_transport: Option<Transport>,
+            expected_state: &'static str,
+            expected_label: serde_json::Value,
+            expected_profile: &'static str,
+            classified: Option<Transport>,
+            classified_mode: Option<Mode>,
+            status: Vec<serde_json::Value>,
+            lines: Vec<serde_json::Value>,
+            snap: serde_json::Value,
+            unchanged: bool,
+        }
+
+        let mut outcomes = Vec::new();
+        for (tag, actual, expected_state, expected_label, expected_profile) in [
+            ("udp", Some(Transport::Udp), "Connected",
+                serde_json::json!("标准连接"), "Udp"),
+            ("tcp", Some(Transport::Tcp), "Connected",
+                serde_json::json!("兼容连接"), "Tcp"),
+            ("malformed", None, "Connected", serde_json::Value::Null, ""),
+            ("disconnected", None, "Disconnected", serde_json::Value::Null, ""),
+        ] {
+            let sandbox = Sandbox(tmp_root(&format!("mvp03-gui-profile-{tag}")));
+            let root = &sandbox.0;
+            write_cfg(root, "L1");
+            write_line_file(root, "L1", true);
+            let line = root.join("lines").join("L1.json");
+            // Strengthen only this disposable line fixture with a complete
+            // representative WG endpoint and explicit proxy-mode inbound.
+            // The documentation address and synthetic keys are never dialed.
+            let mut source: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&line).unwrap()).unwrap();
+            source["endpoints"] = serde_json::json!([{
+                "type":"wireguard","tag":"hk","address":["10.7.0.2/32"],
+                "private_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                "peers":[{"address":"203.0.113.7","port":51820,
+                    "public_key":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+                    "allowed_ips":["0.0.0.0/0"]}]
+            }]);
+            source["inbounds"] = serde_json::json!([
+                {"type":"mixed","tag":"tc-mixed","listen":"127.0.0.1","listen_port":17901}
+            ]);
+            std::fs::write(&line, source.to_string()).unwrap();
+            let runtime = root.join("runtime-engine.json");
+            if tag != "disconnected" {
+                connected_runtime(root, 17991);
+                match actual {
+                    Some(Transport::Udp) => {
+                        std::fs::copy(&line, &runtime).unwrap();
+                    }
+                    Some(Transport::Tcp) => {
+                        let prepared = crate::engine_config::prepare_engine_config(
+                            &line, &Default::default(), &Default::default(),
+                            Transport::Tcp, Mode::Proxy, &runtime, "", None, None,
+                        ).expect("fixture: actual TCP derivation must succeed");
+                        assert_eq!(prepared, runtime, "fixture: must publish runtime");
+                    }
+                    None => std::fs::write(&runtime, "not json").unwrap(),
+                }
+            }
+            let classified = crate::engine_config::actual_transport(&runtime);
+            let classified_mode = crate::engine_config::actual_mode(&runtime);
+            let original_config = config_bytes(root);
+            let original_line = std::fs::read(&line).unwrap();
+            let original_session = std::fs::read(root.join("runtime.json")).ok();
+            let original_runtime = std::fs::read(&runtime).ok();
+            let ctx = ctx_with(None, root);
+            let status = std::cell::RefCell::new(Vec::new());
+            let lines = std::cell::RefCell::new(Vec::new());
+            let mut ui = crate::uiweb::WebUi::new();
+            let snap = ui.snapshot(&|cmd| {
+                match command_name(cmd).as_deref() {
+                    Some("status") => {
+                        let reply = call(cmd, &ctx);
+                        status.borrow_mut().push(reply.clone());
+                        reply
+                    }
+                    Some("lines") => {
+                        let reply = call(cmd, &ctx);
+                        lines.borrow_mut().push(reply.clone());
+                        reply
+                    }
+                    // Unrelated read-only snapshot panels are deliberately
+                    // inert (no data); no fabricated status/lines fields.
+                    Some("providers" | "deployment-list" | "delete-cleanup"
+                        | "line-action-list" | "operation-list" | "servers"
+                        | "auto-route-list" | "quality-summary") =>
+                        serde_json::json!({"ok":false}),
+                    _ => panic!("fixture: unexpected snapshot fetch: {cmd}"),
+                }
+            });
+            let unchanged = config_bytes(root) == original_config
+                && std::fs::read(&line).unwrap() == original_line
+                && std::fs::read(root.join("runtime.json")).ok() == original_session
+                && std::fs::read(&runtime).ok() == original_runtime
+                && !root.join("proxy-journal.json").exists();
+            // Every case is observed and cleaned before the grouped verdict.
+            std::fs::remove_dir_all(root).unwrap();
+            outcomes.push(Outcome {
+                tag, expected_transport: actual, expected_state, expected_label,
+                expected_profile, classified, classified_mode,
+                status: status.into_inner(), lines: lines.into_inner(), snap, unchanged,
+            });
+        }
+
+        // Independent premises and non-target controls must pass first.
+        for o in &outcomes {
+            let tag = o.tag;
+            assert_eq!(o.classified, o.expected_transport, "fixture: {tag} runtime classification");
+            assert_eq!(o.classified_mode, o.expected_transport.map(|_| Mode::Proxy),
+                "fixture: {tag} runtime takeover mode");
+            assert_eq!(o.status.len(), 1, "fixture: {tag} real status fetch");
+            assert_eq!(o.lines.len(), 1, "fixture: {tag} real lines fetch");
+            let st = &o.status[0];
+            let ls = &o.lines[0];
+            assert_eq!(st["ok"], true, "fixture: {tag} IPC status");
+            assert_eq!(st["state"], o.expected_state, "fixture: {tag} IPC state");
+            assert_eq!(st["line"], "线路甲", "fixture: {tag} IPC line");
+            assert_eq!(st.get("transportActual"), Some(&o.expected_label),
+                "fixture: {tag} original IPC transport label/null");
+            assert_eq!(st["mode"], "代理", "fixture: {tag} IPC takeover mode");
+            assert_eq!(ls["ok"], true, "fixture: {tag} IPC lines");
+            assert_eq!(ls["selected"], "L1", "fixture: {tag} selected");
+            assert_eq!(ls["lines"][0]["id"], "L1", "fixture: {tag} selected id");
+            assert_eq!(ls["lines"][0]["selected"], true, "fixture: {tag} selected row");
+            assert_eq!(ls["lines"][0]["transport"], "udp", "fixture: {tag} old preference");
+            assert_eq!(ls["lines"][0]["transportSelected"], false,
+                "fixture: {tag} Auto must remain Auto");
+            assert_eq!(o.snap["Type"], "snapshot", "fixture: {tag} host response");
+            assert_eq!(o.snap["State"]["State"], o.expected_state, "fixture: {tag} host state");
+            assert_eq!(o.snap["State"]["Running"], o.expected_state == "Connected",
+                "fixture: {tag} host Running");
+            assert_eq!(o.snap["State"]["ActiveLineId"], "L1", "fixture: {tag} host line");
+            assert_eq!(o.snap["State"]["TradeName"], "线路甲", "fixture: {tag} host name");
+            assert!(o.unchanged, "fixture: {tag} read-only inputs must remain unchanged");
+        }
+        for o in &outcomes {
+            eprintln!("GUI_ACTIVE_PROFILE_CASE {}: runtime={:?}; state={}; ipc={}; expected={:?}; observed={}",
+                o.tag, o.classified, o.expected_state, o.status[0]["transportActual"],
+                o.expected_profile, o.snap["State"]["ActiveProfile"]);
+        }
+        for o in &outcomes[1..] {
+            assert_eq!(o.snap["State"]["ActiveProfile"], o.expected_profile,
+                "GUI_ACTIVE_PROFILE_CONTROL_FAILED: {}", o.tag);
+        }
+        let udp = &outcomes[0];
+        assert_eq!(udp.snap["State"]["ActiveProfile"], udp.expected_profile,
+            "GUI_ACTIVE_PROFILE_CONTRACT_RED: actual IPC standard connection must project Udp, not Tcp");
+    }
 }
