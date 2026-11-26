@@ -10661,11 +10661,24 @@ mod tests {
 
     #[test]
     fn every_function_reading_a_fetch_reply_only_uses_whitelisted_keys() {
-        // 与上面那条用例同一手法：两份源码都扫，只截到生产代码为止。
         let sources = [
             ("src/uiweb.rs", include_str!("uiweb.rs")),
             ("src/uiweb_form.rs", include_str!("uiweb_form.rs")),
         ];
+        let problems = scan_fetch_reply_contract(&sources);
+        assert!(problems.is_empty(), "fetch reply contract violations:\n{}", problems.join("\n"));
+    }
+
+    // These eight fields belong to the independently obtained status
+    // baseline, not to the raw lines command's write permissions. See #92 C1.
+    const SNAPSHOT_LINES_BASELINE_KEYS: [&str; 8] = [
+        "action", "state", "exitAttribution", "exitEvidence",
+        "exitObservedIp", "exitProbeAtUtc", "startedAt", "transportActual",
+    ];
+
+    // One checker path for real sources and mutation controls; collect all
+    // failures including coverage, not an unrelated panic in negative cases.
+    fn scan_fetch_reply_contract(sources: &[(&str, &str)]) -> Vec<String> {
         let functions: Vec<(usize, FnSource<'_>)> = sources
             .iter()
             .enumerate()
@@ -10682,6 +10695,11 @@ mod tests {
                 || FAILURE_KEYS.contains(&key)
         };
 
+        let expected_baseline: std::collections::BTreeSet<String> =
+            SNAPSHOT_LINES_BASELINE_KEYS.iter().map(|key| (*key).to_string()).collect();
+        let mut baseline_keys = std::collections::BTreeSet::<String>::new();
+        let mut baseline_sites = 0usize;
+        let unique_snapshot = functions.iter().filter(|(_, item)| item.name == "snapshot").count() == 1;
         let mut fetches = 0usize;
         let mut identified = 0usize;
         let mut bindings = 0usize;
@@ -10756,6 +10774,30 @@ mod tests {
                         continue;
                     }
                     checked += 1;
+                    // One recognized, direct literal lines fetch in the actual
+                    // WebUi::snapshot definition. Neither the permissive
+                    // command parser nor the binding name alone grants provenance.
+                    let signature = "    pub fn snapshot(&mut self, fetch: &dyn Fn(&str) -> Value) -> Value {";
+                    let source = production_part(sources[file_index].1);
+                    let snapshot_site = *file == "src/uiweb.rs"
+                        && function.name == "snapshot"
+                        && unique_snapshot
+                        && source.match_indices(signature).count() == 1
+                        && source.find(signature).is_some_and(|start| {
+                            source[..start].rfind("\nimpl ").is_some_and(|owner| {
+                                source[owner..].starts_with("\nimpl WebUi {")
+                            }) && source[start + signature.len() - 1..].as_ptr() == function.body.as_ptr()
+                        })
+                        && name == "lines_raw"
+                        && function.body[..use_site.at].ends_with(concat!(
+                            r##"let st = fetch(r#"{"cmd":"status"}"#);"##,
+                            "\n        let lines_raw = "
+                        ))
+                        && call_argument(function.body, use_site.at) == r##"(r#"{"cmd":"lines"}"#)"##
+                        && function.body[use_site.at..].starts_with(r##"fetch(r#"{"cmd":"lines"}"#);"##);
+                    if snapshot_site {
+                        baseline_sites += 1;
+                    }
                     // 从绑定开始做 BFS：本函数读它的键 → 它被交给谁 → callee 里拿它读什么。
                     let mut queue: Vec<(usize, String, String, usize, usize)> =
                         vec![(file_index, function.name.clone(), name.clone(), use_site.at, 0)];
@@ -10785,6 +10827,17 @@ mod tests {
                             &mut opaque,
                         );
                         for key in &read {
+                            // Only the original direct binding has this
+                            // provenance, never chain or callee reads.
+                            if snapshot_site && depth == 0
+                                && owner_file == file_index
+                                && std::ptr::eq(owner_fn, function)
+                                && handle.as_str() == name.as_str() && from == use_site.at
+                                && expected_baseline.contains(key)
+                            {
+                                baseline_keys.insert(key.clone());
+                                continue;
+                            }
                             if !allowed(key) {
                                 violations.push((
                                     owner_path.to_string(),
@@ -10836,6 +10889,19 @@ mod tests {
         // 与「读到的键不在白名单」「fetch 没对上账」合并成**一份**报告：
         // 一次失败就把所有问题摊开，不要修一条、再跑一条、再看下一条。
         let mut problems: Vec<String> = Vec::new();
+        if baseline_sites != 1 {
+            problems.push(format!("status baseline site count: expected 1, got {baseline_sites}"));
+        }
+        if baseline_keys != expected_baseline {
+            problems.push(format!(
+                "status baseline key set drift: expected {expected_baseline:?}, got {baseline_keys:?}"
+            ));
+        }
+        for key in &expected_baseline {
+            if allowed(key) {
+                problems.push(format!("status baseline key overlaps command/failure allowlist: {key}"));
+            }
+        }
         for (file, function, handle, key) in &violations {
             problems.push(format!(
                 "{file} 函数 {function} 从 `{handle}` 读了回包键 {key}，但它不在 \
@@ -10930,41 +10996,29 @@ mod tests {
         eprintln!(
             "fetch 回包扫描：fetch 调用 {fetches} 处 / 已识别 {identified}（绑定 {bindings}：\
              命令回包 {checked} + status 基线 {statuses}；链式 {chains}）/ 未识别 {} 处 \
-             / {} 个键 / {hops} 跳转交 / {} 条扫不动",
+             / {} 个命令键 + {} 个独立 status 基线键（{baseline_sites} 处） / {hops} 跳转交 / {} 条扫不动",
             fetches - identified,
             keys.len(),
+            baseline_keys.len(),
             opaque.len(),
         );
         // 对账是硬要求：每一处 `fetch(` 要么被识别、要么在 `FETCH_SHAPES` 里登记。
         // 没登记的会作为 problem 列出来（见下），所以这里不断言「数字相等」——
         // 一旦有人按规矩登记了形状，数字本来就该不相等。
-        assert!(
-            checked >= 15,
-            "只扫到 {checked} 个命令回包绑定（共 {bindings} 个 fetch 绑定），\
-             扫描面塌了：这条用例等于没跑"
-        );
-        assert!(
-            keys.len() >= 12,
-            "只从回包里读到 {} 个键（{keys:?}），扫描面塌了：这条用例等于没跑",
-            keys.len()
-        );
-        assert!(
-            hops >= 1,
-            "转交一跳一次都没找到（hops={hops}）：`delete_dialog(&preview, …)` 这类\
-             形状会整类漏掉，扫描面塌了"
-        );
-
-        problems.sort();
-        problems.dedup();
-        assert!(
-            problems.is_empty(),
-            "从 `fetch` 回包里读的键有问题——宿主的 `merge_ui_command_reply` 会静默丢掉\
-             白名单之外的键，症状永远是「后端有数据、界面空白」：\n{}\n\
-             扫到 {bindings} 个 fetch 绑定（其中 {checked} 个是命令回包）、\
-             {} 个键（全部读到的键：{keys:?}）",
-            problems.join("\n"),
-            keys.len()
-        );
+        if checked < 15 {
+            problems.push(format!(
+                "只扫到 {checked} 个命令回包绑定（共 {bindings} 个 fetch 绑定），扫描面塌了"
+            ));
+        }
+        // Baseline reads cannot compensate for lost command-key coverage.
+        if keys.len() < 12 {
+            problems.push(format!(
+                "只从回包里读到 {} 个键（{keys:?}），扫描面塌了", keys.len()
+            ));
+        }
+        if hops < 1 {
+            problems.push(format!("转交一跳一次都没找到（hops={hops}），扫描面塌了"));
+        }
 
         // 关键键必须在集合里：每一条都有过真实事故。谁把某个读者的读操作删掉，
         // 上面那些断言就会跟着「没东西可断言」而变绿——这一条堵住那个口子。
@@ -10989,11 +11043,86 @@ mod tests {
             .copied()
             .filter(|key| !keys.contains(*key))
             .collect();
-        assert!(
-            lost.is_empty(),
-            "这些键本该被扫描抓到，却没有：{lost:?}。要么是某个读者被删了/改了形状\
-             （那这条防回归就失去意义），要么是扫描漏了一类写法——两种都得当场解决。\
-             当前读到的全部键：{keys:?}"
-        );
+        if !lost.is_empty() {
+            problems.push(format!(
+                "这些键本该被扫描抓到，却没有：{lost:?}。当前读到的全部命令键：{keys:?}"
+            ));
+        }
+        problems.sort();
+        problems.dedup();
+        problems
+    }
+
+    #[test]
+    fn snapshot_lines_baseline_provenance_keeps_fetch_contract_fail_closed() {
+        let ui = production_part(include_str!("uiweb.rs"));
+        let form = production_part(include_str!("uiweb_form.rs"));
+        let scan = |source: &str| scan_fetch_reply_contract(&[
+            ("src/uiweb.rs", source), ("src/uiweb_form.rs", form),
+        ]);
+        let positive = scan(ui);
+        assert!(positive.is_empty(), "actual recognized snapshot and command reads: {positive:?}");
+
+        let mutate = |old: &str, new: &str| {
+            assert_eq!(ui.match_indices(old).count(), 1, "mutation anchor drift: {old}");
+            ui.replacen(old, new, 1)
+        };
+        let reject = |label: &str, source: &str, expected: &[&str]| {
+            let problems = scan(source);
+            for marker in expected {
+                assert!(problems.iter().any(|problem| problem.contains(marker)),
+                    "{label}: expected {marker:?}, actual {problems:?}");
+            }
+        };
+        let binding = r##"let lines_raw = fetch(r#"{"cmd":"lines"}"#);"##;
+        for (label, replacement) in [
+            ("wrong command", r##"let lines_raw = fetch(r#"{"cmd":"providers"}"#);"##),
+            ("dynamic command", "let lines_raw = fetch(&cmd);"),
+            ("ambiguous command", r##"let lines_raw = fetch(r#"{"cmd":"lines","cmd":"providers"}"#);"##),
+        ] {
+            reject(label, &mutate(binding, replacement),
+                &["status baseline site count", "读了回包键 exitEvidence"]);
+        }
+        reject("wrong site", &mutate("pub fn snapshot(&mut self,", "pub fn c2_other_site(&mut self,"),
+            &["status baseline site count", "读了回包键 exitEvidence"]);
+        reject("wrong binding", &ui.replace("lines_raw", "c2_other_binding"),
+            &["status baseline site count", "读了回包键 exitEvidence"]);
+
+        let read = r#"lines_raw.get("exitEvidence")"#;
+        reject("missing baseline class", &mutate(read, r#"lines_raw.get("selected")"#),
+            &["status baseline key set drift"]);
+        let after = r##"let providers_raw = fetch(r#"{"cmd":"providers"}"#);"##;
+        let insert = |extra: &str| mutate(after, &format!("{extra}\n        {after}"));
+        reject("extra unlisted key at authorized site",
+            &insert(r#"let extra = lines_raw.get("c2Unknown");"#),
+            &["读了回包键 c2Unknown"]);
+        reject("extra status field outside the eight-key class",
+            &insert(r#"let extra = lines_raw.get("Guard");"#),
+            &["读了回包键 Guard"]);
+        reject("opaque read", &insert("let extra = lines_raw.get(dynamic_key);"),
+            &["键不是字面量", "dynamic_key"]);
+        reject("unmatched fetch", &insert(r##"fetch(r#"{"cmd":"lines"}"#);"##),
+            &["结果没被识别"]);
+        reject("chain without provenance",
+            &insert(r##"let extra = fetch(r#"{"cmd":"lines"}"#).get("state");"##),
+            &["读了回包键 state"]);
+        let hop = format!("{}\nfn c2_hop(reply: &Value) {{ let extra = reply.get(\"state\"); }}\n",
+            insert("c2_hop(&lines_raw);"));
+        reject("callee hop cannot inherit baseline provenance", &hop,
+            &["函数 c2_hop", "读了回包键 state"]);
+
+        let duplicate = format!("{binding}\n        let st = fetch(r#\"{{\"cmd\":\"status\"}}\"#);\n        {binding}");
+        reject("duplicate provenance site", &mutate(binding, &duplicate),
+            &["status baseline site count: expected 1, got 2"]);
+        reject("required command key lost",
+            &mutate(r#"reply.get("qualitySummary")"#, r#"reply.get("providers")"#),
+            &["这些键本该被扫描抓到，却没有", "qualitySummary"]);
+
+        // A deliberately collapsed scan exercises the same coverage verdicts.
+        let collapsed = scan_fetch_reply_contract(&[("src/uiweb.rs", ""), ("src/uiweb_form.rs", "")]);
+        for marker in ["只扫到", "只从回包里读到", "转交一跳一次都没找到", "这些键本该被扫描抓到，却没有"] {
+            assert!(collapsed.iter().any(|problem| problem.contains(marker)),
+                "coverage gate {marker:?} missing: {collapsed:?}");
+        }
     }
 }
