@@ -149,16 +149,26 @@ fn expected_after(
 /// The transaction implementation is separately testable with a FakeOps
 /// that cannot execute any system command or modify any network device.
 trait MutationOps {
-    fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError>;
+    fn snapshot(&mut self, store: &LedgerStore) -> Result<Vec<Peer>, ApplyError>;
     fn write(&mut self, store: &LedgerStore, grant: &Grant, change: Change)
         -> Result<bool, ApplyError>;
     fn mutate(&mut self, grant: &Grant, change: Change)
         -> Result<(), ApplyError>;
 }
 
-struct SystemOps<'a> { interface: &'a str }
+struct SystemOps<'a> {
+    interface: &'a str,
+    #[cfg(feature = "linux-fresh-consume-gate")]
+    expected_server_key: Option<&'a str>,
+}
 impl MutationOps for SystemOps<'_> {
-    fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError> {
+    fn snapshot(&mut self, _store: &LedgerStore) -> Result<Vec<Peer>, ApplyError> {
+        #[cfg(feature = "linux-fresh-consume-gate")]
+        if let Some(expected) = self.expected_server_key {
+            return crate::wg_conf_audit::read_verified_identity_snapshot(
+                _store, self.interface, expected
+            ).map_err(ApplyError::Readback);
+        }
         read_verified_snapshot(self.interface).map_err(ApplyError::Readback)
     }
     fn write(&mut self, store: &LedgerStore, grant: &Grant, change: Change)
@@ -190,11 +200,11 @@ fn apply_with_ops(
         _ => false,
     };
     if !prepared { return Err(ApplyError::Live(LiveError::InvalidArguments)); }
-    let before = ops.snapshot()?;
+    let before = ops.snapshot(store)?;
     let expected = expected_after(&before, grant, operation).map_err(ApplyError::Live)?;
     let changed = ops.write(store, grant, operation)?;
     if changed { ops.mutate(grant, operation)?; }
-    let after = ops.snapshot()?;
+    let after = ops.snapshot(store)?;
     require_exact_match(&expected, &after).map_err(ApplyError::Readback)?;
     match operation {
         Change::Add => {
@@ -218,7 +228,24 @@ pub fn apply_and_confirm(
     store: &mut LedgerStore, interface: &str,
     grant: &Grant, operation: Change,
 ) -> Result<(), ApplyError> {
-    apply_with_ops(store, grant, operation, &mut SystemOps { interface })
+    apply_with_ops(store, grant, operation, &mut SystemOps {
+        interface,
+        #[cfg(feature = "linux-fresh-consume-gate")]
+        expected_server_key: None,
+    })
+}
+
+/// Used only by the authenticated fresh-consume adapter. No identity
+/// downgrade to the older inventory-only snapshot path on either read.
+#[cfg(feature = "linux-fresh-consume-gate")]
+pub(crate) fn apply_fresh_and_confirm(
+    store: &mut LedgerStore, interface: &str, expected_server_key: &str,
+    grant: &Grant,
+) -> Result<(), ApplyError> {
+    apply_with_ops(store, grant, Change::Add, &mut SystemOps {
+        interface,
+        expected_server_key: Some(expected_server_key),
+    })
 }
 
 #[cfg(test)]
@@ -261,7 +288,7 @@ mod tests {
         }
     }
     impl MutationOps for FakeOps {
-        fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError> {
+        fn snapshot(&mut self, _store: &LedgerStore) -> Result<Vec<Peer>, ApplyError> {
             if self.fail_readback || (self.fail_post_change_readback && self.changes > 0) {
                 return Err(ApplyError::Live(LiveError::TimedOut));
             }

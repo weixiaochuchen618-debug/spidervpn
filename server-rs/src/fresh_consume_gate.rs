@@ -1,18 +1,19 @@
-//! SEC-01/02 fresh online invitation authentication, pre-integration only.
-//! Not a legacy importer, HTTP listener, signing service or WG mutator.
+//! SEC-01/02 fresh online invitation authentication and internal enrollment.
+//! Not a legacy importer, HTTP listener or signing service.
 //! Callers must supply independently authenticated invitation metadata and
 //! bearer token, BOTH pinned management and server identity, and the SAME
-//! exclusively locked current LedgerStore used by any future transaction.
+//! exclusively locked current LedgerStore used by the enrollment transaction.
 //! A signed descriptor does NOT sign the bearer token or prove that a legacy
 //! invitation was never revoked: never construct scope from unverified
-//! invites.json, a client body, or a stale snapshot. No production caller yet.
+//! invites.json, a client body, or a stale snapshot. No deployed caller yet.
 #![cfg(all(target_os = "linux", feature = "linux-fresh-consume-gate"))]
 
 use crate::http_one_request::{Method, ParsedRequest, MAX_BODY_BYTES};
-use crate::ledger_disk::LedgerStore;
+use crate::ledger_disk::{LedgerStore, StoreError};
+use crate::wg_live_set::{apply_fresh_and_confirm, ApplyError};
 use crate::legacy_request_proof::{client_digest, recipient_digest};
 use crate::legacy_signed::{b64u, verify_jws};
-use crate::{hex_sha256, lower_uuid, wg_key, Claims, InviteState, Ledger, Peer};
+use crate::{hex_sha256, lower_uuid, wg_key, AddressPool, Claims, Grant, InviteState, Ledger, Peer};
 use ring::{digest, hmac};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -506,6 +507,66 @@ fn check_history(ledger: &Ledger, claims: &Claims) -> Result<(),GateError> {
     }
     if ledger.denied_identity(claims) { return Err(GateError::Revoked); }
     Ok(())
+}
+
+/// Internal enrollment errors. Never use them as an authorization response:
+/// an error after Pending may require explicit administrative reconciliation.
+#[derive(Debug)]
+pub enum FreshEnrollError {
+    Gate(GateError),
+    Ledger(StoreError),
+    Apply(ApplyError),
+}
+
+/// Actual opt-in Linux enrollment adapter, not an HTTP handler or signer.
+/// The scope must originate from independently pinned metadata. The
+/// interface and address pool are trusted local service configuration,
+/// never selected by the request. Hold the SAME exclusively locked current
+/// LedgerStore from authentication through durable reservation and final
+/// readback. Other privileged writers must be excluded by the caller.
+/// Returns a grant only after the exact peer and pinned server identity
+/// have been read back from protected config and kernel and Consumed has
+/// been durably committed. An error is never permission to retry an add.
+pub fn enroll_fresh_consume(
+    store: &mut LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str, pool: AddressPool,
+) -> Result<Grant, FreshEnrollError> {
+    check_retry_interface(scope, interface).map_err(FreshEnrollError::Gate)?;
+    let expected = text(scope.server_binding, "ServerPublicKey")
+        .ok_or(FreshEnrollError::Gate(GateError::InvalidState))?;
+    let generation = store.generation().map_err(FreshEnrollError::Ledger)?;
+    let before = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    // The only conversion into reservation claims is local to this
+    // function. The verified token cannot escape, change stores or be
+    // supplied by a caller as raw claims.
+    let claims = prepare_fresh_consume(store, scope, request)
+        .map_err(FreshEnrollError::Gate)?.claims().clone();
+    let authenticated_at = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    if authenticated_at < before || claims.public_key == expected {
+        return Err(FreshEnrollError::Gate(GateError::InvalidState));
+    }
+    // Refuse known generation exhaustion before any side effects. Both
+    // Pending and Consumed need a generation increment.
+    generation.checked_add(2)
+        .ok_or(FreshEnrollError::Ledger(StoreError::GenerationExhausted))?;
+    let peers = crate::wg_conf_audit::read_verified_identity_snapshot(store, interface, expected)
+        .map_err(|error| FreshEnrollError::Apply(ApplyError::Readback(error)))?;
+    let now = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    check_open_completion(store, scope.invite_id, generation, authenticated_at, now)
+        .map_err(FreshEnrollError::Gate)?;
+    check_history(store.view().map_err(FreshEnrollError::Ledger)?, &claims)
+        .map_err(FreshEnrollError::Gate)?;
+    // Recheck policy and allocate against real inventory in the durable
+    // update itself. A failed/uncertain commit must not reach the WG writer.
+    let grant = store.update(|ledger| ledger.reserve(claims, now, pool, Some(&peers)))
+        .map_err(FreshEnrollError::Ledger)?;
+    // The existing writer checks the exact Pending grant, updates only
+    // this peer and compares the full before/after inventory. The new
+    // path additionally checks the pinned server key at both snapshots,
+    // before the final durable Consumed commit.
+    apply_fresh_and_confirm(store, interface, expected, &grant)
+        .map_err(FreshEnrollError::Apply)?;
+    Ok(grant)
 }
 
 /// Read-only, lock-borrowing retry evidence, NOT a new Grant or response.

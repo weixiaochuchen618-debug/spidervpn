@@ -206,7 +206,8 @@ mod identity_gate {
     use std::io::Cursor;
     use std::process::Stdio;
     use spidervpn_pairing_authority::fresh_consume_gate::{
-        prepare_fresh_consume, prepare_consumed_retry, verify_pinned_invite_metadata, GateError,
+        enroll_fresh_consume, prepare_fresh_consume, prepare_consumed_retry,
+        verify_pinned_invite_metadata, FreshEnrollError, GateError,
     };
     use spidervpn_pairing_authority::http_one_request::{read_one_request, ParsedRequest};
     use spidervpn_pairing_authority::wg_conf_audit::{read_verified_identity_snapshot, ConfigError};
@@ -411,4 +412,145 @@ mod identity_gate {
         write_conf(&conf,&base,None);
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn authenticated_fresh_enrollment_commits_real_peer_and_denies_replay_or_failed_reservation() {
+        assert_eq!(unsafe {geteuid()}, 0);
+        assert_eq!(std::env::var("SPIDERVPN_SEC01_NS_INTERFACE").unwrap(), IFACE);
+        let expected=std::env::var("SPIDERVPN_SEC01_NS_SERVER_PUBLIC_KEY").unwrap();
+        let key=std::env::var("SPIDERVPN_SEC01_NS_CLIENT_PUBLIC_KEY").unwrap();
+        let reader=LiveWgReader::new(IFACE).unwrap();
+        assert_eq!(reader.server_public_key().unwrap(), expected);
+        assert!(reader.snapshot().unwrap().is_empty());
+        let conf=Path::new("/etc/wireguard").join(format!("{IFACE}.conf"));
+        let base=Zeroizing::new(fs::read_to_string(&conf).unwrap());
+        assert!(!base.contains("[Peer]"));
+        let root=test_ledger();
+        let now=i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap();
+        let issued=utc_at(now-60);
+        let expires=utc_at(now+3600);
+        let retry=utc_at(now+3720);
+        let mgmt=Rsa::new(&root,"management.pem");
+        let recipient=Rsa::new(&root,"recipient.pem");
+        let binding=json!({"RemoteOwnerId":"55555555-5555-4555-8555-555555555555",
+            "NodeId":"66666666-6666-4666-8666-666666666666","ServerPublicKey":expected});
+        let fingerprint=format!("SHA256:{}",b64(digest::digest(&digest::SHA256,
+            &serde_json::to_vec(&mgmt.jwk).unwrap()).as_ref()).replace('-',"+").replace('_',"/"));
+        let pin="a".repeat(64);
+        let token=b64(&[77;32]);
+        let invite=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairInvite","InviteId":INV,
+            "RemoteOwnerId":binding["RemoteOwnerId"],"NodeId":binding["NodeId"],
+            "ServerPublicKey":expected,"ServerBinding":binding,
+            "ManagementSigningPublicKey":mgmt.jwk,"IssuedAtUtc":issued,"ExpiresAtUtc":expires,
+            "PublicEndpoint":"pair.example.test:18443","DeviceName":"netns fixture",
+            "Capabilities":{"PairingVersion":1}});
+        let descriptor=mgmt.sign(&json!({"SchemaVersion":1,"Kind":"TradeChannel.OnlineInvite",
+            "InviteId":INV,"Invite":mgmt.sign(&invite),"PublicHost":"pair.example.test","Port":18443,
+            "TlsSha256":pin,"ManagementFingerprint":fingerprint,"ManagementSigningPublicKey":mgmt.jwk,
+            "ExpiresAtUtc":expires,"RetryUntilUtc":retry}));
+        let tag=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,token.as_bytes()),
+            b"SpiderVPN pinned invitation metadata bearer v1");
+        let metadata=serde_json::to_vec(&json!({"SchemaVersion":1,"Kind":"SpiderVPN.InviteMetadata",
+            "InviteId":INV,"BearerHmacSha256":hex(tag.as_ref()),"SignedDescriptor":descriptor,
+            "ManagementSigningPublicKey":mgmt.jwk,"ManagementFingerprint":fingerprint,
+            "ServerBinding":binding,"PublicHost":"pair.example.test","Port":18443,
+            "TlsSha256":pin,"WgInterface":IFACE})).unwrap();
+        let authenticated=verify_pinned_invite_metadata(&metadata,&sha(&metadata),&token).unwrap();
+        let scope=authenticated.scope().unwrap();
+        let inner=json!({"SchemaVersion":1,"Kind":"TradeChannel.ClientRequest","RequestId":REQ,
+            "DeviceId":DEV,"ClientPublicKey":key,"CreatedAtUtc":issued,"AddressFamilies":["IPv4"]});
+        let request_digest=sha(format!("1\nTradeChannel.ClientRequest\n{REQ}\n{DEV}\n{issued}\n{key}\nIPv4").as_bytes());
+        let signed=recipient.sign(&json!({"SchemaVersion":1,"Kind":"TradeChannel.PairRequest",
+            "InviteId":INV,"ServerBinding":binding,"ClientRequest":inner,
+            "DeviceName":"netns fixture","RecipientJwk":recipient.jwk,"RequestDigest":request_digest,
+            "RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":issued}));
+        let req=request(&token,&signed);
+        let pool=AddressPool{network:Ipv4Addr::new(10,66,0,0),prefix:24};
+        let mut store=open(&root);
+        store.update(|l|l.insert_open(INV,now+3600)).unwrap();
+        let ledger_file=root.join("authority-ledger.json");
+        let initial=fs::read(&ledger_file).unwrap();
+        let generation=store.generation().unwrap();
+        let bad_token=request(&b64(&[78;32]),&signed);
+        assert!(matches!(enroll_fresh_consume(&mut store,&scope,&bad_token,IFACE,pool),
+            Err(FreshEnrollError::Gate(GateError::Forbidden))));
+        assert!(matches!(enroll_fresh_consume(&mut store,&scope,&req,"otherci0",pool),
+            Err(FreshEnrollError::Gate(GateError::InvalidState))));
+        // Real config identity denial before reserve: keep live inventory
+        // empty while replacing only the protected test config key.
+        let wrong_key=Command::new("/usr/bin/wg").arg("genkey")
+            .stderr(Stdio::null()).output().unwrap();
+        assert!(wrong_key.status.success());
+        let wrong_key=Zeroizing::new(String::from_utf8(wrong_key.stdout).unwrap());
+        let private=base.lines().find_map(|line|line.strip_prefix("PrivateKey = ")).unwrap();
+        let wrong_conf=Zeroizing::new(base.replace(private,wrong_key.trim()));
+        write_conf(&conf,&wrong_conf,None);
+        assert!(matches!(enroll_fresh_consume(&mut store,&scope,&req,IFACE,pool),
+            Err(FreshEnrollError::Apply(
+                spidervpn_pairing_authority::wg_live_set::ApplyError::Readback(ConfigError::IdentityMismatch)))));
+        write_conf(&conf,&base,None);
+        assert_eq!(store.generation().unwrap(),generation);
+        assert_eq!(fs::read(&ledger_file).unwrap(),initial);
+        assert!(reader.snapshot().unwrap().is_empty());
+        assert!(fs::read(&conf).unwrap().as_slice()==base.as_bytes());
+
+        // Actual store_atomic destination validation failure AFTER the
+        // existing store is locked and authenticated, not a fake ops hook.
+        // A noncooperating fixture actor changes mode only in this temp root.
+        fs::set_permissions(&ledger_file,fs::Permissions::from_mode(0o644)).unwrap();
+        let failed=enroll_fresh_consume(&mut store,&scope,&req,IFACE,pool);
+        fs::set_permissions(&ledger_file,fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(failed,Err(FreshEnrollError::Ledger(
+            spidervpn_pairing_authority::ledger_disk::StoreError::Invalid(_)))));
+        assert!(matches!(store.view(),Err(spidervpn_pairing_authority::ledger_disk::StoreError::Poisoned)));
+        assert_eq!(fs::read(&ledger_file).unwrap(),initial);
+        assert!(reader.snapshot().unwrap().is_empty());
+        assert!(fs::read(&conf).unwrap().as_slice()==base.as_bytes());
+        drop(store);
+        let mut store=open(&root);
+        assert_eq!(store.generation().unwrap(),generation);
+        assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Open)));
+        assert!(LedgerStore::open_existing(&root,Duration::from_millis(25)).is_err());
+
+        // No manual config/peer provisioning or direct reserve/confirm in
+        // this success control: the real adapter owns all three writes.
+        let grant=enroll_fresh_consume(&mut store,&scope,&req,IFACE,pool).unwrap();
+        assert_eq!(grant.claims.public_key,key);
+        assert_eq!(grant.address,Ipv4Addr::new(10,66,0,2));
+        assert_eq!(store.generation().unwrap(),generation+2);
+        assert_eq!(store.view().unwrap().state(INV),Some(&InviteState::Consumed(grant.clone())));
+        let observed=read_verified_identity_snapshot(&store,IFACE,&expected).unwrap();
+        assert_eq!(observed,vec![spidervpn_pairing_authority::Peer {
+            public_key:key.clone(),address:grant.address
+        }]);
+        let committed=fs::read(&ledger_file).unwrap();
+        let committed_conf=Zeroizing::new(fs::read(&conf).unwrap());
+        assert!(matches!(enroll_fresh_consume(&mut store,&scope,&req,IFACE,pool),
+            Err(FreshEnrollError::Gate(GateError::InviteConsumed))));
+        assert_eq!(prepare_consumed_retry(&store,&scope,&req,IFACE).unwrap().claims(),&grant.claims);
+        assert_eq!(fs::read(&ledger_file).unwrap(),committed);
+        assert!(fs::read(&conf).unwrap().as_slice()==committed_conf.as_slice());
+        assert_eq!(reader.snapshot().unwrap(),observed);
+        drop(store);
+        let mut store=open(&root);
+        assert_eq!(store.view().unwrap().state(INV),Some(&InviteState::Consumed(grant.clone())));
+        assert_eq!(store.generation().unwrap(),generation+2);
+        let revoking=store.update(|l|l.begin_revocation(INV)).unwrap();
+        assert!(matches!(enroll_fresh_consume(&mut store,&scope,&req,IFACE,pool),
+            Err(FreshEnrollError::Gate(GateError::Revoked))));
+        spidervpn_pairing_authority::wg_live_set::apply_and_confirm(
+            &mut store,IFACE,&revoking,spidervpn_pairing_authority::wg_peer_plan::Change::Remove
+        ).unwrap();
+        let revoked=fs::read(&ledger_file).unwrap();
+        assert!(matches!(store.view().unwrap().state(INV),Some(InviteState::Revoked(_))));
+        assert!(matches!(enroll_fresh_consume(&mut store,&scope,&req,IFACE,pool),
+            Err(FreshEnrollError::Gate(GateError::Revoked))));
+        assert_eq!(prepare_consumed_retry(&store,&scope,&req,IFACE).err(),Some(GateError::Revoked));
+        assert_eq!(fs::read(&ledger_file).unwrap(),revoked);
+        assert!(read_verified_identity_snapshot(&store,IFACE,&expected).unwrap().is_empty());
+        drop(store);
+        write_conf(&conf,&base,None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
 }
