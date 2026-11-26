@@ -421,6 +421,29 @@ impl LedgerStore {
     }
 }
 
+/// Only fresh_provisioning's exclusive newly-created protected root may
+/// enter this path. Never call from serve/recovery or to reconstruct history.
+#[cfg(feature = "linux-fresh-provisioning")]
+pub(crate) fn publish_fresh_open(root:&Path,dir:&File,id:&str,expires:i64)->Result<(),StoreError> {
+    use std::os::fd::AsRawFd;
+    let _guard=lock::acquire_for(root,Duration::ZERO)?;
+    let mut ledger=Ledger::default();
+    ledger.insert_open(id,expires).map_err(StoreError::Policy)?;
+    let doc=Document {schema_version:SCHEMA,generation:1,ledger,
+        authorization_material:BTreeMap::new()};
+    validate_document(&doc)?;
+    let bytes=serde_json::to_vec(&doc)?;
+    crate::tls_identity::create_fresh_service_file(dir,".fresh-ledger-staging",&bytes)?;
+    let from=std::ffi::CString::new(".fresh-ledger-staging").unwrap();
+    let to=std::ffi::CString::new(LEDGER_NAME).unwrap();
+    if unsafe {libc::renameat2(dir.as_raw_fd(),from.as_ptr(),dir.as_raw_fd(),
+        to.as_ptr(),libc::RENAME_NOREPLACE)}!=0 {
+        return Err(StoreError::Io(io::Error::last_os_error()));
+    }
+    dir.sync_all()?;
+    Ok(())
+}
+
 /// Test-only bootstrap: the production importer must verify signatures,
 /// old tombstones, and WG inventory before creating any production ledger.
 #[cfg(test)]

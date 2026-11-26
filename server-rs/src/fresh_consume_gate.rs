@@ -159,7 +159,7 @@ fn verify_unique_jws(s: &str, key: &Value) -> Option<Value> {
 fn token_shape(token: &str) -> bool {
     token.len() == 43 && b64u(token, 32).is_ok_and(|v| v.len() == 32)
 }
-const METADATA_BEARER_DOMAIN: &[u8] = b"SpiderVPN pinned invitation metadata bearer v1";
+pub(crate) const METADATA_BEARER_DOMAIN: &[u8] = b"SpiderVPN pinned invitation metadata bearer v1";
 
 /// Verified, read-only metadata record. No Debug/Deserialize or public fields;
 /// the candidate bearer is borrowed, never stored in the metadata record.
@@ -286,7 +286,7 @@ pub(crate) fn valid_binding(b: &Value) -> bool {
         && text(b,"ServerPublicKey").is_some_and(canonical_wg_key)
 }
 
-fn management_fingerprint(jwk: &Value) -> Option<String> {
+pub(crate) fn management_fingerprint(jwk: &Value) -> Option<String> {
     let hex=recipient_digest(jwk).ok()?;
     let raw:Vec<u8>=(0..hex.len()).step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i+2],16)).collect::<Result<_,_>>().ok()?;
@@ -306,7 +306,7 @@ fn management_fingerprint(jwk: &Value) -> Option<String> {
     Some(out)
 }
 
-fn check_descriptor(scope: &TrustedOpenInvite<'_>, expires: i64, now: i64)
+pub(crate) fn check_descriptor(scope: &TrustedOpenInvite<'_>, expires: i64, now: i64)
     -> Result<(), GateError>
 {
     let invalid = GateError::InvalidState;

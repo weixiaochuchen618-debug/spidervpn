@@ -306,8 +306,25 @@ pub fn read_verified_snapshot(interface: &str) -> Result<Vec<Peer>, ConfigError>
 pub fn read_verified_identity_snapshot(store: &LedgerStore, interface: &str,
     expected_public_key: &str) -> Result<Vec<Peer>, ConfigError>
 {
-    if !canonical_key(expected_public_key) { return Err(ConfigError::IdentityMismatch); }
     let generation = store.generation().map_err(|_| ConfigError::InvalidAuthority)?;
+    let result=identity_snapshot(interface,expected_public_key)?;
+    if store.generation().map_err(|_| ConfigError::InvalidAuthority)? != generation {
+        return Err(ConfigError::InvalidAuthority);
+    }
+    Ok(result)
+}
+
+// Empty inventory is not proof of history; provenance is external.
+#[cfg(feature = "linux-fresh-provisioning")]
+pub(crate) fn require_fresh_empty_identity(interface:&str,expected:&str)->Result<(),ConfigError> {
+    if !identity_snapshot(interface,expected)?.is_empty() {
+        return Err(ConfigError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn identity_snapshot(interface:&str,expected_public_key:&str)->Result<Vec<Peer>,ConfigError> {
+    if !canonical_key(expected_public_key) { return Err(ConfigError::IdentityMismatch); }
     let reader = LiveWgReader::new(interface).map_err(ConfigError::InvalidPeers)?;
     let check_key = || {
         if reader.server_public_key().map_err(ConfigError::InvalidPeers)? != expected_public_key {
@@ -331,9 +348,6 @@ pub fn read_verified_identity_snapshot(store: &LedgerStore, interface: &str,
     if result.iter().any(|p| !canonical_key(&p.public_key)
         || p.public_key == expected_public_key) {
         return Err(ConfigError::IdentityMismatch);
-    }
-    if store.generation().map_err(|_| ConfigError::InvalidAuthority)? != generation {
-        return Err(ConfigError::InvalidAuthority);
     }
     Ok(result)
 }

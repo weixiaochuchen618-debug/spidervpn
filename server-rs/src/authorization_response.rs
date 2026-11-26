@@ -94,6 +94,8 @@ impl TrustedResponseConfig {
         self.binding == *binding && self.interface == interface
     }
     pub(crate) fn pool(&self) -> AddressPool { self.pool }
+    #[cfg(feature = "linux-fresh-provisioning")]
+    pub(crate) fn binding(&self)->&Value { &self.binding }
 }
 fn public_key(jwk: &Value) -> Result<RsaPublicKey, GateError> {
     recipient_digest(jwk).map_err(|_| INVALID)?;
@@ -106,7 +108,7 @@ pub(crate) fn check_signer(key: &RsaPrivateKey, management: &Value) -> Result<()
     if key.n() != pinned.n() || key.e() != pinned.e() { return Err(INVALID); }
     key.validate().map_err(|_| INVALID)
 }
-fn stamp(unix: i64) -> Result<String, GateError> {
+pub(crate) fn stamp(unix: i64) -> Result<String, GateError> {
     let t = time::OffsetDateTime::from_unix_timestamp(unix).map_err(|_| INVALID)?;
     if !(1970..=9999).contains(&t.year()) { return Err(INVALID); }
     Ok(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
@@ -142,7 +144,7 @@ fn body(grant: &Grant, config: &TrustedResponseConfig, issued: i64, expires: i64
         "IssuedAtUtc":stamp(issued)?, "ExpiresAtUtc":stamp(expires)?, "ClientResponse":response
     }))
 }
-fn sign(body: &Value, key: &RsaPrivateKey) -> Result<String, GateError> {
+pub(crate) fn sign(body: &Value, key: &RsaPrivateKey) -> Result<String, GateError> {
     let input = format!("{}.{}", B64.encode(br#"{"alg":"RS256","typ":"JWT"}"#),
         B64.encode(serde_json::to_vec(body).map_err(|_| INVALID)?));
     let signature = key.sign_with_rng(&mut OsRng, Pkcs1v15Sign::new::<Sha256>(),

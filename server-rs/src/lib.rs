@@ -76,6 +76,9 @@ pub mod pairing_service;
 #[cfg(all(target_os = "linux", feature = "linux-pairing-process"))]
 pub mod service_provisioning;
 
+#[cfg(all(target_os = "linux", feature = "linux-fresh-provisioning"))]
+pub mod fresh_provisioning;
+
 // Cross-crate verification of the ACTUAL Windows SSH guard Rust source on
 // Linux. Test-only, never compiled into the pairing authority binary.
 #[cfg(all(test, target_os = "linux"))]

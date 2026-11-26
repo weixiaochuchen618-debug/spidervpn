@@ -21,6 +21,12 @@ pub fn load_local_authority(root: PathBuf, interface: String, metadata_pin: Stri
     config_pin: &str, tls_pin: &str) -> io::Result<PairingAuthority>
 {
     let dir=open_service_root(&root).map_err(|_|refused())?;
+    // A failed/interrupted fresh init cannot be opened by serve, even if
+    // its ledger rename was already visible. Never remove this marker here.
+    match std::fs::symlink_metadata(root.join(".fresh-init-incomplete")) {
+        Err(e) if e.kind()==io::ErrorKind::NotFound => {},
+        _ => return Err(refused()),
+    }
     // Bounded nonblocking inode check before the existing ledger opener.
     // Never create an empty ledger. The existing lock/transaction validates
     // the actual current document again; privileged competing writers must

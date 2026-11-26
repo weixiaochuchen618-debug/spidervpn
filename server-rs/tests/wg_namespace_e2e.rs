@@ -1442,4 +1442,344 @@ mod identity_gate {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(feature = "linux-fresh-provisioning")]
+    #[test]
+    fn actual_fresh_init_tci1_to_native_service_and_real_peer() {
+        use rsa::pkcs8::DecodePrivateKey;
+        use rustls::pki_types::{CertificateDer, ServerName};
+        use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64,Engine};
+        use std::io::Read;
+        use std::net::{SocketAddr,TcpStream};
+        use std::process::Child;
+        use std::sync::Arc;
+        use std::time::Instant;
+        // Independent legacy RS256 wire verification with the fixture's
+        // independently supplied public JWK, not the server's private helper.
+        fn verify_legacy(s:&str,jwk:&Value)->Value {
+            let parts:Vec<_>=s.split('.').collect();
+            assert_eq!(parts.len(),3);
+            let head:Value=serde_json::from_slice(&B64.decode(parts[0]).unwrap()).unwrap();
+            assert!(head==json!({"alg":"RS256","typ":"JWT"}));
+            let n=B64.decode(jwk["n"].as_str().unwrap()).unwrap();
+            let e=B64.decode(jwk["e"].as_str().unwrap()).unwrap();
+            let sig=B64.decode(parts[2]).unwrap();
+            let input=format!("{}.{}",parts[0],parts[1]);
+            ring::signature::RsaPublicKeyComponents{n:&n,e:&e}
+                .verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256,input.as_bytes(),&sig).unwrap();
+            serde_json::from_slice(&B64.decode(parts[1]).unwrap()).unwrap()
+        }
+        fn protected(root:&Path,name:&str,bytes:&[u8]) {
+            let mut file=OpenOptions::new().create_new(true).write(true).mode(0o600)
+                .open(root.join(name)).unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+        struct Process(Option<Child>);
+        impl Drop for Process {
+            fn drop(&mut self) {
+                if let Some(mut child)=self.0.take() {
+                    let _=child.kill();
+                    let _=child.wait();
+                }
+            }
+        }
+        impl Process {
+            fn spawn(root:&Path,meta:&str,config:&str,tls:&str) -> Self {
+                Self(Some(Command::new(env!("CARGO_BIN_EXE_spidervpn-pair-service"))
+                    .env_clear().args(["serve",root.to_str().unwrap(),"18443",IFACE,meta,config,tls])
+                    .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                    .spawn().unwrap()))
+            }
+            fn ready(&mut self,addr:SocketAddr) {
+                let deadline=Instant::now()+Duration::from_secs(10);
+                loop {
+                    assert!(self.0.as_mut().unwrap().try_wait().unwrap().is_none(),"service exited before bind");
+                    if TcpStream::connect_timeout(&addr,Duration::from_millis(100)).is_ok() { break; }
+                    assert!(Instant::now()<deadline,"service startup timed out");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            fn finish(mut self,timeout:Duration) -> Output {
+                let deadline=Instant::now()+timeout;
+                while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+                    assert!(Instant::now()<deadline,"process did not exit");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                self.0.take().unwrap().wait_with_output().unwrap()
+            }
+            fn stop(self,signal:libc::c_int) {
+                let pid=self.0.as_ref().unwrap().id();
+                assert_eq!(unsafe {libc::kill(pid as libc::pid_t,signal)},0);
+                let out=self.finish(Duration::from_secs(35));
+                assert!(out.status.success() && out.stderr.is_empty());
+                assert!(out.stdout==b"PAIR_SERVICE_READY\nPAIR_SERVICE_STOPPED\n");
+            }
+            fn refused(self) {
+                let out=self.finish(Duration::from_secs(10));
+                assert!(out.status.code()==Some(2) && out.stdout.is_empty());
+                assert!(out.stderr==b"spidervpn-pair-service: protected provisioning refused\n");
+            }
+        }
+        fn client(address: SocketAddr, ca:&[u8], leaf:&[u8])
+            -> StreamOwned<ClientConnection,TcpStream>
+        {
+            let mut roots=RootCertStore::empty();
+            roots.add(CertificateDer::from(ca.to_vec())).unwrap();
+            let config=Arc::new(ClientConfig::builder_with_provider(
+                Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS12]).unwrap()
+                .with_root_certificates(roots).with_no_client_auth());
+            let mut connection=ClientConnection::new(config,
+                ServerName::try_from("203.0.113.10").unwrap()).unwrap();
+            let mut socket=TcpStream::connect_timeout(&address,Duration::from_secs(3)).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(35))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            while connection.is_handshaking() { connection.complete_io(&mut socket).unwrap(); }
+            assert!(connection.protocol_version()==Some(rustls::ProtocolVersion::TLSv1_2));
+            // Independently validate trust chain + exact pinned leaf before
+            // any request is written, not just a successful TLS handshake.
+            assert!(connection.peer_certificates().unwrap()[0].as_ref()==leaf);
+            StreamOwned::new(connection,socket)
+        }
+        fn wire(id:&str,method:&str, host:&str, token:&str, body:Option<&[u8]>) -> Vec<u8> {
+            let suffix=if method=="POST" {"/consume"} else {""};
+            let mut head=format!("{method} /v1/invitations/{id}{suffix} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n");
+            if let Some(body)=body {
+                head.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n",body.len()));
+            }
+            head.push_str("\r\n");
+            let mut bytes=head.into_bytes();
+            if let Some(body)=body { bytes.extend_from_slice(body); }
+            bytes
+        }
+        fn exchange(address:SocketAddr, ca:&[u8], leaf:&[u8], wire:&[u8]) -> (u16,Value) {
+            let mut tls=client(address,ca,leaf);
+            tls.write_all(wire).unwrap();
+            tls.flush().unwrap();
+            let mut response=Vec::new();
+            tls.read_to_end(&mut response).unwrap();
+            assert!(response.len()<=131_072+1024);
+            let text=String::from_utf8(response).unwrap();
+            let (head,body)=text.split_once("\r\n\r\n").unwrap();
+            let mut lines=head.split("\r\n");
+            let status=lines.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+            assert!(head.contains("\r\nContent-Type: application/json\r\n"));
+            assert!(head.ends_with("\r\nConnection: close"));
+            let lengths:Vec<_>=lines.filter_map(|s|s.strip_prefix("Content-Length: ")).collect();
+            assert!(lengths.len()==1 && lengths[0].parse::<usize>().unwrap()==body.len());
+            (status,serde_json::from_str(body).unwrap())
+        }
+
+
+        assert_eq!(unsafe {geteuid()},0);
+        assert_eq!(std::env::var("SPIDERVPN_SEC01_NS_INTERFACE").unwrap(),IFACE);
+        let reader=LiveWgReader::new(IFACE).unwrap();
+        let old_public=reader.server_public_key().unwrap();
+        assert!(reader.snapshot().unwrap().is_empty());
+        let conf=Path::new("/etc/wireguard").join(format!("{IFACE}.conf"));
+        let base=Zeroizing::new(fs::read_to_string(&conf).unwrap());
+        let original_key=base.lines().find_map(|line|line.strip_prefix("PrivateKey = ")).unwrap();
+        let parent=PathBuf::from(format!("/run/spidervpn-fresh-init-ci-{}",std::process::id()));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent,fs::Permissions::from_mode(0o700)).unwrap();
+        let source=parent.join("materials");
+        fs::create_dir(&source).unwrap();
+        fs::set_permissions(&source,fs::Permissions::from_mode(0o700)).unwrap();
+        let root=parent.join("authority");
+        let old_file=parent.join("original.wg");
+        write_key_file(&old_file,original_key);
+        let fresh_file=parent.join("fresh.wg");
+        let generated=Command::new("/usr/bin/wg").arg("genkey").stderr(Stdio::null()).output().unwrap();
+        assert!(generated.status.success());
+        let fresh_key=Zeroizing::new(String::from_utf8(generated.stdout).unwrap());
+        write_key_file(&fresh_file,fresh_key.trim());
+        let fresh_base=Zeroizing::new(base.replace(original_key,fresh_key.trim()));
+        // Fresh WG key in the disposable namespace, not reused from earlier
+        // tests. Provisioning command itself performs no WG/config writes.
+        set_server_key(&fresh_file);
+        write_conf(&conf,&fresh_base,None);
+        let expected=reader.server_public_key().unwrap();
+        assert!(expected!=old_public);
+        let client_key=std::env::var("SPIDERVPN_SEC01_NS_CLIENT_PUBLIC_KEY").unwrap();
+        // Test-only CA and leaf, not a production identity or signer.
+        let openssl=|args:&[&str]| {
+            assert!(Command::new("/usr/bin/openssl").args(args).current_dir(&source)
+                .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success());
+        };
+        openssl(&["req","-x509","-newkey","rsa:2048","-nodes","-days","1",
+            "-subj","/CN=SpiderVPN-Stage4B-Fixture-CA","-addext","basicConstraints=critical,CA:TRUE",
+            "-addext","keyUsage=critical,keyCertSign,cRLSign","-keyout","ca.key","-out","ca.pem"]);
+        openssl(&["req","-new","-newkey","rsa:2048","-nodes","-subj","/CN=203.0.113.10",
+            "-keyout","tls.key","-out","tls.csr"]);
+        fs::write(source.join("tls.ext"),"subjectAltName=IP:203.0.113.10\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n").unwrap();
+        openssl(&["x509","-req","-in","tls.csr","-CA","ca.pem","-CAkey","ca.key","-CAcreateserial",
+            "-days","1","-sha256","-extfile","tls.ext","-out","tls.pem"]);
+        openssl(&["x509","-in","ca.pem","-outform","DER","-out","ca.der"]);
+        openssl(&["x509","-in","tls.pem","-outform","DER","-out","tls.der"]);
+        let ca=fs::read(source.join("ca.der")).unwrap();
+        let leaf=fs::read(source.join("tls.der")).unwrap();
+        let pin=sha(&leaf);
+
+        let mgmt=Rsa::new(&source,"management.key");
+        let recipient=Rsa::new(&parent,"recipient.pem");
+        let binding=json!({"RemoteOwnerId":"55555555-5555-4555-8555-555555555555",
+            "NodeId":"66666666-6666-4666-8666-666666666666","ServerPublicKey":expected});
+        let fingerprint=format!("SHA256:{}",b64(digest::digest(&digest::SHA256,
+            &serde_json::to_vec(&mgmt.jwk).unwrap()).as_ref()).replace('-',"+").replace('_',"/"));
+        let config_record=serde_json::to_vec(&json!({"SchemaVersion":1,"Kind":"SpiderVPN.AuthorizationConfig",
+            "ServerBinding":binding,"WgInterface":IFACE,"TunnelSubnet":"10.66.0.0/24",
+            "ServerAddress":"10.66.0.1/24","PublicEndpoint":"203.0.113.10:51820",
+            "NodeName":"fresh netns fixture","Transport":"udp"})).unwrap();
+        fs::rename(source.join("tls.pem"),source.join("tls.crt")).unwrap();
+        for name in ["tls.crt","tls.key","management.key"] {
+            fs::set_permissions(source.join(name),fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        protected(&source,"authorization-config.json",&config_record);
+        let config_pin=sha(&config_record);
+        let init=|target:&Path,cp:&str| {
+            Command::new(env!("CARGO_BIN_EXE_spidervpn-pair-service")).env_clear()
+                .args(["init-fresh","attest-new-node-no-history",source.to_str().unwrap(),
+                    target.to_str().unwrap(),IFACE,"203.0.113.10","18443",cp,&fingerprint,&pin,
+                    "3600","fresh netns fixture"])
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
+        };
+        let refused=|out:Output| {
+            assert!(out.status.code()==Some(2) && out.stdout.is_empty());
+            assert!(out.stderr==b"spidervpn-pair-service: fresh provisioning refused; do not retry or recreate existing state\n");
+        };
+        let conf_before=Zeroizing::new(fs::read(&conf).unwrap());
+        refused(init(&root,&"0".repeat(64)));
+        assert!(!root.exists());
+        // Existing partial root is never reused or deleted.
+        let partial=parent.join("partial");
+        fs::create_dir(&partial).unwrap();
+        fs::set_permissions(&partial,fs::Permissions::from_mode(0o700)).unwrap();
+        protected(&partial,".fresh-init-incomplete",b"partial fixture\n");
+        refused(init(&partial,&config_pin));
+        assert!(!partial.join("authority-ledger.json").exists());
+        assert!(fs::read(partial.join(".fresh-init-incomplete")).unwrap()==b"partial fixture\n");
+        assert!(!root.exists());
+        let before=i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap();
+        let output=init(&root,&config_pin);
+        assert!(output.status.success() && output.stderr.is_empty());
+        assert!(output.stdout==b"FRESH_AUTHORITY_READY\n");
+        assert!(!root.join(".fresh-init-incomplete").exists());
+        assert!(fs::read(&conf).unwrap().as_slice()==conf_before.as_slice());
+        assert!(reader.snapshot().unwrap().is_empty());
+        // No fixture-written ledger or metadata. Independently decode the
+        // produced TCI1 contract, verify both signatures and actual HMAC.
+        let code_path=root.join("invitation-code.txt");
+        let attrs=fs::symlink_metadata(&code_path).unwrap();
+        assert!(attrs.is_file() && attrs.uid()==0 && attrs.nlink()==1 && attrs.mode()&0o7777==0o600);
+        let code=Zeroizing::new(fs::read_to_string(&code_path).unwrap());
+        assert!(code.trim().len()<=2048);
+        let encoded=code.trim().strip_prefix("TCI1.").unwrap();
+        let bytes=Zeroizing::new(B64.decode(encoded).unwrap());
+        assert!(B64.encode(&*bytes)==encoded);
+        let cv:Value=serde_json::from_slice(&bytes).unwrap();
+        assert!(cv.as_object().unwrap().len()==8 && ["v","h","p","i","k","t","m","e"].iter().all(|k|cv.get(k).is_some()));
+        assert!(cv["v"]==1 && cv["h"]=="203.0.113.10" && cv["p"]==18443
+            && cv["t"]==pin && cv["m"]==fingerprint);
+        let id=cv["i"].as_str().unwrap();
+        assert!(id.len()==36 && id.as_bytes()[14]==b'4' && b"89ab".contains(&id.as_bytes()[19]));
+        assert!(id.split('-').map(str::len).eq([8,4,4,4,12]));
+        let token=cv["k"].as_str().unwrap();
+        assert!(token.len()==43 && B64.decode(token).unwrap().len()==32);
+        let expires=cv["e"].as_i64().unwrap();
+        assert!(expires>=before+3600 && expires<=before+3660);
+        let meta=fs::read(root.join("invite-metadata.json")).unwrap();
+        let mp=fs::read_to_string(root.join("metadata-pin.txt")).unwrap();
+        assert!(mp==sha(&meta) && !String::from_utf8_lossy(&meta).contains(token));
+        let md:Value=serde_json::from_slice(&meta).unwrap();
+        let tag=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,token.as_bytes()),
+            b"SpiderVPN pinned invitation metadata bearer v1");
+        assert!(md["BearerHmacSha256"]==hex(tag.as_ref()) && md["InviteId"]==id);
+        let signed=md["SignedDescriptor"].as_str().unwrap();
+        let descriptor=verify_legacy(signed,&mgmt.jwk);
+        assert!(descriptor["Kind"]=="TradeChannel.OnlineInvite" && descriptor["InviteId"]==id
+            && descriptor["PublicHost"]==cv["h"] && descriptor["Port"]==cv["p"]
+            && descriptor["TlsSha256"]==cv["t"] && descriptor["ManagementFingerprint"]==cv["m"]
+            && descriptor["ExpiresAtUtc"]==utc_at(expires) && descriptor["RetryUntilUtc"]==utc_at(expires+120));
+        let invite=verify_legacy(
+            descriptor["Invite"].as_str().unwrap(),&mgmt.jwk);
+        assert!(invite["Kind"]=="TradeChannel.PairInvite" && invite["InviteId"]==id
+            && invite["ServerBinding"]==binding && invite["ManagementSigningPublicKey"]==mgmt.jwk
+            && invite["ExpiresAtUtc"]==utc_at(expires) && invite["IssuedAtUtc"]==utc_at(expires-3600));
+        let store=open(&root);
+        assert!(matches!(store.view().unwrap().state(id),Some(InviteState::Open)));
+        assert_eq!(store.generation().unwrap(),1);
+        drop(store);
+        let ledger=root.join("authority-ledger.json");
+        let initial=fs::read(&ledger).unwrap();
+        refused(init(&root,&config_pin));
+        assert!(fs::read(&ledger).unwrap()==initial && fs::read(&code_path).unwrap()==code.as_bytes());
+        // A partially published root with otherwise valid state must not
+        // be opened by serve. This is a disposable test-only marker.
+        protected(&root,".fresh-init-incomplete",b"test marker\n");
+        Process::spawn(&root,&mp,&config_pin,&pin).refused();
+        fs::remove_file(root.join(".fresh-init-incomplete")).unwrap();
+        let addr:SocketAddr="127.0.0.1:18443".parse().unwrap();
+        let mut service=Process::spawn(&root,&mp,&config_pin,&pin);
+        service.ready(addr);
+        let host="203.0.113.10:18443";
+        let get=wire(id,"GET",host,token,None);
+        let (status,ready)=exchange(addr,&ca,&leaf,&get);
+        assert!(status==200 && ready["Ok"]==true && ready["Data"]["Status"]=="InvitationReady"
+            && ready["Data"]["SignedDescriptor"]==signed);
+        let issued=utc_at(expires-3600);
+        let inner=json!({"SchemaVersion":1,"Kind":"TradeChannel.ClientRequest","RequestId":REQ,
+            "DeviceId":DEV,"ClientPublicKey":client_key,"CreatedAtUtc":issued,"AddressFamilies":["IPv4"]});
+        let request_digest=sha(format!("1\nTradeChannel.ClientRequest\n{REQ}\n{DEV}\n{issued}\n{client_key}\nIPv4").as_bytes());
+        let request=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairRequest","InviteId":id,
+            "ServerBinding":binding,"ClientRequest":inner,"DeviceName":"fresh fixture","RecipientJwk":recipient.jwk,
+            "RequestDigest":request_digest,"RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":issued});
+        let body=serde_json::to_vec(&json!({"PairRequest":recipient.sign(&request)})).unwrap();
+        let post=wire(id,"POST",host,token,Some(&body));
+        let (status,reply)=exchange(addr,&ca,&leaf,&post);
+        assert!(status==200 && reply["Ok"]==true);
+        let private=rsa::RsaPrivateKey::from_pkcs8_pem(
+            &Zeroizing::new(fs::read_to_string(&recipient.path).unwrap())).unwrap();
+        let original=open_authorization(&reply["Data"],&private).expect("authorization decrypts");
+        let mut store=open(&root);
+        let Some(InviteState::Consumed(grant))=store.view().unwrap().state(id) else {
+            panic!("missing durable consumed grant");
+        };
+        let grant=grant.clone();
+        assert_eq!(store.generation().unwrap(),3);
+        assert_eq!(grant.address,Ipv4Addr::new(10,66,0,2));
+        let observed=read_verified_identity_snapshot(&store,IFACE,&expected).unwrap();
+        assert_eq!(observed,vec![spidervpn_pairing_authority::Peer{
+            public_key:client_key.clone(),address:grant.address}]);
+        assert!(spidervpn_pairing_authority::legacy_signed::audit_signed_consumed(id,
+            &json!({"State":"Consumed","SignedAuthorization":original,
+                "RequestId":REQ,"DeviceId":DEV,"ClientPublicKey":client_key,
+                "ClientAddress":"10.66.0.2/32","RequestDigest":request_digest,
+                "RecipientJwkDigest":grant.claims.recipient_jwk_digest}),&mgmt.jwk,&binding).is_ok());
+        let committed=fs::read(&ledger).unwrap();
+        let durable_conf=Zeroizing::new(fs::read(&conf).unwrap());
+        drop(store);
+        refused(init(&root,&config_pin));
+        let another=parent.join("nonempty-peer-refused");
+        refused(init(&another,&config_pin));
+        assert!(!another.exists());
+        assert!(fs::read(&ledger).unwrap()==committed && fs::read(&code_path).unwrap()==code.as_bytes());
+        assert!(fs::read(&conf).unwrap().as_slice()==durable_conf.as_slice());
+        assert_eq!(reader.snapshot().unwrap(),observed);
+        store=open(&root);
+        assert_eq!(store.generation().unwrap(),3);
+        let revoking=store.update(|l|l.begin_revocation(id)).unwrap();
+        spidervpn_pairing_authority::wg_live_set::apply_and_confirm(&mut store,IFACE,&revoking,
+            spidervpn_pairing_authority::wg_peer_plan::Change::Remove).unwrap();
+        drop(store);
+        assert!(exchange(addr,&ca,&leaf,&get)==(403,json!({"Ok":false,"Code":"Revoked"})));
+        assert!(exchange(addr,&ca,&leaf,&post)==(403,json!({"Ok":false,"Code":"Revoked"})));
+        service.stop(libc::SIGTERM);
+        assert!(reader.snapshot().unwrap().is_empty());
+        set_server_key(&old_file);
+        write_conf(&conf,&base,None);
+        assert!(reader.server_public_key().unwrap()==old_public);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
 }
