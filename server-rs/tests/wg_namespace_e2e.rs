@@ -803,4 +803,313 @@ mod identity_gate {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // One actual Stage 3 service integration test. Reuse the Stage 2
+    // independently implemented JWE/RS256 reader and real netns fixture.
+    #[cfg(feature = "linux-pairing-service")]
+    #[test]
+    fn actual_tls_get_consume_and_lost_reply_retry_use_same_authority() {
+        use rsa::pkcs8::DecodePrivateKey;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+        use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+        use spidervpn_pairing_authority::authorization_response::TrustedResponseConfig;
+        use spidervpn_pairing_authority::pairing_service::{
+            PairingAuthority, ServiceReport, run_loopback_pairing_service,
+        };
+        use std::io::{BufRead, BufReader, Read};
+        use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread::{self, JoinHandle};
+
+        struct Running {
+            stop: Arc<AtomicBool>,
+            worker: Option<JoinHandle<std::io::Result<ServiceReport>>>,
+            address: SocketAddr,
+        }
+        impl Running {
+            fn start(authority: PairingAuthority) -> Self {
+                let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+                let address=listener.local_addr().unwrap();
+                let stop=Arc::new(AtomicBool::new(false));
+                let signal=Arc::clone(&stop);
+                let worker=thread::spawn(move ||
+                    run_loopback_pairing_service(listener,authority,8,4,&signal));
+                Self {stop,worker:Some(worker),address}
+            }
+            fn stop(mut self) -> ServiceReport {
+                self.stop.store(true,Ordering::Release);
+                self.worker.take().unwrap().join().unwrap().unwrap()
+            }
+        }
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.stop.store(true,Ordering::Release);
+                if let Some(worker)=self.worker.take() { let _=worker.join(); }
+            }
+        }
+        fn client(address: SocketAddr, ca:&[u8], leaf:&[u8])
+            -> StreamOwned<ClientConnection,TcpStream>
+        {
+            let mut roots=RootCertStore::empty();
+            roots.add(CertificateDer::from(ca.to_vec())).unwrap();
+            let config=Arc::new(ClientConfig::builder_with_provider(
+                Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS12]).unwrap()
+                .with_root_certificates(roots).with_no_client_auth());
+            let mut connection=ClientConnection::new(config,
+                ServerName::try_from("203.0.113.10").unwrap()).unwrap();
+            let mut socket=TcpStream::connect_timeout(&address,Duration::from_secs(3)).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(35))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            while connection.is_handshaking() { connection.complete_io(&mut socket).unwrap(); }
+            assert!(connection.protocol_version()==Some(rustls::ProtocolVersion::TLSv1_2));
+            // Independently validate trust chain + exact pinned leaf before
+            // any request is written, not just a successful TLS handshake.
+            assert!(connection.peer_certificates().unwrap()[0].as_ref()==leaf);
+            StreamOwned::new(connection,socket)
+        }
+        fn wire(method:&str, host:&str, token:&str, body:Option<&[u8]>) -> Vec<u8> {
+            let suffix=if method=="POST" {"/consume"} else {""};
+            let mut head=format!("{method} /v1/invitations/{INV}{suffix} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n");
+            if let Some(body)=body {
+                head.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n",body.len()));
+            }
+            head.push_str("\r\n");
+            let mut bytes=head.into_bytes();
+            if let Some(body)=body { bytes.extend_from_slice(body); }
+            bytes
+        }
+        fn exchange(address:SocketAddr, ca:&[u8], leaf:&[u8], wire:&[u8]) -> (u16,Value) {
+            let mut tls=client(address,ca,leaf);
+            tls.write_all(wire).unwrap();
+            tls.flush().unwrap();
+            let mut response=Vec::new();
+            tls.read_to_end(&mut response).unwrap();
+            assert!(response.len()<=131_072+1024);
+            let text=String::from_utf8(response).unwrap();
+            let (head,body)=text.split_once("\r\n\r\n").unwrap();
+            let mut lines=head.split("\r\n");
+            let status=lines.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+            assert!(head.contains("\r\nContent-Type: application/json\r\n"));
+            assert!(head.ends_with("\r\nConnection: close"));
+            let lengths:Vec<_>=lines.filter_map(|s|s.strip_prefix("Content-Length: ")).collect();
+            assert!(lengths.len()==1 && lengths[0].parse::<usize>().unwrap()==body.len());
+            (status,serde_json::from_str(body).unwrap())
+        }
+
+        assert_eq!(unsafe {geteuid()},0);
+        assert_eq!(std::env::var("SPIDERVPN_SEC01_NS_INTERFACE").unwrap(),IFACE);
+        let expected=std::env::var("SPIDERVPN_SEC01_NS_SERVER_PUBLIC_KEY").unwrap();
+        let key=std::env::var("SPIDERVPN_SEC01_NS_CLIENT_PUBLIC_KEY").unwrap();
+        let reader=LiveWgReader::new(IFACE).unwrap();
+        assert!(reader.snapshot().unwrap().is_empty());
+        assert!(reader.server_public_key().unwrap()==expected);
+        let conf=Path::new("/etc/wireguard").join(format!("{IFACE}.conf"));
+        let base=Zeroizing::new(fs::read_to_string(&conf).unwrap());
+        let root=test_ledger();
+        // Test-only CA and leaf, not a production identity or signer.
+        let openssl=|args:&[&str]| {
+            assert!(Command::new("/usr/bin/openssl").args(args).current_dir(&root)
+                .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success());
+        };
+        openssl(&["req","-x509","-newkey","rsa:2048","-nodes","-days","1",
+            "-subj","/CN=SpiderVPN-Stage3-Fixture-CA","-addext","basicConstraints=critical,CA:TRUE",
+            "-addext","keyUsage=critical,keyCertSign,cRLSign","-keyout","ca.key","-out","ca.pem"]);
+        openssl(&["req","-new","-newkey","rsa:2048","-nodes","-subj","/CN=203.0.113.10",
+            "-keyout","tls.key","-out","tls.csr"]);
+        fs::write(root.join("tls.ext"),"subjectAltName=IP:203.0.113.10\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n").unwrap();
+        openssl(&["x509","-req","-in","tls.csr","-CA","ca.pem","-CAkey","ca.key","-CAcreateserial",
+            "-days","1","-sha256","-extfile","tls.ext","-out","tls.pem"]);
+        openssl(&["x509","-in","ca.pem","-outform","DER","-out","ca.der"]);
+        openssl(&["x509","-in","tls.pem","-outform","DER","-out","tls.der"]);
+        openssl(&["pkcs8","-topk8","-nocrypt","-in","tls.key","-outform","DER","-out","tls.key.der"]);
+        let ca=fs::read(root.join("ca.der")).unwrap();
+        let leaf=fs::read(root.join("tls.der")).unwrap();
+        let tls_key=Zeroizing::new(fs::read(root.join("tls.key.der")).unwrap());
+        let pin=sha(&leaf);
+        let now=i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap();
+        let issued=utc_at(now-60);
+        let expires=utc_at(now+3600);
+        let retry=utc_at(now+3720);
+        let mgmt=Rsa::new(&root,"management.pem");
+        let recipient=Rsa::new(&root,"recipient.pem");
+        let binding=json!({"RemoteOwnerId":"55555555-5555-4555-8555-555555555555",
+            "NodeId":"66666666-6666-4666-8666-666666666666","ServerPublicKey":expected});
+        let fingerprint=format!("SHA256:{}",b64(digest::digest(&digest::SHA256,
+            &serde_json::to_vec(&mgmt.jwk).unwrap()).as_ref()).replace('-',"+").replace('_',"/"));
+        let token=b64(&[77;32]);
+        let invite=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairInvite","InviteId":INV,
+            "RemoteOwnerId":binding["RemoteOwnerId"],"NodeId":binding["NodeId"],
+            "ServerPublicKey":expected,"ServerBinding":binding,
+            "ManagementSigningPublicKey":mgmt.jwk,"IssuedAtUtc":issued,"ExpiresAtUtc":expires,
+            "PublicEndpoint":"203.0.113.10:18443","DeviceName":"netns fixture",
+            "Capabilities":{"PairingVersion":1}});
+        let descriptor=mgmt.sign(&json!({"SchemaVersion":1,"Kind":"TradeChannel.OnlineInvite",
+            "InviteId":INV,"Invite":mgmt.sign(&invite),"PublicHost":"203.0.113.10","Port":18443,
+            "TlsSha256":pin,"ManagementFingerprint":fingerprint,"ManagementSigningPublicKey":mgmt.jwk,
+            "ExpiresAtUtc":expires,"RetryUntilUtc":retry}));
+        let tag=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,token.as_bytes()),
+            b"SpiderVPN pinned invitation metadata bearer v1");
+        let metadata=serde_json::to_vec(&json!({"SchemaVersion":1,"Kind":"SpiderVPN.InviteMetadata",
+            "InviteId":INV,"BearerHmacSha256":hex(tag.as_ref()),"SignedDescriptor":descriptor,
+            "ManagementSigningPublicKey":mgmt.jwk,"ManagementFingerprint":fingerprint,
+            "ServerBinding":binding,"PublicHost":"203.0.113.10","Port":18443,
+            "TlsSha256":pin,"WgInterface":IFACE})).unwrap();
+        let meta_pin=sha(&metadata);
+        let config_record=serde_json::to_vec(&json!({"SchemaVersion":1,"Kind":"SpiderVPN.AuthorizationConfig",
+            "ServerBinding":binding,"WgInterface":IFACE,"TunnelSubnet":"10.66.0.0/24",
+            "ServerAddress":"10.66.0.1/24","PublicEndpoint":"203.0.113.10:51820",
+            "NodeName":"netns fixture","Transport":"udp"})).unwrap();
+        let management_private=rsa::RsaPrivateKey::from_pkcs8_pem(
+            &Zeroizing::new(fs::read_to_string(&mgmt.path).unwrap())).unwrap();
+        let recipient_private=rsa::RsaPrivateKey::from_pkcs8_pem(
+            &Zeroizing::new(fs::read_to_string(&recipient.path).unwrap())).unwrap();
+        let authority=|tls_pin:&str| PairingAuthority::new(
+            root.clone(),IFACE.to_owned(),metadata.clone(),meta_pin.clone(),
+            TrustedResponseConfig::verify_pinned(&config_record,&sha(&config_record)).unwrap(),
+            management_private.clone(),vec![CertificateDer::from(leaf.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(tls_key.to_vec())),tls_pin.to_owned());
+        assert!(authority(&"0".repeat(64)).is_err());
+
+        let inner=json!({"SchemaVersion":1,"Kind":"TradeChannel.ClientRequest","RequestId":REQ,
+            "DeviceId":DEV,"ClientPublicKey":key,"CreatedAtUtc":issued,"AddressFamilies":["IPv4"]});
+        let request_digest=sha(format!("1\nTradeChannel.ClientRequest\n{REQ}\n{DEV}\n{issued}\n{key}\nIPv4").as_bytes());
+        let pair_request=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairRequest",
+            "InviteId":INV,"ServerBinding":binding,"ClientRequest":inner,
+            "DeviceName":"netns fixture","RecipientJwk":recipient.jwk,"RequestDigest":request_digest,
+            "RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":issued});
+        let body=serde_json::to_vec(&json!({"PairRequest":recipient.sign(&pair_request)})).unwrap();
+        let host="203.0.113.10:18443";
+        let get=wire("GET",host,&token,None);
+        let post=wire("POST",host,&token,Some(&body));
+        let mut store=open(&root);
+        store.update(|l|l.insert_open(INV,now+3600)).unwrap();
+        let generation=store.generation().unwrap();
+        let ledger=root.join("authority-ledger.json");
+        let initial=fs::read(&ledger).unwrap();
+        drop(store);
+
+        let service=Running::start(authority(&pin).unwrap());
+        let addr=service.address;
+        let send=|w:&[u8]| exchange(addr,&ca,&leaf,w);
+        // Real TLS refusal for invalid bearer and malformed HTTP.
+        let wrong_token=b64(&[78;32]);
+        assert!(send(&wire("GET",host,&wrong_token,None))==(403,json!({"Ok":false,"Code":"Forbidden"})));
+        assert!(send(&wire("POST",host,&wrong_token,Some(&body)))==(403,json!({"Ok":false,"Code":"Forbidden"})));
+        let mut malformed=get.clone();
+        malformed[..3].copy_from_slice(b"BAD");
+        assert!(send(&malformed)==(400,json!({"Ok":false,"Code":"InvalidRequest"})));
+        let mut wrong=pair_request.clone();
+        wrong["ServerBinding"]["NodeId"]=json!("88888888-8888-4888-8888-888888888888");
+        let wrong_body=serde_json::to_vec(&json!({"PairRequest":recipient.sign(&wrong)})).unwrap();
+        let (status,denial)=send(&wire("POST",host,&token,Some(&wrong_body)));
+        assert!(status!=200 && denial["Ok"]==false && denial.get("Data").is_none());
+        assert!(send(&wire("GET","wrong.example:18443",&token,None))==
+            (409,json!({"Ok":false,"Code":"InviteMismatch"})));
+        // Plaintext sent to the actual TLS listener can never reach dispatch.
+        let mut plaintext=TcpStream::connect(addr).unwrap();
+        plaintext.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+        plaintext.write_all(&get).unwrap();
+        plaintext.shutdown(Shutdown::Write).unwrap();
+        let mut rejected=Vec::new();
+        let _=plaintext.read_to_end(&mut rejected);
+        assert!(!rejected.windows(b"HTTP/1.1".len()).any(|w|w==b"HTTP/1.1"));
+        drop(plaintext);
+        // Cross-process authority exclusion is fail-fast, not queued work.
+        let busy=open(&root);
+        assert!(send(&get)==(500,json!({"Ok":false,"Code":"InvalidState"})));
+        drop(busy);
+        let (status,descriptor_reply)=send(&get);
+        assert!(status==200 && descriptor_reply==json!({"Ok":true,
+            "Data":{"Status":"InvitationReady","SignedDescriptor":descriptor}}));
+        assert!(fs::read(&ledger).unwrap()==initial);
+        assert!(fs::read(&conf).unwrap().as_slice()==base.as_bytes());
+        assert!(reader.snapshot().unwrap().is_empty());
+
+        // Actual GET -> POST success through encrypted HTTP, not a direct
+        // call to the Stage 2 adapter. Verify independent wire decryption,
+        // legacy signature/binding and actual committed kernel peer.
+        let (status,reply)=send(&post);
+        assert!(status==200 && reply["Ok"]==true && reply.as_object().unwrap().len()==2);
+        let data=&reply["Data"];
+        assert!(data["Status"]=="Authorized" && data["RequestId"]==REQ
+            && data["RequestDigest"]==request_digest);
+        let original=open_authorization(data,&recipient_private).expect("TLS authorization decrypts");
+        let store=open(&root);
+        let Some(InviteState::Consumed(grant))=store.view().unwrap().state(INV) else {
+            panic!("TLS reply without durable consumed grant");
+        };
+        let grant=grant.clone();
+        assert_eq!(store.generation().unwrap(),generation+2);
+        assert_eq!(grant.address,Ipv4Addr::new(10,66,0,2));
+        let observed=read_verified_identity_snapshot(&store,IFACE,&expected).unwrap();
+        assert_eq!(observed,vec![spidervpn_pairing_authority::Peer{
+            public_key:key.clone(),address:grant.address}]);
+        assert!(spidervpn_pairing_authority::legacy_signed::audit_signed_consumed(INV,
+            &json!({"State":"Consumed","SignedAuthorization":original,
+                "RequestId":REQ,"DeviceId":DEV,"ClientPublicKey":key,
+                "ClientAddress":"10.66.0.2/32","RequestDigest":request_digest,
+                "RecipientJwkDigest":grant.claims.recipient_jwk_digest}),&mgmt.jwk,&binding).is_ok());
+        let committed=fs::read(&ledger).unwrap();
+        let material:Value=serde_json::from_slice(&committed).unwrap();
+        assert!(material["authorization_material"][INV]["signed"]==original);
+        let committed_conf=Zeroizing::new(fs::read(&conf).unwrap());
+        drop(store);
+
+        // Client disconnects after an authorized retry's status line,
+        // discarding its response payload. Drain and reopen the real service.
+        let mut lost=client(addr,&ca,&leaf);
+        lost.write_all(&post).unwrap();
+        lost.flush().unwrap();
+        let mut lost=BufReader::new(lost);
+        let mut status_line=String::new();
+        lost.read_line(&mut status_line).unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 200 "));
+        let _=lost.get_mut().sock.shutdown(Shutdown::Both);
+        drop(lost);
+        let report=service.stop();
+        assert!(report.peak_workers<=4 && report.completed>=8 && report.failed>=1);
+        assert!(TcpStream::connect_timeout(&addr,Duration::from_millis(200)).is_err());
+
+        let reopened=Running::start(authority(&pin).unwrap());
+        let (status,retried)=exchange(reopened.address,&ca,&leaf,&post);
+        assert!(status==200 && retried["Ok"]==true);
+        assert!(open_authorization(&retried["Data"],&recipient_private).as_deref()==Some(original.as_str()));
+        assert!(retried["Data"]["EncryptedAuthorization"]!=data["EncryptedAuthorization"]);
+        assert!(fs::read(&ledger).unwrap()==committed);
+        assert!(fs::read(&conf).unwrap().as_slice()==committed_conf.as_slice());
+        assert_eq!(reader.snapshot().unwrap(),observed);
+        let mut store=open(&root);
+        assert_eq!(store.generation().unwrap(),generation+2);
+        let revoking=store.update(|l|l.begin_revocation(INV)).unwrap();
+        spidervpn_pairing_authority::wg_live_set::apply_and_confirm(
+            &mut store,IFACE,&revoking,spidervpn_pairing_authority::wg_peer_plan::Change::Remove).unwrap();
+        let revoked=fs::read(&ledger).unwrap();
+        drop(store);
+        assert!(exchange(reopened.address,&ca,&leaf,&post)==(403,json!({"Ok":false,"Code":"Revoked"})));
+        assert!(exchange(reopened.address,&ca,&leaf,&get)==(403,json!({"Ok":false,"Code":"Revoked"})));
+        assert!(fs::read(&ledger).unwrap()==revoked);
+        assert!(reader.snapshot().unwrap().is_empty());
+        let report=reopened.stop();
+        assert!(report.completed==3);
+        // The actual service keeps one kernel-source cap across TLS and
+        // request phases. Start a fresh accept loop, with no prior worker
+        // racing the saturation control. Four silent connections consume
+        // this source's slots; a fifth is closed rather than queued.
+        let limited=Running::start(authority(&pin).unwrap());
+        let slow:Vec<_>=(0..4).map(|_|TcpStream::connect(limited.address).unwrap()).collect();
+        let mut saturated=TcpStream::connect(limited.address).unwrap();
+        saturated.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut byte=[0u8;1];
+        let denied=saturated.read(&mut byte);
+        assert!(matches!(denied,Ok(0)) || denied.is_err_and(|e|
+            matches!(e.kind(),std::io::ErrorKind::ConnectionReset|std::io::ErrorKind::ConnectionAborted)));
+        drop(saturated);
+        drop(slow);
+        let report=limited.stop();
+        assert!(report.completed==0 && report.source_rejected>=1 && report.peak_workers==4);
+        write_conf(&conf,&base,None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
 }

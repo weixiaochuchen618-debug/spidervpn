@@ -620,6 +620,29 @@ fn check_retry_interface(scope: &TrustedOpenInvite<'_>, interface: &str)
     Ok(())
 }
 
+/// Bind a borrowed, authenticated scope to the separately provisioned
+/// service identity before taking a ledger lock. The existing GET/POST
+/// gates still perform their full signature, state and request checks.
+#[cfg(feature = "linux-pairing-service")]
+pub(crate) fn check_service_scope(scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str, actual_tls_pin: &str,
+    config: &crate::authorization_response::TrustedResponseConfig,
+    management: &rsa::RsaPrivateKey) -> Result<(), GateError>
+{
+    check_retry_interface(scope, interface)?;
+    if scope.tls_der_pin != actual_tls_pin
+        || !config.matches_scope(scope.server_binding, interface) {
+        return Err(GateError::InvalidState);
+    }
+    let route = format!("/v1/invitations/{}{}", scope.invite_id,
+        if request.method == Method::Post { "/consume" } else { "" });
+    if request.target != route { return Err(GateError::NotFound); }
+    if request.host != format!("{}:{}", scope.public_host, scope.port) {
+        return Err(GateError::InviteMismatch);
+    }
+    crate::authorization_response::check_signer(management, scope.management_jwk)
+}
+
 /// Read-only retry under the CURRENT locked store. The local service
 /// selector must exactly match independently pinned WgInterface metadata.
 /// The existing adapter reads kernel inventory, protected wg.conf and kernel

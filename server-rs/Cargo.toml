@@ -65,6 +65,9 @@ linux-fresh-consume-gate = ["linux-handshake-admission", "dep:zeroize"]
 # Internal success response only; does not enable a listener or default daemon.
 linux-authorization-response = ["linux-fresh-consume-gate", "dep:aes", "dep:base64", "dep:cbc", "dep:hmac", "dep:rsa", "dep:sha2", "dep:time"]
 
+# Stage 3 isolated authenticated loopback TLS service. No public bind/deploy.
+linux-pairing-service = ["linux-authorization-response", "linux-tls-wire-lab"]
+
 [[test]]
 name = "wg_namespace_e2e"
 path = "tests/wg_namespace_e2e.rs"
