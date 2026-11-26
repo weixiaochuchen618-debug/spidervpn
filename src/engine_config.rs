@@ -132,6 +132,8 @@ pub fn validate_probe_port_free(port: u16) -> Result<(), String> {
 /// servers = [ {udp dns-direct = 本地}, {https dns-trade = 1.1.1.1:443, detour=trade-exit} ]
 /// rules   = [ 交易域名/程序 => dns-trade ] ; final = dns-direct ; port 53 => hijack-dns
 /// ```
+const TRADE_DNS_ADDRESS: &str = "1.1.1.1";
+
 fn normalize_dns_trade(
     obj: &mut serde_json::Map<String, Value>,
     split: &SplitConfig,
@@ -200,7 +202,7 @@ fn normalize_dns_trade(
         // 查询一律 `exchange4: EOF`，整条线等于不可用。改成不依赖服务器配置。
         serde_json::json!({
             "type": "udp", "tag": "dns-trade",
-            "server": "1.1.1.1", "detour": endpoint_tag
+            "server": TRADE_DNS_ADDRESS, "detour": endpoint_tag
         }),
     ];
     // 线路文件里若已有 dns-direct，保留它：别把用户/线路自带的本地解析器换掉。
@@ -1503,6 +1505,108 @@ pub fn apply_bind_interface(
     changed
 }
 
+/// Limit domain lookups made by the authenticated probe on the known
+/// single-peer, IPv4-only standard WireGuard profile. The SOCKS request still
+/// carries the original domain, and the first tc-check route is unchanged.
+/// sing-box WireGuard resolves that domain using the DNS router and the
+/// original inbound context (not route.default_domain_resolver).
+fn apply_standard_ipv4_probe_dns(obj: &mut serde_json::Map<String, Value>) {
+    let Some([endpoint]) = obj.get("endpoints").and_then(Value::as_array).map(Vec::as_slice)
+        else { return };
+    let Some(tag) = endpoint.get("tag").and_then(Value::as_str).filter(|tag| !tag.is_empty())
+        else { return };
+    let ipv4_addresses = endpoint.get("address").and_then(Value::as_array).is_some_and(|list| {
+        !list.is_empty() && list.iter().all(|address| {
+            address.as_str().and_then(|s| s.split_once('/')).is_some_and(|(ip, prefix)| {
+                ip.parse::<std::net::Ipv4Addr>().is_ok()
+                    && prefix.parse::<u8>().is_ok_and(|p| p <= 32)
+            })
+        })
+    });
+    let full_ipv4_peer = endpoint.get("peers").and_then(Value::as_array).is_some_and(|peers| {
+        peers.len() == 1 && peers[0]["allowed_ips"] == json!(["0.0.0.0/0"])
+    });
+    if endpoint["type"] != "wireguard" || endpoint.get("detour").is_some()
+        || !ipv4_addresses || !full_ipv4_peer
+    {
+        return;
+    }
+    let Some(outbounds) = obj.get("outbounds").and_then(Value::as_array) else { return };
+    let mut selectors = outbounds.iter().filter(|out| out["tag"] == TRADE_EXIT);
+    if !selectors.next().is_some_and(|out| {
+        out["type"] == "selector" && out["outbounds"] == json!([tag])
+    }) || selectors.next().is_some() || outbounds.iter().any(|out| out["tag"] == tag) {
+        return;
+    }
+    let tag = tag.to_owned();
+    let Some(dns) = obj.get_mut("dns").and_then(Value::as_object_mut) else { return };
+    if dns.get("strategy").is_some_and(|s| !matches!(
+        s.as_str(), Some("" | "ipv4_only" | "prefer_ipv4" | "prefer_ipv6")
+    )) {
+        return;
+    }
+    let Some(mut servers) = dns.get("servers").and_then(Value::as_array).cloned()
+        else { return };
+    if servers.is_empty() {
+        return;
+    }
+    let mut rules = match dns.get("rules") {
+        None => Vec::new(),
+        Some(Value::Array(rules)) => rules.clone(),
+        _ => return,
+    };
+    // 1.14's per-query-type rules must not be combined with the legacy
+    // strategy-bearing DNS rules. Support the existing generated trade DNS
+    // shape too, without reinterpreting arbitrary imported DNS policy.
+    let legacy = !rules.is_empty();
+    if legacy && !rules.iter().all(|rule| {
+        rule.as_object().is_some_and(|fields| {
+            fields.len() == 4 && rule["action"] == "route"
+                && rule["server"] == "dns-trade" && rule["strategy"] == "ipv4_only"
+                && (rule.get("process_name").is_some() || rule.get("domain_suffix").is_some())
+        })
+    }) {
+        return;
+    }
+    // Use the existing tunnel DNS recipe, never a local resolver or a fixed
+    // HTTP destination. Appending a new scoped server preserves the default.
+    let trade_server = json!({
+        "type": "udp", "tag": "dns-trade", "server": TRADE_DNS_ADDRESS, "detour": tag
+    });
+    let resolver = if servers.iter().filter(|s| s["tag"] == "dns-trade").count() == 1
+        && servers.contains(&trade_server)
+    {
+        "dns-trade"
+    } else {
+        const PROBE_DNS: &str = "tc-check-dns";
+        if servers.iter().any(|s| s["tag"] == PROBE_DNS) {
+            return;
+        }
+        servers.push(json!({
+            "type": "udp", "tag": PROBE_DNS, "server": TRADE_DNS_ADDRESS, "detour": tag
+        }));
+        PROBE_DNS
+    };
+    let mut probe_rule = json!({
+        "inbound": [PROBE_TAG], "action": "route", "server": resolver, "disable_cache": true
+    });
+    if legacy {
+        probe_rule["strategy"] = json!("ipv4_only");
+        rules.insert(0, probe_rule);
+    } else {
+        // Modern DNS Lookup issues A/AAAA independently. Return NODATA for
+        // AAAA only on tc-check, so no fake address or external AAAA query is
+        // introduced; A still goes through the WireGuard DNS transport.
+        rules.insert(0, probe_rule);
+        rules.insert(0, json!({
+            "inbound": [PROBE_TAG], "query_type": ["AAAA"],
+            "action": "predefined", "rcode": "NOERROR", "answer": []
+        }));
+    }
+    dns.insert("servers".into(), Value::Array(servers));
+    dns.insert("rules".into(), Value::Array(rules));
+}
+
 pub fn prepare_engine_config(
     line_config: &std::path::Path,
     split: &SplitConfig,
@@ -1565,7 +1669,11 @@ pub fn prepare_engine_config(
             inbounds.iter().any(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(PROBE_TAG))
         })
     {
-        enforce_probe_route_invariant(obj)?
+        let changed = enforce_probe_route_invariant(obj)?;
+        if transport == Transport::Udp && mode == Mode::Proxy {
+            apply_standard_ipv4_probe_dns(obj);
+        }
+        changed
     } else {
         false
     };
@@ -3717,6 +3825,110 @@ mod tests {
             ],
             "route": { "rules": [{ "action": "route", "outbound": TRADE_EXIT }], "final": TRADE_EXIT }
         })
+    }
+
+    #[test]
+    fn standard_ipv4_wireguard_probe_resolves_a_through_tunnel_without_changing_other_routes() {
+        let root = std::env::temp_dir().join(format!(
+            "spidervpn-standard-ipv4-probe-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut profile = udp_line();
+        profile["endpoints"] = json!([{
+            "type": "wireguard", "tag": "hk", "system": false,
+            "address": ["10.7.0.2/32"],
+            "peers": [{"address": "203.0.113.10", "port": 51820,
+                       "allowed_ips": ["0.0.0.0/0"]}]
+        }]);
+        profile["outbounds"] = json!([
+            {"type": "selector", "tag": TRADE_EXIT, "outbounds": ["hk"], "default": "hk"},
+            {"type": "selector", "tag": DAILY_EXIT, "outbounds": ["direct", "hk"], "default": "direct"},
+            {"type": "direct", "tag": "direct"}
+        ]);
+        profile["dns"] = json!({
+            "servers": [{"type": "local", "tag": "dns-direct"}],
+            "final": "dns-direct", "strategy": "ipv4_only"
+        });
+        profile["route"] = json!({
+            "rules": [
+                {"inbound": [PROBE_TAG], "outbound": TRADE_EXIT},
+                {"inbound": [MIXED_TAG], "outbound": DAILY_EXIT}
+            ],
+            "final": DAILY_EXIT,
+            "default_domain_resolver": {"server":"dns-direct", "strategy":"prefer_ipv4"}
+        });
+        let agents = crate::config::AgentsConfig::default();
+        let split = SplitConfig::default();
+        let prepare = |name: &str, profile: &Value, transport, split: &SplitConfig, creds| {
+            let line = root.join(format!("{name}.json"));
+            let runtime = root.join(format!("{name}-runtime.json"));
+            let original = profile.to_string();
+            std::fs::write(&line, &original).unwrap();
+            let path = prepare_engine_config(
+                &line, split, &agents, transport, Mode::Proxy, &runtime, "", creds, Some(18003)
+            ).unwrap();
+            assert_eq!(std::fs::read_to_string(&line).unwrap(), original);
+            let effective: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if creds.is_some() {
+                assert_eq!(probe_evidence_skip_reason_for_session(&path, 18003, "fresh-user", "fresh-pass"), None);
+            }
+            effective
+        };
+        let creds = Some(("fresh-user", "fresh-pass"));
+        // Original IPv4-only skeleton, and the reported failure shape where
+        // the existing normalizer discarded the global IPv4 strategy before
+        // stripping the unused transport. Both need a tunnel-only probe resolver.
+        for (name, input, resolver) in [
+            ("standard", profile.clone(), "tc-check-dns"),
+            ("standard-with-transit", prepend_outbound(profile.clone(), transit_outbound(TRANSPORT_TAG)), "dns-trade"),
+        ] {
+            let actual = prepare(name, &input, Transport::Udp, &split, creds);
+            let dns_rules = actual["dns"]["rules"].as_array().expect("scoped probe DNS rules");
+            assert_eq!(dns_rules, &vec![
+                json!({"inbound":[PROBE_TAG],"query_type":["AAAA"],"action":"predefined","rcode":"NOERROR","answer":[]}),
+                json!({"inbound":[PROBE_TAG],"action":"route","server":resolver,"disable_cache":true})
+            ]);
+            assert!(actual["dns"]["servers"].as_array().unwrap().contains(&json!({
+                "type":"udp","tag":resolver,"server":TRADE_DNS_ADDRESS,"detour":"hk"
+            })));
+            assert_eq!(actual["dns"]["servers"][0], input["dns"]["servers"][0]);
+            assert_eq!(actual["route"]["default_domain_resolver"], profile["route"]["default_domain_resolver"]);
+            assert_eq!(actual["route"]["rules"][0], profile["route"]["rules"][0]);
+            assert_eq!(actual["route"]["rules"][1], profile["route"]["rules"][1]);
+            assert_eq!(actual["route"]["final"], DAILY_EXIT);
+            assert_eq!(actual["outbounds"], profile["outbounds"]);
+            assert_eq!(actual["endpoints"], profile["endpoints"]);
+            if name == "standard" {
+                assert_eq!(actual["dns"]["final"], "dns-direct");
+                assert_eq!(actual["dns"]["strategy"], "ipv4_only");
+            } else {
+                assert_eq!(actual["dns"]["final"], "dns-trade");
+                assert!(actual["dns"].get("strategy").is_none());
+            }
+        }
+        // Existing strategy-bearing trade rules retain legacy mode and order.
+        let cfg = crate::config::parse(
+            r#"{"schema":2,"split":{"domains":[{"value":"example.com","target":"trade"}]}}"#
+        ).unwrap();
+        let with_transit = prepend_outbound(profile.clone(), transit_outbound(TRANSPORT_TAG));
+        let legacy = prepare("legacy", &with_transit, Transport::Udp, &cfg.split, creds);
+        assert_eq!(legacy["dns"]["rules"], json!([
+            {"inbound":[PROBE_TAG],"action":"route","server":"dns-trade","strategy":"ipv4_only","disable_cache":true},
+            {"domain_suffix":["example.com"],"action":"route","server":"dns-trade","strategy":"ipv4_only"}
+        ]));
+        // IPv6-capable profiles and compatible transport retain their previous
+        // resolver policy. A disabled probe never adds a new DNS rule/server.
+        let mut dual = profile.clone();
+        dual["endpoints"][0]["address"] = json!(["10.7.0.2/32", "fd00::2/128"]);
+        dual["endpoints"][0]["peers"][0]["allowed_ips"] = json!(["0.0.0.0/0", "::/0"]);
+        assert_eq!(prepare("dual", &dual, Transport::Udp, &split, creds)["dns"], dual["dns"]);
+        let compatible = prepare("compatible", &with_transit, Transport::Tcp, &split, creds);
+        assert_eq!(compatible["endpoints"][0]["detour"], TRANSPORT_TAG);
+        assert_eq!(compatible["dns"]["rules"], json!([]));
+        assert_eq!(compatible["dns"]["final"], "dns-trade");
+        assert_eq!(prepare("disabled", &profile, Transport::Udp, &split, None)["dns"], profile["dns"]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// 参数齐全的 vless 出站（VLESS + REALITY）。tag 由调用方给：
