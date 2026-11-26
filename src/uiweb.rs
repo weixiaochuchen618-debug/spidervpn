@@ -2993,6 +2993,35 @@ impl WebUi {
             .unwrap_or_default();
         let st = fetch(r#"{"cmd":"status"}"#);
         let lines_raw = fetch(r#"{"cmd":"lines"}"#);
+        // The lines adapter already carries a later status projection. For a
+        // completed disconnect with a valid selection, use that whole offline
+        // projection rather than combining the old connected status with new rows.
+        let st = if st.get("state").and_then(Value::as_str) == Some("Connected")
+            && lines_raw.get("ok").and_then(Value::as_bool) == Some(true)
+            && lines_raw.get("state").and_then(Value::as_str) == Some("Disconnected")
+            && lines_raw.get("action").and_then(Value::as_str) == Some("Connect")
+            && lines_raw.get("selected").and_then(Value::as_str).is_some_and(|id| {
+                !id.is_empty()
+                    && lines_raw.get("lines").and_then(Value::as_array).is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            row.get("id").and_then(Value::as_str) == Some(id)
+                                && row.get("selected").and_then(Value::as_bool) == Some(true)
+                        })
+                    })
+            })
+            && lines_raw.get("exitEvidence").and_then(Value::as_str).is_some_and(|status| status != "verified")
+            && lines_raw.get("exitObservedIp") == Some(&Value::Null)
+            && lines_raw.get("exitAttribution").and_then(Value::as_str) == Some("Unknown")
+            && lines_raw.get("exitProbeAtUtc") == Some(&Value::Null)
+            && lines_raw.get("transportActual") == Some(&Value::Null)
+            && lines_raw.get("startedAt").and_then(Value::as_str) == Some("")
+            && lines_raw.get("latencyMs") == Some(&Value::Null)
+            && lines_raw.get("measuredAtUtc") == Some(&Value::Null)
+        {
+            lines_raw.clone()
+        } else {
+            st
+        };
         let providers_raw = fetch(r#"{"cmd":"providers"}"#);
         // 部署任务：**同一条命令**（`deployment-list`）给管道、CLI 与页面，三处口径
         // 不会漂。这里刻意不做缓存：读的是本地几十条小 JSON，一帧一次远比
