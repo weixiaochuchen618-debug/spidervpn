@@ -16845,4 +16845,109 @@ mod tests {
             "MODELED_HOST_GENERATION_CONTRACT_RED: disconnected B must not inherit A running/InUse; B_in_use={b_in_use} B_running={b_running} A_verified_quartet={old_verified}; original_condition={original_condition} exit_consistency={exit_consistency} coherent_a={coherent_a} offline_or_unavailable={offline_or_unavailable} no_current_exit={no_current_exit} A_in_use={a_in_use}; mixed_state={} mixed_active={} mixed_running={} mixed_exit={exit}; stable_A_exit={}",
             m["State"], m["ActiveLineId"], m["Running"], a["ExitEvidence"]);
     }
+
+    #[test]
+    fn mvp03_lines_merge_preserves_authoritative_status_baseline() {
+        use serde_json::{json, Value};
+
+        struct Sandbox(PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let sandbox = Sandbox(tmp_root("mvp03-lines-status-provenance"));
+        let root = &sandbox.0;
+        let cfg = write_cfg(root, "L1");
+        write_line_file(root, "L1", true);
+        write_line_file(root, "L2", true);
+        let mut ctx = ctx_with(Some(cfg), root);
+        let offline = !connection_busy(root)
+            && !root.join("runtime.json").exists()
+            && !root.join("runtime-engine.json").exists()
+            && !root.join("proxy-journal.json").exists();
+
+        // Actual raw IPC list, then the same reload/status/merge boundary
+        // as the host adapter. No engine, pipe or browser is started.
+        let raw = call(r#"{"cmd":"lines"}"#, &ctx);
+        ctx.cfg = Some(crate::config::load(&root.join(crate::config::DEFAULT_PATH))
+            .expect("fixture: reload config").expect("fixture: saved config"));
+        let baseline = crate::status_state(&ctx);
+        let mut merged = baseline.clone();
+        crate::uiweb::merge_ui_command_reply(&mut merged, &raw);
+
+        // Synthetic negative control ONLY: no command is executed. Keep the
+        // genuine list payload; attempt to replace each protected baseline key.
+        // latencyMs/measuredAtUtc are intentionally whitelisted, and failure
+        // keys have their own merge rule; neither is covered by this contract.
+        let conflicts = json!({
+            "action": "Disconnect",
+            "state": "Connected",
+            "exitAttribution": "LineServer",
+            "exitEvidence": "verified",
+            "exitObservedIp": "203.0.113.77",
+            "exitProbeAtUtc": "2000-01-01T00:00:00Z",
+            "startedAt": "2000-01-01T00:00:00Z",
+            "transportActual": "TCP"
+        });
+        let unknown = "mvp03UnlistedCommandPayload";
+        let mut hostile = raw.clone();
+        let fields = hostile.as_object_mut().expect("fixture: raw lines object");
+        for (key, value) in conflicts.as_object().expect("fixture: conflict object") {
+            fields.insert(key.clone(), value.clone());
+        }
+        fields.insert(unknown.into(), json!("synthetic unlisted value"));
+        let mut negative = baseline.clone();
+        crate::uiweb::merge_ui_command_reply(&mut negative, &hostile);
+
+        let offline_after = !connection_busy(root)
+            && !root.join("runtime.json").exists()
+            && !root.join("runtime-engine.json").exists()
+            && !root.join("proxy-journal.json").exists();
+        std::fs::remove_dir_all(root).expect("fixture: explicit disposable root cleanup");
+
+        assert!(offline && offline_after, "fixture: offline before and after");
+        assert_eq!(raw["ok"], true, "fixture: actual lines success");
+        assert_eq!(raw["selected"], "L1");
+        let rows = raw["lines"].as_array().expect("fixture: actual list array");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row["id"] == "L1" && row["selected"] == true));
+        assert!(rows.iter().any(|row| row["id"] == "L2" && row["selected"] == false));
+        assert_eq!(baseline["ok"], true, "fixture: actual status success");
+        assert_eq!(baseline["state"], "Disconnected", "fixture: actual offline status");
+        assert_eq!(baseline["action"], "Connect");
+        assert_eq!(baseline["exitEvidence"], "unverified");
+        assert_eq!(baseline["exitAttribution"], "Unknown");
+        assert_eq!(baseline.get("exitObservedIp"), Some(&Value::Null));
+        assert_eq!(baseline.get("exitProbeAtUtc"), Some(&Value::Null));
+        assert_eq!(baseline["startedAt"], "");
+        assert_eq!(baseline.get("transportActual"), Some(&Value::Null));
+        assert!(baseline.get(unknown).is_none(), "fixture: unknown absent at source");
+
+        let mut violations = Vec::new();
+        for (key, conflicting) in conflicts.as_object().unwrap() {
+            let actual = baseline.get(key).expect("fixture: protected baseline key present");
+            assert_ne!(actual, conflicting, "fixture: genuinely conflicting {key}");
+            if raw.get(key).is_some() {
+                violations.push(format!("{key}: unexpectedly in real raw lines"));
+            }
+            if merged.get(key) != Some(actual) {
+                violations.push(format!("{key}: real merge changed baseline"));
+            }
+            if negative.get(key) != Some(actual) {
+                violations.push(format!("{key}: synthetic command overrode baseline"));
+            }
+        }
+        for key in ["lines", "selected"] {
+            if merged.get(key) != raw.get(key) || negative.get(key) != raw.get(key) {
+                violations.push(format!("{key}: legitimate command payload lost"));
+            }
+        }
+        if merged.get(unknown).is_some() || negative.get(unknown).is_some() {
+            violations.push(format!("{unknown}: unlisted command payload admitted"));
+        }
+        assert!(violations.is_empty(),
+            "MVP03_STATUS_BASELINE_PROVENANCE: {violations:?}; protected baseline={baseline}; actual merged={merged}; synthetic negative merged={negative}");
+    }
 }
