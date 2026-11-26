@@ -170,11 +170,17 @@ pub struct AuthenticatedInviteMetadata<'a> {
 }
 impl AuthenticatedInviteMetadata<'_> {
     pub fn scope(&self) -> Result<TrustedOpenInvite<'_>,GateError> {
-        let v=&self.record;
+        scope_from_record(&self.record,self.bearer)
+    }
+}
+
+fn scope_from_record<'a>(v: &'a Value, bearer: &'a str)
+    -> Result<TrustedOpenInvite<'a>,GateError>
+{
         let invalid=GateError::InvalidState;
         Ok(TrustedOpenInvite {
             invite_id:text(v,"InviteId").ok_or(invalid)?,
-            token:self.bearer,
+            token:bearer,
             signed_descriptor:text(v,"SignedDescriptor").ok_or(invalid)?,
             management_jwk:v.get("ManagementSigningPublicKey").ok_or(invalid)?,
             management_fingerprint:text(v,"ManagementFingerprint").ok_or(invalid)?,
@@ -185,7 +191,6 @@ impl AuthenticatedInviteMetadata<'_> {
             tls_der_pin:text(v,"TlsSha256").ok_or(invalid)?,
             wg_interface:text(v,"WgInterface").filter(|name|crate::wg_readonly::valid_interface(name)).ok_or(invalid)?,
         })
-    }
 }
 
 fn decode_sha256_hex(s: &str) -> Option<Vec<u8>> {
@@ -338,7 +343,10 @@ fn check_descriptor(scope: &TrustedOpenInvite<'_>, expires: i64, now: i64)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Operation { Get, Fresh, Retry }
+enum Operation { Get, Fresh, Retry,
+    #[cfg(feature = "linux-pairing-process")]
+    GetRetry,
+}
 
 fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
     request: &ParsedRequest, now: i64, operation: Operation) -> Result<&'a Ledger, GateError>
@@ -351,7 +359,13 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
         || scope.port==0 || now<0
         || management_fingerprint(scope.management_jwk).as_deref()!=Some(scope.management_fingerprint)
     { return Err(GateError::InvalidState); }
-    let consume = operation != Operation::Get;
+    let get_retry = match operation {
+        #[cfg(feature = "linux-pairing-process")]
+        Operation::GetRetry => true,
+        _ => false,
+    };
+    let retry = operation == Operation::Retry || get_retry;
+    let consume = operation != Operation::Get && !get_retry;
     let route = format!("/v1/invitations/{}{}",scope.invite_id,
         if consume {"/consume"} else {""});
     if request.target!=route || request.method!=if consume {Method::Post} else {Method::Get}
@@ -365,13 +379,13 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
         .ok_or(GateError::Forbidden)?;
     if !token_matches(scope.token,presented) { return Err(GateError::Forbidden); }
     match inv.state {
-        InviteState::Open if operation == Operation::Retry => return Err(GateError::InvalidState),
+        InviteState::Open if retry => return Err(GateError::InvalidState),
         InviteState::Open if now>=inv.expires_unix => return Err(GateError::InviteExpired),
         InviteState::Open => {},
         InviteState::Cancelled => return Err(GateError::InviteCancelled),
         InviteState::Expired => return Err(GateError::InviteExpired),
         InviteState::Revoking(_) | InviteState::Revoked(_) => return Err(GateError::Revoked),
-        InviteState::Consumed(_) if operation == Operation::Retry => {
+        InviteState::Consumed(_) if retry => {
             // Exclusive upper bound: never extend the signed legacy window.
             if now >= inv.expires_unix.checked_add(120).ok_or(GateError::InvalidState)? {
                 return Err(GateError::InviteExpired);
@@ -417,6 +431,94 @@ fn read_open_with_clock<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'a
     if !request.body.is_empty() { return Err(GateError::InvalidRequest); }
     check_open_completion(store,scope.invite_id,generation,now,clock()?)?;
     Ok(OpenDescriptor { signed_descriptor:scope.signed_descriptor,_store:store })
+}
+
+/// GET-first recovery is only a read-only hint to the existing client.
+/// A bearer alone never grants authorization or reveals the original
+/// signed authorization. POST must still prove the original request.
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn read_retry_descriptor(store: &LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str) -> Result<Value,GateError>
+{
+    let invalid=GateError::InvalidState;
+    let now=system_utc_seconds()?;
+    let generation=store.generation().map_err(|_|invalid)?;
+    let ledger=common(store,scope,request,now,Operation::GetRetry)?;
+    if !request.body.is_empty() { return Err(GateError::InvalidRequest); }
+    check_retry_interface(scope,interface)?;
+    let Some(InviteState::Consumed(grant))=ledger.state(scope.invite_id) else {
+        return Err(invalid);
+    };
+    check_history(ledger,&grant.claims)?;
+    let material=store.authorization_material(scope.invite_id).map_err(|_|invalid)?;
+    if material.grant!=*grant || now<material.issued_unix || now>=material.expires_unix
+        || material.issued_unix.checked_add(3600)!=Some(material.expires_unix)
+    { return Err(invalid); }
+    let body=verify_unique_jws(&material.signed,scope.management_jwk).ok_or(invalid)?;
+    let c=&grant.claims;
+    if !version_kind(&body,"TradeChannel.PairAuthorization")
+        || text(&body,"InviteId")!=Some(c.invite_id.as_str())
+        || body.get("ServerBinding")!=Some(scope.server_binding)
+        || text(&body,"RemoteOwnerId")!=text(scope.server_binding,"RemoteOwnerId")
+        || text(&body,"NodeId")!=text(scope.server_binding,"NodeId")
+        || text(&body,"RequestId")!=Some(c.request_id.as_str())
+        || text(&body,"DeviceId")!=Some(c.device_id.as_str())
+        || text(&body,"ClientPublicKey")!=Some(c.public_key.as_str())
+        || text(&body,"ClientAddress")!=Some(format!("{}/32",grant.address).as_str())
+        || text(&body,"RequestDigest")!=Some(c.request_digest.as_str())
+        || text(&body,"RequestDigestAlgorithm")!=Some("TC-ClientRequest-v1")
+        || text(&body,"RecipientJwkDigest")!=Some(c.recipient_jwk_digest.as_str())
+        || text(&body,"IssuedAtUtc").and_then(utc_seconds)!=Some(material.issued_unix)
+        || text(&body,"ExpiresAtUtc").and_then(utc_seconds)!=Some(material.expires_unix)
+        || body.get("ConfigRevision").and_then(Value::as_u64)!=Some(1)
+        || !body.get("ClientResponse").is_some_and(Value::is_object)
+    { return Err(invalid); }
+    let expected=text(scope.server_binding,"ServerPublicKey").ok_or(invalid)?;
+    let peers=crate::wg_conf_audit::read_verified_identity_snapshot(store,interface,expected)
+        .map_err(|_|invalid)?;
+    ledger.retry(&grant.claims,Some(&peers)).map_err(|_|invalid)?;
+    let after=system_utc_seconds()?;
+    if after<now || after>=material.expires_unix
+        || store.generation().map_err(|_|invalid)?!=generation { return Err(invalid); }
+    common(store,scope,request,after,Operation::GetRetry)?;
+    Ok(serde_json::json!({"Status":"RetryOnly","SignedDescriptor":scope.signed_descriptor}))
+}
+
+/// Local startup validation, not bearer authentication. The root is
+/// already protected and the metadata digest is independently supplied.
+/// No scope or grant escapes, and no ledger or kernel mutation occurs.
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn preflight_service_metadata(store: &LedgerStore, raw: &[u8], pin: &str,
+    interface: &str, tls_pin: &str,
+    config: &crate::authorization_response::TrustedResponseConfig,
+    management: &rsa::RsaPrivateKey) -> Result<(),GateError>
+{
+    let invalid=GateError::InvalidState;
+    if raw.is_empty() || raw.len()>MAX_BODY_BYTES
+        || digest::digest(&digest::SHA256,raw).as_ref()!=decode_sha256_hex(pin).ok_or(invalid)?.as_slice()
+    { return Err(invalid); }
+    let record=unique_json(raw).ok_or(invalid)?;
+    if !version_kind(&record,"SpiderVPN.InviteMetadata")
+        || record.as_object().is_none_or(|o|o.len()!=12)
+        || decode_sha256_hex(text(&record,"BearerHmacSha256").ok_or(invalid)?).is_none()
+    { return Err(invalid); }
+    // Empty token cannot pass any request gate. Only structural and signed
+    // identity checks are used during startup; the real bearer is required
+    // separately for every actual request.
+    let scope=scope_from_record(&record,"")?;
+    if !lower_uuid(scope.invite_id) || !valid_binding(scope.server_binding)
+        || !hex_sha256(scope.tls_der_pin) || scope.tls_der_pin!=tls_pin
+        || management_fingerprint(scope.management_jwk).as_deref()!=Some(scope.management_fingerprint)
+        || !config.matches_scope(scope.server_binding,interface)
+    { return Err(invalid); }
+    check_retry_interface(&scope,interface)?;
+    crate::authorization_response::check_signer(management,scope.management_jwk)?;
+    let ledger=store.view().map_err(|_|invalid)?;
+    let invite=ledger.invitations.get(scope.invite_id).ok_or(invalid)?;
+    check_descriptor(&scope,invite.expires_unix,system_utc_seconds()?)?;
+    crate::wg_conf_audit::read_verified_identity_snapshot(store,interface,
+        text(scope.server_binding,"ServerPublicKey").ok_or(invalid)?).map_err(|_|invalid)?;
+    Ok(())
 }
 
 /// Exact POST consume envelope, bearer + independently signed invitation +

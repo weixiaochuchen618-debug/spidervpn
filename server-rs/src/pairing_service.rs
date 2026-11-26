@@ -74,6 +74,20 @@ impl PairingAuthority {
         Ok(Self { root, interface, metadata, metadata_pin, tls_pin, config, management, tls })
     }
 
+    #[cfg(feature = "linux-pairing-process")]
+    pub(crate) fn from_protected_local(root: PathBuf, interface: String,
+        metadata: Vec<u8>, metadata_pin: String, config: TrustedResponseConfig,
+        management: rsa::RsaPrivateKey, identity: crate::tls_identity::VerifiedTlsIdentity)
+        -> io::Result<Self>
+    {
+        let store=LedgerStore::open_existing(&root,Duration::ZERO).map_err(|_|invalid())?;
+        crate::fresh_consume_gate::preflight_service_metadata(&store,&metadata,&metadata_pin,
+            &interface,&identity.leaf_der_sha256,&config,&management).map_err(|_|invalid())?;
+        drop(store);
+        Ok(Self {root,interface,metadata,metadata_pin,tls_pin:identity.leaf_der_sha256,
+            config,management,tls:identity.server_config})
+    }
+
     pub(crate) fn tls_config(&self) -> Arc<ServerConfig> {
         Arc::clone(&self.tls)
     }
@@ -92,8 +106,15 @@ impl PairingAuthority {
         let mut store = LedgerStore::open_existing(&self.root, Duration::ZERO)
             .map_err(|_| GateError::InvalidState)?;
         match request.method {
-            Method::Get => read_open_descriptor(&store, &scope, request)
-                .map(|d| d.legacy_data()),
+            Method::Get => {
+                let opened=read_open_descriptor(&store, &scope, request).map(|d|d.legacy_data());
+                #[cfg(feature = "linux-pairing-process")]
+                if matches!(&opened,Err(GateError::InviteConsumed)) {
+                    return crate::fresh_consume_gate::read_retry_descriptor(&store,&scope,
+                        request,&self.interface);
+                }
+                opened
+            },
             Method::Post => consume_authorization(&mut store, &scope, request,
                 &self.interface, &self.config, &self.management).map_err(|e| match e {
                     FreshEnrollError::Gate(g) => g,

@@ -193,6 +193,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --manifest-path server-rs/Cargo.toml --features linux-pairing-service --lib
+          cargo build --locked --manifest-path server-rs/Cargo.toml --features linux-pairing-process --bin spidervpn-pair-service
           cargo metadata --locked --no-deps --format-version 1 --manifest-path server-rs/Cargo.toml | jq -e '.packages[] | select(.name == "spidervpn-pairing-authority") | ((.features.default // []) == []) and (.features["linux-pairing-service"] | index("linux-authorization-response") != null)' >/dev/null
       - name: SEC-02 opt-in Rust denial process build and unprivileged denial
         shell: bash
@@ -367,7 +368,7 @@ jobs:
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="$PWD/server-rs/target/netns"
-          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-netns-acceptance,linux-admin-finalize,linux-fresh-consume-gate,linux-authorization-response,linux-pairing-service --test wg_namespace_e2e --no-run --message-format=json > "$RUNNER_TEMP/sec01-build.json"
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-netns-acceptance,linux-admin-finalize,linux-fresh-consume-gate,linux-authorization-response,linux-pairing-service,linux-pairing-process --test wg_namespace_e2e --no-run --message-format=json > "$RUNNER_TEMP/sec01-build.json"
           test_bin="$(jq -r 'select(.reason=="compiler-artifact" and .target.name=="wg_namespace_e2e") | .executable // empty' "$RUNNER_TEMP/sec01-build.json" | tail -n1)"
           test -n "$test_bin"
           test -x "$test_bin"

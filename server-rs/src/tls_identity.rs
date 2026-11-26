@@ -198,6 +198,27 @@ fn read_from_verified_dir(dir: &File, uid: u32, expected_pin: &str)
     Ok(VerifiedTlsIdentity { server_config, leaf_der_sha256: calculated })
 }
 
+/// Explicit local process root, with every component checked from "/".
+/// No environment-selected root, symlink traversal or writable ancestors.
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn open_service_root(path: &std::path::Path) -> io::Result<File> {
+    if unsafe { geteuid() } != 0 { return Err(denied("pairing service requires root")); }
+    let name=path.to_str().ok_or_else(|| denied("invalid service root"))?;
+    let parts:Vec<_>=name.strip_prefix('/').ok_or_else(|| denied("absolute service root required"))?
+        .split('/').collect();
+    open_trusted_tree(&File::open("/")?,&parts,0)
+}
+
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn read_service_file(dir: &File, name: &str, max: usize) -> io::Result<Vec<u8>> {
+    secure_file(dir,name,0,max,true)
+}
+
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn read_service_identity(dir: &File, pin: &str) -> io::Result<VerifiedTlsIdentity> {
+    read_from_verified_dir(dir,0,pin)
+}
+
 /// Separate disposable process-lab TLS material. Never fall back to the
 /// production certificate or to a caller-controlled directory/environment.
 /// Only the root startup phase may read this exact protected directory.

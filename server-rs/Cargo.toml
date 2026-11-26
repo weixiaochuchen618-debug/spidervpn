@@ -67,6 +67,8 @@ linux-authorization-response = ["linux-fresh-consume-gate", "dep:aes", "dep:base
 
 # Stage 3 isolated authenticated loopback TLS service. No public bind/deploy.
 linux-pairing-service = ["linux-authorization-response", "linux-tls-wire-lab"]
+# Explicit local service executable. No default startup or public bind.
+linux-pairing-process = ["linux-pairing-service", "linux-tls-identity-lab", "dep:libc"]
 
 [[test]]
 name = "wg_namespace_e2e"
@@ -92,3 +94,8 @@ required-features = ["linux-denial-process-lab"]
 name = "denial_process_e2e"
 path = "tests/denial_process_e2e.rs"
 required-features = ["linux-denial-process-lab"]
+
+[[bin]]
+name = "spidervpn-pair-service"
+path = "src/bin/spidervpn-pair-service.rs"
+required-features = ["linux-pairing-process"]
