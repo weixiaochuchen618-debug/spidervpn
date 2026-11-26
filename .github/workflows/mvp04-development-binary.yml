@@ -1,0 +1,71 @@
+name: MVP-04 Windows development binary (not a release)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  mvp04-dev-binary:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'integration/mvp04-dev-build-20261126' && github.base_ref == 'fix/mvp03-status-generation-snapshot-test-20261126'
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      MVP_SOURCE_SHA: '5189ecfe5e3774b99583b6e2a7554ab0b1b4459f'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 5189ecfe5e3774b99583b6e2a7554ab0b1b4459f
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Compile exact frozen source without execution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:MVP_SOURCE_SHA) { throw 'Unexpected source SHA' }
+          $dirty = & git status --porcelain
+          if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Source checkout is not clean' }
+          $rust = & rustc -vV
+          if ($LASTEXITCODE -ne 0) { throw 'rustc version failed' }
+          $cargo = & cargo -V
+          if ($LASTEXITCODE -ne 0) { throw 'cargo version failed' }
+          $rust | Write-Host
+          $cargo | Write-Host
+          $lockHash = (Get-FileHash -LiteralPath Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()
+          & cargo build --locked --release --target x86_64-pc-windows-msvc --bin spidervpn
+          if ($LASTEXITCODE -ne 0) { throw 'Development build failed' }
+          if ((Get-FileHash -LiteralPath Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant() -cne $lockHash) { throw 'Cargo.lock changed' }
+          $release = Join-Path $PWD 'target/x86_64-pc-windows-msvc/release'
+          $exe = Join-Path $release 'spidervpn.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Missing development EXE' }
+          $out = Join-Path $env:RUNNER_TEMP 'spidervpn-mvp04-dev'
+          New-Item -ItemType Directory -Path $out | Out-Null
+          Copy-Item -LiteralPath $exe -Destination $out
+          # Dependency output is not an independently approved vendor binary.
+          # Include it only if the x64 candidate bytes are unambiguous.
+          $loaders = @(Get-ChildItem -LiteralPath $release -Recurse -File -Filter 'WebView2Loader.dll' | Where-Object { $_.FullName -match '[\\/]x64[\\/]' })
+          $loaderState = 'NOT_BUNDLED_NO_UNAMBIGUOUS_X64_DEPENDENCY_OUTPUT'
+          if ($loaders.Count -gt 0) {
+            $digests = @($loaders | Get-FileHash -Algorithm SHA256 | Select-Object -ExpandProperty Hash -Unique)
+            if ($digests.Count -eq 1) {
+              Copy-Item -LiteralPath $loaders[0].FullName -Destination $out
+              $loaderState = 'BUNDLED_LOCKED_BUILD_OUTPUT_NOT_VENDOR_APPROVED'
+            }
+          }
+          $files = @(Get-ChildItem -LiteralPath $out -File | ForEach-Object {
+            @{name=$_.Name; bytes=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+          })
+          $record = @{source_sha=$head; workflow_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; target='x86_64-pc-windows-msvc'; profile='release'; command='cargo build --locked --release --target x86_64-pc-windows-msvc --bin spidervpn'; rustc=($rust -join "`n"); cargo=$cargo; cargo_lock_sha256=$lockHash; files=$files; loader_status=$loaderState; engine_bundled=$false; product_run=$false; installation_approved=$false; release_approved=$false}
+          $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $out 'build-evidence.json') -Encoding utf8
+          $record | ConvertTo-Json -Depth 6
+          @('DEVELOPMENT BUILD ONLY - NOT APPROVED FOR INSTALLATION OR RELEASE.', 'No sing-box engine is bundled. A loader, if present, is unapproved locked build output.', 'Do not run until the coordinator confirms the isolated test environment and approved dependencies.', 'No VPN, WFP, installation or product runtime validation was performed.') | Set-Content -LiteralPath (Join-Path $out 'README.txt') -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spidervpn-mvp04-dev-5189ecfe5e37
+          path: ${{ runner.temp }}/spidervpn-mvp04-dev/
+          if-no-files-found: error
+          retention-days: 7
