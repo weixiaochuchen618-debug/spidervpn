@@ -16820,7 +16820,29 @@ mod tests {
         let old_verified = m["ExitEvidence"]["Verified"] == true
             && m["ExitEvidence"]["ObservedIP"] == "8.8.8.8"
             && m["ExitEvidence"]["Attribution"] == "LineServer";
-        assert!(!(b_in_use || b_running),
-            "MODELED_HOST_GENERATION_CONTRACT_RED: disconnected B must not inherit A running/InUse; B_in_use={b_in_use} B_running={b_running} A_verified_quartet={old_verified}");
+        let original_condition = !(b_in_use || b_running);
+        let a_in_use = readiness(&mixed, "L1") == "InUse";
+        let exit = &m["ExitEvidence"];
+        // Retaining A's verified evidence requires the whole coherent A
+        // projection, including the exact original probe timestamp.
+        let coherent_a = m["State"] == "Connected"
+            && m["Running"] == true
+            && m["ActiveLineId"] == "L1"
+            && a_in_use && !b_in_use
+            && exit == &a["ExitEvidence"];
+        // Fault is the existing explicit unavailable state. Both rows
+        // must remain present. Historical Check/Passed/time may survive.
+        let offline_or_unavailable = (m["State"] == "Disconnected"
+            && m["ActiveLineId"] == "L2") || m["State"] == "Fault";
+        let no_current_exit = m["Running"] == false
+            && !a_in_use && !b_in_use
+            && exit["Verified"] == false
+            && exit["Status"].as_str().is_some_and(|status| status != "verified")
+            && exit.get("ObservedIP") == Some(&Value::Null)
+            && exit["Attribution"] == "Unknown";
+        let exit_consistency = coherent_a || (offline_or_unavailable && no_current_exit);
+        assert!(original_condition && exit_consistency,
+            "MODELED_HOST_GENERATION_CONTRACT_RED: disconnected B must not inherit A running/InUse; B_in_use={b_in_use} B_running={b_running} A_verified_quartet={old_verified}; original_condition={original_condition} exit_consistency={exit_consistency} coherent_a={coherent_a} offline_or_unavailable={offline_or_unavailable} no_current_exit={no_current_exit} A_in_use={a_in_use}; mixed_state={} mixed_active={} mixed_running={} mixed_exit={exit}; stable_A_exit={}",
+            m["State"], m["ActiveLineId"], m["Running"], a["ExitEvidence"]);
     }
 }
