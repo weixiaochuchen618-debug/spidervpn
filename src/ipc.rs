@@ -16455,4 +16455,499 @@ mod tests {
         assert_eq!(udp.snap["State"]["ActiveProfile"], udp.expected_profile,
             "GUI_ACTIVE_PROFILE_CONTRACT_RED: actual IPC standard connection must project Udp, not Tcp");
     }
+
+
+    #[test]
+    fn mvp03_status_generation_snapshot_never_attributes_old_exit_to_new_active_line() {
+        use serde_json::{json, Value};
+        use std::cell::{Cell, RefCell};
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream, Shutdown};
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::time::{Duration, Instant};
+
+        // MODELED boundary: a completed disconnect and legal offline use
+        // between two coherent adapter reads, NOT a live pipe/browser race.
+        // The only live PID is this test process; never call disconnect/kill.
+        struct Sandbox(PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        struct Loopback {
+            listener: TcpListener,
+            stop: Arc<AtomicBool>,
+            worker: Option<std::thread::JoinHandle<usize>>,
+        }
+        impl Loopback {
+            fn start() -> Self {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                // Deadline is only a failure bound, not a scheduling premise.
+                listener.set_nonblocking(true).unwrap();
+                let active = listener.try_clone().unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let flag = Arc::clone(&stop);
+                let worker = std::thread::spawn(move || {
+                    let mut completed = 0;
+                    for (host, path, status, body) in [
+                        ("www.gstatic.com", "/generate_204", "204 No Content", ""),
+                        ("checkip.amazonaws.com", "/", "200 OK", "8.8.8.8\n"),
+                    ] {
+                        let deadline = Instant::now() + Duration::from_secs(15);
+                        let mut stream = loop {
+                            if flag.load(Ordering::SeqCst) { return completed; }
+                            match active.accept() {
+                                Ok((stream, _)) => break stream,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    assert!(Instant::now() < deadline, "fixture: accept deadline");
+                                    std::thread::yield_now();
+                                }
+                                Err(e) => panic!("fixture: accept: {e}"),
+                            }
+                        };
+                        if flag.load(Ordering::SeqCst) { return completed; }
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                        stream.set_nodelay(true).unwrap();
+                        let mut greeting = [0u8; 4];
+                        stream.read_exact(&mut greeting).unwrap();
+                        assert_eq!(greeting, [5, 2, 0, 2], "fixture: SOCKS greeting");
+                        stream.write_all(&[5, 2]).unwrap();
+                        let mut auth = [0u8; 2];
+                        stream.read_exact(&mut auth).unwrap();
+                        assert_eq!(auth[0], 1);
+                        let mut user = vec![0u8; usize::from(auth[1])];
+                        stream.read_exact(&mut user).unwrap();
+                        let mut plen = [0u8; 1];
+                        stream.read_exact(&mut plen).unwrap();
+                        let mut pass = vec![0u8; usize::from(plen[0])];
+                        stream.read_exact(&mut pass).unwrap();
+                        assert_eq!(user, b"u", "fixture: authenticated user");
+                        assert_eq!(pass, b"p", "fixture: authenticated password");
+                        stream.write_all(&[1, 0]).unwrap();
+                        let mut head = [0u8; 5];
+                        stream.read_exact(&mut head).unwrap();
+                        assert_eq!(&head[..4], &[5, 1, 0, 3], "fixture: domain CONNECT");
+                        let mut dest = vec![0u8; usize::from(head[4]) + 2];
+                        stream.read_exact(&mut dest).unwrap();
+                        assert_eq!(&dest[..dest.len()-2], host.as_bytes(), "fixture: SOCKS domain");
+                        assert_eq!(&dest[dest.len()-2..], &80u16.to_be_bytes(), "fixture: SOCKS port");
+                        // No forwarding or DNS; these names/IPs are fixture text.
+                        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                        let mut req = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while !req.ends_with(b"\r\n\r\n") {
+                            assert!(Instant::now() < deadline, "fixture: HTTP header deadline");
+                            let n = stream.read(&mut chunk).unwrap();
+                            assert!(n > 0, "fixture: premature HTTP EOF");
+                            req.extend_from_slice(&chunk[..n]);
+                            assert!(req.len() <= 8192, "fixture: bounded HTTP headers");
+                        }
+                        assert!(req.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()),
+                            "fixture: origin-form request");
+                        stream.write_all(format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ).as_bytes()).unwrap();
+                        if !body.is_empty() {
+                            stream.shutdown(Shutdown::Write).unwrap();
+                        }
+                        completed += 1;
+                    }
+                    completed
+                });
+                Self { listener, stop, worker: Some(worker) }
+            }
+
+            fn port(&self) -> u16 {
+                self.listener.local_addr().unwrap().port()
+            }
+
+            fn stop_and_join(&mut self) -> Option<std::thread::Result<usize>> {
+                let worker = self.worker.take()?;
+                self.stop.store(true, Ordering::SeqCst);
+                if !worker.is_finished() {
+                    let addr = self.listener.local_addr().unwrap();
+                    let _ = TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+                }
+                Some(worker.join())
+            }
+
+            fn finish(&mut self) {
+                assert_eq!(self.stop_and_join().unwrap().expect("fixture: loopback worker"), 2,
+                    "fixture: exactly two authenticated HTTP exchanges");
+            }
+        }
+        impl Drop for Loopback {
+            fn drop(&mut self) {
+                let _ = self.stop_and_join();
+            }
+        }
+
+        struct AdapterRead {
+            cmd: String,
+            raw: Value,
+            second: Value,
+            merged: Value,
+        }
+
+        // Production-shaped relevant adapter path (main.rs), not the nested
+        // UI closure itself. Provider/tray append and unrelated panels inert.
+        // Both actual handler reads and actual merge are retained, unmodified.
+        fn adapter(cmd: &str, ctx: &RefCell<Ctx>, reads: &RefCell<Vec<AdapterRead>>) -> Value {
+            let raw = call(cmd, &ctx.borrow());
+            {
+                let mut c = ctx.borrow_mut();
+                if let Ok(Some(cfg)) = crate::config::load(&c.root.join(crate::config::DEFAULT_PATH)) {
+                    c.cfg = Some(cfg);
+                }
+            }
+            let second = crate::status_state(&ctx.borrow());
+            let mut merged = second.clone();
+            crate::uiweb::merge_ui_command_reply(&mut merged, &raw);
+            reads.borrow_mut().push(AdapterRead {
+                cmd: command_name(cmd).unwrap(), raw, second, merged: merged.clone(),
+            });
+            merged
+        }
+
+        fn readiness<'a>(snap: &'a Value, id: &str) -> &'a Value {
+            let lines = snap["State"]["Lines"].as_array().expect("fixture: host lines");
+            &lines.iter().find(|line| line["Id"] == id)
+                .expect("fixture: host line ID")["Readiness"]["State"]
+        }
+
+        fn verified_a(st: &Value, probe_at: &Value) {
+            assert_eq!(st["ok"], true, "fixture: A status ok");
+            assert_eq!(st["state"], "Connected", "fixture: A connected");
+            assert_eq!(st["line"], "线路甲", "fixture: A line");
+            assert_eq!(st["exitTrade"], "hk", "fixture: A trade selector");
+            assert_eq!(st["exitEvidence"], "verified", "fixture: A actual verified");
+            assert_eq!(st["exitObservedIp"], "8.8.8.8", "fixture: A actual IP");
+            assert_eq!(st["exitAttribution"], "LineServer", "fixture: A attribution");
+            assert_eq!(&st["exitProbeAtUtc"], probe_at, "fixture: A probe time");
+        }
+
+        fn offline_b(st: &Value) {
+            assert_eq!(st["ok"], true, "fixture: B status ok");
+            assert_eq!(st["state"], "Disconnected", "fixture: B disconnected");
+            assert_eq!(st["line"], "线路乙", "fixture: B line");
+            assert_ne!(st["exitEvidence"], "verified", "fixture: no current A verification");
+            assert_eq!(st.get("exitObservedIp"), Some(&Value::Null), "fixture: no current A IP");
+            assert_eq!(st["exitAttribution"], "Unknown", "fixture: no current A attribution");
+            assert_eq!(st.get("exitProbeAtUtc"), Some(&Value::Null), "fixture: no current A probe time");
+        }
+
+        let sandbox = Sandbox(tmp_root("mvp03-status-generation"));
+        let root = &sandbox.0;
+        let cfg = write_cfg(root, "L1");
+        let line = cfg.current_line().expect("fixture: selected A").clone();
+        let mut server = Loopback::start();
+        connected_runtime(root, server.port());
+        // Minimal VLESS-shaped qualified runtime: actual transport unknown
+        // (no WG endpoint); transport classification is not this contract.
+        let runtime_path = root.join("runtime-engine.json");
+        let mut runtime: Value = serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
+        runtime["outbounds"][0]["server"] = json!("8.8.8.8");
+        runtime["outbounds"][0]["server_port"] = json!(8443);
+        std::fs::write(&runtime_path, runtime.to_string()).unwrap();
+        for (id, ip) in [("L1", "8.8.8.8"), ("L2", "1.1.1.1")] {
+            write_line_file(root, id, true);
+            let mut source = json!({"outbounds": runtime["outbounds"].clone(),
+                "inbounds": [{"type":"mixed","tag":"tc-mixed","listen":"127.0.0.1",
+                    "listen_port":if id == "L1" { 17901 } else { 17902 }}]});
+            source["outbounds"][0]["server"] = json!(ip);
+            std::fs::write(root.join("lines").join(format!("{id}.json")), source.to_string()).unwrap();
+        }
+        assert_eq!(crate::engine_config::actual_transport(&runtime_path), None,
+            "fixture: minimal VLESS runtime, not a classified transport");
+        assert_eq!(crate::exit_probe::server_ips(root, &line), vec!["8.8.8.8".to_string()]);
+        let plan = crate::selfcheck::ProbePlan::Dial {
+            port: server.port(), username: "u".into(), password: "p".into(),
+        };
+        let check = crate::selfcheck::check_and_record(root, &plan, 2_000);
+        assert!(check.ok && check.via_trade_exit && check.status == Some(204)
+            && check.skipped.is_none(), "fixture: actual Check204: {check:?}");
+        assert!(crate::selfcheck::current_qualified_trade_pass(root), "fixture: current Check");
+        let rec = crate::exit_probe::probe_and_record(root, &line, &plan, 2_000)
+            .expect("fixture: actual authenticated exit observation");
+        server.finish();
+        assert!(rec.attributed && rec.binding.is_some(), "fixture: original exit binding");
+        assert_eq!(rec.line_id, "L1");
+        assert_eq!(rec.ip, "8.8.8.8");
+        assert_eq!(crate::selfcheck::runtime_started_at(root).as_deref(), Some(rec.started_at.as_str()));
+        assert_eq!(crate::exit_probe::load(root), Some(rec.clone()));
+        assert!(crate::exit_probe::belongs_to_current_connection(&rec, root),
+            "fixture: original current exit binding");
+        let probe_at = json!(crate::selfcheck::at_rfc3339(rec.at).expect("fixture: probe time"));
+        let ctx = RefCell::new(ctx_with(Some(cfg), root));
+        let before = config_bytes(root);
+        let refused = call(r#"{"cmd":"use","id":"L2"}"#, &ctx.borrow());
+        assert_eq!(refused["ok"], false, "fixture: actual live use refusal");
+        assert!(refused["error"].as_str().unwrap_or_default().contains("请先断开"));
+        assert_eq!(config_bytes(root), before, "fixture: refused live use unchanged");
+        assert!(connection_busy(root));
+        let exit_bytes = std::fs::read(root.join("exit-probe.json")).unwrap();
+        let check_bytes = std::fs::read(root.join("last-check.json")).unwrap();
+        let reads = RefCell::new(Vec::new());
+        let transition = Cell::new(false);
+        let switched = Cell::new(false);
+
+        let fetch = |cmd: &str| {
+            match command_name(cmd).as_deref() {
+                Some("status") => adapter(cmd, &ctx, &reads),
+                Some("lines") => {
+                    if transition.get() && !switched.replace(true) {
+                        // Simulate ONLY the completed disconnect file postcondition.
+                        // The prior adapter's first and second status reads have
+                        // already returned. Never change selected while live.
+                        {
+                            let captured = reads.borrow();
+                            assert_eq!(captured.len(), 1, "fixture: completed A adapter before switch");
+                            assert_eq!(captured[0].cmd, "status");
+                            verified_a(&captured[0].raw, &probe_at);
+                            verified_a(&captured[0].second, &probe_at);
+                            verified_a(&captured[0].merged, &probe_at);
+                        }
+                        assert!(connection_busy(root));
+                        assert!(!root.join("proxy-journal.json").exists());
+                        std::fs::remove_file(root.join("runtime.json")).unwrap();
+                        std::fs::remove_file(&runtime_path).unwrap();
+                        crate::selfcheck::clear_latency(root);
+                        assert!(!connection_busy(root), "fixture: modeled disconnect completed");
+                        assert_eq!(crate::exit_probe::load(root), Some(rec.clone()),
+                            "fixture: historical A still readable");
+                        assert!(!crate::exit_probe::belongs_to_current_connection(&rec, root),
+                            "fixture: actual stale record reader denies A");
+                        assert!(!crate::selfcheck::current_qualified_trade_pass(root));
+                        let used = call(r#"{"cmd":"use","id":"L2"}"#, &ctx.borrow());
+                        assert_eq!(used["ok"], true, "fixture: real offline use: {used}");
+                        assert_eq!(used["selected"], "L2");
+                        let disk = crate::config::load(&root.join(crate::config::DEFAULT_PATH))
+                            .unwrap().expect("fixture: disk config");
+                        assert_eq!(disk.selected, "L2", "fixture: real persisted B");
+                        assert!(!connection_busy(root), "fixture: B remains offline");
+                        assert_eq!(crate::exit_probe::load(root), Some(rec.clone()));
+                        assert!(!crate::exit_probe::belongs_to_current_connection(&rec, root));
+                    }
+                    adapter(cmd, &ctx, &reads)
+                }
+                Some("providers" | "deployment-list" | "delete-cleanup"
+                    | "line-action-list" | "operation-list" | "servers"
+                    | "auto-route-list" | "quality-summary") => json!({"ok":false}),
+                _ => panic!("fixture: unexpected snapshot fetch: {cmd}"),
+            }
+        };
+
+        let stable_a = crate::uiweb::WebUi::new().snapshot(&fetch);
+        let reads_a = std::mem::take(&mut *reads.borrow_mut());
+        transition.set(true);
+        let mixed = crate::uiweb::WebUi::new().snapshot(&fetch);
+        let reads_mixed = std::mem::take(&mut *reads.borrow_mut());
+        transition.set(false);
+        let stable_b = crate::uiweb::WebUi::new().snapshot(&fetch);
+        let reads_b = std::mem::take(&mut *reads.borrow_mut());
+        let history_preserved = std::fs::read(root.join("exit-probe.json")).unwrap() == exit_bytes
+            && std::fs::read(root.join("last-check.json")).unwrap() == check_bytes
+            && !root.join("runtime.json").exists() && !runtime_path.exists()
+            && !root.join("proxy-journal.json").exists();
+        // Explicit cleanup before grouped control and target verdicts.
+        drop(fetch);
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert!(switched.get() && history_preserved, "fixture: one modeled switch and history retained");
+        for (tag, rs, snap) in [
+            ("stable-A", &reads_a, &stable_a),
+            ("mixed", &reads_mixed, &mixed),
+            ("stable-B", &reads_b, &stable_b),
+        ] {
+            assert_eq!(rs.len(), 2, "fixture: {tag} two actual adapter reads");
+            assert_eq!(rs[0].cmd, "status");
+            assert_eq!(rs[1].cmd, "lines");
+            let status_a = tag != "stable-B";
+            for st in [&rs[0].raw, &rs[0].second, &rs[0].merged] {
+                if status_a { verified_a(st, &probe_at); } else { offline_b(st); }
+            }
+            let selected = if tag == "stable-A" { "L1" } else { "L2" };
+            assert_eq!(rs[1].raw["ok"], true);
+            assert_eq!(rs[1].raw["selected"], selected);
+            let row = rs[1].raw["lines"].as_array().unwrap().iter()
+                .find(|row| row["id"] == selected).expect("fixture: selected row");
+            assert_eq!(row["selected"], true);
+            assert_eq!(rs[1].merged["selected"], selected);
+            assert_eq!(rs[1].merged["lines"], rs[1].raw["lines"]);
+            for st in [&rs[1].second, &rs[1].merged] {
+                if tag == "stable-A" { verified_a(st, &probe_at); } else { offline_b(st); }
+            }
+            assert_eq!(snap["Type"], "snapshot");
+            let st = &snap["State"];
+            eprintln!("STATUS_GENERATION_CASE {tag}: status_line={}; status_state={}; status_exit={}; lines_selected={}; lines_second_state={}; running={}; active={}; L2_readiness={}; exit={}",
+                rs[0].merged["line"], rs[0].merged["state"], rs[0].merged["exitEvidence"],
+                rs[1].merged["selected"], rs[1].second["state"], st["Running"],
+                st["ActiveLineId"], readiness(snap, "L2"), st["ExitEvidence"]);
+        }
+
+        let a = &stable_a["State"];
+        assert_eq!(a["State"], "Connected", "fixture: stable A host state");
+        assert_eq!(a["Running"], true);
+        assert_eq!(a["ActiveLineId"], "L1");
+        assert_eq!(readiness(&stable_a, "L1"), "InUse");
+        assert_eq!(a["ExitEvidence"]["Verified"], true);
+        assert_eq!(a["ExitEvidence"]["Status"], "verified");
+        assert_eq!(a["ExitEvidence"]["ObservedIP"], "8.8.8.8");
+        assert_eq!(a["ExitEvidence"]["Attribution"], "LineServer");
+        assert_eq!(a["ExitEvidence"]["CheckedAtUtc"], probe_at);
+        let b = &stable_b["State"];
+        assert_eq!(b["State"], "Disconnected", "fixture: stable B host state");
+        assert_eq!(b["Running"], false);
+        assert_eq!(b["ActiveLineId"], "L2");
+        assert_ne!(readiness(&stable_b, "L2"), "InUse");
+        assert_eq!(b["ExitEvidence"]["Verified"], false);
+        assert_ne!(b["ExitEvidence"]["Status"], "verified");
+        assert_eq!(b["ExitEvidence"]["ObservedIP"], Value::Null);
+        assert_eq!(b["ExitEvidence"]["Attribution"], "Unknown");
+
+        // Allow a coherent A frame, coherent disconnected B, or unavailable
+        // state. Do not require freshness after a coherent response returns.
+        let m = &mixed["State"];
+        let b_in_use = readiness(&mixed, "L2") == "InUse";
+        let b_running = m["Running"] == true && m["ActiveLineId"] == "L2";
+        let old_verified = m["ExitEvidence"]["Verified"] == true
+            && m["ExitEvidence"]["ObservedIP"] == "8.8.8.8"
+            && m["ExitEvidence"]["Attribution"] == "LineServer";
+        let original_condition = !(b_in_use || b_running);
+        let a_in_use = readiness(&mixed, "L1") == "InUse";
+        let exit = &m["ExitEvidence"];
+        // Retaining A's verified evidence requires the whole coherent A
+        // projection, including the exact original probe timestamp.
+        let coherent_a = m["State"] == "Connected"
+            && m["Running"] == true
+            && m["ActiveLineId"] == "L1"
+            && a_in_use && !b_in_use
+            && exit == &a["ExitEvidence"];
+        // Fault is the existing explicit unavailable state. Both rows
+        // must remain present. Historical Check/Passed/time may survive.
+        let offline_or_unavailable = (m["State"] == "Disconnected"
+            && m["ActiveLineId"] == "L2") || m["State"] == "Fault";
+        let no_current_exit = m["Running"] == false
+            && !a_in_use && !b_in_use
+            && exit["Verified"] == false
+            && exit["Status"].as_str().is_some_and(|status| status != "verified")
+            && exit.get("ObservedIP") == Some(&Value::Null)
+            && exit["Attribution"] == "Unknown";
+        let exit_consistency = coherent_a || (offline_or_unavailable && no_current_exit);
+        assert!(original_condition && exit_consistency,
+            "MODELED_HOST_GENERATION_CONTRACT_RED: disconnected B must not inherit A running/InUse; B_in_use={b_in_use} B_running={b_running} A_verified_quartet={old_verified}; original_condition={original_condition} exit_consistency={exit_consistency} coherent_a={coherent_a} offline_or_unavailable={offline_or_unavailable} no_current_exit={no_current_exit} A_in_use={a_in_use}; mixed_state={} mixed_active={} mixed_running={} mixed_exit={exit}; stable_A_exit={}",
+            m["State"], m["ActiveLineId"], m["Running"], a["ExitEvidence"]);
+    }
+
+    #[test]
+    fn mvp03_lines_merge_preserves_authoritative_status_baseline() {
+        use serde_json::{json, Value};
+
+        struct Sandbox(PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let sandbox = Sandbox(tmp_root("mvp03-lines-status-provenance"));
+        let root = &sandbox.0;
+        let cfg = write_cfg(root, "L1");
+        write_line_file(root, "L1", true);
+        write_line_file(root, "L2", true);
+        let mut ctx = ctx_with(Some(cfg), root);
+        let offline = !connection_busy(root)
+            && !root.join("runtime.json").exists()
+            && !root.join("runtime-engine.json").exists()
+            && !root.join("proxy-journal.json").exists();
+
+        // Actual raw IPC list, then the same reload/status/merge boundary
+        // as the host adapter. No engine, pipe or browser is started.
+        let raw = call(r#"{"cmd":"lines"}"#, &ctx);
+        ctx.cfg = Some(crate::config::load(&root.join(crate::config::DEFAULT_PATH))
+            .expect("fixture: reload config").expect("fixture: saved config"));
+        let baseline = crate::status_state(&ctx);
+        let mut merged = baseline.clone();
+        crate::uiweb::merge_ui_command_reply(&mut merged, &raw);
+
+        // Synthetic negative control ONLY: no command is executed. Keep the
+        // genuine list payload; attempt to replace each protected baseline key.
+        // latencyMs/measuredAtUtc are intentionally whitelisted, and failure
+        // keys have their own merge rule; neither is covered by this contract.
+        let conflicts = json!({
+            "action": "Disconnect",
+            "state": "Connected",
+            "exitAttribution": "LineServer",
+            "exitEvidence": "verified",
+            "exitObservedIp": "203.0.113.77",
+            "exitProbeAtUtc": "2000-01-01T00:00:00Z",
+            "startedAt": "2000-01-01T00:00:00Z",
+            "transportActual": "TCP"
+        });
+        let unknown = "mvp03UnlistedCommandPayload";
+        let mut hostile = raw.clone();
+        let fields = hostile.as_object_mut().expect("fixture: raw lines object");
+        for (key, value) in conflicts.as_object().expect("fixture: conflict object") {
+            fields.insert(key.clone(), value.clone());
+        }
+        fields.insert(unknown.into(), json!("synthetic unlisted value"));
+        let mut negative = baseline.clone();
+        crate::uiweb::merge_ui_command_reply(&mut negative, &hostile);
+
+        let offline_after = !connection_busy(root)
+            && !root.join("runtime.json").exists()
+            && !root.join("runtime-engine.json").exists()
+            && !root.join("proxy-journal.json").exists();
+        std::fs::remove_dir_all(root).expect("fixture: explicit disposable root cleanup");
+
+        assert!(offline && offline_after, "fixture: offline before and after");
+        assert_eq!(raw["ok"], true, "fixture: actual lines success");
+        assert_eq!(raw["selected"], "L1");
+        let rows = raw["lines"].as_array().expect("fixture: actual list array");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row["id"] == "L1" && row["selected"] == true));
+        assert!(rows.iter().any(|row| row["id"] == "L2" && row["selected"] == false));
+        assert_eq!(baseline["ok"], true, "fixture: actual status success");
+        assert_eq!(baseline["state"], "Disconnected", "fixture: actual offline status");
+        assert_eq!(baseline["action"], "Connect");
+        assert_eq!(baseline["exitEvidence"], "unverified");
+        assert_eq!(baseline["exitAttribution"], "Unknown");
+        assert_eq!(baseline.get("exitObservedIp"), Some(&Value::Null));
+        assert_eq!(baseline.get("exitProbeAtUtc"), Some(&Value::Null));
+        assert_eq!(baseline["startedAt"], "");
+        assert_eq!(baseline.get("transportActual"), Some(&Value::Null));
+        assert!(baseline.get(unknown).is_none(), "fixture: unknown absent at source");
+
+        let mut violations = Vec::new();
+        for (key, conflicting) in conflicts.as_object().unwrap() {
+            let actual = baseline.get(key).expect("fixture: protected baseline key present");
+            assert_ne!(actual, conflicting, "fixture: genuinely conflicting {key}");
+            if raw.get(key).is_some() {
+                violations.push(format!("{key}: unexpectedly in real raw lines"));
+            }
+            if merged.get(key) != Some(actual) {
+                violations.push(format!("{key}: real merge changed baseline"));
+            }
+            if negative.get(key) != Some(actual) {
+                violations.push(format!("{key}: synthetic command overrode baseline"));
+            }
+        }
+        for key in ["lines", "selected"] {
+            if merged.get(key) != raw.get(key) || negative.get(key) != raw.get(key) {
+                violations.push(format!("{key}: legitimate command payload lost"));
+            }
+        }
+        if merged.get(unknown).is_some() || negative.get(unknown).is_some() {
+            violations.push(format!("{unknown}: unlisted command payload admitted"));
+        }
+        assert!(violations.is_empty(),
+            "MVP03_STATUS_BASELINE_PROVENANCE: {violations:?}; protected baseline={baseline}; actual merged={merged}; synthetic negative merged={negative}");
+    }
 }
