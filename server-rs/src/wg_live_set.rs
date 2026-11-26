@@ -193,6 +193,21 @@ fn apply_with_ops(
     store: &mut LedgerStore, grant: &Grant,
     operation: Change, ops: &mut impl MutationOps,
 ) -> Result<(), ApplyError> {
+    apply_with_ops_and_confirm(store, grant, operation, ops, |store, after| {
+        store.update(|ledger| ledger.confirm_consumed(
+            &grant.claims.invite_id, Some(after)
+        )).map_err(ApplyError::Ledger)?;
+        Ok(())
+    })
+}
+
+// One shared protected writer and exact readback path. The finalizer is
+// crate-private and cannot be selected by a request or external caller.
+fn apply_with_ops_and_confirm(
+    store: &mut LedgerStore, grant: &Grant,
+    operation: Change, ops: &mut impl MutationOps,
+    confirm_add: impl FnOnce(&mut LedgerStore, &[Peer]) -> Result<(), ApplyError>,
+) -> Result<(), ApplyError> {
     let ledger = store.view().map_err(ApplyError::Ledger)?;
     let prepared = match (operation, ledger.state(&grant.claims.invite_id)) {
         (Change::Add, Some(InviteState::Pending(g))) => g == grant,
@@ -207,11 +222,7 @@ fn apply_with_ops(
     let after = ops.snapshot(store)?;
     require_exact_match(&expected, &after).map_err(ApplyError::Readback)?;
     match operation {
-        Change::Add => {
-            store.update(|ledger| ledger.confirm_consumed(
-                &grant.claims.invite_id, Some(&after)
-            )).map_err(ApplyError::Ledger)?;
-        }
+        Change::Add => confirm_add(store, &after)?,
         Change::Remove => {
             store.update(|ledger| ledger.confirm_revocation(
                 &grant.claims.invite_id, Some(&after)
@@ -245,6 +256,24 @@ pub(crate) fn apply_fresh_and_confirm(
     apply_with_ops(store, grant, Change::Add, &mut SystemOps {
         interface,
         expected_server_key: Some(expected_server_key),
+    })
+}
+
+/// Stage 2 finalizes the exact peer and original response in one durable
+/// Consumed commit. No success material is returned by the WG writer.
+#[cfg(feature = "linux-authorization-response")]
+pub(crate) fn apply_fresh_and_confirm_authorized(
+    store: &mut LedgerStore, interface: &str, expected_server_key: &str,
+    grant: &Grant, material: crate::ledger_disk::AuthorizationMaterial,
+) -> Result<(), ApplyError> {
+    if material.grant != *grant {
+        return Err(ApplyError::Live(LiveError::InvalidArguments));
+    }
+    apply_with_ops_and_confirm(store, grant, Change::Add, &mut SystemOps {
+        interface, expected_server_key: Some(expected_server_key),
+    }, |store, after| {
+        store.confirm_authorized(material, after).map_err(ApplyError::Ledger)?;
+        Ok(())
     })
 }
 

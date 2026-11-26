@@ -124,7 +124,7 @@ impl<'de> Deserialize<'de> for Unique {
     }
 }
 
-fn unique_json(raw: &[u8]) -> Option<Value> {
+pub(crate) fn unique_json(raw: &[u8]) -> Option<Value> {
     serde_json::from_slice::<Unique>(raw).ok().map(|v| v.0)
 }
 fn text<'a>(v: &'a Value, field: &str) -> Option<&'a str> {
@@ -274,7 +274,7 @@ fn canonical_wg_key(s: &str) -> bool {
     let url = s[..43].replace('+', "-").replace('/', "_");
     b64u(&url,32).is_ok_and(|b| b.len()==32 && b.iter().any(|x| *x!=0))
 }
-fn valid_binding(b: &Value) -> bool {
+pub(crate) fn valid_binding(b: &Value) -> bool {
     b.as_object().is_some_and(|o| o.len()==3)
         && text(b,"RemoteOwnerId").is_some_and(lower_uuid)
         && text(b,"NodeId").is_some_and(lower_uuid)
@@ -531,6 +531,23 @@ pub fn enroll_fresh_consume(
     store: &mut LedgerStore, scope: &TrustedOpenInvite<'_>,
     request: &ParsedRequest, interface: &str, pool: AddressPool,
 ) -> Result<Grant, FreshEnrollError> {
+    let (grant, ()) = reserve_authenticated(store, scope, request, interface, pool,
+        |_, _, _| Ok(()))?;
+    let expected = text(scope.server_binding, "ServerPublicKey")
+        .ok_or(FreshEnrollError::Gate(GateError::InvalidState))?;
+    apply_fresh_and_confirm(store, interface, expected, &grant)
+        .map_err(FreshEnrollError::Apply)?;
+    Ok(grant)
+}
+
+// Authenticate, observe, preview the exact grant, optionally prepare response
+// material, then durably reserve that same grant. Both enrollment paths
+// share the same verification, fresh-clock and locked policy checks.
+fn reserve_authenticated<T>(
+    store: &mut LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str, pool: AddressPool,
+    prepare: impl FnOnce(&Grant, &Value, i64) -> Result<T, FreshEnrollError>,
+) -> Result<(Grant, T), FreshEnrollError> {
     check_retry_interface(scope, interface).map_err(FreshEnrollError::Gate)?;
     let expected = text(scope.server_binding, "ServerPublicKey")
         .ok_or(FreshEnrollError::Gate(GateError::InvalidState))?;
@@ -539,8 +556,11 @@ pub fn enroll_fresh_consume(
     // The only conversion into reservation claims is local to this
     // function. The verified token cannot escape, change stores or be
     // supplied by a caller as raw claims.
-    let claims = prepare_fresh_consume(store, scope, request)
-        .map_err(FreshEnrollError::Gate)?.claims().clone();
+    let verified = prepare_fresh_consume(store, scope, request)
+        .map_err(FreshEnrollError::Gate)?;
+    let claims = verified.claims().clone();
+    let recipient = verified.recipient_jwk().clone();
+    drop(verified);
     let authenticated_at = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
     if authenticated_at < before || claims.public_key == expected {
         return Err(FreshEnrollError::Gate(GateError::InvalidState));
@@ -556,23 +576,32 @@ pub fn enroll_fresh_consume(
         .map_err(FreshEnrollError::Gate)?;
     check_history(store.view().map_err(FreshEnrollError::Ledger)?, &claims)
         .map_err(FreshEnrollError::Gate)?;
-    // Recheck policy and allocate against real inventory in the durable
-    // update itself. A failed/uncertain commit must not reach the WG writer.
-    let grant = store.update(|ledger| ledger.reserve(claims, now, pool, Some(&peers)))
-        .map_err(FreshEnrollError::Ledger)?;
-    // The existing writer checks the exact Pending grant, updates only
-    // this peer and compares the full before/after inventory. The new
-    // path additionally checks the pinned server key at both snapshots,
-    // before the final durable Consumed commit.
-    apply_fresh_and_confirm(store, interface, expected, &grant)
-        .map_err(FreshEnrollError::Apply)?;
-    Ok(grant)
+    // Preview is not a reservation or authority. Prepare the complete
+    // encrypted reply before any WG mutation and reject any mismatch with
+    // the actual allocation made by the durable update.
+    let mut preview = store.view().map_err(FreshEnrollError::Ledger)?.clone();
+    let predicted = preview.reserve(claims.clone(), now, pool, Some(&peers))
+        .map_err(|err| FreshEnrollError::Ledger(StoreError::Policy(err)))?;
+    let prepared = prepare(&predicted, &recipient, now)?;
+    let commit_now = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    check_open_completion(store, scope.invite_id, generation, now, commit_now)
+        .map_err(FreshEnrollError::Gate)?;
+    check_history(store.view().map_err(FreshEnrollError::Ledger)?, &claims)
+        .map_err(FreshEnrollError::Gate)?;
+    let grant = store.update(|ledger| {
+        let actual = ledger.reserve(claims, commit_now, pool, Some(&peers))?;
+        if actual != predicted { return Err(crate::Refusal::Conflict); }
+        Ok(actual)
+    }).map_err(FreshEnrollError::Ledger)?;
+    Ok((grant, prepared))
 }
 
 /// Read-only, lock-borrowing retry evidence, NOT a new Grant or response.
 /// Cannot be constructed by network deserialization or used to add a peer.
 pub struct VerifiedConsumedRetry<'a> {
     claims: Claims,
+    #[cfg(feature = "linux-authorization-response")]
+    recipient_jwk: Value,
     _store: &'a LedgerStore,
 }
 impl VerifiedConsumedRetry<'_> {
@@ -624,7 +653,7 @@ fn prepare_retry_with_observation<'a>(store: &'a LedgerStore, scope: &TrustedOpe
     let now=clock()?;
     let generation=store.generation().map_err(|_|GateError::InvalidState)?;
     let ledger=common(store,scope,request,now,Operation::Retry)?;
-    let (claims,_)=verify_consume_claims(scope,request,now)?;
+    let (claims,_recipient_jwk)=verify_consume_claims(scope,request,now)?;
     check_history(ledger,&claims)?;
     // Authenticate and reject mismatched consumed claims before privileged IO.
     let Some(InviteState::Consumed(grant))=ledger.state(scope.invite_id) else {
@@ -653,7 +682,66 @@ fn prepare_retry_with_observation<'a>(store: &'a LedgerStore, scope: &TrustedOpe
         crate::Refusal::Revoked | crate::Refusal::RevokedIdentity => GateError::Revoked,
         _ => GateError::InvalidState,
     })?;
-    Ok(VerifiedConsumedRetry { claims,_store:store })
+    Ok(VerifiedConsumedRetry { claims,
+        #[cfg(feature = "linux-authorization-response")]
+        recipient_jwk:_recipient_jwk,
+        _store:store })
+}
+
+/// Non-listening Stage 2 consume handler. Only authenticated requests may
+/// produce the client-compatible success data. The caller must provision
+/// current trusted metadata/config/key and exclude all privileged writers.
+/// No HTTP-selected recipient, raw Grant signing, listener or deployment.
+/// Consumed retry performs no ledger/config/kernel mutation or signing.
+#[cfg(feature = "linux-authorization-response")]
+pub fn consume_authorization(
+    store: &mut LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str,
+    config: &crate::authorization_response::TrustedResponseConfig,
+    management_key: &rsa::RsaPrivateKey,
+) -> Result<Value, FreshEnrollError> {
+    use crate::authorization_response as response;
+    let invalid = || FreshEnrollError::Gate(GateError::InvalidState);
+    check_retry_interface(scope, interface).map_err(FreshEnrollError::Gate)?;
+    if !config.matches_scope(scope.server_binding, interface) { return Err(invalid()); }
+    response::check_signer(management_key, scope.management_jwk)
+        .map_err(FreshEnrollError::Gate)?;
+    let expected = text(scope.server_binding, "ServerPublicKey").ok_or_else(invalid)?;
+    if matches!(store.view().map_err(FreshEnrollError::Ledger)?.state(scope.invite_id),
+        Some(InviteState::Consumed(_))) {
+        let verified = prepare_consumed_retry(store, scope, request, interface)
+            .map_err(FreshEnrollError::Gate)?;
+        let Some(InviteState::Consumed(grant)) =
+            store.view().map_err(FreshEnrollError::Ledger)?.state(scope.invite_id)
+        else { return Err(invalid()); };
+        if &grant.claims != verified.claims() { return Err(invalid()); }
+        let material = store.authorization_material(scope.invite_id)
+            .map_err(FreshEnrollError::Ledger)?;
+        let now = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+        let data = response::retry(material, grant, &verified.recipient_jwk, config,
+            scope.management_jwk, now).map_err(FreshEnrollError::Gate)?;
+        let after = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+        if after < now || after >= material.expires_unix { return Err(invalid()); }
+        common(store, scope, request, after, Operation::Retry).map_err(FreshEnrollError::Gate)?;
+        return Ok(data);
+    }
+    let (grant, (material, data)) = reserve_authenticated(
+        store, scope, request, interface, config.pool(),
+        |grant, recipient, now| response::prepare(grant, recipient, config,
+            scope.management_jwk, management_key, now).map_err(FreshEnrollError::Gate)
+    )?;
+    crate::wg_live_set::apply_fresh_and_confirm_authorized(
+        store, interface, expected, &grant, material
+    ).map_err(FreshEnrollError::Apply)?;
+    // Only a successful durable Consumed+material commit can release the
+    // precomputed response. A poisoned or expired result is never success.
+    let saved = store.authorization_material(scope.invite_id)
+        .map_err(FreshEnrollError::Ledger)?;
+    let after = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    if saved.grant != grant || after < saved.issued_unix || after >= saved.expires_unix {
+        return Err(invalid());
+    }
+    Ok(data)
 }
 
 // L1 is deliberately test-only. A matched local observation cannot be

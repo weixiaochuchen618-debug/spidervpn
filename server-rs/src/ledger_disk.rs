@@ -23,7 +23,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -67,12 +67,32 @@ impl From<serde_json::Error> for StoreError {
     fn from(err: serde_json::Error) -> Self { Self::Json(err) }
 }
 
+/// Original response material is part of the same protected atomic document
+/// as the exact grant. It is never reconstructed from an old Consumed record.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuthorizationMaterial {
+    pub(crate) grant: Grant,
+    pub(crate) signed: String,
+    pub(crate) issued_unix: i64,
+    pub(crate) expires_unix: i64,
+}
+impl std::fmt::Debug for AuthorizationMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthorizationMaterial([redacted])")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
     schema_version: u32,
     generation: u64,
     ledger: Ledger,
+    // Version-1 documents without response material remain readable and
+    // byte-compatible on ordinary writes. Missing material denies a reply.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    authorization_material: BTreeMap<String, AuthorizationMaterial>,
 }
 
 pub struct LedgerStore {
@@ -82,6 +102,7 @@ pub struct LedgerStore {
     _guard: AuthorityLock,
     generation: u64,
     value: Ledger,
+    authorization_material: BTreeMap<String, AuthorizationMaterial>,
     poisoned: bool,
 }
 
@@ -147,6 +168,27 @@ fn validate(ledger: &Ledger) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn validate_document(doc: &Document) -> Result<(), StoreError> {
+    validate(&doc.ledger)?;
+    if doc.authorization_material.len() > doc.ledger.invitations.len() {
+        return Err(StoreError::Invalid("unbound authorization material"));
+    }
+    for (id, m) in &doc.authorization_material {
+        let grant = match doc.ledger.state(id) {
+            Some(InviteState::Consumed(g) | InviteState::Revoking(g) | InviteState::Revoked(g)) => g,
+            _ => return Err(StoreError::Invalid("authorization material without terminal grant")),
+        };
+        if m.grant != *grant || m.issued_unix < 0
+            || m.issued_unix.checked_add(3600) != Some(m.expires_unix)
+            || m.signed.is_empty() || m.signed.len() > 131_072
+            || m.signed.split('.').count() != 3
+            || !m.signed.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+            return Err(StoreError::Invalid("invalid bound authorization material"));
+        }
+    }
+    Ok(())
+}
+
 fn assert_private(file: &File) -> Result<(), StoreError> {
     let meta = file.metadata()?;
     let owner = unsafe { geteuid() };
@@ -179,7 +221,7 @@ fn read_validated_document(root: &Path) -> Result<(Document, Vec<u8>), StoreErro
         return Err(StoreError::Invalid("authority ledger exceeds input bound"));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    (&file).take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err(StoreError::Invalid("authority ledger expanded while reading"));
     }
@@ -187,7 +229,15 @@ fn read_validated_document(root: &Path) -> Result<(Document, Vec<u8>), StoreErro
     if doc.schema_version != SCHEMA || doc.generation == 0 {
         return Err(StoreError::Invalid("unknown ledger schema or impossible generation"));
     }
-    validate(&doc.ledger)?;
+    validate_document(&doc)?;
+    // On reopen, a prior rename may have been visible before a failed
+    // directory fsync. Do not expose original response material until this
+    // exact protected file and its directory have both synced successfully.
+    // This does not repair Pending or establish anti-rollback history.
+    if !doc.authorization_material.is_empty() {
+        file.sync_all()?;
+        File::open(root)?.sync_all()?;
+    }
     Ok((doc, bytes))
 }
 
@@ -234,7 +284,7 @@ fn temporary_path(root: &Path) -> Result<PathBuf, StoreError> {
 }
 
 fn store_atomic(root: &Path, doc: &Document) -> Result<(), StoreError> {
-    validate(&doc.ledger)?;
+    validate_document(doc)?;
     if doc.schema_version != SCHEMA || doc.generation == 0 {
         return Err(StoreError::Invalid("invalid ledger commit generation"));
     }
@@ -288,6 +338,7 @@ impl LedgerStore {
             _guard: guard,
             generation: doc.generation,
             value: doc.ledger,
+            authorization_material: doc.authorization_material,
             poisoned: false,
         })
     }
@@ -310,16 +361,52 @@ impl LedgerStore {
         &mut self,
         f: impl FnOnce(&mut Ledger) -> Result<T, Refusal>,
     ) -> Result<T, StoreError> {
+        self.update_inner(f, None)
+    }
+
+    #[cfg(feature = "linux-authorization-response")]
+    pub(crate) fn authorization_material(&self, id: &str) -> Result<&AuthorizationMaterial, StoreError> {
+        if self.poisoned { return Err(StoreError::Poisoned); }
+        self.authorization_material.get(id)
+            .ok_or(StoreError::Invalid("original authorization material unavailable"))
+    }
+
+    /// The readback-confirmed Consumed transition and original signed
+    /// material are committed together, never as two separate updates.
+    #[cfg(feature = "linux-authorization-response")]
+    pub(crate) fn confirm_authorized(&mut self, material: AuthorizationMaterial,
+        peers: &[crate::Peer]) -> Result<Grant, StoreError>
+    {
+        let grant = material.grant.clone();
+        self.update_inner(|ledger| {
+            let confirmed = ledger.confirm_consumed(&grant.claims.invite_id, Some(peers))?;
+            if confirmed != grant { return Err(Refusal::Conflict); }
+            Ok(confirmed)
+        }, Some(material))
+    }
+
+    fn update_inner<T>(
+        &mut self, f: impl FnOnce(&mut Ledger) -> Result<T, Refusal>,
+        material: Option<AuthorizationMaterial>,
+    ) -> Result<T, StoreError> {
         if self.poisoned { return Err(StoreError::Poisoned); }
         let mut next = self.value.clone();
         let output = f(&mut next).map_err(StoreError::Policy)?;
         validate(&next)?;
         let generation = self.generation.checked_add(1)
             .ok_or(StoreError::GenerationExhausted)?;
+        let mut next_material = self.authorization_material.clone();
+        if let Some(m) = material {
+            if next_material.contains_key(&m.grant.claims.invite_id) {
+                return Err(StoreError::Invalid("cannot replace original authorization"));
+            }
+            next_material.insert(m.grant.claims.invite_id.clone(), m);
+        }
         if let Err(error) = store_atomic(&self.root, &Document {
             schema_version: SCHEMA,
             generation,
             ledger: next.clone(),
+            authorization_material: next_material.clone(),
         }) {
             // The atomic rename may have happened even if the final fsync
             // failed. Treat the in-memory copy as stale, block ALL further
@@ -328,6 +415,7 @@ impl LedgerStore {
             return Err(error);
         }
         self.value = next;
+        self.authorization_material = next_material;
         self.generation = generation;
         Ok(output)
     }
@@ -343,6 +431,7 @@ pub(crate) fn bootstrap_for_test(root: &Path) -> Result<(), StoreError> {
         .custom_flags(O_NOFOLLOW).open(path)?;
     let data = serde_json::to_vec(&Document {
         schema_version: SCHEMA, generation: 1, ledger: Ledger::default(),
+        authorization_material: BTreeMap::new(),
     })?;
     file.write_all(&data)?;
     file.sync_all()?;
@@ -474,6 +563,38 @@ mod tests {
         fs::remove_dir_all(p).unwrap();
     }
 
+    #[cfg(feature = "linux-authorization-response")]
+    #[test]
+    fn uncertain_final_authorization_commit_poisoned_store_exposes_no_reply_material() {
+        let p = dir("authorization-uncertain");
+        bootstrap_for_test(&p).unwrap();
+        let mut store = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
+        store.update(|l| l.insert_open(INV, 600)).unwrap();
+        let g = store.update(|l| l.reserve(claim(INV), 100, pool(), Some(&[]))).unwrap();
+        // Storage-only marker, deliberately not a valid signed response.
+        // The response handler must additionally verify the actual JWS.
+        let material = AuthorizationMaterial { grant:g.clone(), signed:"a.b.c".into(),
+            issued_unix:100, expires_unix:3700 };
+        assert!(store.authorization_material(INV).is_err());
+        FAIL_AFTER_RENAME.with(|cell| cell.set(true));
+        let failure = store.confirm_authorized(material, &[peer(&g)]);
+        FAIL_AFTER_RENAME.with(|cell| cell.set(false));
+        assert!(matches!(failure, Err(StoreError::Io(_))));
+        assert!(matches!(store.view(), Err(StoreError::Poisoned)));
+        assert!(matches!(store.authorization_material(INV), Err(StoreError::Poisoned)));
+        assert!(matches!(store.generation(), Err(StoreError::Poisoned)));
+        drop(store);
+        // The actual post-rename failure leaves the complete new document
+        // visible. Reopening re-syncs it; neither half may appear alone.
+        let store = LedgerStore::open_existing(&p, Duration::ZERO).unwrap();
+        assert_eq!(store.view().unwrap().state(INV), Some(&InviteState::Consumed(g.clone())));
+        let saved=store.authorization_material(INV).unwrap();
+        assert!(saved.grant==g && saved.signed=="a.b.c" && saved.issued_unix==100
+            && saved.expires_unix==3700);
+        drop(store);
+        fs::remove_dir_all(p).unwrap();
+    }
+
     #[test]
     fn damaged_unknown_schema_or_missing_tombstone_fails_closed() {
         let p = dir("corrupt");
@@ -491,7 +612,7 @@ mod tests {
         bad.confirm_consumed(INV, Some(&[peer(&g)])).unwrap();
         bad.begin_revocation(INV).unwrap();
         bad.invitations.get_mut(INV).unwrap().state = InviteState::Revoked(g);
-        let json = serde_json::to_vec(&Document {schema_version:SCHEMA, generation:2, ledger:bad}).unwrap();
+        let json = serde_json::to_vec(&Document {schema_version:SCHEMA, generation:2, ledger:bad, authorization_material:BTreeMap::new()}).unwrap();
         fs::write(p.join(LEDGER_NAME), json).unwrap();
         assert!(matches!(LedgerStore::open_existing(&p, Duration::ZERO),
             Err(StoreError::Invalid(_))));

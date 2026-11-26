@@ -271,8 +271,11 @@ mod identity_gate {
         }
     }
     fn request(token:&str, signed:&str) -> ParsedRequest {
+        request_at(token,signed,"pair.example.test:18443")
+    }
+    fn request_at(token:&str, signed:&str, host:&str) -> ParsedRequest {
         let body=serde_json::to_vec(&json!({"PairRequest":signed})).unwrap();
-        let mut wire=format!("POST /v1/invitations/{INV}/consume HTTP/1.1\r\nHost: pair.example.test:18443\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",body.len()).into_bytes();
+        let mut wire=format!("POST /v1/invitations/{INV}/consume HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",body.len()).into_bytes();
         wire.extend(body);
         read_one_request(&mut Cursor::new(wire)).unwrap()
     }
@@ -528,6 +531,20 @@ mod identity_gate {
         assert!(matches!(enroll_fresh_consume(&mut store,&scope,&req,IFACE,pool),
             Err(FreshEnrollError::Gate(GateError::InviteConsumed))));
         assert_eq!(prepare_consumed_retry(&store,&scope,&req,IFACE).unwrap().claims(),&grant.claims);
+        #[cfg(feature = "linux-authorization-response")]
+        {
+            use rsa::pkcs8::DecodePrivateKey;
+            use spidervpn_pairing_authority::authorization_response::TrustedResponseConfig;
+            use spidervpn_pairing_authority::fresh_consume_gate::consume_authorization;
+            let management_private=rsa::RsaPrivateKey::from_pkcs8_pem(
+                &Zeroizing::new(fs::read_to_string(&mgmt.path).unwrap())).unwrap();
+            let raw=serde_json::to_vec(&json!({"SchemaVersion":1,"Kind":"SpiderVPN.AuthorizationConfig",
+                "ServerBinding":binding,"WgInterface":IFACE,"TunnelSubnet":"10.66.0.0/24",
+                "ServerAddress":"10.66.0.1/24","PublicEndpoint":"203.0.113.10:51820",
+                "NodeName":"netns fixture","Transport":"udp"})).unwrap();
+            let config=TrustedResponseConfig::verify_pinned(&raw,&sha(&raw)).unwrap();
+            assert!(consume_authorization(&mut store,&scope,&req,IFACE,&config,&management_private).is_err());
+        }
         assert_eq!(fs::read(&ledger_file).unwrap(),committed);
         assert!(fs::read(&conf).unwrap().as_slice()==committed_conf.as_slice());
         assert_eq!(reader.snapshot().unwrap(),observed);
@@ -548,6 +565,239 @@ mod identity_gate {
         assert_eq!(prepare_consumed_retry(&store,&scope,&req,IFACE).err(),Some(GateError::Revoked));
         assert_eq!(fs::read(&ledger_file).unwrap(),revoked);
         assert!(read_verified_identity_snapshot(&store,IFACE,&expected).unwrap().is_empty());
+        drop(store);
+        write_conf(&conf,&base,None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Independent consumer of the actual compact wire. Production uses
+    // Hmac<Sha512> to seal and the client-compatible checks below use ring
+    // for the RFC 7518 AAD/IV/ciphertext/AL tag and legacy RS256 verifier.
+    // This is not an invocation of the Windows client executable.
+    #[cfg(feature = "linux-authorization-response")]
+    fn open_authorization(data:&Value, key:&rsa::RsaPrivateKey) -> Option<String> {
+        use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+        let wire=data.get("EncryptedAuthorization")?.as_str()?;
+        let parts:Vec<_>=wire.split('.').collect();
+        if parts.len()!=5 || parts.iter().any(|s|s.is_empty()) { return None; }
+        let header:Value=serde_json::from_slice(&B64.decode(parts[0]).ok()?).ok()?;
+        if header!=json!({"alg":"RSA-OAEP-256","enc":"A256CBC-HS512","cty":"TC-Pairing-v1"}) {
+            return None;
+        }
+        let cek=Zeroizing::new(key.decrypt_blinded(&mut rsa::rand_core::OsRng,
+            rsa::Oaep::new::<sha2::Sha256>(),&B64.decode(parts[1]).ok()?).ok()?);
+        let iv=B64.decode(parts[2]).ok()?;
+        let mut ciphertext=B64.decode(parts[3]).ok()?;
+        let tag=B64.decode(parts[4]).ok()?;
+        if cek.len()!=64 || iv.len()!=16 || tag.len()!=32
+            || ciphertext.is_empty() || ciphertext.len()%16!=0 { return None; }
+        let mac_key=hmac::Key::new(hmac::HMAC_SHA512,&cek[..32]);
+        let mut mac=hmac::Context::with_key(&mac_key);
+        mac.update(parts[0].as_bytes());
+        mac.update(&iv);
+        mac.update(&ciphertext);
+        mac.update(&((parts[0].len() as u64)*8).to_be_bytes());
+        if &mac.sign().as_ref()[..32]!=tag.as_slice() { return None; }
+        let plaintext=cbc::Decryptor::<aes::Aes256>::new_from_slices(&cek[32..],&iv)
+            .ok()?.decrypt_padded_mut::<Pkcs7>(&mut ciphertext).ok()?;
+        String::from_utf8(plaintext.to_vec()).ok()
+    }
+
+    #[cfg(feature = "linux-authorization-response")]
+    #[test]
+    fn actual_signed_encrypted_consume_and_original_authorization_survive_reopen() {
+        assert_eq!(unsafe {geteuid()}, 0);
+        assert_eq!(std::env::var("SPIDERVPN_SEC01_NS_INTERFACE").unwrap(), IFACE);
+        let expected=std::env::var("SPIDERVPN_SEC01_NS_SERVER_PUBLIC_KEY").unwrap();
+        let key=std::env::var("SPIDERVPN_SEC01_NS_CLIENT_PUBLIC_KEY").unwrap();
+        let reader=LiveWgReader::new(IFACE).unwrap();
+        assert_eq!(reader.server_public_key().unwrap(), expected);
+        assert!(reader.snapshot().unwrap().is_empty());
+        let conf=Path::new("/etc/wireguard").join(format!("{IFACE}.conf"));
+        let base=Zeroizing::new(fs::read_to_string(&conf).unwrap());
+        assert!(!base.contains("[Peer]"));
+        let root=test_ledger();
+        let now=i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap();
+        let issued=utc_at(now-60);
+        let expires=utc_at(now+3600);
+        let retry=utc_at(now+3720);
+        let mgmt=Rsa::new(&root,"management.pem");
+        let recipient=Rsa::new(&root,"recipient.pem");
+        let binding=json!({"RemoteOwnerId":"55555555-5555-4555-8555-555555555555",
+            "NodeId":"66666666-6666-4666-8666-666666666666","ServerPublicKey":expected});
+        let fingerprint=format!("SHA256:{}",b64(digest::digest(&digest::SHA256,
+            &serde_json::to_vec(&mgmt.jwk).unwrap()).as_ref()).replace('-',"+").replace('_',"/"));
+        let pin="a".repeat(64);
+        let token=b64(&[77;32]);
+        let invite=json!({"SchemaVersion":1,"Kind":"TradeChannel.PairInvite","InviteId":INV,
+            "RemoteOwnerId":binding["RemoteOwnerId"],"NodeId":binding["NodeId"],
+            "ServerPublicKey":expected,"ServerBinding":binding,
+            "ManagementSigningPublicKey":mgmt.jwk,"IssuedAtUtc":issued,"ExpiresAtUtc":expires,
+            "PublicEndpoint":"203.0.113.10:18443","DeviceName":"netns fixture",
+            "Capabilities":{"PairingVersion":1}});
+        let descriptor=mgmt.sign(&json!({"SchemaVersion":1,"Kind":"TradeChannel.OnlineInvite",
+            "InviteId":INV,"Invite":mgmt.sign(&invite),"PublicHost":"203.0.113.10","Port":18443,
+            "TlsSha256":pin,"ManagementFingerprint":fingerprint,"ManagementSigningPublicKey":mgmt.jwk,
+            "ExpiresAtUtc":expires,"RetryUntilUtc":retry}));
+        let tag=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,token.as_bytes()),
+            b"SpiderVPN pinned invitation metadata bearer v1");
+        let metadata=serde_json::to_vec(&json!({"SchemaVersion":1,"Kind":"SpiderVPN.InviteMetadata",
+            "InviteId":INV,"BearerHmacSha256":hex(tag.as_ref()),"SignedDescriptor":descriptor,
+            "ManagementSigningPublicKey":mgmt.jwk,"ManagementFingerprint":fingerprint,
+            "ServerBinding":binding,"PublicHost":"203.0.113.10","Port":18443,
+            "TlsSha256":pin,"WgInterface":IFACE})).unwrap();
+        let authenticated=verify_pinned_invite_metadata(&metadata,&sha(&metadata),&token).unwrap();
+        let scope=authenticated.scope().unwrap();
+        let inner=json!({"SchemaVersion":1,"Kind":"TradeChannel.ClientRequest","RequestId":REQ,
+            "DeviceId":DEV,"ClientPublicKey":key,"CreatedAtUtc":issued,"AddressFamilies":["IPv4"]});
+        let request_digest=sha(format!("1\nTradeChannel.ClientRequest\n{REQ}\n{DEV}\n{issued}\n{key}\nIPv4").as_bytes());
+        let signed=recipient.sign(&json!({"SchemaVersion":1,"Kind":"TradeChannel.PairRequest",
+            "InviteId":INV,"ServerBinding":binding,"ClientRequest":inner,
+            "DeviceName":"netns fixture","RecipientJwk":recipient.jwk,"RequestDigest":request_digest,
+            "RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":issued}));
+        let req=request_at(&token,&signed,"203.0.113.10:18443");
+        let mut store=open(&root);
+        store.update(|l|l.insert_open(INV,now+3600)).unwrap();
+        let ledger_file=root.join("authority-ledger.json");
+        let initial=fs::read(&ledger_file).unwrap();
+        let generation=store.generation().unwrap();
+
+        use rsa::pkcs8::DecodePrivateKey;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+        use spidervpn_pairing_authority::authorization_response::TrustedResponseConfig;
+        use spidervpn_pairing_authority::fresh_consume_gate::consume_authorization;
+        let management_private=rsa::RsaPrivateKey::from_pkcs8_pem(
+            &Zeroizing::new(fs::read_to_string(&mgmt.path).unwrap())).unwrap();
+        let recipient_private=rsa::RsaPrivateKey::from_pkcs8_pem(
+            &Zeroizing::new(fs::read_to_string(&recipient.path).unwrap())).unwrap();
+        let transport=json!({"Type":"tcp-reality","Server":"198.51.100.9","Port":8443,
+            "Uuid":"77777777-7777-4777-8777-777777777777","ServerName":"gate.example.test",
+            "RealityPublicKey":b64(&[7;32]),"RealityShortId":"aabbccdd"});
+        let config_record=json!({"SchemaVersion":1,"Kind":"SpiderVPN.AuthorizationConfig",
+            "ServerBinding":binding,"WgInterface":IFACE,"TunnelSubnet":"10.66.0.0/24",
+            "ServerAddress":"10.66.0.1/24","PublicEndpoint":"203.0.113.10:51820",
+            "NodeName":"netns fixture","Transport":transport});
+        let raw=serde_json::to_vec(&config_record).unwrap();
+        let config=TrustedResponseConfig::verify_pinned(&raw,&sha(&raw)).unwrap();
+        assert!(TrustedResponseConfig::verify_pinned(&raw,&"0".repeat(64)).is_err());
+        let mut wrong_binding=config_record.clone();
+        wrong_binding["ServerBinding"]["NodeId"]=json!("88888888-8888-4888-8888-888888888888");
+        let wrong=serde_json::to_vec(&wrong_binding).unwrap();
+        let wrong=TrustedResponseConfig::verify_pinned(&wrong,&sha(&wrong)).unwrap();
+        assert!(consume_authorization(&mut store,&scope,&req,IFACE,&wrong,&management_private).is_err());
+        assert!(consume_authorization(&mut store,&scope,&req,IFACE,&config,&recipient_private).is_err());
+        let bad_token=request_at(&b64(&[78;32]),&signed,"203.0.113.10:18443");
+        assert!(matches!(consume_authorization(&mut store,&scope,&bad_token,IFACE,&config,&management_private),
+            Err(FreshEnrollError::Gate(GateError::Forbidden))));
+        let wrong_request=recipient.sign(&json!({"SchemaVersion":1,"Kind":"TradeChannel.PairRequest",
+            "InviteId":INV,"ServerBinding":binding,"ClientRequest":inner,
+            "DeviceName":"netns fixture","RecipientJwk":recipient.jwk,"RequestDigest":"0".repeat(64),
+            "RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":issued}));
+        let wrong_request=request_at(&token,&wrong_request,"203.0.113.10:18443");
+        assert!(consume_authorization(&mut store,&scope,&wrong_request,IFACE,&config,&management_private).is_err());
+        // Actual protected config identity denial; no peer or grant written.
+        let missing_key=Zeroizing::new("[Interface]\nAddress = 10.66.0.1/24\n".to_owned());
+        write_conf(&conf,&missing_key,None);
+        assert!(consume_authorization(&mut store,&scope,&req,IFACE,&config,&management_private).is_err());
+        write_conf(&conf,&base,None);
+        assert_eq!(store.generation().unwrap(),generation);
+        assert!(fs::read(&ledger_file).unwrap()==initial);
+        assert!(reader.snapshot().unwrap().is_empty());
+        assert!(fs::read(&conf).unwrap().as_slice()==base.as_bytes());
+
+        // Real atomic reservation failure after successful authentication and
+        // encryption feasibility. Neither the response nor a peer may escape.
+        fs::set_permissions(&ledger_file,fs::Permissions::from_mode(0o644)).unwrap();
+        let failed=consume_authorization(&mut store,&scope,&req,IFACE,&config,&management_private);
+        fs::set_permissions(&ledger_file,fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(failed,Err(FreshEnrollError::Ledger(
+            spidervpn_pairing_authority::ledger_disk::StoreError::Invalid(_)))));
+        assert!(store.view().is_err());
+        assert!(fs::read(&ledger_file).unwrap()==initial);
+        assert!(reader.snapshot().unwrap().is_empty());
+        assert!(fs::read(&conf).unwrap().as_slice()==base.as_bytes());
+        drop(store);
+        let mut store=open(&root);
+
+        let data=consume_authorization(&mut store,&scope,&req,IFACE,&config,&management_private).unwrap();
+        assert!(data.as_object().unwrap().len()==4 && data["Status"]=="Authorized"
+            && data["RequestId"]==REQ && data["RequestDigest"]==request_digest);
+        let original=open_authorization(&data,&recipient_private).expect("recipient opens actual wire");
+        assert!(open_authorization(&data,&management_private).is_none());
+        let Some(InviteState::Consumed(grant))=store.view().unwrap().state(INV) else {
+            panic!("actual response requires durable Consumed");
+        };
+        let grant=grant.clone();
+        assert_eq!(grant.address,Ipv4Addr::new(10,66,0,2));
+        assert_eq!(store.generation().unwrap(),generation+2);
+        let observed=read_verified_identity_snapshot(&store,IFACE,&expected).unwrap();
+        assert_eq!(observed,vec![spidervpn_pairing_authority::Peer {
+            public_key:key.clone(),address:grant.address
+        }]);
+        // Existing independent RS256 and legacy record/binding verifier,
+        // not a self-only test of the new sign/seal code.
+        let old=json!({"State":"Consumed","SignedAuthorization":original,
+            "RequestId":REQ,"DeviceId":DEV,"ClientPublicKey":key,
+            "ClientAddress":"10.66.0.2/32","RequestDigest":request_digest,
+            "RecipientJwkDigest":grant.claims.recipient_jwk_digest});
+        assert!(spidervpn_pairing_authority::legacy_signed::audit_signed_consumed(
+            INV,&old,&mgmt.jwk,&binding).is_ok());
+        let body:Value=serde_json::from_slice(&B64.decode(original.split('.').nth(1).unwrap()).unwrap()).unwrap();
+        let committed=fs::read(&ledger_file).unwrap();
+        let doc:Value=serde_json::from_slice(&committed).unwrap();
+        let material=&doc["authorization_material"][INV];
+        let issued_unix=material["issued_unix"].as_i64().unwrap();
+        let expires_unix=material["expires_unix"].as_i64().unwrap();
+        assert!(issued_unix>=now && expires_unix==issued_unix+3600);
+        assert!(material["signed"]==original);
+        assert!(body["IssuedAtUtc"]==utc_at(issued_unix) && body["ExpiresAtUtc"]==utc_at(expires_unix));
+        assert!(body["InviteId"]==INV && body["RequestId"]==REQ && body["DeviceId"]==DEV
+            && body["ClientPublicKey"]==key && body["RequestDigest"]==request_digest
+            && body["ServerBinding"]==binding && body["RemoteOwnerId"]==binding["RemoteOwnerId"]
+            && body["NodeId"]==binding["NodeId"] && body["ConfigRevision"]==1
+            && body["RecipientJwkDigest"]==grant.claims.recipient_jwk_digest);
+        let response=&body["ClientResponse"];
+        assert!(response==&json!({"SchemaVersion":1,"Kind":"TradeChannel.ClientResponse",
+            "Status":"Authorized","RequestId":REQ,"DeviceId":DEV,"NodeId":binding["NodeId"],
+            "NodeName":"netns fixture","ClientPublicKey":key,"ServerPublicKey":expected,
+            "ClientAddress":"10.66.0.2/32","ServerAddress":"10.66.0.1/24","TunnelSubnet":"10.66.0.0/24",
+            "AllowedIPs":["0.0.0.0/0"],"AddressFamilies":["IPv4"],"PublicEndpoint":"203.0.113.10:51820",
+            "PersistentKeepalive":25,"ConfigRevision":1,"Transport":transport}));
+        let committed_conf=Zeroizing::new(fs::read(&conf).unwrap());
+        drop(store);
+        let mut store=open(&root);
+        let retried=consume_authorization(&mut store,&scope,&req,IFACE,&config,&management_private).unwrap();
+        assert!(open_authorization(&retried,&recipient_private).as_deref()==Some(original.as_str()));
+        assert!(retried["EncryptedAuthorization"]!=data["EncryptedAuthorization"]);
+        let changed_recipient=mgmt.sign(&json!({"SchemaVersion":1,"Kind":"TradeChannel.PairRequest",
+            "InviteId":INV,"ServerBinding":binding,"ClientRequest":inner,
+            "DeviceName":"netns fixture","RecipientJwk":mgmt.jwk,"RequestDigest":request_digest,
+            "RequestDigestAlgorithm":"TC-ClientRequest-v1","CreatedAtUtc":issued}));
+        let changed_recipient=request_at(&token,&changed_recipient,"203.0.113.10:18443");
+        assert!(matches!(consume_authorization(&mut store,&scope,&changed_recipient,IFACE,&config,&management_private),
+            Err(FreshEnrollError::Gate(GateError::PairingMismatch))));
+        let mut changed_config=config_record.clone();
+        changed_config["PublicEndpoint"]=json!("203.0.113.10:51821");
+        let changed=serde_json::to_vec(&changed_config).unwrap();
+        let changed=TrustedResponseConfig::verify_pinned(&changed,&sha(&changed)).unwrap();
+        assert!(consume_authorization(&mut store,&scope,&req,IFACE,&changed,&management_private).is_err());
+        assert_eq!(store.generation().unwrap(),generation+2);
+        assert!(fs::read(&ledger_file).unwrap()==committed);
+        assert!(fs::read(&conf).unwrap().as_slice()==committed_conf.as_slice());
+        assert_eq!(reader.snapshot().unwrap(),observed);
+
+        let revoking=store.update(|l|l.begin_revocation(INV)).unwrap();
+        assert!(matches!(consume_authorization(&mut store,&scope,&req,IFACE,&config,&management_private),
+            Err(FreshEnrollError::Gate(GateError::Revoked))));
+        spidervpn_pairing_authority::wg_live_set::apply_and_confirm(
+            &mut store,IFACE,&revoking,spidervpn_pairing_authority::wg_peer_plan::Change::Remove
+        ).unwrap();
+        let revoked=fs::read(&ledger_file).unwrap();
+        assert!(matches!(consume_authorization(&mut store,&scope,&req,IFACE,&config,&management_private),
+            Err(FreshEnrollError::Gate(GateError::Revoked))));
+        assert!(fs::read(&ledger_file).unwrap()==revoked);
+        assert!(reader.snapshot().unwrap().is_empty());
         drop(store);
         write_conf(&conf,&base,None);
         fs::remove_dir_all(root).unwrap();

@@ -23,6 +23,14 @@ rustls = { version = "=0.23.46", default-features = false, features = ["ring", "
 zeroize = { version = "=1.9.1", optional = true }
 # Existing pinned transitive libc; expose only for the opted-in Linux process lab.
 libc = { version = "=0.2.191", optional = true }
+# Exact versions in the client lock. Used only for opt-in response issuance.
+aes = { version = "=0.8.4", optional = true }
+base64 = { version = "=0.23.1", optional = true }
+cbc = { version = "=0.1.2", optional = true }
+hmac = { version = "=0.12.1", optional = true }
+rsa = { version = "=0.9.10", features = ["sha2"], optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+time = { version = "=0.3.55", optional = true }
 
 [features]
 # Only the explicit privileged netns CI job compiles and runs this test.
@@ -54,6 +62,8 @@ linux-persistent-listener-lab = ["linux-bounded-accept-lab"]
 linux-denial-process-lab = ["linux-persistent-listener-lab", "dep:libc"]
 # Default-off request authentication against an independently trusted invite.
 linux-fresh-consume-gate = ["linux-handshake-admission", "dep:zeroize"]
+# Internal success response only; does not enable a listener or default daemon.
+linux-authorization-response = ["linux-fresh-consume-gate", "dep:aes", "dep:base64", "dep:cbc", "dep:hmac", "dep:rsa", "dep:sha2", "dep:time"]
 
 [[test]]
 name = "wg_namespace_e2e"
