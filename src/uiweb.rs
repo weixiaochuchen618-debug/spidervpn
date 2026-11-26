@@ -10676,6 +10676,109 @@ mod tests {
         "exitObservedIp", "exitProbeAtUtc", "startedAt", "transportActual",
     ];
 
+    // This is a deliberately narrow lexical contract for the one privileged
+    // binding, not a replacement for the general fetch scanner. Accept only
+    // the existing immutable root declaration, direct reads and the one
+    // existing whole-value clone into the offline status selection. Any other
+    // mention (including patterns, mutation, qualified names or aliases) is
+    // an ambiguity, even if the general scanner deduplicates its keys.
+    fn snapshot_lines_binding_identity(body: &str, fetch_at: usize) -> Result<(), &'static str> {
+        const NAME: &str = "lines_raw";
+        let declaration_at = fetch_at.checked_sub("lines_raw = ".len())
+            .ok_or("missing declaration")?;
+        // Lex only the forms used by this function: line comments, simple
+        // raw/ordinary strings, words and punctuation. Unsupported lexical
+        // forms fail closed here instead of trying to parse arbitrary Rust.
+        let lexer = regex::Regex::new(
+            r###"//[^\n]*|r#".*?"#|"(?:\\[^\r\n]|[^"\\\r\n])*"|\w+|[^\s]"###,
+        ).expect("snapshot provenance lexer");
+        let tokens: Vec<_> = lexer.find_iter(body)
+            .filter(|token| !token.as_str().starts_with("//"))
+            .collect();
+        let word = |index: usize| tokens.get(index).map(|token| token.as_str());
+        // The original scanner is textual. Do not grant provenance to
+        // occurrences in strings/comments or substrings that it might see.
+        if body.match_indices(NAME).count()
+            != tokens.iter().filter(|token| token.as_str() == NAME).count()
+        {
+            return Err("non-token occurrence of lines_raw");
+        }
+        let mut delimiters = Vec::new();
+        let mut declaration = None;
+        let mut clone_count = 0;
+        for (index, token) in tokens.iter().enumerate() {
+            let text = token.as_str();
+            if matches!(text, "\"" | "'" | "#" | "\\")
+                || body[token.start()..].starts_with("/*")
+                || body[token.start()..].starts_with("*/")
+            {
+                return Err("unsupported lexical form");
+            }
+            if text == NAME {
+                if token.start() == declaration_at {
+                    if delimiters.as_slice() != ["{"]
+                        || index == 0 || word(index - 1) != Some("let")
+                        || word(index + 1) != Some("=")
+                        || word(index + 2) != Some("fetch")
+                        || tokens[index + 2].start() != fetch_at
+                    {
+                        return Err("lines_raw declaration is not immutable function-root binding");
+                    }
+                    declaration = Some(index);
+                } else {
+                    let Some(declared) = declaration else {
+                        return Err("lines_raw mention before original declaration");
+                    };
+                    let previous = index.checked_sub(1).and_then(word);
+                    if matches!(previous, Some("." | ":" | "#")) {
+                        return Err("qualified lines_raw is not the original binding");
+                    }
+                    let suffix = body[token.end()..].trim_start();
+                    if suffix.starts_with(".get(") {
+                        // Immutable Value::get, with the original scanner
+                        // still checking literal/opaque keys and callee hops.
+                    } else if suffix.starts_with(".clone()") {
+                        // Only the existing tail clone of the status-selection
+                        // then branch may transfer the whole value. Its let/if
+                        // must begin immediately after the literal fetch;
+                        // no intervening root statement may own the clone.
+                        let start = declared + 7;
+                        if word(start) != Some("let")
+                            || word(start + 1) != Some("st")
+                            || word(start + 2) != Some("=")
+                            || word(start + 3) != Some("if")
+                            || delimiters.as_slice() != ["{", "{"]
+                            || previous != Some("{")
+                            || !body[token.start()..].starts_with(
+                                "lines_raw.clone()\n        } else {\n            st\n        };"
+                            )
+                            || tokens[start..index].iter().any(|t| t.as_str() == ";")
+                        {
+                            return Err("unproven lines_raw whole-value clone/alias");
+                        }
+                        clone_count += 1;
+                    } else {
+                        return Err("unproven use of lines_raw (shadow, rebind or alias)");
+                    }
+                }
+            }
+            match text {
+                "{" | "(" | "[" => delimiters.push(text),
+                "}" | ")" | "]" => {
+                    let expected = match text { "}" => "{", ")" => "(", _ => "[" };
+                    if delimiters.pop() != Some(expected) {
+                        return Err("ambiguous delimiter scope");
+                    }
+                }
+                _ => {}
+            }
+        }
+        if declaration.is_none() || !delimiters.is_empty() || clone_count != 1 {
+            return Err("missing original binding, balanced scope or unique approved clone");
+        }
+        Ok(())
+    }
+
     // One checker path for real sources and mutation controls; collect all
     // failures including coverage, not an unrelated panic in negative cases.
     fn scan_fetch_reply_contract(sources: &[(&str, &str)]) -> Vec<String> {
@@ -10699,6 +10802,7 @@ mod tests {
             SNAPSHOT_LINES_BASELINE_KEYS.iter().map(|key| (*key).to_string()).collect();
         let mut baseline_keys = std::collections::BTreeSet::<String>::new();
         let mut baseline_sites = 0usize;
+        let mut provenance_problems = Vec::new();
         let unique_snapshot = functions.iter().filter(|(_, item)| item.name == "snapshot").count() == 1;
         let mut fetches = 0usize;
         let mut identified = 0usize;
@@ -10795,9 +10899,21 @@ mod tests {
                         ))
                         && call_argument(function.body, use_site.at) == r##"(r#"{"cmd":"lines"}"#)"##
                         && function.body[use_site.at..].starts_with(r##"fetch(r#"{"cmd":"lines"}"#);"##);
-                    if snapshot_site {
+                    let binding_proven = if snapshot_site {
                         baseline_sites += 1;
-                    }
+                        match snapshot_lines_binding_identity(function.body, use_site.at) {
+                            Ok(()) => true,
+                            Err(reason) => {
+                                provenance_problems.push(format!(
+                                    "{file} {} status baseline binding identity: {reason}",
+                                    function.name
+                                ));
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
                     // 从绑定开始做 BFS：本函数读它的键 → 它被交给谁 → callee 里拿它读什么。
                     let mut queue: Vec<(usize, String, String, usize, usize)> =
                         vec![(file_index, function.name.clone(), name.clone(), use_site.at, 0)];
@@ -10829,7 +10945,7 @@ mod tests {
                         for key in &read {
                             // Only the original direct binding has this
                             // provenance, never chain or callee reads.
-                            if snapshot_site && depth == 0
+                            if binding_proven && depth == 0
                                 && owner_file == file_index
                                 && std::ptr::eq(owner_fn, function)
                                 && handle.as_str() == name.as_str() && from == use_site.at
@@ -10889,6 +11005,7 @@ mod tests {
         // 与「读到的键不在白名单」「fetch 没对上账」合并成**一份**报告：
         // 一次失败就把所有问题摊开，不要修一条、再跑一条、再看下一条。
         let mut problems: Vec<String> = Vec::new();
+        problems.extend(provenance_problems);
         if baseline_sites != 1 {
             problems.push(format!("status baseline site count: expected 1, got {baseline_sites}"));
         }
@@ -11110,6 +11227,37 @@ mod tests {
             insert("c2_hop(&lines_raw);"));
         reject("callee hop cannot inherit baseline provenance", &hop,
             &["函数 c2_hop", "读了回包键 state"]);
+
+        // These mutations leave the actual recognized declaration and
+        // eight original reads in place. The checker must reject ambiguous
+        // binding identity itself, not merely an unrelated coverage failure.
+        let after_providers = |extra: &str| mutate(after, &format!("{after}\n        {extra}"));
+        for (label, extra, reason) in [
+            ("nested same-name business payload",
+                r#"{ let lines_raw = providers_raw["providers"].clone(); let extra = lines_raw.get("state"); }"#,
+                "unproven use of lines_raw"),
+            ("same-scope local rebinding",
+                r#"let lines_raw = providers_raw["providers"].clone(); let extra = lines_raw.get("state");"#,
+                "unproven use of lines_raw"),
+            ("assignment to original handle",
+                r#"lines_raw = providers_raw["providers"].clone(); let extra = lines_raw.get("state");"#,
+                "unproven use of lines_raw"),
+            ("unproven whole-value alias",
+                r#"let alias = lines_raw.clone(); let extra = alias.get("state");"#,
+                "unproven lines_raw whole-value clone/alias"),
+            ("unproven borrowed alias",
+                r#"let alias = &lines_raw; let extra = alias.get("state");"#,
+                "unproven use of lines_raw"),
+            ("qualified same-name field",
+                r#"let extra = other.lines_raw.get("state");"#,
+                "qualified lines_raw"),
+            ("closure parameter shadow",
+                r#"let inner = |lines_raw: Value| lines_raw.get("state").cloned();"#,
+                "unproven use of lines_raw"),
+        ] {
+            reject(label, &after_providers(extra),
+                &["status baseline binding identity", reason]);
+        }
 
         let duplicate = format!("{binding}\n        let st = fetch(r#\"{{\"cmd\":\"status\"}}\"#);\n        {binding}");
         reject("duplicate provenance site", &mutate(binding, &duplicate),
