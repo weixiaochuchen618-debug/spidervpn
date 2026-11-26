@@ -442,3 +442,53 @@ jobs:
           # Only test-generated /tmp owner-only directories; never the
           # actual /var/lib/tradechannel pairing service or systemd unit.
           sudo "$binary" legacy_retire::tests --test-threads=1 --nocapture
+
+  stage2-native-lock-diagnostic:
+    # Temporary #95 lock-resolution evidence only; not an acceptance gate.
+    if: github.event_name == 'pull_request' && github.event.pull_request.number == 98
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cc8e6fa749355b652533541c602562a80d815dc4
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate lock with native Cargo in disposable copy
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = cc8e6fa749355b652533541c602562a80d815dc4
+          scratch="$(mktemp -d "$RUNNER_TEMP/stage2-lock.XXXXXX")"
+          evidence="$RUNNER_TEMP/stage2-lock-evidence"
+          mkdir -p "$evidence"
+          cp -a server-rs "$scratch/server-rs"
+          cargo --version --verbose | tee "$evidence/resolver-version.txt"
+          rustc --version --verbose | tee -a "$evidence/resolver-version.txt"
+          if ! cargo metadata --offline --format-version 1 --manifest-path "$scratch/server-rs/Cargo.toml" --all-features > "$scratch/metadata.json"; then
+            cp server-rs/Cargo.lock "$scratch/server-rs/Cargo.lock"
+            cargo metadata --format-version 1 --manifest-path "$scratch/server-rs/Cargo.toml" --all-features > "$scratch/metadata.json"
+          fi
+          cargo metadata --locked --format-version 1 --manifest-path "$scratch/server-rs/Cargo.toml" --all-features > /dev/null
+          cp "$scratch/server-rs/Cargo.lock" "$evidence/Cargo.lock"
+          rc=0
+          git diff --no-index -- server-rs/Cargo.lock "$evidence/Cargo.lock" > "$evidence/resolver.diff" || rc=$?
+          test "$rc" -le 1
+          printf 'Generated lock SHA256: '
+          sha256sum "$evidence/Cargo.lock"
+          printf 'Generated lock Git blob: '
+          git hash-object "$evidence/Cargo.lock"
+          cat "$evidence/resolver.diff"
+          git diff --exit-code
+      - name: Upload lock resolution evidence only
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-native-cargo-lock-evidence
+          path: |
+            ${{ runner.temp }}/stage2-lock-evidence/Cargo.lock
+            ${{ runner.temp }}/stage2-lock-evidence/resolver-version.txt
+            ${{ runner.temp }}/stage2-lock-evidence/resolver.diff
+          if-no-files-found: error
+          retention-days: 3
