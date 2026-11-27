@@ -1445,6 +1445,7 @@ mod identity_gate {
     #[cfg(feature = "linux-fresh-provisioning")]
     #[test]
     fn actual_fresh_init_tci1_to_native_service_and_real_peer() {
+        use spidervpn_pairing_authority::wg_conf_audit::require_exact_match;
         use rsa::pkcs8::DecodePrivateKey;
         use rustls::pki_types::{CertificateDer, ServerName};
         use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -1803,6 +1804,151 @@ mod identity_gate {
         assert!(fs::read(&ledger).unwrap() == revoked_ledger);
         assert!(fs::read(&conf).unwrap().as_slice() == revoked_conf.as_slice());
         assert!(reader.snapshot().unwrap().is_empty());
+
+        // Reuse the protected materials and TLS client for a separate Rust
+        // root over the four-peer legacy shape: deployment plus three V2 grants.
+        let existing_root = parent.join("existing-authority");
+        let mut legacy_conf = Zeroizing::new(fresh_base.to_string());
+        let mut devices = Vec::new();
+        let mut old_invites = Vec::new();
+        let mut old_peers = Vec::new();
+        let deployed_device = "37000000-0000-4000-8000-000000000000";
+        let expired_ids = [
+            "39000000-0000-4000-8000-000000000001",
+            "39000000-0000-4000-8000-000000000002",
+        ];
+        let expired_at = before - 120;
+        for id in expired_ids {
+            old_invites.push(json!({"id": id, "expires_unix": expired_at, "state": "Open"}));
+        }
+        for index in 0..4u8 {
+            let device_id = format!("37000000-0000-4000-8000-{index:012x}");
+            let request_id = format!("38000000-0000-4000-8000-{index:012x}");
+            let key = base64::engine::general_purpose::STANDARD.encode([index + 1; 32]);
+            let address = Ipv4Addr::new(10, 66, 0, index + 2);
+            let cidr = format!("{address}/32");
+            let original = json!({"SchemaVersion":1, "Kind":"TradeChannel.ClientRequest",
+                "RequestId":request_id, "DeviceId":device_id, "ClientPublicKey":key,
+                "CreatedAtUtc":issued, "AddressFamilies":["IPv4"]});
+            let origin = if index == 0 {
+                json!({"kind":"deployment", "plan_id":"36000000-0000-4000-8000-000000000001"})
+            } else {
+                let old_id = format!("32000000-0000-4000-8000-{index:012x}");
+                old_invites.push(json!({"id":old_id, "expires_unix":expired_at, "state":"Consumed"}));
+                let digest = sha(format!("1\nTradeChannel.ClientRequest\n{request_id}\n{device_id}\n{issued}\n{key}\nIPv4").as_bytes());
+                let authorization = mgmt.sign(&json!({"SchemaVersion":2,
+                    "Kind":"TradeChannel.PairAuthorization", "InviteId":old_id,
+                    "ServerBinding":binding, "RemoteOwnerId":binding["RemoteOwnerId"],
+                    "NodeId":binding["NodeId"], "RequestId":request_id, "DeviceId":device_id,
+                    "ClientPublicKey":key, "ClientAddress":cidr, "ConfigRevision":u64::from(index)+2,
+                    "RequestDigestAlgorithm":"TC-ClientRequest-v1", "RequestDigest":digest,
+                    "ExitEvidence":{"Source":"ServerVerifiedTlsTrace"}}));
+                json!({"kind":"signed_v2", "authorization":authorization})
+            };
+            devices.push(json!({"request":original, "address":address, "revoked":false, "origin":origin}));
+            legacy_conf.push_str(&format!("\n[Peer]\nPublicKey = {key}\nAllowedIPs = {cidr}\n"));
+            assert!(Command::new("/usr/bin/wg")
+                .args(["set", IFACE, "peer", &key, "allowed-ips", &cidr])
+                .status().unwrap().success());
+            old_peers.push(spidervpn_pairing_authority::Peer { public_key: key, address });
+        }
+        fs::write(&conf, legacy_conf.as_bytes()).unwrap();
+        let snapshot = serde_json::to_vec(&json!({"schema_version":1, "server_binding":binding,
+            "config_revision":5, "management_revision":9, "devices":devices, "invitations":old_invites}))
+            .unwrap();
+        protected(&source, "existing-history.json", &snapshot);
+        let snapshot_pin = sha(&snapshot);
+        let adopt = |snapshot_pin: &str| {
+            Command::new(env!("CARGO_BIN_EXE_spidervpn-pair-service")).env_clear()
+                .args(["init-existing", "attest-verified-frozen-tradechannel", snapshot_pin,
+                    source.to_str().unwrap(), existing_root.to_str().unwrap(), IFACE,
+                    "203.0.113.10", "18443", &config_pin, &fingerprint, &pin,
+                    "3600", "existing netns fixture"])
+                .stdin(Stdio::null()).output().unwrap()
+        };
+        let bad_pin = adopt(&"0".repeat(64));
+        assert!(bad_pin.status.code() == Some(2) && !existing_root.exists());
+        let adopted = adopt(&snapshot_pin);
+        assert!(adopted.status.success() && adopted.stderr.is_empty(),
+            "existing-node initialization failed");
+        assert!(adopted.stdout == b"EXISTING_AUTHORITY_READY\n");
+        assert!(fs::read(&conf).unwrap() == legacy_conf.as_bytes());
+        assert!(fs::read(existing_root.join("existing-history.json")).unwrap() == snapshot);
+        let retained_ledger = existing_root.join("authority-ledger.json");
+        let adopted_bytes = fs::read(&retained_ledger).unwrap();
+        let document: Value = serde_json::from_slice(&adopted_bytes).unwrap();
+        let registered = &document["ledger"]["existing_history"]["devices"];
+        assert!(registered.as_object().unwrap().len() == 4 &&
+            registered[deployed_device]["origin"]["kind"] == "deployment");
+        assert!(registered.as_object().unwrap().values().filter(|d|
+            d["origin"]["kind"] == "signed_v2" && d["state"] == "Active").count() == 3);
+        let adopted_store = open(&existing_root);
+        assert_eq!(adopted_store.generation().unwrap(), 1);
+        for id in expired_ids {
+            assert_eq!(adopted_store.view().unwrap().state(id), Some(&InviteState::Expired));
+        }
+        require_exact_match(
+            &old_peers, &read_verified_identity_snapshot(&adopted_store, IFACE, &expected).unwrap(),
+        ).unwrap();
+        drop(adopted_store);
+
+        let new_meta = fs::read_to_string(existing_root.join("metadata-pin.txt")).unwrap();
+        let new_code = Zeroizing::new(fs::read_to_string(existing_root.join("invitation-code.txt")).unwrap());
+        let new_wire = Zeroizing::new(B64.decode(new_code.trim().strip_prefix("TCI1.").unwrap()).unwrap());
+        let new_invite: Value = serde_json::from_slice(&new_wire).unwrap();
+        let fresh_token = new_invite["k"].as_str().unwrap();
+        let fresh_id = new_invite["i"].as_str().unwrap();
+        let mut migrated = Process::spawn(&existing_root, &new_meta, &config_pin, &pin);
+        migrated.ready(addr);
+        assert_eq!(exchange(addr, &ca, &leaf, &wire(fresh_id, "GET", host, fresh_token, None)).0, 200);
+        for id in expired_ids {
+            let old_get = wire(id, "GET", host, fresh_token, None);
+            assert_eq!(exchange(addr, &ca, &leaf, &old_get).0, 404);
+        }
+        migrated.stop(libc::SIGTERM);
+        let mut migrated = Process::spawn(&existing_root, &new_meta, &config_pin, &pin);
+        migrated.ready(addr);
+        assert!(fs::read(&retained_ledger).unwrap() == adopted_bytes);
+        let revoke_existing = || {
+            Command::new(env!("CARGO_BIN_EXE_spidervpn-pair-service")).env_clear()
+                .args(["revoke", existing_root.to_str().unwrap(), IFACE, &new_meta,
+                    &config_pin, &pin, deployed_device])
+                .stdin(Stdio::null()).output().unwrap()
+        };
+        succeeded(revoke_existing());
+        let remaining = &old_peers[1..];
+        let complete = fs::read(&retained_ledger).unwrap();
+        let final_document: Value = serde_json::from_slice(&complete).unwrap();
+        let ledger_body = &final_document["ledger"];
+        assert_eq!(final_document["generation"], 3);
+        assert_eq!(ledger_body["existing_history"]["devices"][deployed_device]["state"], "Revoked");
+        assert_eq!(ledger_body["revoked_devices"], json!([deployed_device]));
+        assert_eq!(ledger_body["revoked_keys"], json!([old_peers[0].public_key]));
+        succeeded(revoke_existing());
+        migrated.stop(libc::SIGTERM);
+        let mut migrated = Process::spawn(&existing_root, &new_meta, &config_pin, &pin);
+        migrated.ready(addr);
+        let adopted_store = open(&existing_root);
+        require_exact_match(
+            remaining, &read_verified_identity_snapshot(&adopted_store, IFACE, &expected).unwrap(),
+        ).unwrap();
+        let mut copied = adopted_store.view().unwrap().clone();
+        let replay = Claims {
+            invite_id: fresh_id.to_owned(),
+            device_id: deployed_device.to_owned(),
+            ..claims(&client_key)
+        };
+        let pool = AddressPool { network: Ipv4Addr::new(10, 66, 0, 0), prefix: 24 };
+        assert_eq!(copied.reserve(replay, before, pool, Some(remaining)), Err(Refusal::RevokedIdentity));
+        drop(adopted_store);
+        assert!(fs::read(&retained_ledger).unwrap() == complete);
+        migrated.stop(libc::SIGTERM);
+        for peer in remaining {
+            assert!(Command::new("/usr/bin/wg")
+                .args(["set", IFACE, "peer", &peer.public_key, "remove"])
+                .status().unwrap().success());
+        }
+        println!("Existing authority verified: four peers retained, two expired invitations refused, one peer durably revoked");
         set_server_key(&old_file);
         write_conf(&conf,&base,None);
         assert!(reader.server_public_key().unwrap()==old_public);

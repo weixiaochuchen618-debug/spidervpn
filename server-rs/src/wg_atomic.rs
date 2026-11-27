@@ -19,10 +19,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{Grant, InviteState};
 use crate::ledger_disk::{LedgerStore, StoreError};
 use crate::wg_conf_audit::{read_verified_snapshot, ConfigError};
-use crate::wg_peer_plan::{plan_change, Change, Plan, PlanError};
+use crate::wg_peer_plan::{plan_peer_change, PeerChange, Plan, PlanError};
 use crate::wg_readonly::valid_interface;
 
 const WG_ROOT: &str = "/etc/wireguard";
@@ -148,17 +147,11 @@ fn replace_verified(
     operation
 }
 fn expected_status(
-    store: &LedgerStore, grant: &Grant, operation: Change,
+    store: &LedgerStore, change: PeerChange<'_>,
 ) -> Result<(), AtomicError> {
-    let state = store.view().map_err(AtomicError::Ledger)?
-        .state(&grant.claims.invite_id)
-        .ok_or(AtomicError::InvalidIdentity)?;
-    let approved = match (operation, state) {
-        (Change::Add, InviteState::Pending(g)) => g == grant,
-        (Change::Remove, InviteState::Revoking(g)) => g == grant,
-        _ => false,
-    };
-    if !approved { return Err(AtomicError::InvalidIdentity); }
+    if !change.prepared(store.view().map_err(AtomicError::Ledger)?) {
+        return Err(AtomicError::InvalidIdentity);
+    }
     Ok(())
 }
 
@@ -166,17 +159,17 @@ fn expected_status(
 /// future Rust adapter MUST invoke it only after durable authorization and
 /// MUST execute syncconf and verify live+disk state before final ledger commit.
 pub(crate) fn write_pinned_config(
-    store: &LedgerStore, interface: &str, grant: &Grant, operation: Change,
+    store: &LedgerStore, interface: &str, change: PeerChange<'_>,
 ) -> Result<bool, AtomicError> {
     if !valid_interface(interface) { return Err(AtomicError::UnsafeConfig); }
-    expected_status(store, grant, operation)?;
+    expected_status(store, change)?;
     root_check(Path::new(WG_ROOT), true)?;
     // Stable before-view is mandatory; cannot add/revoke from conflicting
     // live and durable config inventories.
     read_verified_snapshot(interface).map_err(AtomicError::ReadOnlyValidation)?;
     let target = Path::new(WG_ROOT).join(format!("{interface}.conf"));
     let (original, identity) = read_current(&target)?;
-    let plan = plan_change(&original, grant, operation).map_err(AtomicError::Plan)?;
+    let plan = plan_peer_change(&original, change).map_err(AtomicError::Plan)?;
     replace_verified(Path::new(WG_ROOT), &target, &original, &identity, &plan)?;
     Ok(plan.changed())
 }
@@ -184,8 +177,9 @@ pub(crate) fn write_pinned_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AddressPool, Claims};
+    use crate::{AddressPool, Claims, Grant, InviteState};
     use crate::ledger_disk;
+    use crate::wg_peer_plan::{plan_change, Change};
     use std::net::Ipv4Addr;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::time::Duration;
@@ -227,7 +221,7 @@ mod tests {
         fs::set_permissions(&target,fs::Permissions::from_mode(0o600)).unwrap();
         let (original,meta)=read_current(&target).unwrap();
         let plan=plan_change(&original,&g,Change::Add).unwrap();
-        expected_status(&store,&g,Change::Add).unwrap();
+        expected_status(&store,PeerChange::Invitation(&g,Change::Add)).unwrap();
         assert!(!String::from_utf8_lossy(&original).contains(&g.claims.public_key));
         replace_verified(&p,&target,&original,&meta,&plan).unwrap();
         let new=fs::read(&target).unwrap();
@@ -290,13 +284,13 @@ mod tests {
     #[test]
     fn wrong_ledger_phase_or_grant_cannot_write() {
         let (p,mut store,g)=setup("phase");
-        assert!(expected_status(&store,&g,Change::Remove).is_err());
+        assert!(expected_status(&store,PeerChange::Invitation(&g,Change::Remove)).is_err());
         let mut changed=g.clone();
         changed.address=Ipv4Addr::new(10,66,0,12);
-        assert!(expected_status(&store,&changed,Change::Add).is_err());
+        assert!(expected_status(&store,PeerChange::Invitation(&changed,Change::Add)).is_err());
         store.update(|l|l.begin_revocation(INV)).unwrap();
-        assert!(expected_status(&store,&g,Change::Add).is_err());
-        expected_status(&store,&g,Change::Remove).unwrap();
+        assert!(expected_status(&store,PeerChange::Invitation(&g,Change::Add)).is_err());
+        expected_status(&store,PeerChange::Invitation(&g,Change::Remove)).unwrap();
         drop(store);fs::remove_dir_all(p).unwrap();
     }
 }

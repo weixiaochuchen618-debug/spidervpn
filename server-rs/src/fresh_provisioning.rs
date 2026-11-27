@@ -1,13 +1,15 @@
-//! First authority creation, not recovery or migration. Genuine new-node
-//! provenance and exclusive privileged writers are external trust inputs.
+//! First Rust authority creation for a new node or verified TradeChannel
+//! history. Operator-provided identity and exclusive writers are trust inputs.
 #![cfg(all(target_os = "linux", feature = "linux-fresh-provisioning"))]
 
 use crate::authorization_response::{TrustedResponseConfig,check_signer,sign,stamp};
+use crate::existing_devices::provisioning as existing_history;
 use crate::fresh_consume_gate::{management_fingerprint,verify_pinned_invite_metadata,
     check_descriptor,METADATA_BEARER_DOMAIN};
 use crate::tls_identity::{open_service_root,read_service_file,read_service_identity,
     create_fresh_service_root,create_fresh_service_file};
-use crate::wg_conf_audit::require_fresh_empty_identity;
+use crate::wg_conf_audit::require_initial_inventory;
+use crate::Ledger;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64,Engine};
 use ring::{digest,hmac,rand::{SecureRandom,SystemRandom}};
 use rsa::{pkcs8::DecodePrivateKey,traits::PublicKeyParts,RsaPrivateKey};
@@ -32,11 +34,27 @@ fn uuid(rng:&SystemRandom)->io::Result<String> {
         hex(&b[8..10]),hex(&b[10..])))
 }
 
+const HISTORY_FILE: &str = "existing-history.json";
+
+pub enum NodeHistory<'a> {
+    New,
+    VerifiedTradeChannel { snapshot_pin: &'a str },
+}
+
 /// Only explicit init-fresh with operator new-node attestation. Never
 /// called by serve. No old authority, generic signing or legacy input.
 pub fn initialize_new_node(source:PathBuf,root:PathBuf,interface:&str,host:&str,port:u16,
     config_pin:&str,management_pin:&str,tls_pin:&str,lifetime:i64,name:&str)->io::Result<()>
 {
+    initialize_node(source, root, interface, host, port, config_pin, management_pin, tls_pin,
+        lifetime, name, NodeHistory::New)
+}
+
+/// Build a new, protected Rust data root from independently pinned inputs.
+pub fn initialize_node(source: PathBuf, root: PathBuf, interface: &str, host: &str, port: u16,
+    config_pin: &str, management_pin: &str, tls_pin: &str, lifetime: i64, name: &str,
+    history: NodeHistory<'_>,
+) -> io::Result<()> {
     let ip:Ipv4Addr=host.parse().map_err(|_|refused())?;
     if ip.to_string()!=host || ip.is_loopback() || ip.is_unspecified()
         || ip.is_multicast() || ip.is_broadcast() || port<1024
@@ -74,14 +92,32 @@ pub fn initialize_new_node(source:PathBuf,root:PathBuf,interface:&str,host:&str,
     if identity.leaf_der_sha256!=tls_pin {return Err(refused());}
     let cert=read_service_file(&input,"tls.crt",128*1024).map_err(|_|refused())?;
     let tls_key=Zeroizing::new(read_service_file(&input,"tls.key",32*1024).map_err(|_|refused())?);
-    require_fresh_empty_identity(interface,expected).map_err(|_|refused())?;
+    let issued = now()?;
+    let (mut ledger, initial_peers, archive) = match history {
+        NodeHistory::New => {
+            match std::fs::symlink_metadata(source.join(HISTORY_FILE)) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                _ => return Err(refused()),
+            }
+            (Ledger::default(), Vec::new(), None)
+        }
+        NodeHistory::VerifiedTradeChannel { snapshot_pin } => {
+            let bytes = read_service_file(&input, HISTORY_FILE, 4 * 1024 * 1024)
+                .map_err(|_| refused())?;
+            let (ledger, peers) = existing_history::load(
+                &bytes, snapshot_pin, binding, &jwk, config.pool(), issued,
+            ).map_err(|_| refused())?;
+            (ledger, peers, Some(bytes))
+        }
+    };
+    require_initial_inventory(interface, expected, &initial_peers).map_err(|_| refused())?;
     let rng=SystemRandom::new();
     let id=uuid(&rng)?;
     let mut secret=Zeroizing::new([0u8;32]);
     rng.fill(&mut *secret).map_err(|_|refused())?;
     let token=Zeroizing::new(B64.encode(&*secret));
-    let issued=now()?;
     let expires=issued.checked_add(lifetime).ok_or_else(refused)?;
+    ledger.insert_open(&id, expires).map_err(|_| refused())?;
     let issued_at=stamp(issued).map_err(|_|refused())?;
     let expires_at=stamp(expires).map_err(|_|refused())?;
     let retry_at=stamp(expires.checked_add(120).ok_or_else(refused)?).map_err(|_|refused())?;
@@ -119,13 +155,16 @@ pub fn initialize_new_node(source:PathBuf,root:PathBuf,interface:&str,host:&str,
         ("metadata-pin.txt",meta_pin.as_bytes()),("invitation-code.txt",code.as_bytes())] {
         create_fresh_service_file(&dir,name,bytes)?;
     }
+    if let Some(bytes) = archive {
+        create_fresh_service_file(&dir, HISTORY_FILE, &bytes)?;
+    }
     // Verify copied identity and current WG again before publishing ledger.
     read_service_identity(&dir,tls_pin).map_err(|_|refused())?;
-    require_fresh_empty_identity(interface,expected).map_err(|_|refused())?;
+    require_initial_inventory(interface, expected, &initial_peers).map_err(|_| refused())?;
     let after=now()?;
     if after<issued || after>=expires {return Err(refused());}
     dir.sync_all()?;
-    crate::ledger_disk::publish_fresh_open(&root,&dir,&id,expires).map_err(|_|refused())?;
+    crate::ledger_disk::publish_initial_ledger(&root, &dir, ledger).map_err(|_| refused())?;
     let store=crate::ledger_disk::LedgerStore::open_existing(&root,std::time::Duration::ZERO)
         .map_err(|_|refused())?;
     crate::fresh_consume_gate::preflight_service_metadata(&store,&metadata,&meta_pin,interface,

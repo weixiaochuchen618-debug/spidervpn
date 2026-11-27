@@ -90,6 +90,7 @@ impl PairingAuthority {
 
     #[cfg(feature = "linux-pairing-process")]
     pub(crate) fn revoke_registered_device(&self, device_id: &str) -> io::Result<()> {
+        use crate::existing_devices::ExistingDeviceState;
         use crate::InviteState;
 
         // Revalidate current provisioning and inventory under the same
@@ -98,6 +99,19 @@ impl PairingAuthority {
         let scope = crate::fresh_consume_gate::preflight_service_metadata(&store, &self.metadata,
             &self.metadata_pin, &self.interface, &self.tls_pin, &self.config, &self.management)
             .map_err(|_| invalid())?;
+        if let Some(device) = store.view().map_err(|_| invalid())?.existing_device(device_id) {
+            let target = match device.state {
+                ExistingDeviceState::Active => store
+                    .update(|ledger| ledger.begin_existing_revocation(device_id))
+                    .map_err(|_| invalid())?,
+                ExistingDeviceState::Revoking => device.clone(),
+                // Preflight has already proved the revoked key remains absent.
+                ExistingDeviceState::Revoked => return Ok(()),
+            };
+            return crate::wg_live_set::apply_existing_revocation_and_confirm(
+                &mut store, &self.interface, &scope.server_public_key, device_id, &target,
+            ).map_err(|_| invalid());
+        }
         let grant = match store.view().map_err(|_| invalid())?.state(&scope.invite_id) {
             Some(InviteState::Consumed(grant)) if grant.claims.device_id == device_id => {
                 store.update(|ledger| ledger.begin_revocation(&scope.invite_id)).map_err(|_| invalid())?

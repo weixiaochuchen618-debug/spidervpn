@@ -19,6 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
 
+mod existing_devices;
+use existing_devices::{ExistingDevice, ExistingDeviceState, ExistingHistory};
+
 #[cfg(target_os = "linux")]
 pub mod lock;
 
@@ -220,6 +223,8 @@ pub struct Ledger {
     pub(crate) invitations: BTreeMap<String, Invitation>,
     pub(crate) revoked_devices: BTreeSet<String>,
     pub(crate) revoked_keys: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) existing_history: Option<ExistingHistory>,
 }
 
 pub(crate) fn lower_uuid(s: &str) -> bool {
@@ -269,6 +274,48 @@ fn exact_peer(grant: &Grant, peers: &[Peer]) -> Result<(), Refusal> {
 }
 
 impl Ledger {
+    pub(crate) fn existing_devices(&self) -> impl Iterator<Item = (&String, &ExistingDevice)> {
+        self.existing_history.iter().flat_map(|history| &history.devices)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "linux-pairing-process"))]
+    pub(crate) fn existing_device(&self, device_id: &str) -> Option<&ExistingDevice> {
+        self.existing_history.as_ref()?.devices.get(device_id)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "linux-pairing-process"))]
+    pub(crate) fn begin_existing_revocation(&mut self, device_id: &str)
+        -> Result<ExistingDevice, Refusal>
+    {
+        let device = self.existing_history.as_mut()
+            .and_then(|history| history.devices.get_mut(device_id))
+            .ok_or(Refusal::InvalidRequest)?;
+        if device.state != ExistingDeviceState::Active {
+            return Err(Refusal::RecoveryRequired);
+        }
+        device.state = ExistingDeviceState::Revoking;
+        Ok(device.clone())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "linux-pairing-process"))]
+    pub(crate) fn confirm_existing_revocation(&mut self, device_id: &str, peers: &[Peer])
+        -> Result<(), Refusal>
+    {
+        let device = self.existing_history.as_mut()
+            .and_then(|history| history.devices.get_mut(device_id))
+            .ok_or(Refusal::InvalidRequest)?;
+        if device.state != ExistingDeviceState::Revoking {
+            return Err(Refusal::RecoveryRequired);
+        }
+        if peers.iter().any(|peer| peer.public_key == device.public_key || peer.address == device.address) {
+            return Err(Refusal::PeerMismatch);
+        }
+        self.revoked_devices.insert(device_id.to_owned());
+        self.revoked_keys.insert(device.public_key.clone());
+        device.state = ExistingDeviceState::Revoked;
+        Ok(())
+    }
+
     pub fn insert_open(&mut self, id: &str, expires_unix: i64) -> Result<(), Refusal> {
         if !lower_uuid(id) {
             return Err(Refusal::InvalidRequest);
@@ -305,6 +352,10 @@ impl Ledger {
     fn denied_identity(&self, req: &Claims) -> bool {
         self.revoked_devices.contains(&req.device_id)
             || self.revoked_keys.contains(&req.public_key)
+            || self.existing_devices().any(|(id, device)| {
+                device.state == ExistingDeviceState::Revoking
+                    && (*id == req.device_id || device.public_key == req.public_key)
+            })
             || self.invitations.values().any(|inv| match &inv.state {
                 InviteState::Revoking(g) | InviteState::Revoked(g) => {
                     g.claims.device_id == req.device_id
@@ -350,6 +401,13 @@ impl Ledger {
         let mut reserved_ips = BTreeSet::new();
         let mut reserved_keys = BTreeSet::new();
         let mut reserved_devices = BTreeSet::new();
+        for (device_id, device) in self.existing_devices() {
+            if device.state != ExistingDeviceState::Revoked {
+                reserved_ips.insert(u32::from(device.address));
+                reserved_keys.insert(device.public_key.as_str());
+                reserved_devices.insert(device_id.as_str());
+            }
+        }
         for inv in self.invitations.values() {
             match &inv.state {
                 InviteState::Pending(g) | InviteState::Consumed(g) | InviteState::Revoking(g) => {

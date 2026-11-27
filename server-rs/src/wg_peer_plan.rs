@@ -1,7 +1,8 @@
 //! SEC-01 S03: prepare ONE WireGuard peer config change without side effects.
 //!
 //! This pre-integration Rust planner never executes a command or writes files.
-//! Its input is a previously authenticated Grant plus verified wg-quick config.
+//! Its input is a previously authenticated grant or registered-device
+//! removal plus verified wg-quick config.
 //! It preserves every byte of unrelated peer/interface sections (including
 //! comments and secrets) and revalidates the resulting complete peer set.
 //!
@@ -12,8 +13,11 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::{claims_valid, Grant, Peer};
+use crate::{claims_valid, Grant, InviteState, Ledger, Peer};
+#[cfg(feature = "linux-pairing-process")]
+use crate::existing_devices::{ExistingDevice, ExistingDeviceState};
 use crate::wg_conf_audit::{parse_wg_quick_conf, require_exact_match, ConfigError};
+use std::net::Ipv4Addr;
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
@@ -21,6 +25,46 @@ const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub enum Change {
     Add,
     Remove,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PeerChange<'a> {
+    Invitation(&'a Grant, Change),
+    #[cfg(feature = "linux-pairing-process")]
+    ExistingRemoval { device_id: &'a str, device: &'a ExistingDevice },
+}
+
+impl<'a> PeerChange<'a> {
+    pub(crate) fn target(self) -> (&'a str, Ipv4Addr, Change) {
+        match self {
+            Self::Invitation(grant, operation) => (&grant.claims.public_key, grant.address, operation),
+            #[cfg(feature = "linux-pairing-process")]
+            Self::ExistingRemoval { device, .. } => (&device.public_key, device.address, Change::Remove),
+        }
+    }
+
+    pub(crate) fn valid(self) -> bool {
+        match self {
+            Self::Invitation(grant, _) => claims_valid(&grant.claims) && grant.address.is_private(),
+            #[cfg(feature = "linux-pairing-process")]
+            Self::ExistingRemoval { device_id, device } => device.valid(device_id),
+        }
+    }
+
+    pub(crate) fn prepared(self, ledger: &Ledger) -> bool {
+        match self {
+            Self::Invitation(grant, operation) => match (operation, ledger.state(&grant.claims.invite_id)) {
+                (Change::Add, Some(InviteState::Pending(saved)))
+                | (Change::Remove, Some(InviteState::Revoking(saved))) => saved == grant,
+                _ => false,
+            },
+            #[cfg(feature = "linux-pairing-process")]
+            Self::ExistingRemoval { device_id, device } => {
+                device.state == ExistingDeviceState::Revoking
+                    && ledger.existing_device(device_id) == Some(device)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,9 +122,14 @@ fn peer_sections(text: &str) -> Vec<(usize, usize)> {
 pub fn plan_change(
     current: &[u8], grant: &Grant, change: Change,
 ) -> Result<Plan, PlanError> {
-    if !claims_valid(&grant.claims) || !grant.address.is_private() {
+    plan_peer_change(current, PeerChange::Invitation(grant, change))
+}
+
+pub(crate) fn plan_peer_change(current: &[u8], change: PeerChange<'_>) -> Result<Plan, PlanError> {
+    if !change.valid() {
         return Err(PlanError::InvalidGrant);
     }
+    let (public_key, address, operation) = change.target();
     if current.len() > MAX_CONFIG_BYTES { return Err(PlanError::ResultTooLarge); }
     let original = parse_wg_quick_conf(current).map_err(|_| PlanError::InvalidConfig)?;
     let input = std::str::from_utf8(current).map_err(|_| PlanError::InvalidConfig)?;
@@ -88,10 +137,13 @@ pub fn plan_change(
     if spans.len() != original.len() {
         return Err(PlanError::InconsistentConfig);
     }
-    let existing_key = original.iter().position(|p| p.public_key == grant.claims.public_key);
-    let existing_ip = original.iter().position(|p| p.address == grant.address);
-    let (result, expected, changed) = match change {
+    let existing_key = original.iter().position(|p| p.public_key == public_key);
+    let existing_ip = original.iter().position(|p| p.address == address);
+    let (result, expected, changed) = match operation {
         Change::Add => {
+            let PeerChange::Invitation(grant, Change::Add) = change else {
+                return Err(PlanError::InvalidGrant);
+            };
             if existing_key.is_some() { return Err(PlanError::PeerConflict); }
             if existing_ip.is_some() { return Err(PlanError::AddressConflict); }
             let mut data = current.to_vec();
@@ -99,11 +151,11 @@ pub fn plan_change(
             data.extend_from_slice(format!(
                 "\n[Peer]\n# tc-pair request={} device={}\nPublicKey = {}\nAllowedIPs = {}/32\n",
                 grant.claims.request_id, grant.claims.device_id,
-                grant.claims.public_key, grant.address
+                public_key, address
             ).as_bytes());
             let mut peers = original.clone();
             peers.push(Peer {
-                public_key: grant.claims.public_key.clone(), address: grant.address,
+                public_key: public_key.to_owned(), address,
             });
             (data, peers, true)
         }

@@ -108,7 +108,9 @@ pub struct LedgerStore {
 
 /// Reject both stale and internally impossible states, without attempting
 /// silent recovery that might resurrect a previously revoked peer.
-fn validate(ledger: &Ledger) -> Result<(), StoreError> {
+pub(crate) fn validate(ledger: &Ledger) -> Result<(), StoreError> {
+    use crate::existing_devices::{DeviceOrigin, ExistingDeviceState};
+
     let mut seen_keys = BTreeSet::new();
     let mut seen_devices = BTreeSet::new();
     let mut active_addresses = BTreeSet::new();
@@ -124,6 +126,36 @@ fn validate(ledger: &Ledger) -> Result<(), StoreError> {
         || !ledger.revoked_devices.iter().all(|s| lower_uuid(s))
     {
         return Err(StoreError::Invalid("invalid durable revocation tombstone"));
+    }
+
+    if let Some(history) = &ledger.existing_history {
+        if !crate::hex_sha256(&history.snapshot_sha256)
+            || history.devices.is_empty() || history.devices.len() > 4096
+        {
+            return Err(StoreError::Invalid("invalid existing device history"));
+        }
+    }
+    let mut original_invites = BTreeSet::new();
+    for (id, device) in ledger.existing_devices() {
+        if !device.valid(id) || !seen_keys.insert(device.public_key.as_str())
+            || !seen_devices.insert(id.as_str())
+        {
+            return Err(StoreError::Invalid("invalid or duplicate existing device"));
+        }
+        if let DeviceOrigin::SignedV2 { invite_id, .. } = &device.origin {
+            if !original_invites.insert(invite_id)
+                || !matches!(ledger.state(invite_id), Some(InviteState::Cancelled))
+            {
+                return Err(StoreError::Invalid("existing device lost closed invitation"));
+            }
+        }
+        let revoked = device.state == ExistingDeviceState::Revoked;
+        if ledger.revoked_keys.contains(&device.public_key) != revoked
+            || ledger.revoked_devices.contains(id) != revoked
+            || (!revoked && !active_addresses.insert(device.address))
+        {
+            return Err(StoreError::Invalid("existing device conflicts with durable peer history"));
+        }
     }
 
     for (id, inv) in &ledger.invitations {
@@ -421,14 +453,13 @@ impl LedgerStore {
     }
 }
 
-/// Only fresh_provisioning's exclusive newly-created protected root may
-/// enter this path. Never call from serve/recovery or to reconstruct history.
+/// Only explicit provisioning to a newly created protected root may use this.
 #[cfg(feature = "linux-fresh-provisioning")]
-pub(crate) fn publish_fresh_open(root:&Path,dir:&File,id:&str,expires:i64)->Result<(),StoreError> {
+pub(crate) fn publish_initial_ledger(root: &Path, dir: &File, ledger: Ledger)
+    -> Result<(), StoreError>
+{
     use std::os::fd::AsRawFd;
     let _guard=lock::acquire_for(root,Duration::ZERO)?;
-    let mut ledger=Ledger::default();
-    ledger.insert_open(id,expires).map_err(StoreError::Policy)?;
     let doc=Document {schema_version:SCHEMA,generation:1,ledger,
         authorization_material:BTreeMap::new()};
     validate_document(&doc)?;

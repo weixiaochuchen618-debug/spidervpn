@@ -47,8 +47,8 @@ fn protect_local_process(privilege_error: &'static str) -> Result<(), &'static s
 fn run() -> Result<(), &'static str> {
     let args:Vec<_>=std::env::args_os().skip(1).collect();
     #[cfg(feature = "linux-fresh-provisioning")]
-    if args.first().and_then(|s|s.to_str())==Some("init-fresh") {
-        return init_fresh(&args);
+    if matches!(args.first().and_then(|s|s.to_str()), Some("init-fresh" | "init-existing")) {
+        return initialize(&args);
     }
     if args.first().and_then(|s|s.to_str())==Some("revoke") {
         return revoke(&args);
@@ -93,20 +93,32 @@ fn revoke(args: &[std::ffi::OsString]) -> Result<(), &'static str> {
 }
 
 #[cfg(feature = "linux-fresh-provisioning")]
-fn init_fresh(args:&[std::ffi::OsString])->Result<(),&'static str> {
+fn initialize(args: &[std::ffi::OsString]) -> Result<(), &'static str> {
+    use spidervpn_pairing_authority::fresh_provisioning::{initialize_node, NodeHistory};
+
     let values:Vec<&str>=args.iter().map(|s|s.to_str().ok_or("invalid fresh arguments"))
         .collect::<Result<_,_>>()?;
-    let ["init-fresh","attest-new-node-no-history",source,root,interface,host,port,
-        config_pin,management_pin,tls_pin,lifetime,name]=values.as_slice() else {
-        return Err("usage: init-fresh attest-new-node-no-history MATERIAL_ROOT NEW_ROOT INTERFACE IPV4 PORT CONFIG_SHA256 MANAGEMENT_FINGERPRINT TLS_SHA256 LIFETIME_SECONDS NAME");
+    let (history, fields, ready, refusal) = match values.as_slice() {
+        ["init-fresh", "attest-new-node-no-history", fields @ ..] => (
+            NodeHistory::New, fields, "FRESH_AUTHORITY_READY",
+            "fresh provisioning refused; do not retry or recreate existing state",
+        ),
+        ["init-existing", "attest-verified-frozen-tradechannel", snapshot_pin, fields @ ..] => (
+            NodeHistory::VerifiedTradeChannel { snapshot_pin }, fields, "EXISTING_AUTHORITY_READY",
+            "existing authority provisioning refused",
+        ),
+        _ => return Err("explicit fresh or verified existing-node attestation required"),
+    };
+    let [source, root, interface, host, port, config_pin, management_pin, tls_pin, lifetime, name] = fields else {
+        return Err("provisioning requires MATERIAL_ROOT NEW_ROOT INTERFACE IPV4 PORT CONFIG_SHA256 MANAGEMENT_FINGERPRINT TLS_SHA256 LIFETIME_SECONDS NAME");
     };
     protect_local_process("fresh privileged startup refused")?;
-    spidervpn_pairing_authority::fresh_provisioning::initialize_new_node(
+    initialize_node(
         PathBuf::from(*source),PathBuf::from(*root),interface,host,
         port.parse().map_err(|_|"invalid port")?,config_pin,management_pin,tls_pin,
-        lifetime.parse().map_err(|_|"invalid lifetime")?,name)
-        .map_err(|_|"fresh provisioning refused; do not retry or recreate existing state")?;
-    println!("FRESH_AUTHORITY_READY");
+        lifetime.parse().map_err(|_|"invalid lifetime")?,name,history)
+        .map_err(|_| refusal)?;
+    println!("{ready}");
     Ok(())
 }
 

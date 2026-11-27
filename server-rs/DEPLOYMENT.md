@@ -16,7 +16,7 @@ Observe static READY/STOPPED markers, process exit, exact executable identity an
 
 ## Revoke a registered device
 
-Run as root in the same authorized namespace with the current root, interface and trusted pins from `serve`. Use the exact `DeviceId` from the registered grant for this root's pinned invitation.
+Run as root in the same authorized namespace with the current root, interface and trusted pins from `serve`. Use the exact `DeviceId` of the registered device, including devices carried forward by `init-existing`.
 
 ```text
 /path/to/verified/spidervpn-pair-service revoke /protected/current-root WG_INTERFACE METADATA_SHA256 CONFIG_SHA256 TLS_SHA256 DEVICE_ID
@@ -41,3 +41,17 @@ Prepare a protected material directory (0700, trusted root-owned ancestors) cont
 NEW_ROOT must be a nonexistent child of an existing trusted root-owned 0700 parent, separate from material root, never a current or historical authority location. Lifetime 60–86400 seconds; canonical non-loopback IPv4, port 1024–65535; name 1–64 valid characters. The exact TCI1 code is in `invitation-code.txt` (0600); never log or pass it through argv or environment. Only after successful exit and FRESH_AUTHORITY_READY, transfer the code privately to the intended client. `metadata-pin.txt` contains the new metadata digest for the trusted operator to record and pass to unchanged serve with original config/TLS pins. It is a trusted local creation handoff, not independent provisioning on another host. Keep the code file protected; never include it in shared diagnostics/backups. Serve remains loopback-only.
 
 All output uses exclusive creation; the durable validated Open ledger is published last without replacement, with an incomplete marker blocking serve until state is synced. Existing roots, including partial state, reject init. On failure leave root/marker untouched, never retry under another name or remove marker; seek explicit recovery authority. If final marker removal sync fails, ledger bytes were already synced, but publication is uncertain: stop. No anti-rollback or privileged adversary guarantee. Single initial invite; future issuance/renewal, rollout/rollback, public exposure and actual Windows pairing require separate approval.
+
+## Initialize from verified TradeChannel history
+
+The `linux-fresh-provisioning` build also accepts a snapshot from a previously verified, frozen TradeChannel authority. Establish the original deployment, all registrations, revocations and invitation history independently. Obtain the snapshot SHA-256 from that decision. Both the legacy online service and the legacy SSH administration path must be fenced before a cutover snapshot is taken.
+
+Put `existing-history.json` in the same protected material directory with mode 0600. It is a normalized snapshot with `schema_version` 1, `server_binding` matching the trusted config, `config_revision`, `management_revision`, `devices` and `invitations`. Each device has its original `request` (the TradeChannel ClientRequest object), IPv4 `address`, boolean `revoked` and `origin`. The original deployed device uses `{"kind":"deployment","plan_id":"..."}`. A paired device uses `{"kind":"signed_v2","authorization":"<original compact JWS>"}`. Invitation rows contain `id`, `expires_unix` and the original `state`. Keep private keys and invitation bearers outside this archive.
+
+```text
+/path/to/verified/spidervpn-pair-service init-existing attest-verified-frozen-tradechannel HISTORY_SHA256 MATERIAL_ROOT NEW_ROOT WG_INTERFACE ADVERTISED_IPV4 PORT CONFIG_SHA256 MANAGEMENT_FINGERPRINT TLS_SHA256 LIFETIME_SECONDS NAME
+```
+
+Run against the isolated interface and protected `/etc/wireguard/WG_INTERFACE.conf`. Initialization checks the exact server identity and active peer set in both kernel and config. It verifies the original V2 signatures and request bindings, archives the snapshot unchanged, and publishes separate device records and a fresh Rust invitation. Previously consumed invitations stay closed and expired invitations retain their expiry. A still-valid legacy Open invitation blocks initialization.
+
+Use the current data root on restart. If a revocation leaves the kernel and config divergent, the device remains `Revoking` and the command reports failure. Reconcile the isolated peer views before retry. An earlier binary that cannot read the device records is ineligible for rollback. The old TradeChannel boot config path and its writer handoff require separate live cutover validation.
