@@ -323,6 +323,7 @@ pub(crate) fn require_fresh_empty_identity(interface:&str,expected:&str)->Result
     Ok(())
 }
 
+#[cfg(feature = "linux-fresh-consume-gate")]
 fn identity_snapshot(interface:&str,expected_public_key:&str)->Result<Vec<Peer>,ConfigError> {
     if !canonical_key(expected_public_key) { return Err(ConfigError::IdentityMismatch); }
     let reader = LiveWgReader::new(interface).map_err(ConfigError::InvalidPeers)?;
