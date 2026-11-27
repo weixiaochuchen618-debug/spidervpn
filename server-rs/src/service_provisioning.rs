@@ -44,3 +44,14 @@ pub fn load_local_authority(root: PathBuf, interface: String, metadata_pin: Stri
     PairingAuthority::from_protected_local(root,interface,metadata,metadata_pin,
         config,management,identity).map_err(|_|refused())
 }
+
+/// Revoke the registered device for the independently pinned local invitation.
+pub fn revoke_local_device(root: PathBuf, interface: String, metadata_pin: String,
+    config_pin: &str, tls_pin: &str, device_id: &str) -> io::Result<()>
+{
+    if !crate::lower_uuid(device_id) {
+        return Err(refused());
+    }
+    let authority = load_local_authority(root, interface, metadata_pin, config_pin, tls_pin)?;
+    authority.revoke_registered_device(device_id)
+}

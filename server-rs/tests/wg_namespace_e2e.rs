@@ -1766,15 +1766,42 @@ mod identity_gate {
         assert!(fs::read(&ledger).unwrap()==committed && fs::read(&code_path).unwrap()==code.as_bytes());
         assert!(fs::read(&conf).unwrap().as_slice()==durable_conf.as_slice());
         assert_eq!(reader.snapshot().unwrap(),observed);
+
+        let revoke = |device_id: &str| {
+            Command::new(env!("CARGO_BIN_EXE_spidervpn-pair-service")).env_clear()
+                .args(["revoke", root.to_str().unwrap(), IFACE, &mp, &config_pin, &pin, device_id])
+                .stdin(Stdio::null()).output().unwrap()
+        };
+        let wrong_device = revoke("77777777-7777-4777-8777-777777777777");
+        assert!(wrong_device.status.code() == Some(2) && wrong_device.stdout.is_empty());
+        assert!(fs::read(&ledger).unwrap() == committed);
+        assert!(fs::read(&conf).unwrap().as_slice() == durable_conf.as_slice());
+        assert_eq!(reader.snapshot().unwrap(), observed);
+
+        let succeeded = |out: Output| {
+            assert!(out.status.success() && out.stderr.is_empty());
+            assert!(out.stdout == b"PAIR_DEVICE_REVOKED\n");
+        };
+        succeeded(revoke(DEV));
         store=open(&root);
-        assert_eq!(store.generation().unwrap(),3);
-        let revoking=store.update(|l|l.begin_revocation(id)).unwrap();
-        spidervpn_pairing_authority::wg_live_set::apply_and_confirm(&mut store,IFACE,&revoking,
-            spidervpn_pairing_authority::wg_peer_plan::Change::Remove).unwrap();
+        assert_eq!(store.generation().unwrap(), 5);
+        assert!(matches!(store.view().unwrap().state(id), Some(InviteState::Revoked(saved)) if *saved == grant));
+        assert!(read_verified_identity_snapshot(&store, IFACE, &expected).unwrap().is_empty());
         drop(store);
+        let revoked_ledger = fs::read(&ledger).unwrap();
+        let revoked_conf = Zeroizing::new(fs::read(&conf).unwrap());
+        succeeded(revoke(DEV));
         assert!(exchange(addr,&ca,&leaf,&get)==(403,json!({"Ok":false,"Code":"Revoked"})));
         assert!(exchange(addr,&ca,&leaf,&post)==(403,json!({"Ok":false,"Code":"Revoked"})));
         service.stop(libc::SIGTERM);
+
+        let mut restarted = Process::spawn(&root, &mp, &config_pin, &pin);
+        restarted.ready(addr);
+        assert!(exchange(addr,&ca,&leaf,&get)==(403,json!({"Ok":false,"Code":"Revoked"})));
+        assert!(exchange(addr,&ca,&leaf,&post)==(403,json!({"Ok":false,"Code":"Revoked"})));
+        restarted.stop(libc::SIGTERM);
+        assert!(fs::read(&ledger).unwrap() == revoked_ledger);
+        assert!(fs::read(&conf).unwrap().as_slice() == revoked_conf.as_slice());
         assert!(reader.snapshot().unwrap().is_empty());
         set_server_key(&old_file);
         write_conf(&conf,&base,None);

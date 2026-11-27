@@ -14,6 +14,18 @@ Run only with explicit authorization in an isolated network namespace. Existing 
 
 Observe static READY/STOPPED markers, process exit, exact executable identity and actual local TLS responses. SIGTERM or SIGINT closes the accept loop and drains admitted workers within existing network budgets; local disk/transaction failures can delay drain. Restart with the same current trusted root and pins only after the previous process has exited. GET returns InvitationReady for Open and RetryOnly for eligible Consumed; identical authenticated POST returns the original signed authorization. No state creation or expiry extension on GET.
 
+## Revoke a registered device
+
+Run as root in the same authorized namespace with the current root, interface and trusted pins from `serve`. Use the exact `DeviceId` from the registered grant for this root's pinned invitation.
+
+```text
+/path/to/verified/spidervpn-pair-service revoke /protected/current-root WG_INTERFACE METADATA_SHA256 CONFIG_SHA256 TLS_SHA256 DEVICE_ID
+```
+
+The command persists `Revoking` before changing WireGuard, then records `Revoked` only after readback confirms absence from the live interface and protected config. Exit 0 with `PAIR_DEVICE_REVOKED` confirms completion. Repeating a completed revocation checks absence without rewriting state. On failure, inspect current state and use the existing recovery procedure if the config and live interface diverge. Authenticated GET and POST for the revoked invitation return `403 Revoked`, including after restart with the current ledger.
+
+## Restart and rollback
+
 Rollback: stop and verify exit, preserve the current durable ledger, protected WG config and live peers, and verify identity/inventory. An earlier executable/unit may be restored only if separately proven compatible with the current durable state and writer fence. Never restore an older ledger, delete Pending/Revoking, recreate missing state or reactivate the legacy writer after Rust mutation. If compatibility/history cannot be established, leave the service stopped and request explicit recovery authorization. No real VPS rollout, Windows pairing or legacy migration is authorized by this document.
 
 ## Stage 4B: first-time authority only (not migration)

@@ -88,6 +88,35 @@ impl PairingAuthority {
             config,management,tls:identity.server_config})
     }
 
+    #[cfg(feature = "linux-pairing-process")]
+    pub(crate) fn revoke_registered_device(&self, device_id: &str) -> io::Result<()> {
+        use crate::InviteState;
+
+        // Revalidate current provisioning and inventory under the same
+        // exclusive ledger lock as the removal and both durable commits.
+        let mut store = LedgerStore::open_existing(&self.root, Duration::ZERO).map_err(|_| invalid())?;
+        let scope = crate::fresh_consume_gate::preflight_service_metadata(&store, &self.metadata,
+            &self.metadata_pin, &self.interface, &self.tls_pin, &self.config, &self.management)
+            .map_err(|_| invalid())?;
+        let grant = match store.view().map_err(|_| invalid())?.state(&scope.invite_id) {
+            Some(InviteState::Consumed(grant)) if grant.claims.device_id == device_id => {
+                store.update(|ledger| ledger.begin_revocation(&scope.invite_id)).map_err(|_| invalid())?
+            }
+            Some(InviteState::Revoking(grant)) if grant.claims.device_id == device_id => grant.clone(),
+            Some(InviteState::Revoked(grant)) if grant.claims.device_id == device_id => {
+                if scope.peers.iter().any(|peer| {
+                    peer.public_key == grant.claims.public_key || peer.address == grant.address
+                }) {
+                    return Err(invalid());
+                }
+                return Ok(());
+            }
+            _ => return Err(invalid()),
+        };
+        crate::wg_live_set::apply_revocation_and_confirm(&mut store, &self.interface,
+            &scope.server_public_key, &grant).map_err(|_| invalid())
+    }
+
     pub(crate) fn tls_config(&self) -> Arc<ServerConfig> {
         Arc::clone(&self.tls)
     }

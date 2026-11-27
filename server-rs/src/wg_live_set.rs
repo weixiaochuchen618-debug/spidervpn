@@ -259,6 +259,17 @@ pub(crate) fn apply_fresh_and_confirm(
     })
 }
 
+/// The local administrator uses the same pinned identity before and after removing a peer.
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn apply_revocation_and_confirm(
+    store: &mut LedgerStore, interface: &str, expected_server_key: &str, grant: &Grant,
+) -> Result<(), ApplyError> {
+    apply_with_ops(store, grant, Change::Remove, &mut SystemOps {
+        interface,
+        expected_server_key: Some(expected_server_key),
+    })
+}
+
 /// Stage 2 finalizes the exact peer and original response in one durable
 /// Consumed commit. No success material is returned by the WG writer.
 #[cfg(feature = "linux-authorization-response")]

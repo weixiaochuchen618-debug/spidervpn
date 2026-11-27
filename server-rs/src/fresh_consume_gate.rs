@@ -491,7 +491,7 @@ pub(crate) fn read_retry_descriptor(store: &LedgerStore, scope: &TrustedOpenInvi
 pub(crate) fn preflight_service_metadata(store: &LedgerStore, raw: &[u8], pin: &str,
     interface: &str, tls_pin: &str,
     config: &crate::authorization_response::TrustedResponseConfig,
-    management: &rsa::RsaPrivateKey) -> Result<(),GateError>
+    management: &rsa::RsaPrivateKey) -> Result<VerifiedLocalScope, GateError>
 {
     let invalid=GateError::InvalidState;
     if raw.is_empty() || raw.len()>MAX_BODY_BYTES
@@ -516,9 +516,21 @@ pub(crate) fn preflight_service_metadata(store: &LedgerStore, raw: &[u8], pin: &
     let ledger=store.view().map_err(|_|invalid)?;
     let invite=ledger.invitations.get(scope.invite_id).ok_or(invalid)?;
     check_descriptor(&scope,invite.expires_unix,system_utc_seconds()?)?;
-    crate::wg_conf_audit::read_verified_identity_snapshot(store,interface,
-        text(scope.server_binding,"ServerPublicKey").ok_or(invalid)?).map_err(|_|invalid)?;
-    Ok(())
+    let server_public_key = text(scope.server_binding, "ServerPublicKey").ok_or(invalid)?;
+    let peers = crate::wg_conf_audit::read_verified_identity_snapshot(store, interface, server_public_key)
+        .map_err(|_| invalid)?;
+    Ok(VerifiedLocalScope {
+        invite_id: scope.invite_id.to_owned(),
+        server_public_key: server_public_key.to_owned(),
+        peers,
+    })
+}
+
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) struct VerifiedLocalScope {
+    pub(crate) invite_id: String,
+    pub(crate) server_public_key: String,
+    pub(crate) peers: Vec<Peer>,
 }
 
 /// Exact POST consume envelope, bearer + independently signed invitation +
