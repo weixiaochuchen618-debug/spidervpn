@@ -175,6 +175,27 @@ jobs:
           ! grep -F 'fresh_consume_gate' src/pairhost.rs
           grep -F 'ExecStart=/usr/bin/python3 -I ' src/pairhost.rs >/dev/null
 
+      - name: MVP-04 default-off signed encrypted consume response and atomic material storage
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path server-rs/Cargo.toml --features linux-authorization-response --lib
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-authorization-response --lib ledger_disk::tests -- --test-threads=1 --nocapture
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-authorization-response --lib authorization_response::tests -- --test-threads=1 --nocapture
+          cargo metadata --locked --no-deps --format-version 1 --manifest-path server-rs/Cargo.toml | jq -e '.packages[] | select(.name == "spidervpn-pairing-authority") | ((.features.default // []) == []) and (.features["linux-authorization-response"] | index("linux-fresh-consume-gate") != null)' >/dev/null
+
+      - name: MVP-04 default-off authenticated TLS pairing service build
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path server-rs/Cargo.toml --features linux-pairing-service --lib
+          cargo build --locked --manifest-path server-rs/Cargo.toml --features linux-pairing-process --bin spidervpn-pair-service
+          cargo build --locked --manifest-path server-rs/Cargo.toml --features linux-fresh-provisioning --bin spidervpn-pair-service
+          cargo metadata --locked --no-deps --format-version 1 --manifest-path server-rs/Cargo.toml | jq -e '.packages[] | select(.name == "spidervpn-pairing-authority") | ((.features.default // []) == []) and (.features["linux-pairing-service"] | index("linux-authorization-response") != null)' >/dev/null
       - name: SEC-02 opt-in Rust denial process build and unprivileged denial
         shell: bash
         env:
@@ -348,7 +369,7 @@ jobs:
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="$PWD/server-rs/target/netns"
-          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-netns-acceptance,linux-admin-finalize,linux-fresh-consume-gate --test wg_namespace_e2e --no-run --message-format=json > "$RUNNER_TEMP/sec01-build.json"
+          cargo test --locked --manifest-path server-rs/Cargo.toml --features linux-netns-acceptance,linux-admin-finalize,linux-fresh-consume-gate,linux-authorization-response,linux-pairing-service,linux-pairing-process,linux-fresh-provisioning --test wg_namespace_e2e --no-run --message-format=json > "$RUNNER_TEMP/sec01-build.json"
           test_bin="$(jq -r 'select(.reason=="compiler-artifact" and .target.name=="wg_namespace_e2e") | .executable // empty' "$RUNNER_TEMP/sec01-build.json" | tail -n1)"
           test -n "$test_bin"
           test -x "$test_bin"
@@ -375,6 +396,7 @@ jobs:
           sudo install -d -m 0700 -o 0 -g 0 /etc/wireguard
           test ! -e "$conf"
           sudo ip netns add "$ns"
+          sudo ip -n "$ns" link set lo up
           sudo ip -n "$ns" link add "$iface" type wireguard
           sudo ip -n "$ns" link set "$iface" up
           sudo ip netns exec "$ns" /usr/bin/wg set "$iface" private-key "$server_key"

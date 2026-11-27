@@ -198,6 +198,66 @@ fn read_from_verified_dir(dir: &File, uid: u32, expected_pin: &str)
     Ok(VerifiedTlsIdentity { server_config, leaf_der_sha256: calculated })
 }
 
+/// Explicit local process root, with every component checked from "/".
+/// No environment-selected root, symlink traversal or writable ancestors.
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn open_service_root(path: &std::path::Path) -> io::Result<File> {
+    if unsafe { geteuid() } != 0 { return Err(denied("pairing service requires root")); }
+    let name=path.to_str().ok_or_else(|| denied("invalid service root"))?;
+    let parts:Vec<_>=name.strip_prefix('/').ok_or_else(|| denied("absolute service root required"))?
+        .split('/').collect();
+    open_trusted_tree(&File::open("/")?,&parts,0)
+}
+
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn read_service_file(dir: &File, name: &str, max: usize) -> io::Result<Vec<u8>> {
+    secure_file(dir,name,0,max,true)
+}
+
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn read_service_identity(dir: &File, pin: &str) -> io::Result<VerifiedTlsIdentity> {
+    read_from_verified_dir(dir,0,pin)
+}
+
+/// Create exactly one new child of a protected, explicitly selected parent.
+/// mkdirat is exclusive; no following/reusing an existing or partial root.
+#[cfg(feature = "linux-fresh-provisioning")]
+pub(crate) fn create_fresh_service_root(path: &std::path::Path) -> io::Result<File> {
+    let name=path.file_name().and_then(|s|s.to_str()).ok_or_else(||denied("invalid fresh root"))?;
+    let parent=path.parent().ok_or_else(||denied("invalid fresh parent"))?;
+    if !path.is_absolute() || parent.join(name)!=path || name=="." || name==".."
+        || path.to_str().is_none_or(|s|s.split('/').skip(1).any(|p|p.is_empty()||p=="."||p==".."))
+    { return Err(denied("invalid fresh path")); }
+    let dir=open_service_root(parent)?;
+    let n=CString::new(name).map_err(|_|denied("invalid fresh name"))?;
+    if unsafe {libc::mkdirat(dir.as_raw_fd(),n.as_ptr(),0o700)}!=0 {
+        return Err(io::Error::last_os_error());
+    }
+    let child=open_child(&dir,name,O_DIRECTORY)?;
+    check_dir(&child,0,true)?;
+    dir.sync_all()?;
+    Ok(child)
+}
+
+#[cfg(feature = "linux-fresh-provisioning")]
+pub(crate) fn create_fresh_service_file(dir:&File,name:&str,bytes:&[u8])->io::Result<()> {
+    use std::io::Write;
+    if name.is_empty() || name=="." || name==".." || name.contains('/') {
+        return Err(denied("invalid fresh file"));
+    }
+    let n=CString::new(name).map_err(|_|denied("invalid fresh file"))?;
+    let fd=unsafe {libc::openat(dir.as_raw_fd(),n.as_ptr(),
+        libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL|libc::O_NOFOLLOW|libc::O_CLOEXEC,0o600)};
+    if fd<0 {return Err(io::Error::last_os_error());}
+    let mut file=unsafe {File::from_raw_fd(fd)};
+    let m=file.metadata()?;
+    if !m.is_file() || m.uid()!=0 || m.nlink()!=1 || m.mode()&0o7777!=0o600 {
+        return Err(denied("unsafe fresh file"));
+    }
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
 /// Separate disposable process-lab TLS material. Never fall back to the
 /// production certificate or to a caller-controlled directory/environment.
 /// Only the root startup phase may read this exact protected directory.

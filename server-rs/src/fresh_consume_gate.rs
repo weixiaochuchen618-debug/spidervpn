@@ -1,18 +1,19 @@
-//! SEC-01/02 fresh online invitation authentication, pre-integration only.
-//! Not a legacy importer, HTTP listener, signing service or WG mutator.
+//! SEC-01/02 fresh online invitation authentication and internal enrollment.
+//! Not a legacy importer, HTTP listener or signing service.
 //! Callers must supply independently authenticated invitation metadata and
 //! bearer token, BOTH pinned management and server identity, and the SAME
-//! exclusively locked current LedgerStore used by any future transaction.
+//! exclusively locked current LedgerStore used by the enrollment transaction.
 //! A signed descriptor does NOT sign the bearer token or prove that a legacy
 //! invitation was never revoked: never construct scope from unverified
-//! invites.json, a client body, or a stale snapshot. No production caller yet.
+//! invites.json, a client body, or a stale snapshot. No deployed caller yet.
 #![cfg(all(target_os = "linux", feature = "linux-fresh-consume-gate"))]
 
 use crate::http_one_request::{Method, ParsedRequest, MAX_BODY_BYTES};
-use crate::ledger_disk::LedgerStore;
+use crate::ledger_disk::{LedgerStore, StoreError};
+use crate::wg_live_set::{apply_fresh_and_confirm, ApplyError};
 use crate::legacy_request_proof::{client_digest, recipient_digest};
 use crate::legacy_signed::{b64u, verify_jws};
-use crate::{hex_sha256, lower_uuid, wg_key, Claims, InviteState, Ledger, Peer};
+use crate::{hex_sha256, lower_uuid, wg_key, AddressPool, Claims, Grant, InviteState, Ledger, Peer};
 use ring::{digest, hmac};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -123,7 +124,7 @@ impl<'de> Deserialize<'de> for Unique {
     }
 }
 
-fn unique_json(raw: &[u8]) -> Option<Value> {
+pub(crate) fn unique_json(raw: &[u8]) -> Option<Value> {
     serde_json::from_slice::<Unique>(raw).ok().map(|v| v.0)
 }
 fn text<'a>(v: &'a Value, field: &str) -> Option<&'a str> {
@@ -158,7 +159,7 @@ fn verify_unique_jws(s: &str, key: &Value) -> Option<Value> {
 fn token_shape(token: &str) -> bool {
     token.len() == 43 && b64u(token, 32).is_ok_and(|v| v.len() == 32)
 }
-const METADATA_BEARER_DOMAIN: &[u8] = b"SpiderVPN pinned invitation metadata bearer v1";
+pub(crate) const METADATA_BEARER_DOMAIN: &[u8] = b"SpiderVPN pinned invitation metadata bearer v1";
 
 /// Verified, read-only metadata record. No Debug/Deserialize or public fields;
 /// the candidate bearer is borrowed, never stored in the metadata record.
@@ -169,11 +170,17 @@ pub struct AuthenticatedInviteMetadata<'a> {
 }
 impl AuthenticatedInviteMetadata<'_> {
     pub fn scope(&self) -> Result<TrustedOpenInvite<'_>,GateError> {
-        let v=&self.record;
+        scope_from_record(&self.record,self.bearer)
+    }
+}
+
+fn scope_from_record<'a>(v: &'a Value, bearer: &'a str)
+    -> Result<TrustedOpenInvite<'a>,GateError>
+{
         let invalid=GateError::InvalidState;
         Ok(TrustedOpenInvite {
             invite_id:text(v,"InviteId").ok_or(invalid)?,
-            token:self.bearer,
+            token:bearer,
             signed_descriptor:text(v,"SignedDescriptor").ok_or(invalid)?,
             management_jwk:v.get("ManagementSigningPublicKey").ok_or(invalid)?,
             management_fingerprint:text(v,"ManagementFingerprint").ok_or(invalid)?,
@@ -184,7 +191,6 @@ impl AuthenticatedInviteMetadata<'_> {
             tls_der_pin:text(v,"TlsSha256").ok_or(invalid)?,
             wg_interface:text(v,"WgInterface").filter(|name|crate::wg_readonly::valid_interface(name)).ok_or(invalid)?,
         })
-    }
 }
 
 fn decode_sha256_hex(s: &str) -> Option<Vec<u8>> {
@@ -273,14 +279,14 @@ fn canonical_wg_key(s: &str) -> bool {
     let url = s[..43].replace('+', "-").replace('/', "_");
     b64u(&url,32).is_ok_and(|b| b.len()==32 && b.iter().any(|x| *x!=0))
 }
-fn valid_binding(b: &Value) -> bool {
+pub(crate) fn valid_binding(b: &Value) -> bool {
     b.as_object().is_some_and(|o| o.len()==3)
         && text(b,"RemoteOwnerId").is_some_and(lower_uuid)
         && text(b,"NodeId").is_some_and(lower_uuid)
         && text(b,"ServerPublicKey").is_some_and(canonical_wg_key)
 }
 
-fn management_fingerprint(jwk: &Value) -> Option<String> {
+pub(crate) fn management_fingerprint(jwk: &Value) -> Option<String> {
     let hex=recipient_digest(jwk).ok()?;
     let raw:Vec<u8>=(0..hex.len()).step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i+2],16)).collect::<Result<_,_>>().ok()?;
@@ -300,7 +306,7 @@ fn management_fingerprint(jwk: &Value) -> Option<String> {
     Some(out)
 }
 
-fn check_descriptor(scope: &TrustedOpenInvite<'_>, expires: i64, now: i64)
+pub(crate) fn check_descriptor(scope: &TrustedOpenInvite<'_>, expires: i64, now: i64)
     -> Result<(), GateError>
 {
     let invalid = GateError::InvalidState;
@@ -337,7 +343,10 @@ fn check_descriptor(scope: &TrustedOpenInvite<'_>, expires: i64, now: i64)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Operation { Get, Fresh, Retry }
+enum Operation { Get, Fresh, Retry,
+    #[cfg(feature = "linux-pairing-process")]
+    GetRetry,
+}
 
 fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
     request: &ParsedRequest, now: i64, operation: Operation) -> Result<&'a Ledger, GateError>
@@ -350,7 +359,13 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
         || scope.port==0 || now<0
         || management_fingerprint(scope.management_jwk).as_deref()!=Some(scope.management_fingerprint)
     { return Err(GateError::InvalidState); }
-    let consume = operation != Operation::Get;
+    let get_retry = match operation {
+        #[cfg(feature = "linux-pairing-process")]
+        Operation::GetRetry => true,
+        _ => false,
+    };
+    let retry = operation == Operation::Retry || get_retry;
+    let consume = operation != Operation::Get && !get_retry;
     let route = format!("/v1/invitations/{}{}",scope.invite_id,
         if consume {"/consume"} else {""});
     if request.target!=route || request.method!=if consume {Method::Post} else {Method::Get}
@@ -364,13 +379,13 @@ fn common<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'_>,
         .ok_or(GateError::Forbidden)?;
     if !token_matches(scope.token,presented) { return Err(GateError::Forbidden); }
     match inv.state {
-        InviteState::Open if operation == Operation::Retry => return Err(GateError::InvalidState),
+        InviteState::Open if retry => return Err(GateError::InvalidState),
         InviteState::Open if now>=inv.expires_unix => return Err(GateError::InviteExpired),
         InviteState::Open => {},
         InviteState::Cancelled => return Err(GateError::InviteCancelled),
         InviteState::Expired => return Err(GateError::InviteExpired),
         InviteState::Revoking(_) | InviteState::Revoked(_) => return Err(GateError::Revoked),
-        InviteState::Consumed(_) if operation == Operation::Retry => {
+        InviteState::Consumed(_) if retry => {
             // Exclusive upper bound: never extend the signed legacy window.
             if now >= inv.expires_unix.checked_add(120).ok_or(GateError::InvalidState)? {
                 return Err(GateError::InviteExpired);
@@ -416,6 +431,106 @@ fn read_open_with_clock<'a>(store: &'a LedgerStore, scope: &TrustedOpenInvite<'a
     if !request.body.is_empty() { return Err(GateError::InvalidRequest); }
     check_open_completion(store,scope.invite_id,generation,now,clock()?)?;
     Ok(OpenDescriptor { signed_descriptor:scope.signed_descriptor,_store:store })
+}
+
+/// GET-first recovery is only a read-only hint to the existing client.
+/// A bearer alone never grants authorization or reveals the original
+/// signed authorization. POST must still prove the original request.
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn read_retry_descriptor(store: &LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str) -> Result<Value,GateError>
+{
+    let invalid=GateError::InvalidState;
+    let now=system_utc_seconds()?;
+    let generation=store.generation().map_err(|_|invalid)?;
+    let ledger=common(store,scope,request,now,Operation::GetRetry)?;
+    if !request.body.is_empty() { return Err(GateError::InvalidRequest); }
+    check_retry_interface(scope,interface)?;
+    let Some(InviteState::Consumed(grant))=ledger.state(scope.invite_id) else {
+        return Err(invalid);
+    };
+    check_history(ledger,&grant.claims)?;
+    let material=store.authorization_material(scope.invite_id).map_err(|_|invalid)?;
+    if material.grant!=*grant || now<material.issued_unix || now>=material.expires_unix
+        || material.issued_unix.checked_add(3600)!=Some(material.expires_unix)
+    { return Err(invalid); }
+    let body=verify_unique_jws(&material.signed,scope.management_jwk).ok_or(invalid)?;
+    let c=&grant.claims;
+    if !version_kind(&body,"TradeChannel.PairAuthorization")
+        || text(&body,"InviteId")!=Some(c.invite_id.as_str())
+        || body.get("ServerBinding")!=Some(scope.server_binding)
+        || text(&body,"RemoteOwnerId")!=text(scope.server_binding,"RemoteOwnerId")
+        || text(&body,"NodeId")!=text(scope.server_binding,"NodeId")
+        || text(&body,"RequestId")!=Some(c.request_id.as_str())
+        || text(&body,"DeviceId")!=Some(c.device_id.as_str())
+        || text(&body,"ClientPublicKey")!=Some(c.public_key.as_str())
+        || text(&body,"ClientAddress")!=Some(format!("{}/32",grant.address).as_str())
+        || text(&body,"RequestDigest")!=Some(c.request_digest.as_str())
+        || text(&body,"RequestDigestAlgorithm")!=Some("TC-ClientRequest-v1")
+        || text(&body,"RecipientJwkDigest")!=Some(c.recipient_jwk_digest.as_str())
+        || text(&body,"IssuedAtUtc").and_then(utc_seconds)!=Some(material.issued_unix)
+        || text(&body,"ExpiresAtUtc").and_then(utc_seconds)!=Some(material.expires_unix)
+        || body.get("ConfigRevision").and_then(Value::as_u64)!=Some(1)
+        || !body.get("ClientResponse").is_some_and(Value::is_object)
+    { return Err(invalid); }
+    let expected=text(scope.server_binding,"ServerPublicKey").ok_or(invalid)?;
+    let peers=crate::wg_conf_audit::read_verified_identity_snapshot(store,interface,expected)
+        .map_err(|_|invalid)?;
+    ledger.retry(&grant.claims,Some(&peers)).map_err(|_|invalid)?;
+    let after=system_utc_seconds()?;
+    if after<now || after>=material.expires_unix
+        || store.generation().map_err(|_|invalid)?!=generation { return Err(invalid); }
+    common(store,scope,request,after,Operation::GetRetry)?;
+    Ok(serde_json::json!({"Status":"RetryOnly","SignedDescriptor":scope.signed_descriptor}))
+}
+
+/// Local startup validation, not bearer authentication. The root is
+/// already protected and the metadata digest is independently supplied.
+/// No scope or grant escapes, and no ledger or kernel mutation occurs.
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn preflight_service_metadata(store: &LedgerStore, raw: &[u8], pin: &str,
+    interface: &str, tls_pin: &str,
+    config: &crate::authorization_response::TrustedResponseConfig,
+    management: &rsa::RsaPrivateKey) -> Result<VerifiedLocalScope, GateError>
+{
+    let invalid=GateError::InvalidState;
+    if raw.is_empty() || raw.len()>MAX_BODY_BYTES
+        || digest::digest(&digest::SHA256,raw).as_ref()!=decode_sha256_hex(pin).ok_or(invalid)?.as_slice()
+    { return Err(invalid); }
+    let record=unique_json(raw).ok_or(invalid)?;
+    if !version_kind(&record,"SpiderVPN.InviteMetadata")
+        || record.as_object().is_none_or(|o|o.len()!=12)
+        || decode_sha256_hex(text(&record,"BearerHmacSha256").ok_or(invalid)?).is_none()
+    { return Err(invalid); }
+    // Empty token cannot pass any request gate. Only structural and signed
+    // identity checks are used during startup; the real bearer is required
+    // separately for every actual request.
+    let scope=scope_from_record(&record,"")?;
+    if !lower_uuid(scope.invite_id) || !valid_binding(scope.server_binding)
+        || !hex_sha256(scope.tls_der_pin) || scope.tls_der_pin!=tls_pin
+        || management_fingerprint(scope.management_jwk).as_deref()!=Some(scope.management_fingerprint)
+        || !config.matches_scope(scope.server_binding,interface)
+    { return Err(invalid); }
+    check_retry_interface(&scope,interface)?;
+    crate::authorization_response::check_signer(management,scope.management_jwk)?;
+    let ledger=store.view().map_err(|_|invalid)?;
+    let invite=ledger.invitations.get(scope.invite_id).ok_or(invalid)?;
+    check_descriptor(&scope,invite.expires_unix,system_utc_seconds()?)?;
+    let server_public_key = text(scope.server_binding, "ServerPublicKey").ok_or(invalid)?;
+    let peers = crate::wg_conf_audit::read_verified_identity_snapshot(store, interface, server_public_key)
+        .map_err(|_| invalid)?;
+    Ok(VerifiedLocalScope {
+        invite_id: scope.invite_id.to_owned(),
+        server_public_key: server_public_key.to_owned(),
+        peers,
+    })
+}
+
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) struct VerifiedLocalScope {
+    pub(crate) invite_id: String,
+    pub(crate) server_public_key: String,
+    pub(crate) peers: Vec<Peer>,
 }
 
 /// Exact POST consume envelope, bearer + independently signed invitation +
@@ -508,10 +623,99 @@ fn check_history(ledger: &Ledger, claims: &Claims) -> Result<(),GateError> {
     Ok(())
 }
 
+/// Internal enrollment errors. Never use them as an authorization response:
+/// an error after Pending may require explicit administrative reconciliation.
+#[derive(Debug)]
+pub enum FreshEnrollError {
+    Gate(GateError),
+    Ledger(StoreError),
+    Apply(ApplyError),
+}
+
+/// Actual opt-in Linux enrollment adapter, not an HTTP handler or signer.
+/// The scope must originate from independently pinned metadata. The
+/// interface and address pool are trusted local service configuration,
+/// never selected by the request. Hold the SAME exclusively locked current
+/// LedgerStore from authentication through durable reservation and final
+/// readback. Other privileged writers must be excluded by the caller.
+/// Returns a grant only after the exact peer and pinned server identity
+/// have been read back from protected config and kernel and Consumed has
+/// been durably committed. An error is never permission to retry an add.
+pub fn enroll_fresh_consume(
+    store: &mut LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str, pool: AddressPool,
+) -> Result<Grant, FreshEnrollError> {
+    let (grant, ()) = reserve_authenticated(store, scope, request, interface, pool,
+        |_, _, _| Ok(()))?;
+    let expected = text(scope.server_binding, "ServerPublicKey")
+        .ok_or(FreshEnrollError::Gate(GateError::InvalidState))?;
+    apply_fresh_and_confirm(store, interface, expected, &grant)
+        .map_err(FreshEnrollError::Apply)?;
+    Ok(grant)
+}
+
+// Authenticate, observe, preview the exact grant, optionally prepare response
+// material, then durably reserve that same grant. Both enrollment paths
+// share the same verification, fresh-clock and locked policy checks.
+fn reserve_authenticated<T>(
+    store: &mut LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str, pool: AddressPool,
+    prepare: impl FnOnce(&Grant, &Value, i64) -> Result<T, FreshEnrollError>,
+) -> Result<(Grant, T), FreshEnrollError> {
+    check_retry_interface(scope, interface).map_err(FreshEnrollError::Gate)?;
+    let expected = text(scope.server_binding, "ServerPublicKey")
+        .ok_or(FreshEnrollError::Gate(GateError::InvalidState))?;
+    let generation = store.generation().map_err(FreshEnrollError::Ledger)?;
+    let before = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    // The only conversion into reservation claims is local to this
+    // function. The verified token cannot escape, change stores or be
+    // supplied by a caller as raw claims.
+    let verified = prepare_fresh_consume(store, scope, request)
+        .map_err(FreshEnrollError::Gate)?;
+    let claims = verified.claims().clone();
+    let recipient = verified.recipient_jwk().clone();
+    drop(verified);
+    let authenticated_at = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    if authenticated_at < before || claims.public_key == expected {
+        return Err(FreshEnrollError::Gate(GateError::InvalidState));
+    }
+    // Refuse known generation exhaustion before any side effects. Both
+    // Pending and Consumed need a generation increment.
+    generation.checked_add(2)
+        .ok_or(FreshEnrollError::Ledger(StoreError::GenerationExhausted))?;
+    let peers = crate::wg_conf_audit::read_verified_identity_snapshot(store, interface, expected)
+        .map_err(|error| FreshEnrollError::Apply(ApplyError::Readback(error)))?;
+    let now = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    check_open_completion(store, scope.invite_id, generation, authenticated_at, now)
+        .map_err(FreshEnrollError::Gate)?;
+    check_history(store.view().map_err(FreshEnrollError::Ledger)?, &claims)
+        .map_err(FreshEnrollError::Gate)?;
+    // Preview is not a reservation or authority. Prepare the complete
+    // encrypted reply before any WG mutation and reject any mismatch with
+    // the actual allocation made by the durable update.
+    let mut preview = store.view().map_err(FreshEnrollError::Ledger)?.clone();
+    let predicted = preview.reserve(claims.clone(), now, pool, Some(&peers))
+        .map_err(|err| FreshEnrollError::Ledger(StoreError::Policy(err)))?;
+    let prepared = prepare(&predicted, &recipient, now)?;
+    let commit_now = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    check_open_completion(store, scope.invite_id, generation, now, commit_now)
+        .map_err(FreshEnrollError::Gate)?;
+    check_history(store.view().map_err(FreshEnrollError::Ledger)?, &claims)
+        .map_err(FreshEnrollError::Gate)?;
+    let grant = store.update(|ledger| {
+        let actual = ledger.reserve(claims, commit_now, pool, Some(&peers))?;
+        if actual != predicted { return Err(crate::Refusal::Conflict); }
+        Ok(actual)
+    }).map_err(FreshEnrollError::Ledger)?;
+    Ok((grant, prepared))
+}
+
 /// Read-only, lock-borrowing retry evidence, NOT a new Grant or response.
 /// Cannot be constructed by network deserialization or used to add a peer.
 pub struct VerifiedConsumedRetry<'a> {
     claims: Claims,
+    #[cfg(feature = "linux-authorization-response")]
+    recipient_jwk: Value,
     _store: &'a LedgerStore,
 }
 impl VerifiedConsumedRetry<'_> {
@@ -528,6 +732,29 @@ fn check_retry_interface(scope: &TrustedOpenInvite<'_>, interface: &str)
         return Err(GateError::InvalidState);
     }
     Ok(())
+}
+
+/// Bind a borrowed, authenticated scope to the separately provisioned
+/// service identity before taking a ledger lock. The existing GET/POST
+/// gates still perform their full signature, state and request checks.
+#[cfg(feature = "linux-pairing-service")]
+pub(crate) fn check_service_scope(scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str, actual_tls_pin: &str,
+    config: &crate::authorization_response::TrustedResponseConfig,
+    management: &rsa::RsaPrivateKey) -> Result<(), GateError>
+{
+    check_retry_interface(scope, interface)?;
+    if scope.tls_der_pin != actual_tls_pin
+        || !config.matches_scope(scope.server_binding, interface) {
+        return Err(GateError::InvalidState);
+    }
+    let route = format!("/v1/invitations/{}{}", scope.invite_id,
+        if request.method == Method::Post { "/consume" } else { "" });
+    if request.target != route { return Err(GateError::NotFound); }
+    if request.host != format!("{}:{}", scope.public_host, scope.port) {
+        return Err(GateError::InviteMismatch);
+    }
+    crate::authorization_response::check_signer(management, scope.management_jwk)
 }
 
 /// Read-only retry under the CURRENT locked store. The local service
@@ -563,7 +790,7 @@ fn prepare_retry_with_observation<'a>(store: &'a LedgerStore, scope: &TrustedOpe
     let now=clock()?;
     let generation=store.generation().map_err(|_|GateError::InvalidState)?;
     let ledger=common(store,scope,request,now,Operation::Retry)?;
-    let (claims,_)=verify_consume_claims(scope,request,now)?;
+    let (claims,_recipient_jwk)=verify_consume_claims(scope,request,now)?;
     check_history(ledger,&claims)?;
     // Authenticate and reject mismatched consumed claims before privileged IO.
     let Some(InviteState::Consumed(grant))=ledger.state(scope.invite_id) else {
@@ -592,7 +819,66 @@ fn prepare_retry_with_observation<'a>(store: &'a LedgerStore, scope: &TrustedOpe
         crate::Refusal::Revoked | crate::Refusal::RevokedIdentity => GateError::Revoked,
         _ => GateError::InvalidState,
     })?;
-    Ok(VerifiedConsumedRetry { claims,_store:store })
+    Ok(VerifiedConsumedRetry { claims,
+        #[cfg(feature = "linux-authorization-response")]
+        recipient_jwk:_recipient_jwk,
+        _store:store })
+}
+
+/// Non-listening Stage 2 consume handler. Only authenticated requests may
+/// produce the client-compatible success data. The caller must provision
+/// current trusted metadata/config/key and exclude all privileged writers.
+/// No HTTP-selected recipient, raw Grant signing, listener or deployment.
+/// Consumed retry performs no ledger/config/kernel mutation or signing.
+#[cfg(feature = "linux-authorization-response")]
+pub fn consume_authorization(
+    store: &mut LedgerStore, scope: &TrustedOpenInvite<'_>,
+    request: &ParsedRequest, interface: &str,
+    config: &crate::authorization_response::TrustedResponseConfig,
+    management_key: &rsa::RsaPrivateKey,
+) -> Result<Value, FreshEnrollError> {
+    use crate::authorization_response as response;
+    let invalid = || FreshEnrollError::Gate(GateError::InvalidState);
+    check_retry_interface(scope, interface).map_err(FreshEnrollError::Gate)?;
+    if !config.matches_scope(scope.server_binding, interface) { return Err(invalid()); }
+    response::check_signer(management_key, scope.management_jwk)
+        .map_err(FreshEnrollError::Gate)?;
+    let expected = text(scope.server_binding, "ServerPublicKey").ok_or_else(invalid)?;
+    if matches!(store.view().map_err(FreshEnrollError::Ledger)?.state(scope.invite_id),
+        Some(InviteState::Consumed(_))) {
+        let verified = prepare_consumed_retry(store, scope, request, interface)
+            .map_err(FreshEnrollError::Gate)?;
+        let Some(InviteState::Consumed(grant)) =
+            store.view().map_err(FreshEnrollError::Ledger)?.state(scope.invite_id)
+        else { return Err(invalid()); };
+        if &grant.claims != verified.claims() { return Err(invalid()); }
+        let material = store.authorization_material(scope.invite_id)
+            .map_err(FreshEnrollError::Ledger)?;
+        let now = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+        let data = response::retry(material, grant, &verified.recipient_jwk, config,
+            scope.management_jwk, now).map_err(FreshEnrollError::Gate)?;
+        let after = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+        if after < now || after >= material.expires_unix { return Err(invalid()); }
+        common(store, scope, request, after, Operation::Retry).map_err(FreshEnrollError::Gate)?;
+        return Ok(data);
+    }
+    let (grant, (material, data)) = reserve_authenticated(
+        store, scope, request, interface, config.pool(),
+        |grant, recipient, now| response::prepare(grant, recipient, config,
+            scope.management_jwk, management_key, now).map_err(FreshEnrollError::Gate)
+    )?;
+    crate::wg_live_set::apply_fresh_and_confirm_authorized(
+        store, interface, expected, &grant, material
+    ).map_err(FreshEnrollError::Apply)?;
+    // Only a successful durable Consumed+material commit can release the
+    // precomputed response. A poisoned or expired result is never success.
+    let saved = store.authorization_material(scope.invite_id)
+        .map_err(FreshEnrollError::Ledger)?;
+    let after = system_utc_seconds().map_err(FreshEnrollError::Gate)?;
+    if saved.grant != grant || after < saved.issued_unix || after >= saved.expires_unix {
+        return Err(invalid());
+    }
+    Ok(data)
 }
 
 // L1 is deliberately test-only. A matched local observation cannot be

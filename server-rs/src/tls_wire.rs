@@ -136,6 +136,49 @@ pub fn spawn_tls12_denial_only_response(
     )
 }
 
+/// Stage 3 concrete authenticated service worker. No caller-provided
+/// success callback or raw Claims/Grant path. Same real handshake and
+/// independent post-handshake admission as the denial-only lab.
+#[cfg(feature = "linux-pairing-service")]
+pub(crate) fn spawn_tls12_pairing_response(
+    handshakes: &HandshakeAdmission,
+    requests: &RequestAdmission,
+    stream: TcpStream,
+    authority: Arc<crate::pairing_service::PairingAuthority>,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    use std::io::Write;
+    let config = authority.tls_config();
+    handshakes.spawn_one_request(
+        requests, stream,
+        move |transport| finish_tls12_handshake(config, transport),
+        move |transport, mut tls| {
+            let request = {
+                let mut decrypted = Stream::new(&mut tls, &mut *transport);
+                read_one_request(&mut decrypted)
+            };
+            // Confirm the absolute request deadline even if the parser
+            // completed from already-buffered TLS plaintext.
+            transport.flush()?;
+            let reply = authority.reply(request)?;
+            // No ledger lock survives reply construction. A lost reply is
+            // not an instruction to roll back a durable Consumed grant.
+            {
+                let mut decrypted = Stream::new(&mut tls, &mut *transport);
+                decrypted.write_all(&reply)?;
+                decrypted.flush()?;
+            }
+            tls.send_close_notify();
+            while tls.wants_write() {
+                if tls.write_tls(transport)? == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero,
+                        "pairing TLS close_notify not flushed"));
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

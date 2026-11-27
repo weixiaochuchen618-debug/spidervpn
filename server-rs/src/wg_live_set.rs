@@ -23,11 +23,13 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{claims_valid, wg_key, Grant, InviteState, Peer};
+use crate::{Grant, Peer};
+#[cfg(feature = "linux-pairing-process")]
+use crate::existing_devices::ExistingDevice;
 use crate::ledger_disk::{LedgerStore, StoreError};
 use crate::wg_atomic::{write_pinned_config, AtomicError};
 use crate::wg_conf_audit::{read_verified_snapshot, require_exact_match, ConfigError};
-use crate::wg_peer_plan::Change;
+use crate::wg_peer_plan::{Change, PeerChange};
 use crate::wg_readonly::{valid_interface, ReadError};
 
 const WG_BINARY: &str = "/usr/bin/wg";
@@ -54,21 +56,22 @@ pub enum ApplyError {
 pub fn peer_command_args(
     interface: &str, grant: &Grant, operation: Change,
 ) -> Result<Vec<String>, LiveError> {
-    if !valid_interface(interface)
-        || !claims_valid(&grant.claims)
-        || !grant.address.is_private()
-        || !wg_key(&grant.claims.public_key)
-    {
+    command_args(interface, PeerChange::Invitation(grant, operation))
+}
+
+fn command_args(interface: &str, change: PeerChange<'_>) -> Result<Vec<String>, LiveError> {
+    if !valid_interface(interface) || !change.valid() {
         return Err(LiveError::InvalidArguments);
     }
+    let (public_key, address, operation) = change.target();
     let mut args = vec![
         "set".into(), interface.into(), "peer".into(),
-        grant.claims.public_key.clone(),
+        public_key.to_owned(),
     ];
     match operation {
         Change::Add => {
             args.push("allowed-ips".into());
-            args.push(format!("{}/32", grant.address));
+            args.push(format!("{address}/32"));
         }
         Change::Remove => args.push("remove".into()),
     }
@@ -80,10 +83,8 @@ fn checked_wg_executable() -> Result<(), LiveError> {
     crate::wg_readonly::trusted_wg_binary(Path::new(WG_BINARY))
         .map_err(|_: ReadError| LiveError::UnsafeBinary)
 }
-fn set_one_peer(
-    interface: &str, grant: &Grant, operation: Change,
-) -> Result<(), LiveError> {
-    let args = peer_command_args(interface, grant, operation)?;
+fn set_one_peer(interface: &str, change: PeerChange<'_>) -> Result<(), LiveError> {
+    let args = command_args(interface, change)?;
     checked_wg_executable()?;
     let mut child = Command::new(WG_BINARY)
         .args(&args)
@@ -114,32 +115,29 @@ fn set_one_peer(
         }
     }
 }
-fn expected_after(
-    before: &[Peer], grant: &Grant, operation: Change,
-) -> Result<Vec<Peer>, LiveError> {
+fn expected_after(before: &[Peer], change: PeerChange<'_>) -> Result<Vec<Peer>, LiveError> {
+    let (public_key, address, operation) = change.target();
     let mut peers = before.to_vec();
     match operation {
         Change::Add => {
-            if peers.iter().any(|p| p.public_key == grant.claims.public_key
-                || p.address == grant.address)
+            if peers.iter().any(|p| p.public_key == public_key || p.address == address)
             {
                 return Err(LiveError::InvalidArguments);
             }
             peers.push(Peer {
-                public_key: grant.claims.public_key.clone(),
-                address: grant.address,
+                public_key: public_key.to_owned(),
+                address,
             });
         }
         Change::Remove => {
-            let found_key = peers.iter().any(|p| p.public_key == grant.claims.public_key);
-            let found_ip = peers.iter().any(|p| p.address == grant.address);
+            let found_key = peers.iter().any(|p| p.public_key == public_key);
+            let found_ip = peers.iter().any(|p| p.address == address);
             if found_key != found_ip
-                || peers.iter().any(|p| p.public_key == grant.claims.public_key
-                    && p.address != grant.address)
+                || peers.iter().any(|p| p.public_key == public_key && p.address != address)
             {
                 return Err(LiveError::InvalidArguments);
             }
-            peers.retain(|p| p.public_key != grant.claims.public_key);
+            peers.retain(|p| p.public_key != public_key);
         }
     }
     Ok(peers)
@@ -149,33 +147,37 @@ fn expected_after(
 /// The transaction implementation is separately testable with a FakeOps
 /// that cannot execute any system command or modify any network device.
 trait MutationOps {
-    fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError>;
-    fn write(&mut self, store: &LedgerStore, grant: &Grant, change: Change)
-        -> Result<bool, ApplyError>;
-    fn mutate(&mut self, grant: &Grant, change: Change)
-        -> Result<(), ApplyError>;
+    fn snapshot(&mut self, store: &LedgerStore) -> Result<Vec<Peer>, ApplyError>;
+    fn write(&mut self, store: &LedgerStore, change: PeerChange<'_>) -> Result<bool, ApplyError>;
+    fn mutate(&mut self, change: PeerChange<'_>) -> Result<(), ApplyError>;
 }
 
-struct SystemOps<'a> { interface: &'a str }
+struct SystemOps<'a> {
+    interface: &'a str,
+    #[cfg(feature = "linux-fresh-consume-gate")]
+    expected_server_key: Option<&'a str>,
+}
 impl MutationOps for SystemOps<'_> {
-    fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError> {
+    fn snapshot(&mut self, _store: &LedgerStore) -> Result<Vec<Peer>, ApplyError> {
+        #[cfg(feature = "linux-fresh-consume-gate")]
+        if let Some(expected) = self.expected_server_key {
+            return crate::wg_conf_audit::read_verified_identity_snapshot(
+                _store, self.interface, expected
+            ).map_err(ApplyError::Readback);
+        }
         read_verified_snapshot(self.interface).map_err(ApplyError::Readback)
     }
-    fn write(&mut self, store: &LedgerStore, grant: &Grant, change: Change)
-        -> Result<bool, ApplyError>
-    {
-        write_pinned_config(store, self.interface, grant, change)
+    fn write(&mut self, store: &LedgerStore, change: PeerChange<'_>) -> Result<bool, ApplyError> {
+        write_pinned_config(store, self.interface, change)
             .map_err(ApplyError::Config)
     }
-    fn mutate(&mut self, grant: &Grant, change: Change)
-        -> Result<(), ApplyError>
-    {
-        set_one_peer(self.interface, grant, change).map_err(ApplyError::Live)
+    fn mutate(&mut self, change: PeerChange<'_>) -> Result<(), ApplyError> {
+        set_one_peer(self.interface, change).map_err(ApplyError::Live)
     }
 }
 
 /// The only finalization path: with the same durable authority lock held,
-/// validate the exact pending grant, compare pre-state, write config,
+/// validate the exact pending grant or revoking device, compare pre-state, write config,
 /// mutate just the target peer, read back, then finally commit the ledger.
 /// Any error leaves a *nonterminal* Pending/Revoking state. A repeat request
 /// is NOT permission to redo the update without trusted reconciliation.
@@ -183,32 +185,30 @@ fn apply_with_ops(
     store: &mut LedgerStore, grant: &Grant,
     operation: Change, ops: &mut impl MutationOps,
 ) -> Result<(), ApplyError> {
+    apply_with_ops_and_confirm(store, PeerChange::Invitation(grant, operation), ops, |store, after| {
+        let id = &grant.claims.invite_id;
+        store.update(|ledger| match operation {
+            Change::Add => ledger.confirm_consumed(id, Some(after)).map(|_| ()),
+            Change::Remove => ledger.confirm_revocation(id, Some(after)),
+        }).map_err(ApplyError::Ledger)
+    })
+}
+
+// One shared protected writer and exact readback path. The finalizer is
+// crate-private and cannot be selected by a request or external caller.
+fn apply_with_ops_and_confirm(
+    store: &mut LedgerStore, change: PeerChange<'_>, ops: &mut impl MutationOps,
+    confirm: impl FnOnce(&mut LedgerStore, &[Peer]) -> Result<(), ApplyError>,
+) -> Result<(), ApplyError> {
     let ledger = store.view().map_err(ApplyError::Ledger)?;
-    let prepared = match (operation, ledger.state(&grant.claims.invite_id)) {
-        (Change::Add, Some(InviteState::Pending(g))) => g == grant,
-        (Change::Remove, Some(InviteState::Revoking(g))) => g == grant,
-        _ => false,
-    };
-    if !prepared { return Err(ApplyError::Live(LiveError::InvalidArguments)); }
-    let before = ops.snapshot()?;
-    let expected = expected_after(&before, grant, operation).map_err(ApplyError::Live)?;
-    let changed = ops.write(store, grant, operation)?;
-    if changed { ops.mutate(grant, operation)?; }
-    let after = ops.snapshot()?;
+    if !change.prepared(ledger) { return Err(ApplyError::Live(LiveError::InvalidArguments)); }
+    let before = ops.snapshot(store)?;
+    let expected = expected_after(&before, change).map_err(ApplyError::Live)?;
+    let changed = ops.write(store, change)?;
+    if changed { ops.mutate(change)?; }
+    let after = ops.snapshot(store)?;
     require_exact_match(&expected, &after).map_err(ApplyError::Readback)?;
-    match operation {
-        Change::Add => {
-            store.update(|ledger| ledger.confirm_consumed(
-                &grant.claims.invite_id, Some(&after)
-            )).map_err(ApplyError::Ledger)?;
-        }
-        Change::Remove => {
-            store.update(|ledger| ledger.confirm_revocation(
-                &grant.claims.invite_id, Some(&after)
-            )).map_err(ApplyError::Ledger)?;
-        }
-    }
-    Ok(())
+    confirm(store, &after)
 }
 
 /// A production-capable entrypoint but not wired to the current server:
@@ -218,13 +218,74 @@ pub fn apply_and_confirm(
     store: &mut LedgerStore, interface: &str,
     grant: &Grant, operation: Change,
 ) -> Result<(), ApplyError> {
-    apply_with_ops(store, grant, operation, &mut SystemOps { interface })
+    apply_with_ops(store, grant, operation, &mut SystemOps {
+        interface,
+        #[cfg(feature = "linux-fresh-consume-gate")]
+        expected_server_key: None,
+    })
+}
+
+/// Used only by the authenticated fresh-consume adapter. No identity
+/// downgrade to the older inventory-only snapshot path on either read.
+#[cfg(feature = "linux-fresh-consume-gate")]
+pub(crate) fn apply_fresh_and_confirm(
+    store: &mut LedgerStore, interface: &str, expected_server_key: &str,
+    grant: &Grant,
+) -> Result<(), ApplyError> {
+    apply_with_ops(store, grant, Change::Add, &mut SystemOps {
+        interface,
+        expected_server_key: Some(expected_server_key),
+    })
+}
+
+/// The local administrator uses the same pinned identity before and after removing a peer.
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn apply_revocation_and_confirm(
+    store: &mut LedgerStore, interface: &str, expected_server_key: &str, grant: &Grant,
+) -> Result<(), ApplyError> {
+    apply_with_ops(store, grant, Change::Remove, &mut SystemOps {
+        interface,
+        expected_server_key: Some(expected_server_key),
+    })
+}
+
+#[cfg(feature = "linux-pairing-process")]
+pub(crate) fn apply_existing_revocation_and_confirm(
+    store: &mut LedgerStore, interface: &str, expected_server_key: &str,
+    device_id: &str, device: &ExistingDevice,
+) -> Result<(), ApplyError> {
+    let target = PeerChange::ExistingRemoval { device_id, device };
+    apply_with_ops_and_confirm(store, target, &mut SystemOps {
+        interface,
+        expected_server_key: Some(expected_server_key),
+    }, |store, peers| {
+        store.update(|ledger| ledger.confirm_existing_revocation(device_id, peers))
+            .map_err(ApplyError::Ledger)
+    })
+}
+
+/// Stage 2 finalizes the exact peer and original response in one durable
+/// Consumed commit. No success material is returned by the WG writer.
+#[cfg(feature = "linux-authorization-response")]
+pub(crate) fn apply_fresh_and_confirm_authorized(
+    store: &mut LedgerStore, interface: &str, expected_server_key: &str,
+    grant: &Grant, material: crate::ledger_disk::AuthorizationMaterial,
+) -> Result<(), ApplyError> {
+    if material.grant != *grant {
+        return Err(ApplyError::Live(LiveError::InvalidArguments));
+    }
+    apply_with_ops_and_confirm(store, PeerChange::Invitation(grant, Change::Add), &mut SystemOps {
+        interface, expected_server_key: Some(expected_server_key),
+    }, |store, after| {
+        store.confirm_authorized(material, after).map_err(ApplyError::Ledger)?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Claims;
+    use crate::{Claims, InviteState};
     use std::net::Ipv4Addr;
 
     fn grant() -> Grant {
@@ -261,16 +322,21 @@ mod tests {
         }
     }
     impl MutationOps for FakeOps {
-        fn snapshot(&mut self) -> Result<Vec<Peer>, ApplyError> {
+        fn snapshot(&mut self, _store: &LedgerStore) -> Result<Vec<Peer>, ApplyError> {
             if self.fail_readback || (self.fail_post_change_readback && self.changes > 0) {
                 return Err(ApplyError::Live(LiveError::TimedOut));
             }
             require_exact_match(&self.live,&self.disk).map_err(ApplyError::Readback)?;
             Ok(self.live.clone())
         }
-        fn write(&mut self, store: &LedgerStore, grant: &Grant, op: Change)
+        fn write(&mut self, store: &LedgerStore, change: PeerChange<'_>)
             -> Result<bool, ApplyError>
         {
+            let (grant, op) = match change {
+                PeerChange::Invitation(grant, op) => (grant, op),
+                #[cfg(feature = "linux-pairing-process")]
+                PeerChange::ExistingRemoval { .. } => panic!("invitation fixture received an existing device"),
+            };
             let state = store.view().map_err(ApplyError::Ledger)?
                 .state(&grant.claims.invite_id);
             assert!(matches!(
@@ -282,15 +348,15 @@ mod tests {
             ), "external write must only occur AFTER the durable deny state");
             self.writes += 1;
             if self.fail_write { return Err(ApplyError::Config(AtomicError::Io)); }
-            let next = expected_after(&self.disk,grant,op).map_err(ApplyError::Live)?;
+            let next = expected_after(&self.disk,change).map_err(ApplyError::Live)?;
             let changed = next != self.disk;
             self.disk = next;
             Ok(changed)
         }
-        fn mutate(&mut self, grant: &Grant, op: Change) -> Result<(), ApplyError> {
+        fn mutate(&mut self, change: PeerChange<'_>) -> Result<(), ApplyError> {
             self.changes += 1;
             if self.fail_change { return Err(ApplyError::Live(LiveError::CommandFailed)); }
-            self.live = expected_after(&self.live,grant,op).map_err(ApplyError::Live)?;
+            self.live = expected_after(&self.live,change).map_err(ApplyError::Live)?;
             Ok(())
         }
     }
@@ -435,7 +501,7 @@ mod tests {
             public_key:format!("{}=","B".repeat(43)),
             address:Ipv4Addr::new(10,66,0,3),
         };
-        let expected=expected_after(&[unrelated.clone()],&g,Change::Add).unwrap();
+        let expected=expected_after(&[unrelated.clone()],PeerChange::Invitation(&g,Change::Add)).unwrap();
         assert_eq!(expected.len(),2);
         assert!(expected.contains(&unrelated));
         assert!(expected.contains(&Peer {
@@ -446,21 +512,21 @@ mod tests {
     fn revoke_existing_or_already_missing_peer_is_idempotent() {
         let g=grant();
         let current=Peer{public_key:g.claims.public_key.clone(),address:g.address};
-        assert_eq!(expected_after(&[current],&g,Change::Remove).unwrap(),vec![]);
-        assert_eq!(expected_after(&[],&g,Change::Remove).unwrap(),vec![]);
+        assert_eq!(expected_after(&[current],PeerChange::Invitation(&g,Change::Remove)).unwrap(),vec![]);
+        assert_eq!(expected_after(&[],PeerChange::Invitation(&g,Change::Remove)).unwrap(),vec![]);
     }
     #[test]
     fn revoke_wrong_ip_or_add_duplicate_target_is_refused() {
         let g=grant();
         let wrong=Peer{public_key:g.claims.public_key.clone(),
             address:Ipv4Addr::new(10,66,0,9)};
-        assert_eq!(expected_after(&[wrong.clone()],&g,Change::Remove),
+        assert_eq!(expected_after(&[wrong.clone()],PeerChange::Invitation(&g,Change::Remove)),
             Err(LiveError::InvalidArguments));
-        assert_eq!(expected_after(&[wrong],&g,Change::Add),
+        assert_eq!(expected_after(&[wrong],PeerChange::Invitation(&g,Change::Add)),
             Err(LiveError::InvalidArguments));
         let wrong_key=Peer{public_key:format!("{}=","B".repeat(43)),
             address:g.address};
-        assert_eq!(expected_after(&[wrong_key],&g,Change::Remove),
+        assert_eq!(expected_after(&[wrong_key],PeerChange::Invitation(&g,Change::Remove)),
             Err(LiveError::InvalidArguments));
     }
 }

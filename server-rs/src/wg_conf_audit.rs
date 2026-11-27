@@ -306,8 +306,41 @@ pub fn read_verified_snapshot(interface: &str) -> Result<Vec<Peer>, ConfigError>
 pub fn read_verified_identity_snapshot(store: &LedgerStore, interface: &str,
     expected_public_key: &str) -> Result<Vec<Peer>, ConfigError>
 {
-    if !canonical_key(expected_public_key) { return Err(ConfigError::IdentityMismatch); }
+    use crate::existing_devices::ExistingDeviceState::{Active, Revoked, Revoking};
+
     let generation = store.generation().map_err(|_| ConfigError::InvalidAuthority)?;
+    let result=identity_snapshot(interface,expected_public_key)?;
+    if store.generation().map_err(|_| ConfigError::InvalidAuthority)? != generation {
+        return Err(ConfigError::InvalidAuthority);
+    }
+    let ledger = store.view().map_err(|_| ConfigError::InvalidAuthority)?;
+    for (_, device) in ledger.existing_devices() {
+        let observed = result.iter().find(|peer| peer.public_key == device.public_key);
+        let exact = observed.is_some_and(|peer| peer.address == device.address);
+        let consistent = match device.state {
+            Active => exact,
+            Revoking => exact || (observed.is_none()
+                && result.iter().all(|peer| peer.address != device.address)),
+            Revoked => observed.is_none(),
+        };
+        if !consistent {
+            return Err(ConfigError::SnapshotMismatch);
+        }
+    }
+    Ok(result)
+}
+
+// Inventory does not prove history. Provisioning verifies history separately.
+#[cfg(feature = "linux-fresh-provisioning")]
+pub(crate) fn require_initial_inventory(interface: &str, server_key: &str, peers: &[Peer])
+    -> Result<(), ConfigError>
+{
+    require_exact_match(&identity_snapshot(interface, server_key)?, peers)
+}
+
+#[cfg(feature = "linux-fresh-consume-gate")]
+fn identity_snapshot(interface:&str,expected_public_key:&str)->Result<Vec<Peer>,ConfigError> {
+    if !canonical_key(expected_public_key) { return Err(ConfigError::IdentityMismatch); }
     let reader = LiveWgReader::new(interface).map_err(ConfigError::InvalidPeers)?;
     let check_key = || {
         if reader.server_public_key().map_err(ConfigError::InvalidPeers)? != expected_public_key {
@@ -331,9 +364,6 @@ pub fn read_verified_identity_snapshot(store: &LedgerStore, interface: &str,
     if result.iter().any(|p| !canonical_key(&p.public_key)
         || p.public_key == expected_public_key) {
         return Err(ConfigError::IdentityMismatch);
-    }
-    if store.generation().map_err(|_| ConfigError::InvalidAuthority)? != generation {
-        return Err(ConfigError::InvalidAuthority);
     }
     Ok(result)
 }
