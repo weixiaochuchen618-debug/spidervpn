@@ -1768,12 +1768,12 @@ mod identity_gate {
         assert!(fs::read(&conf).unwrap().as_slice()==durable_conf.as_slice());
         assert_eq!(reader.snapshot().unwrap(),observed);
 
-        let revoke = |device_id: &str| {
+        let revoke = |metadata_pin: &str, device_id: &str| {
             Command::new(env!("CARGO_BIN_EXE_spidervpn-pair-service")).env_clear()
-                .args(["revoke", root.to_str().unwrap(), IFACE, &mp, &config_pin, &pin, device_id])
+                .args(["revoke", root.to_str().unwrap(), IFACE, metadata_pin, &config_pin, &pin, device_id])
                 .stdin(Stdio::null()).output().unwrap()
         };
-        let wrong_device = revoke("77777777-7777-4777-8777-777777777777");
+        let wrong_device = revoke(&mp, "77777777-7777-4777-8777-777777777777");
         assert!(wrong_device.status.code() == Some(2) && wrong_device.stdout.is_empty());
         assert!(fs::read(&ledger).unwrap() == committed);
         assert!(fs::read(&conf).unwrap().as_slice() == durable_conf.as_slice());
@@ -1783,7 +1783,7 @@ mod identity_gate {
             assert!(out.status.success() && out.stderr.is_empty());
             assert!(out.stdout == b"PAIR_DEVICE_REVOKED\n");
         };
-        succeeded(revoke(DEV));
+        succeeded(revoke(&mp, DEV));
         store=open(&root);
         assert_eq!(store.generation().unwrap(), 5);
         assert!(matches!(store.view().unwrap().state(id), Some(InviteState::Revoked(saved)) if *saved == grant));
@@ -1791,7 +1791,7 @@ mod identity_gate {
         drop(store);
         let revoked_ledger = fs::read(&ledger).unwrap();
         let revoked_conf = Zeroizing::new(fs::read(&conf).unwrap());
-        succeeded(revoke(DEV));
+        succeeded(revoke(&mp, DEV));
         assert!(exchange(addr,&ca,&leaf,&get)==(403,json!({"Ok":false,"Code":"Revoked"})));
         assert!(exchange(addr,&ca,&leaf,&post)==(403,json!({"Ok":false,"Code":"Revoked"})));
         service.stop(libc::SIGTERM);
@@ -1804,6 +1804,86 @@ mod identity_gate {
         assert!(fs::read(&ledger).unwrap() == revoked_ledger);
         assert!(fs::read(&conf).unwrap().as_slice() == revoked_conf.as_slice());
         assert!(reader.snapshot().unwrap().is_empty());
+
+        // Issue another operational code with the same protected authority.
+        let issuance = Command::new(env!("CARGO_BIN_EXE_spidervpn-pair-service"))
+            .env_clear()
+            .args(["issue-invite", root.to_str().unwrap(), IFACE, &mp, &config_pin,
+                &pin, "3600", "second authorized device"])
+            .stdin(Stdio::null()).output().unwrap();
+        assert!(issuance.status.success() && issuance.stderr.is_empty());
+        let output = String::from_utf8(issuance.stdout).unwrap();
+        let second_pin = output.strip_prefix("PAIR_INVITATION_READY ").unwrap().trim_end();
+        let second_slot = root.join(format!("invite-{second_pin}"));
+        let second_metadata = fs::read(second_slot.join("invite-metadata.json")).unwrap();
+        assert!(second_pin == sha(&second_metadata) && second_pin != mp);
+        assert!(fs::read(root.join("invite-metadata.json")).unwrap() == meta);
+        assert!(fs::read(&code_path).unwrap() == code.as_bytes());
+        assert!(fs::read(&conf).unwrap().as_slice() == revoked_conf.as_slice());
+        assert!(reader.snapshot().unwrap().is_empty());
+
+        let second_path = second_slot.join("invitation-code.txt");
+        assert_eq!(fs::metadata(&second_path).unwrap().mode() & 0o7777, 0o600);
+        let second_code = Zeroizing::new(fs::read_to_string(&second_path).unwrap());
+        let second_bytes = Zeroizing::new(B64.decode(second_code.trim().strip_prefix("TCI1.").unwrap()).unwrap());
+        let second: Value = serde_json::from_slice(&second_bytes).unwrap();
+        let second_id = second["i"].as_str().unwrap();
+        let second_token = second["k"].as_str().unwrap();
+        assert!(second_id != id && second_token != token);
+        assert!(second["h"] == cv["h"] && second["p"] == cv["p"] && second["t"] == pin);
+        let store = open(&root);
+        assert_eq!(store.generation().unwrap(), 6);
+        assert!(matches!(store.view().unwrap().state(second_id), Some(InviteState::Open)));
+        assert!(matches!(store.view().unwrap().state(id), Some(InviteState::Revoked(saved)) if *saved == grant));
+        drop(store);
+
+        // A committed row without published metadata cannot start its listener.
+        let pending = root.join(format!(".invite-{second_id}.pending"));
+        fs::rename(&second_slot, &pending).unwrap();
+        Process::spawn(&root, second_pin, &config_pin, &pin).refused();
+        fs::rename(&pending, &second_slot).unwrap();
+
+        let mut second_service = Process::spawn(&root, second_pin, &config_pin, &pin);
+        second_service.ready(addr);
+        let second_get = wire(second_id, "GET", host, second_token, None);
+        let (status, response) = exchange(addr, &ca, &leaf, &second_get);
+        assert!(status == 200 && response["Data"]["Status"] == "InvitationReady");
+
+        let second_device = "34000000-0000-4000-8000-000000000001";
+        let second_request = "34000000-0000-4000-8000-000000000002";
+        let second_key = base64::engine::general_purpose::STANDARD.encode([42; 32]);
+        let second_issued = utc_at(second["e"].as_i64().unwrap() - 3600);
+        let mut request = request.clone();
+        request["InviteId"] = json!(second_id);
+        request["ClientRequest"]["RequestId"] = json!(second_request);
+        request["ClientRequest"]["DeviceId"] = json!(second_device);
+        request["ClientRequest"]["ClientPublicKey"] = json!(second_key);
+        request["ClientRequest"]["CreatedAtUtc"] = json!(second_issued);
+        request["CreatedAtUtc"] = json!(second_issued);
+        request["RequestDigest"] = json!(sha(format!(
+            "1\nTradeChannel.ClientRequest\n{second_request}\n{second_device}\n{second_issued}\n{second_key}\nIPv4",
+        ).as_bytes()));
+        let second_body = serde_json::to_vec(&json!({"PairRequest": recipient.sign(&request)})).unwrap();
+        let second_post = wire(second_id, "POST", host, second_token, Some(&second_body));
+        let (status, response) = exchange(addr, &ca, &leaf, &second_post);
+        assert!(status == 200 && response["Ok"] == true);
+        let store = open(&root);
+        assert_eq!(store.generation().unwrap(), 8);
+        assert!(matches!(store.view().unwrap().state(second_id), Some(InviteState::Consumed(saved))
+            if saved.claims.device_id == second_device));
+        let peers = read_verified_identity_snapshot(&store, IFACE, &expected).unwrap();
+        assert!(peers.len() == 1 && peers[0].public_key == second_key);
+        drop(store);
+        succeeded(revoke(second_pin, second_device));
+        second_service.stop(libc::SIGTERM);
+
+        let mut restarted = Process::spawn(&root, &mp, &config_pin, &pin);
+        restarted.ready(addr);
+        assert!(exchange(addr, &ca, &leaf, &get) == (403, json!({"Ok":false,"Code":"Revoked"})));
+        assert!(exchange(addr, &ca, &leaf, &post) == (403, json!({"Ok":false,"Code":"Revoked"})));
+        restarted.stop(libc::SIGTERM);
+        assert!(reader.snapshot().unwrap().is_empty());
+        println!("Second invitation verified: same ledger, real enrollment and revocation, original invite still revoked");
 
         // Reuse the protected materials and TLS client for a separate Rust
         // root over the four-peer legacy shape: deployment plus three V2 grants.

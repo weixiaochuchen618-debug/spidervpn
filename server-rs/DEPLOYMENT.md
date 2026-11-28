@@ -40,7 +40,7 @@ Prepare a protected material directory (0700, trusted root-owned ancestors) cont
 
 NEW_ROOT must be a nonexistent child of an existing trusted root-owned 0700 parent, separate from material root, never a current or historical authority location. Lifetime 60–86400 seconds; canonical non-loopback IPv4, port 1024–65535; name 1–64 valid characters. The exact TCI1 code is in `invitation-code.txt` (0600); never log or pass it through argv or environment. Only after successful exit and FRESH_AUTHORITY_READY, transfer the code privately to the intended client. `metadata-pin.txt` contains the new metadata digest for the trusted operator to record and pass to unchanged serve with original config/TLS pins. It is a trusted local creation handoff, not independent provisioning on another host. Keep the code file protected; never include it in shared diagnostics/backups. Serve remains loopback-only.
 
-All output uses exclusive creation; the durable validated Open ledger is published last without replacement, with an incomplete marker blocking serve until state is synced. Existing roots, including partial state, reject init. On failure leave root/marker untouched, never retry under another name or remove marker; seek explicit recovery authority. If final marker removal sync fails, ledger bytes were already synced, but publication is uncertain: stop. No anti-rollback or privileged adversary guarantee. Single initial invite; future issuance/renewal, rollout/rollback, public exposure and actual Windows pairing require separate approval.
+All output uses exclusive creation; the durable validated Open ledger is published last without replacement, with an incomplete marker blocking serve until state is synced. Existing roots, including partial state, reject init. On failure leave root/marker untouched, never retry under another name or remove marker; seek explicit recovery authority. If final marker removal sync fails, ledger bytes were already synced, but publication is uncertain: stop. No anti-rollback or privileged adversary guarantee. The initializer issues one invitation. Rollout, public exposure and actual Windows pairing require separate approval.
 
 ## Initialize from verified TradeChannel history
 
@@ -55,3 +55,15 @@ Put `existing-history.json` in the same protected material directory with mode 0
 Run against the isolated interface and protected `/etc/wireguard/WG_INTERFACE.conf`. Initialization checks the exact server identity and active peer set in both kernel and config. It verifies the original V2 signatures and request bindings, archives the snapshot unchanged, and publishes separate device records and a fresh Rust invitation. Previously consumed invitations stay closed and expired invitations retain their expiry. A still-valid legacy Open invitation blocks initialization.
 
 Use the current data root on restart. If a revocation leaves the kernel and config divergent, the device remains `Revoking` and the command reports failure. Reconcile the isolated peer views before retry. An earlier binary that cannot read the device records is ineligible for rollback. The old TradeChannel boot config path and its writer handoff require separate live cutover validation.
+
+## Issue another invitation from the current authority
+
+With the `linux-fresh-provisioning` build, an authorized root operator can issue a new TCI1 invitation from the existing authority. Use the trusted pins from a successful initialization or previous issuance. Keep the writer fence in place. The command reuses the signed pairing address and TLS port and checks the current WireGuard server binding, live peers and protected config while holding the ledger lock.
+
+```text
+/path/to/verified/spidervpn-pair-service issue-invite ROOT WG_INTERFACE METADATA_SHA256 CONFIG_SHA256 TLS_SHA256 LIFETIME_SECONDS NAME
+```
+
+On exit 0, `PAIR_INVITATION_READY <new-metadata-pin>` identifies the new invitation. Transfer the code from `ROOT/invite-<new-metadata-pin>/invitation-code.txt` (0600) privately. Use the new pin in the existing `serve` and `revoke` commands for this invitation. The listener handles the invitation selected by its pin. To serve the new invitation on the same loopback port, stop the previous listener, verify it exited, and start the listener with the new pin. The ledger, keys and WireGuard configuration remain shared across invitations.
+
+If issuance fails, inspect the current root before issuing again. An unpublished `.invite-*.pending` directory may accompany an unused Open record. Keep it private and use a code only after successful publication. Earlier executables that only read the initial metadata cannot serve new invitation pins. Preserve the current ledger across any binary change.

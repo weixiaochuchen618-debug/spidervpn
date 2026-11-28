@@ -47,8 +47,10 @@ fn protect_local_process(privilege_error: &'static str) -> Result<(), &'static s
 fn run() -> Result<(), &'static str> {
     let args:Vec<_>=std::env::args_os().skip(1).collect();
     #[cfg(feature = "linux-fresh-provisioning")]
-    if matches!(args.first().and_then(|s|s.to_str()), Some("init-fresh" | "init-existing")) {
-        return initialize(&args);
+    match args.first().and_then(|s| s.to_str()) {
+        Some("init-fresh" | "init-existing") => return initialize(&args),
+        Some("issue-invite") => return issue_invite(&args),
+        _ => {}
     }
     if args.first().and_then(|s|s.to_str())==Some("revoke") {
         return revoke(&args);
@@ -89,6 +91,28 @@ fn revoke(args: &[std::ffi::OsString]) -> Result<(), &'static str> {
     revoke_local_device(PathBuf::from(root), interface.to_owned(), metadata_pin.to_owned(),
         config_pin, tls_pin, device_id).map_err(|_|"device revocation refused; inspect current authority and peer state")?;
     println!("PAIR_DEVICE_REVOKED");
+    Ok(())
+}
+
+#[cfg(feature = "linux-fresh-provisioning")]
+fn issue_invite(args: &[std::ffi::OsString]) -> Result<(), &'static str> {
+    use spidervpn_pairing_authority::service_provisioning::issue_local_invite;
+
+    let [_, root, interface, metadata_pin, config_pin, tls_pin, lifetime, name] = args else {
+        return Err("usage: issue-invite ROOT INTERFACE METADATA_SHA256 CONFIG_SHA256 TLS_SHA256 LIFETIME_SECONDS NAME");
+    };
+    let interface = interface.to_str().ok_or("invalid interface")?;
+    let metadata_pin = metadata_pin.to_str().ok_or("invalid pin")?;
+    let config_pin = config_pin.to_str().ok_or("invalid pin")?;
+    let tls_pin = tls_pin.to_str().ok_or("invalid pin")?;
+    let lifetime = lifetime.to_str().and_then(|value| value.parse().ok()).ok_or("invalid lifetime")?;
+    let name = name.to_str().ok_or("invalid name")?;
+    protect_local_process("invitation issuance privileged startup refused")?;
+
+    let pin = issue_local_invite(std::path::Path::new(root), interface, metadata_pin, config_pin,
+        tls_pin, lifetime, name)
+        .map_err(|_| "invitation issuance refused; inspect current authority before retrying")?;
+    println!("PAIR_INVITATION_READY {pin}");
     Ok(())
 }
 

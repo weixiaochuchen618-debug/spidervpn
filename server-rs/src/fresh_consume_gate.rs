@@ -523,6 +523,8 @@ pub(crate) fn preflight_service_metadata(store: &LedgerStore, raw: &[u8], pin: &
         invite_id: scope.invite_id.to_owned(),
         server_public_key: server_public_key.to_owned(),
         peers,
+        #[cfg(feature = "linux-fresh-provisioning")]
+        advertised_endpoint: (scope.public_host.to_owned(), scope.port),
     })
 }
 
@@ -531,6 +533,8 @@ pub(crate) struct VerifiedLocalScope {
     pub(crate) invite_id: String,
     pub(crate) server_public_key: String,
     pub(crate) peers: Vec<Peer>,
+    #[cfg(feature = "linux-fresh-provisioning")]
+    pub(crate) advertised_endpoint: (String, u16),
 }
 
 /// Exact POST consume envelope, bearer + independently signed invitation +
