@@ -1353,3 +1353,11 @@ PR/commit/CI: ...
 - **#94 实机产品收敛**：用户转交PC1 12:42–12:45 UTC只读报告（REPORTED_LOCAL，非A现场亲验）：测试peer未撤销、授权/manifest/内核身份及/32一致、无冲突、资源hash一致；UDP51820监听和本机放行，最近握手12:18:13Z、当前loopback endpoint与兼容转发一致、RX13424/TX32532稳定、PC1现役连接持续，无写入/重启。未证明历史标准成功握手或上游拦截及精确故障原因。继承PC2精确PR99 4c0e2547df1d579d013f8fb443f402a17edc6653兼容实际HTTP204/LineServer及代理恢复通过，IPV4_PROBE_FIX_ACCEPTED_SCOPED / COMPATIBLE_TUNNEL_PASS_REPORTED_LOCAL / STANDARD_UDP_EGRESS_FAIL_REPORTED_LOCAL_OPTIONAL_NONBLOCKING。撤销§107 PC1/PC2进一步UDP-only诊断及同步复测权限；无新测试/源码/CI/审计；C STOP_WRITE，#99冻结。#94 OPEN仅保留实际生命周期/集成待办，不以UDP单独失败阻塞；自动重连及WFP真实验收仍未证明。
 - **#95 Stage3正式限定验收**：[COORD7192798533](https://github.com/weixiaochuchen618-debug/spidervpn/issues/95#issuecomment-7192798533)，B终态7192655526/7192656651，D独立双终验7192678210/7192679127。精确ccb314b1d2fa4c42a7acaa90c2de413d0da00f95，父48732677876b31e3cf90b981af0e28d316db9a07，4 workflow/5 job/82步success，A本轮核原生四workflow45813568622/45813568562/45813568694/45813568600，继承实际TLS GET/POST、持久授权重试及netns内核证据。COORD_ACCEPTED_SCOPED / STAGE3_TLS_NETNS_NATIVE_PASS / SECURITY_PARTIAL。B STOP_WRITE、D限定审查完成，Stage4须另明确部署入口、可信配置、最小文件和锁；下一产品里程碑受控部署回滚与实际Windows配对（含GET-first重试），任一安全传输可用即可，不重复Stage2/3审计。未实际VPS部署/Windows配对/公开监听/迁移，无新Stage4写权。
 - **恢复HEAD及锁**：main857ea7593941ce79f6507db5b1ced076c3a077ba、累计C3 5189ecfe5e3774b99583b6e2a7554ab0b1b4459f、#97 1689858d55a97a5196d4e52857022d43968c397d、#98 ccb314b1d2fa4c42a7acaa90c2de413d0da00f95、#99 4c0e2547df1d579d013f8fb443f402a17edc6653均实际compare identical/0/0；接管前docs dbb870dd2db10312e43e826c7be21f576d913a30 identical。#96 WFP可信历史/旧writer围栏阻塞及WFP05 NOT RUN不变。A仅文档/调度，B/C STOP_WRITE，D STRICT_READ_ONLY无新审查任务。无真实环境改动、无main/merge，#52/#94/#95/#96 OPEN，SECURITY_PARTIAL。
+
+## D.157. 2026-11-28 传输验收标准与受限线路结案
+
+按产品负责人确认，标准 UDP 和兼容 TCP 各在支持该传输的服务器或线路上通过一次真实端到端验收即可。两次可以使用不同环境。凭证据确认认证隧道出网和正常收尾，记录实际提交及测试环境。单条线路使用已验证的任一可用传输即可。
+
+`mvp04-debug` 的服务器环境限制 UDP，017 的 UDP 自检失败按已知线路限制结案，对产品交付无阻塞。ELEVEN 在 `7265ca846a4b733b20397fa5c9453cf666ed74e1` 实测兼容 TCP 认证 HTTP 204。UDP 自检失败后自动回退一次，恢复 TCP 认证出网，断开后四项代理完整还原。此线路停止 UDP 专项复测、排障、修补和追加审计。[017 实机回执](https://github.com/weixiaochuchen618-debug/spidervpn/issues/95#issuecomment-7235738474) · [产品主线](https://github.com/weixiaochuchen618-debug/spidervpn/issues/94#issuecomment-7212384390)
+
+本节为 §108 和 D.156 的传输验收补充。后续按[长期产品传输验收规则](../agents/README.md#长期产品传输验收规则用户-2026-11-28-确认)处理。
