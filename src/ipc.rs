@@ -540,8 +540,9 @@ fn auto_reroute_json(ctx: &Ctx, raw: &str) -> String {
     if !busy(ctx) {
         return refuse_with_code("当前没有连接，不需要自动切换", "state");
     }
-    let from = crate::engine_config::actual_transport(&ctx.root.join("runtime-engine.json"))
-        .unwrap_or_else(|| line.effective_transport());
+    let engine_path = ctx.root.join("runtime-engine.json");
+    let from_actual = crate::engine_config::actual_transport(&engine_path);
+    let from = from_actual.unwrap_or_else(|| line.effective_transport());
     let alternate = match from {
         Transport::Udp => Transport::Tcp,
         Transport::Tcp => Transport::Udp,
@@ -563,22 +564,34 @@ fn auto_reroute_json(ctx: &Ctx, raw: &str) -> String {
     // 网络整体换了：必须断开后再测两个候选——连接中测当前标准连接会打断它自己。
     // 断开之后无论测出什么都要重连，所以这一条路径一定有一次短暂断线。
     if reason == "network" {
-        let reply = reroute_probe_cycle(ctx, &cfg, &line, &binary, from, now);
-        match reply {
-            Err(error) => {
-                view["Note"] = serde_json::json!(format!("切换没有完成：{error}"));
-            }
-            Ok(winner) => {
-                view["To"] = serde_json::json!(winner.id());
-                view["Switched"] = serde_json::json!(winner != from);
-                view["Note"] = if winner == from {
+        if !cfg.current_line().is_some_and(|current| current.id == line.id) {
+            return refuse_with_code("只能自动重连当前选中的线路", "state");
+        }
+        let previous = from_actual
+            .filter(|_| crate::selfcheck::current_qualified_trade_pass(&ctx.root));
+        match reroute_probe_cycle(ctx, &cfg, &line, &binary, previous, now) {
+            Ok((actual, recovered)) => {
+                view["To"] = serde_json::json!(actual.id());
+                view["Switched"] = serde_json::json!(actual != from);
+                view["Note"] = if recovered {
+                    serde_json::json!(format!(
+                        "新方式未通过认证自检，已恢复到{}并通过认证自检",
+                        actual.label()
+                    ))
+                } else if actual == from {
                     serde_json::json!(format!(
                         "网络已变化，已重测并重新连接（仍使用{}）",
-                        winner.label()
+                        actual.label()
                     ))
                 } else {
-                    serde_json::json!(format!("网络已变化，已切换到{}", winner.label()))
+                    serde_json::json!(format!("网络已变化，已切换到{}", actual.label()))
                 };
+            }
+            Err(error) => {
+                if let Some(actual) = crate::engine_config::actual_transport(&engine_path) {
+                    view["To"] = serde_json::json!(actual.id());
+                }
+                view["Note"] = serde_json::json!(format!("切换没有完成：{error}"));
             }
         }
         return serde_json::json!({"ok": true, "autoReroute": view}).to_string();
@@ -614,63 +627,76 @@ fn auto_reroute_json(ctx: &Ctx, raw: &str) -> String {
     serde_json::json!({"ok": true, "autoReroute": view}).to_string()
 }
 
-/// 断开 → 探测两个候选 → 重连。返回重连实际使用的方式。
+/// 网络变化时，候选探测只负责选路。新会话须独立通过认证自检。
 fn reroute_probe_cycle(
     ctx: &Ctx,
     cfg: &crate::config::AppConfig,
     line: &crate::config::LineConfig,
     binary: &std::path::Path,
-    fallback: Transport,
+    previous: Option<Transport>,
     now_unix: i64,
-) -> Result<Transport, String> {
-    let reply_of = |text: String| {
-        serde_json::from_str::<serde_json::Value>(&text)
-            .unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "宿主回包不是合法 JSON"}))
-    };
-    let disconnected = reply_of(disconnect_json(ctx));
-    if disconnected.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        let message = disconnected
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("断开没有完成");
-        return Err(format!("断开失败：{message}"));
-    }
-    let evidence = crate::autoroute::probe_line(&ctx.root, cfg, line, binary, now_unix);
-    let winner = evidence.winner.unwrap_or(fallback);
-    let connected = reply_of(connect_json(ctx));
-    if connected.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        let message = connected
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("重连没有完成");
-        return Err(format!("重连失败：{message}"));
-    }
-    Ok(winner)
+) -> Result<(Transport, bool), String> {
+    require_reroute_step(disconnect_json(ctx), "断开")?;
+    let mut evidence = crate::autoroute::probe_line(&ctx.root, cfg, line, binary, now_unix);
+    complete_network_reroute(previous, |transport| {
+        if transport.is_some() {
+            require_reroute_step(disconnect_json(ctx), "断开")?;
+        }
+        let target = RerouteTarget { line_id: &line.id, transport };
+        require_reroute_step(connect_json_with(ctx, Some(target)), "重连")?;
+        let actual = crate::engine_config::actual_transport(&ctx.root.join("runtime-engine.json"))
+            .ok_or_else(|| "无法确认重连后的实际连接方式".to_string())?;
+        let verified = crate::selfcheck::current_qualified_trade_pass(&ctx.root);
+        if !verified {
+            if let Err(error) = crate::autoroute::invalidate_reroute_candidate(
+                &ctx.root, &line.id, actual, &mut evidence,
+            ) {
+                eprintln!("自动选路证据更新失败：{error}");
+            }
+        }
+        Ok((actual, verified))
+    })
 }
 
-/// 断开 → 连接。连接会复用刚落盘的证据（`connect` 走 `choose_transport`）。
-fn reroute_cycle(ctx: &Ctx) -> serde_json::Value {
-    let reply_of = |text: String| {
-        serde_json::from_str::<serde_json::Value>(&text)
-            .unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "宿主回包不是合法 JSON"}))
+fn complete_network_reroute(
+    previous: Option<Transport>,
+    mut connect: impl FnMut(Option<Transport>) -> Result<(Transport, bool), String>,
+) -> Result<(Transport, bool), String> {
+    let (actual, verified) = connect(None)?;
+    if verified {
+        return Ok((actual, false));
+    }
+    let Some(previous) = previous.filter(|prior| *prior != actual) else {
+        return Err("重连后的认证交易出口自检未通过".into());
     };
-    let disconnected = reply_of(disconnect_json(ctx));
-    if disconnected.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        let message = disconnected
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("断开没有完成");
-        return serde_json::json!({"error": format!("断开失败：{message}")});
+    let (restored, verified) = connect(Some(previous))
+        .map_err(|error| format!("新方式未通过认证自检，恢复{}失败：{error}", previous.label()))?;
+    if restored != previous || !verified {
+        return Err("恢复连接未能验证原先的连接方式".into());
     }
-    let connected = reply_of(connect_json(ctx));
-    if connected.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        let message = connected
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("重连没有完成");
-        return serde_json::json!({"error": format!("重连失败：{message}")});
+    Ok((restored, true))
+}
+
+fn require_reroute_step(reply: String, action: &str) -> Result<(), String> {
+    let reply = serde_json::from_str::<serde_json::Value>(&reply)
+        .map_err(|_| format!("{action}失败：宿主回包不是合法 JSON"))?;
+    if reply.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(());
     }
-    serde_json::json!({"ok": true})
+    let message = reply.get("error").and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{action}没有完成"));
+    Err(format!("{action}失败：{message}"))
+}
+
+/// 断开 → 连接。连接会复用刚落盘的证据（connect 走 choose_transport）。
+fn reroute_cycle(ctx: &Ctx) -> serde_json::Value {
+    match require_reroute_step(disconnect_json(ctx), "断开")
+        .and_then(|_| require_reroute_step(connect_json(ctx), "重连"))
+    {
+        Ok(()) => serde_json::json!({"ok": true}),
+        Err(error) => serde_json::json!({"error": error}),
+    }
 }
 
 fn lines_json(ctx: &Ctx) -> String {
@@ -5610,6 +5636,15 @@ fn status_json(ctx: &Ctx) -> String {
 /// 连接：事务本体复用 `connect::connect`，这里只做两件事——
 /// 把「没配置」翻译成人话，把结果翻译成 JSON。
 fn connect_json(ctx: &Ctx) -> String {
+    connect_json_with(ctx, None)
+}
+
+struct RerouteTarget<'a> {
+    line_id: &'a str,
+    transport: Option<Transport>,
+}
+
+fn connect_json_with(ctx: &Ctx, reroute: Option<RerouteTarget<'_>>) -> String {
     // Refusal before config preparation, journal, proxy or new spawn.
     // Do not clear prior self-check evidence or run cleanup on this refusal.
     let _runtime_occupancy = match crate::runtime_occupancy::admit() {
@@ -5629,12 +5664,20 @@ fn connect_json(ctx: &Ctx) -> String {
         Some(c) => c,
         None => return refuse_now("找不到配置文件（config.json），请先导入线路"),
     };
+    if let Some(target) = &reroute {
+        if !cfg.current_line().is_some_and(|line| {
+            line.id == target.line_id && line.transport.is_none()
+        }) {
+            return refuse("当前线路已变化或已固定连接方式，未重连");
+        }
+    }
     // 已连接时不能先重写 runtime-engine.json：sing-box 仍在用旧探测凭据，
     // 若磁盘被新凭据覆盖，就会变成「运行配置与记录不一致」。
     let preflight_store = crate::proxy::ProxyStore::system();
     match crate::connect::preflight_before_prepare(
         cfg, &ctx.root, &preflight_store, &crate::probe::pid_alive, ctx.legacy_running,
     ) {
+        Ok(true) if reroute.is_some() => return refuse("当前已有连接，未建立新的重连会话"),
         Ok(true) => {
             let outcome = crate::connect::record_already_connected(cfg, &ctx.root, &ctx.origin(None));
             return outcome_json(Ok(outcome));
@@ -5674,18 +5717,20 @@ fn connect_json(ctx: &Ctx) -> String {
     // A8：自动档先按「用户固定 → 新鲜证据 → 现场探测 → 已验证/标准」选一次。
     // 连接已经在跑时 `busy` 为真，只复用证据，绝不再起一个引擎去抢 WireGuard 身份。
     // 这个值必须在 `engine_cfg` 之外：连接成功后「已验证的方式」要记的就是它。
-    let transport = match cfg.current_line() {
-        Some(line) => crate::autoroute::choose_transport(
-            &ctx.root,
-            cfg,
-            line,
-            Some(engine_binary.as_path()),
-            !busy(ctx),
-            crate::model::now_epoch_secs_u64() as i64,
-        )
-        .transport,
-        None => crate::config::Transport::Udp,
-    };
+    let transport = reroute.and_then(|target| target.transport).unwrap_or_else(|| {
+        match cfg.current_line() {
+            Some(line) => crate::autoroute::choose_transport(
+                &ctx.root,
+                cfg,
+                line,
+                Some(engine_binary.as_path()),
+                !busy(ctx),
+                crate::model::now_epoch_secs_u64() as i64,
+            )
+            .transport,
+            None => Transport::Udp,
+        }
+    });
     let engine_cfg = match cfg.current_engine_path(&ctx.root) {
         Some(p) => {
             // 连接前把分流规则应用一遍：界面上改了规则也可能还没同步到线路文件。
@@ -10563,6 +10608,29 @@ mod tests {
         assert_eq!(parsed.ufw, "Status: active");
         // 少 TC_DONE：脚本被截断，缺字段不能被当成「没装/没监听」。
         assert!(parse_pair_service("TC_UNIT=1\nTC_ACTIVE=active\n").is_none());
+    }
+
+    #[test]
+    fn network_reroute_recovers_once_from_an_unverified_winner() {
+        let mut attempts = Vec::new();
+        let result = complete_network_reroute(Some(Transport::Tcp), |transport| {
+            attempts.push(transport);
+            match transport {
+                None => Ok((Transport::Udp, false)),
+                Some(Transport::Tcp) => Ok((Transport::Tcp, true)),
+                Some(Transport::Udp) => panic!("必须恢复先前验证过的 TCP"),
+            }
+        });
+        assert_eq!(result, Ok((Transport::Tcp, true)));
+        assert_eq!(attempts, [None, Some(Transport::Tcp)]);
+
+        attempts.clear();
+        let failed = complete_network_reroute(Some(Transport::Tcp), |transport| {
+            attempts.push(transport);
+            Ok((transport.unwrap_or(Transport::Udp), false))
+        });
+        assert!(failed.is_err());
+        assert_eq!(attempts, [None, Some(Transport::Tcp)]);
     }
 
     #[test]
