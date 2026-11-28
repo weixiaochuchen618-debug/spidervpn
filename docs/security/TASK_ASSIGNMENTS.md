@@ -945,3 +945,11 @@ DEV-01 已正式 ACTIVE 并独占 #29 分支；DEV-02 保持 ACTIVE、独占 #3 
 - **Stage4A正式限定验收**：[COORD #95 7194532200](https://github.com/weixiaochuchen618-debug/spidervpn/issues/95#issuecomment-7194532200)。精确08f91cc2d6c42e59b9363ea0253eb75616883fb5，父ccb314b1d2fa4c42a7acaa90c2de413d0da00f95，B终态7193885731/7193887081，D独立终验7194086426/7194087602；A实际核分支/main不变、#98 Draft同base C3、十授权路径、四原生workflow45830029125/45830029127/45830029170/45830029138全部success，继承D五job/82步及实际Linux进程kernel L550/L557 6/0。真实隔离子进程注册peer、TERM后同状态重启、GET RetryOnly及原POST授权重试、撤销/INT清理。STAGE4A_PROCESS_NETNS_NATIVE_PASS / GET_FIRST_RETRY_NATIVE_PASS / COORD_ACCEPTED_SCOPED / SECURITY_PARTIAL。过期Open实际验证，Consumed时间界限源码检查；真实Windows/VPS/公开监听/生产回滚/迁移未执行，不重复审计。
 - **Stage4B唯一写锁**：[正式授权 #95 7194540305](https://github.com/weixiaochuchen618-debug/spidervpn/issues/95#issuecomment-7194540305)。A核DEPLOYMENT.md、service_provisioning.rs:20ff、ledger_disk.rs:424ff bootstrap仅测试、src/pairing.rs:120ff TCI1客户端协议、现有可信配置与身份读取/签名路径；实际缺口为新节点尚无Rust首次授权状态及邀请生成命令。B DEV-01 sole ACTIVE_FRESH_AUTHORITY_PROVISIONING，原fix/mvp04-rust-pair-enroll-20261126及Draft #98，从精确08f91cc2d6c42e59b9363ea0253eb75616883fb5续写。目标default-off显式Rust fresh-init、独立可信新WG/管理/TLS身份和保护配置、新根必须不存在、不把空peer当历史证明；生成真实客户端TCI1及签名描述符/认证元数据/持久Open ledger，邀请码仅保护输出，禁止泄漏。严格新建/不覆盖/失败不自动清理或重建，现有serve缺失ledger仍拒绝；不操作现有节点、不复用旧密钥/迁移旧历史、不修改网络、无公开监听。限定文件/验收见正式授权：一个实际隔离新节点命令产出状态及邀请码，现服务加载、独立协议核验、实际GET/POST/peer、重复初始化拒绝、必要错误对照、原生CI；不制造额外测试矩阵。B候选后STOP_WRITE，D仅新delta和实际CI，遇无法证明新节点或安全发布则报告真实阻塞，不扩权。
 - **状态**：C STOP_WRITE，#99冻结，UDP可选非阻塞；#96 WFP原门槛不变。真实Windows配对、可信生产部署与回滚仍待条件及另授权。无新增Issue/PR/分支，无本轮产品源码/CI修改或真实环境操作，不合并main。SECURITY_PARTIAL。
+
+## §111. 2026-11-28 电脑 1 主开发与 022 验收收口
+
+用户将日常开发集中到电脑 1。已建本机工作树 `dev/pc1-mvp06`，起点为集成候选 `7265ca846a4b733b20397fa5c9453cf666ed74e1`。COORD-01 在电脑 1 规划、调度和验收。代码实现可直接调用本机 CodeBuddy CLI 的 `deepseek-v4.1-flash --effort max`，按实际差异和本地验证收尾。现有 CI 提供原生平台验证。本机 Windows GNU 已通过 `cargo +stable-x86_64-pc-windows-gnu check --offline --locked --bin spidervpn --target x86_64-pc-windows-gnu`。
+
+该候选在 ELEVEN 的 022 实机验收通过。实际切换至热点一次，GUI 自然调度一次自动重连，新的兼容 TCP 会话取得认证 HTTP 204 和 `verified / LineServer`。GUI 正常退出，原 Wi-Fi 与四项代理完全恢复。此次实际切换授权已完成。ELEVEN 保留为按需复验设备，§104 作为其普通产品运行的历史授权和范围来源。[022 实机回执](https://github.com/weixiaochuchen618-debug/spidervpn/issues/95#issuecomment-7238056934)
+
+后续从电脑 1 的工作树接续已有任务。[本机开发工作流](../agents/README.md#电脑-1-开发工作流)
