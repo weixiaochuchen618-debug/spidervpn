@@ -685,6 +685,39 @@ pub fn load_evidence(root: &Path, line_id: &str) -> Option<Evidence> {
         .and_then(evidence_from_json)
 }
 
+/// 只更新本轮探测留下的候选。失败不产生新资格，也不延长证据有效期。
+pub(crate) fn invalidate_reroute_candidate(
+    root: &Path,
+    line_id: &str,
+    transport: Transport,
+    expected: &mut Evidence,
+) -> Result<(), String> {
+    let now = crate::model::now_epoch_secs_u64() as i64;
+    if !is_fresh(expected, &network_fingerprint(), now) {
+        return Ok(());
+    }
+    let mut store = load_store(root);
+    let Some(mut evidence) = store["Lines"].get(line_id).and_then(evidence_from_json) else {
+        return Ok(());
+    };
+    if evidence != *expected {
+        return Ok(());
+    }
+    let Some(candidate) = evidence.candidates.iter_mut()
+        .find(|c| c.transport == transport && c.reachable)
+    else {
+        return Ok(());
+    };
+    candidate.reachable = false;
+    candidate.latency_ms = None;
+    candidate.error = "重连后的认证交易出口自检未通过".to_string();
+    evidence.winner = rank(&evidence.candidates);
+    store["Lines"][line_id] = evidence_to_json(&evidence);
+    save_store(root, &store)?;
+    *expected = evidence;
+    Ok(())
+}
+
 /// 连接前的选择：用户固定 → 新鲜证据 → 现场探测 → 兜底（已验证→标准）。
 ///
 /// `allow_probe = false`（例如连接已经在跑）时只用证据或兜底：再起一个引擎去探测
